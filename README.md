@@ -46,9 +46,14 @@ python -m ruff check .
 ```
 
 code-visualization and pr-visualization each carry their own copy of `common.py`,
-`extract_tabs.py`, `check_codemap_state.py`, and `verify_citations.py`. The copies are
-byte-identical and must stay that way — a skill directory has to be self-contained to
-be zipped and installed on its own, so the duplication is deliberate, not drift.
+`extract_tabs.py`, `check_codemap_state.py`, `verify_citations.py`,
+`lint_fragments.py`, and `coverage_data.py`. The copies are byte-identical and CI
+enforces it — a skill directory has to be self-contained to be zipped and installed
+on its own, so the duplication is deliberate, not drift. `assemble.py` is identical
+except for one line (the `--label` default), also CI-checked. Two files differ on
+purpose and are NOT synced: `assets/template.html` (each skill has its own theme;
+the renderers and placeholders match, which a test pins) and
+`references/llm-tabs.md` (different tab sets).
 
 CI also runs a ratchet: python-simplifier's bug-class detectors must stay silent on
 every skill's own `scripts/` directory.

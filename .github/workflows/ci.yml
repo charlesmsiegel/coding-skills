@@ -25,6 +25,25 @@ jobs:
       - name: Lint (ruff)
         run: ruff check .
 
+      # The two visualization skills each ship their own copy of the shared
+      # scripts (a skill directory must be self-contained to be zipped alone).
+      # README declares the copies byte-identical; this makes that invariant
+      # real instead of aspirational.
+      - name: Shared visualization files stay byte-identical
+        run: |
+          set -e
+          CV=skills/code-visualization/scripts
+          PR=skills/pr-visualization/scripts
+          for f in common.py extract_tabs.py check_codemap_state.py \
+                   verify_citations.py lint_fragments.py coverage_data.py; do
+            cmp "$CV/$f" "$PR/$f" || { echo "::error::$f has drifted between the two skills"; exit 1; }
+          done
+          # assemble.py differs in exactly one line: the --label default.
+          if ! diff <(sed 's/PULL REQUEST REVIEW/CODEBASE ATLAS/' "$PR/assemble.py") "$CV/assemble.py"; then
+            echo "::error::assemble.py copies differ beyond the --label default"
+            exit 1
+          fi
+
       - name: Smoke tests (every detector fires on its fixture, quiet on clean code)
         run: pytest -q
 
