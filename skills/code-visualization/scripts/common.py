@@ -1,6 +1,7 @@
 """Shared helpers for codebase/PR analyzers. Stdlib only."""
 import html
 import json
+import os
 import re
 import subprocess
 from pathlib import Path
@@ -40,6 +41,15 @@ BRANCH_RE = re.compile(
     r"|&&|\|\||\?\s"
 )
 
+# Artifacts this toolchain generates into the repo (committed with the PR by
+# design). Diff analysis must exclude them — "the report covers everything
+# except itself" — and staleness checks must not count them as drift.
+GENERATED_DOC_RE = re.compile(r"^docs/(codemap\.html|pr-[^/]+\.html)$")
+
+
+def is_generated_doc(path: str) -> bool:
+    return bool(GENERATED_DOC_RE.match(path))
+
 
 def detect_lang(path: str) -> str:
     p = Path(path)
@@ -60,22 +70,38 @@ def is_test_path(path: str) -> bool:
     )
 
 
-def walk_source(repo: Path, max_file_bytes: int = 2_000_000):
-    """Yield (relpath_str, Path) for tracked-looking source files."""
-    for p in sorted(repo.rglob("*")):
-        if not p.is_file():
-            continue
-        rel = p.relative_to(repo)
-        if any(part in EXCLUDE_DIRS or part.startswith(".") and part not in {".github"} for part in rel.parts[:-1]):
-            continue
-        if rel.parts and rel.parts[0].startswith(".") and rel.parts[0] != ".github":
-            continue
-        try:
-            if p.stat().st_size > max_file_bytes:
+def walk_source(repo: Path, max_file_bytes: int = 2_000_000, skipped_large: list | None = None,
+                extra_exclude: set | None = None):
+    """Yield (relpath_str, Path) for tracked-looking source files.
+
+    Excluded directories are pruned during the walk (a node_modules tree is
+    never entered, not enumerated-then-discarded). Files over max_file_bytes
+    are skipped; pass a list as skipped_large to learn which, so callers can
+    report the omission instead of silently analyzing around a 3 MB god-file.
+    extra_exclude adds user-named directory names (e.g. generated code) to the
+    standard exclusion set.
+    """
+    exclude = EXCLUDE_DIRS | (extra_exclude or set())
+    for dirpath, dirnames, filenames in os.walk(repo):
+        dirnames[:] = sorted(
+            d for d in dirnames
+            if d not in exclude and not (d.startswith(".") and d != ".github")
+        )
+        at_root = Path(dirpath) == repo
+        for name in sorted(filenames):
+            if at_root and name.startswith("."):
                 continue
-        except OSError:
-            continue
-        yield str(rel).replace("\\", "/"), p
+            p = Path(dirpath) / name
+            rel = str(p.relative_to(repo)).replace("\\", "/")
+            try:
+                size = p.stat().st_size
+            except OSError:
+                continue
+            if size > max_file_bytes:
+                if skipped_large is not None:
+                    skipped_large.append({"path": rel, "bytes": size})
+                continue
+            yield rel, p
 
 
 def read_text(p: Path) -> str:
@@ -102,11 +128,14 @@ def loc_and_complexity(text: str):
     return loc, branches, max_depth
 
 
-def git(repo: Path, *args, check: bool = True) -> str:
-    r = subprocess.run(
-        ["git", "-C", str(repo), *args],
-        capture_output=True, text=True, errors="replace",
-    )
+def git(repo: Path, *args, check: bool = True, timeout: int = 300) -> str:
+    try:
+        r = subprocess.run(
+            ["git", "-C", str(repo), *args],
+            capture_output=True, text=True, errors="replace", timeout=timeout,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError(f"git {' '.join(args)} timed out after {timeout}s") from exc
     if check and r.returncode != 0:
         raise RuntimeError(f"git {' '.join(args)} failed: {r.stderr.strip()[:400]}")
     return r.stdout

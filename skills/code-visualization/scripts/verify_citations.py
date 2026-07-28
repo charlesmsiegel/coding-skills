@@ -36,6 +36,15 @@ CITE_RE = re.compile(
     r"^(?P<path>[\w./\-]+\.[A-Za-z][\w]{0,9})"
     r"(?::(?P<lines>\d[\d,\s]*(?:[-\u2013\u2014]\d+)?(?:,\s*\d+(?:[-\u2013\u2014]\d+)?)*))?/?$"
 )
+# Well-known extensionless files, citable with the same :lines syntax.
+EXTLESS_RE = re.compile(
+    r"^(?P<path>(?:[\w./\-]+/)?(?:Makefile|Dockerfile|Justfile|Rakefile|Gemfile|Procfile|Vagrantfile|Caddyfile|Jenkinsfile))"
+    r"(?::(?P<lines>\d[\d,\s]*(?:[-\u2013\u2014]\d+)?(?:,\s*\d+(?:[-\u2013\u2014]\d+)?)*))?$"
+)
+# A token that was probably MEANT as a file:line citation but doesn't parse \u2014
+# reported as unverified instead of silently dropped, so exit 0 can't overstate
+# what was actually checked.
+LOOKS_CITEY_RE = re.compile(r"^\S+\.[A-Za-z]\w{0,9}\s*(?:#L|@|:{2}|\sL)\s*\d+", re.I)
 
 
 def parse_lines(spec):
@@ -101,7 +110,7 @@ def main() -> int:
                 line_cache[rel] = []
         return line_cache[rel]
 
-    report, broken, ok_count = [], 0, 0
+    report, skipped, broken, ok_count = [], [], 0, 0
     frags = sorted(p for p in tabs.glob("*.html") if p.is_file())
     for frag in frags:
         if wanted and frag.name[:2] not in wanted:
@@ -110,15 +119,25 @@ def main() -> int:
         seen = set()
         for m in CODE_RE.finditer(text):
             token = m.group(1).strip()
-            cm = CITE_RE.match(token)
-            if not cm:
-                continue
             key = (frag.name, token)
             if key in seen:
                 continue
+            cm = CITE_RE.match(token) or EXTLESS_RE.match(token)
+            if not cm:
+                if LOOKS_CITEY_RE.match(token):
+                    seen.add(key)
+                    skipped.append({"fragment": frag.name, "citation": token,
+                                    "reason": "unrecognized citation format (use path/file.ext:LINE)"})
+                continue
             seen.add(key)
             path = cm.group("path").rstrip("/")
-            if Path(path).suffix.lower() not in KNOWN_EXTS:
+            suffix = Path(path).suffix.lower()
+            if suffix and suffix not in KNOWN_EXTS:
+                if "/" in path or cm.group("lines"):
+                    # Meant as a citation (has a dir or line numbers) but the
+                    # extension is unknown — unverified, not silently ignored.
+                    skipped.append({"fragment": frag.name, "citation": token,
+                                    "reason": f"unverified: extension {suffix} not in KNOWN_EXTS"})
                 continue  # dotted identifier (sys.argv, Context.scope), not a file
             resolved, status = resolve(path)
             entry = {"fragment": frag.name, "citation": token, "path": path,
@@ -137,11 +156,13 @@ def main() -> int:
                         broken += 1
                         break
                     lo = max(1, a - args.context)
-                    hi = min(len(lines), (a if a == b else b) + args.context)
-                    span = lines[lo - 1: min(hi, a + 2 - 1)] if b - a > 6 else lines[lo - 1: hi]
+                    hi = min(len(lines), b + args.context)
+                    span = lines[lo - 1: hi]
+                    shown = [ln.rstrip()[:160] for ln in span[:8]]
+                    # The marker must appear whenever lines were omitted — a
+                    # silently truncated span reads as the whole citation.
                     content.append({"lines": f"{a}" if a == b else f"{a}-{b}",
-                                    "content": [ln.rstrip()[:160] for ln in span[:8]]
-                                    + (["…"] if (b - a + 1) > 8 else [])})
+                                    "content": shown + (["…"] if len(span) > 8 else [])})
                 entry["cited_content"] = content
             if not entry["status"].startswith("line-out"):
                 ok_count += 1
@@ -151,8 +172,10 @@ def main() -> int:
         "checked_fragments": [f.name for f in frags if not wanted or f.name[:2] in wanted],
         "citations_ok": ok_count,
         "citations_broken": broken,
-        "note": "A resolving citation is necessary, not sufficient: read cited_content and confirm it still supports the claim. Line content shifts when code moves even if the line number stays valid.",
+        "citations_skipped": len(skipped),
+        "note": "A resolving citation is necessary, not sufficient: read cited_content and confirm it still supports the claim. Line content shifts when code moves even if the line number stays valid. citations_skipped counts tokens that look like citations but were NOT verified — rewrite them in path/file.ext:LINE form if they are real.",
         "citations": report,
+        "skipped": skipped,
     }
     print(json.dumps(summary, indent=2))
     return 1 if broken else 0

@@ -48,7 +48,9 @@ def python_edges(rel, text, py_idx):
     edges = set()
     try:
         tree = ast.parse(text)
-    except SyntaxError:
+    # ValueError: NUL bytes (e.g. a mis-detected binary); RecursionError:
+    # pathologically nested literals. Either must cost one file, not the run.
+    except (SyntaxError, ValueError, RecursionError):
         return edges
     pkg_parts = rel.rsplit(".", 1)[0].split("/")
     if pkg_parts[-1] == "__init__":
@@ -125,25 +127,35 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("repo")
     ap.add_argument("--tabs-dir", required=True)
+    ap.add_argument("--exclude", default="",
+                    help="comma-separated extra directory names to skip (e.g. generated,migrations)")
     ap.add_argument("--depth", type=int, default=0, help="module grouping depth below source root (0=auto)")
     ap.add_argument("--max-nodes", type=int, default=55)
     args = ap.parse_args()
+    extra_exclude = {d.strip() for d in args.exclude.split(",") if d.strip()}
     repo = Path(args.repo).resolve()
 
-    texts, locs = {}, {}
-    for rel, p in walk_source(repo):
+    paths, locs = {}, {}
+    for rel, p in walk_source(repo, extra_exclude=extra_exclude):
         lang = detect_lang(rel)
         if lang in ("Other", "Markdown", "reStructuredText", "JSON", "YAML", "TOML", "HTML", "CSS"):
             continue
-        t = read_text(p)
-        texts[rel] = t
-        locs[rel] = loc_and_complexity(t)[0]
-    file_set = set(texts)
+        paths[rel] = p
+        locs[rel] = loc_and_complexity(read_text(p))[0]
+    file_set = set(paths)
     py_idx = build_python_index(file_set)
     go_mod = go_module_path(repo)
+    # dir -> .go files, so Go import resolution is a lookup instead of a scan
+    # over every file for every import (quadratic on large Go monorepos).
+    go_files_by_dir = defaultdict(list)
+    for f in file_set:
+        if f.endswith(".go"):
+            go_files_by_dir[str(Path(f).parent).replace("\\", "/")].append(f)
 
     edges = defaultdict(set)  # src file -> {dst files}
-    for rel, text in texts.items():
+    # Files are re-read here rather than kept from the first pass: holding
+    # every source text at once is multi-GB on big repos.
+    for rel, text in ((rel, read_text(p)) for rel, p in paths.items()):
         ext = "." + rel.rsplit(".", 1)[-1] if "." in rel else ""
         if ext in (".py", ".pyi"):
             edges[rel] |= python_edges(rel, text, py_idx)
@@ -171,10 +183,11 @@ def main() -> int:
                     sub = m.group(1)[len(go_mod):].strip("/")
                     src_dir = str(Path(rel).parent).replace("\\", "/")
                     for cand_dir in (sub, f"src/{sub}"):
-                        for f in file_set:
-                            if f.startswith(cand_dir + "/") and f.endswith(".go") and str(Path(f).parent).replace("\\", "/") == cand_dir and f != rel:
-                                if cand_dir != src_dir:
-                                    edges[rel].add(f)
+                        if cand_dir == src_dir:
+                            continue
+                        for f in go_files_by_dir.get(cand_dir, ()):
+                            if f != rel:
+                                edges[rel].add(f)
         elif ext == ".rs":
             for use in RUST_USE_RE.findall(text):
                 segs = use.split("::")
@@ -236,8 +249,8 @@ def main() -> int:
     depth = args.depth
     if depth == 0:
         depth = 1
-        mods = {module_of(r, 1) for r in texts}
-        if len(mods) < 6 and len(texts) > 25:
+        mods = {module_of(r, 1) for r in paths}
+        if len(mods) < 6 and len(paths) > 25:
             depth = 2
 
     mod_loc, mod_files = defaultdict(int), defaultdict(int)
@@ -314,7 +327,7 @@ def main() -> int:
     file_adj = defaultdict(set)
     for src, dsts in edges.items():
         file_adj[src] |= dsts
-    file_sccs = find_sccs(sorted(texts), file_adj)
+    file_sccs = find_sccs(sorted(paths), file_adj)
     cyc_members = {m for scc in sccs for m in scc}
     scc_of = {}
     for i, scc in enumerate(sccs):

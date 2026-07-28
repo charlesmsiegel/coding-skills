@@ -25,7 +25,7 @@ import re
 import sys
 from pathlib import Path
 
-from common import git
+from common import GENERATED_DOC_RE, git
 
 MARKER_RE = re.compile(r"^(<{7}|={7}|>{7})( |$)", re.M)
 SHA_RE = re.compile(r"\b[0-9a-f]{7,40}\b")
@@ -53,21 +53,22 @@ def main() -> int:
         print(json.dumps(out, indent=2))
         return 1
 
-    # last commit touching the codemap; merge commit => suspect splice
+    # last commit touching the codemap; merge commit => suspect splice.
+    # NUL-separated fields: parents must come from %P alone — scanning the
+    # whole line would mistake a sha quoted in a revert subject for a parent.
     try:
-        last = git(repo, "log", "--full-history", "-1", "--format=%H %P %cs %s", "--", rel).strip()
+        last = git(repo, "log", "--full-history", "-1", "--format=%H%x00%P%x00%cs %s", "--", rel).strip()
     except Exception as e:
         last = ""
         out["git_note"] = f"history unavailable: {e}"
     merge_last = False
-    if last:
-        parts = last.split()
-        sha, rest = parts[0], parts[1:]
-        parents = [p for p in rest if re.fullmatch(r"[0-9a-f]{40}", p)]
+    if last and "\0" in last:
+        sha, parent_field, rest = (last.split("\0", 2) + ["", ""])[:3]
+        parents = parent_field.split()
         merge_last = len(parents) >= 2
         out["last_commit_touching_codemap"] = {
             "sha": sha[:12], "is_merge": merge_last,
-            "line": last[:160],
+            "line": f"{sha[:12]} {rest}"[:160],
         }
         if merge_last:
             for i, p in enumerate(parents, 1):
@@ -84,8 +85,16 @@ def main() -> int:
         if git(repo, "rev-parse", "--verify", "--quiet", f"{cand}^{{commit}}", check=False).strip():
             meta_sha = cand
             break
-    head = git(repo, "rev-parse", "--short", "HEAD").strip()
-    out["head"] = head
+    # This is the first command the workflow runs — a non-git dir or unborn
+    # HEAD must still produce a JSON verdict, not a traceback.
+    try:
+        out["head"] = git(repo, "rev-parse", "--short", "HEAD").strip()
+    except Exception as e:
+        out["git_note"] = f"HEAD unavailable: {e}"
+        out["verdict"] = "unknown-vintage"
+        out["detail"] = "cannot assess staleness without git history; treat the codemap as unverified"
+        print(json.dumps(out, indent=2))
+        return 1
     if meta_sha:
         out["meta_sha"] = meta_sha
         behind = git(repo, "rev-list", "--count", f"{meta_sha}..HEAD").strip()
@@ -93,7 +102,7 @@ def main() -> int:
         try:
             diff = git(repo, "diff", "--name-only", f"{meta_sha}..HEAD")
             names = [line for line in diff.splitlines() if line.strip()]
-            real = [n for n in names if not re.match(r"^docs/(codemap\.html|pr-[^/]+\.html)$", n)]
+            real = [n for n in names if not GENERATED_DOC_RE.match(n)]
             out["files_changed_since"] = len(real)
             out["generated_docs_changed_since"] = len(names) - len(real)
         except RuntimeError as e:

@@ -18,7 +18,10 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("repo")
     ap.add_argument("--tabs-dir", required=True)
+    ap.add_argument("--exclude", default="",
+                    help="comma-separated extra directory names to skip (e.g. generated,migrations)")
     args = ap.parse_args()
+    extra_exclude = {d.strip() for d in args.exclude.split(",") if d.strip()}
     repo = Path(args.repo).resolve()
 
     files = []  # (rel, lang, loc, branches, depth, is_test)
@@ -26,10 +29,17 @@ def main() -> int:
     lang_files = defaultdict(int)
     dir_loc = defaultdict(int)
     test_loc = src_loc = 0
+    skipped_large = []
+    other_files = 0
+    other_exts = defaultdict(int)
 
-    for rel, p in walk_source(repo):
+    for rel, p in walk_source(repo, skipped_large=skipped_large, extra_exclude=extra_exclude):
         lang = detect_lang(rel)
         if lang == "Other":
+            # Unrecognized language: counted and reported, never silently
+            # dropped — a Dart or Haskell repo must not read as "empty".
+            other_files += 1
+            other_exts[Path(rel).suffix.lower() or "(no ext)"] += 1
             continue
         text = read_text(p)
         loc, branches, depth = loc_and_complexity(text)
@@ -59,6 +69,20 @@ def main() -> int:
     top_dirs = sorted(dir_loc.items(), key=lambda kv: -kv[1])[:14]
     max_dir = top_dirs[0][1] if top_dirs else 1
     test_ratio = (100.0 * test_loc / (test_loc + src_loc)) if (test_loc + src_loc) else 0.0
+
+    coverage_notes = []
+    if other_files:
+        top_ext = ", ".join(f"{e} ({n})" for e, n in
+                            sorted(other_exts.items(), key=lambda kv: -kv[1])[:5])
+        coverage_notes.append(
+            f"{other_files:,} file(s) in unrecognized languages are not counted above ({esc(top_ext)})")
+    if skipped_large:
+        biggest_skipped = max(skipped_large, key=lambda s: s["bytes"])
+        coverage_notes.append(
+            f"{len(skipped_large)} file(s) over 2 MB skipped entirely, largest "
+            f"<code>{esc(biggest_skipped['path'])}</code> ({biggest_skipped['bytes']//1_000_000} MB)")
+    coverage_note = (
+        f"<p class=\"dim\">Coverage: {'; '.join(coverage_notes)}.</p>" if coverage_notes else "")
 
     lang_rows = "\n".join(
         f"<tr><td>{esc(lang)}</td><td class='num'>{n:,}</td>"
@@ -97,6 +121,7 @@ def main() -> int:
 <div class="tbl-wrap"><table class="sortable">
 <thead><tr><th>Language</th><th class="num">LOC</th><th class="num">Files</th><th>Share</th><th class="num">%</th></tr></thead>
 <tbody>{lang_rows}</tbody></table></div>
+{coverage_note}
 
 <h2>Top-level directories</h2>
 <div class="tbl-wrap"><table class="sortable">
@@ -126,6 +151,13 @@ def main() -> int:
         "source_files": len(files),
         "test_loc_share_pct": round(test_ratio, 1),
         "languages": {lang: n for lang, n in top_langs[:8]},
+        # What the numbers above do NOT include — so a sparse inventory reads
+        # as a coverage gap, not as a small codebase.
+        "excluded": {
+            "unrecognized_language_files": other_files,
+            "unrecognized_extensions": dict(sorted(other_exts.items(), key=lambda kv: -kv[1])[:8]),
+            "files_over_2mb": skipped_large[:10],
+        },
         "top_dirs": dict(top_dirs[:10]),
         "largest_files": [{"path": r, "loc": n} for r, _, n, _, _, _ in biggest[:10]],
         "most_branch_heavy": [{"path": r, "branches": b, "loc": n} for r, _, n, b, _, _ in most_complex[:10]],

@@ -180,20 +180,6 @@ def test_diff_fails_loudly_on_an_unresolvable_base(repo, tabs, run_script):
     assert list(tabs.iterdir()) == [], "a failed run must not leave half a report behind"
 
 
-def test_diff_reports_a_docs_only_diff_as_an_error(repo, tabs, run_script):
-    """Regenerated docs alone are not a reviewable change."""
-    repo.write("src/core.py", BASE_CORE)
-    repo.write("docs/codemap.html", "<html>old</html>\n")
-    repo.commit("base")
-    repo.write("docs/codemap.html", "<html>new</html>\n")
-    repo.commit("only regenerate the atlas")
-
-    result = run_script(SCRIPTS / "analyze_diff.py", repo.path, "--tabs-dir", tabs,
-                        "--base", "HEAD~1", expect_rc=1)
-
-    assert "generated report docs" in json.loads(result.stdout)["error"]
-
-
 # --------------------------------------------------------------------------- #
 # Blast radius
 # --------------------------------------------------------------------------- #
@@ -268,3 +254,39 @@ def test_assemble_differs_only_in_its_default_label():
 
     assert cv != pr
     assert cv.replace('default="CODEBASE ATLAS"', 'default="PULL REQUEST REVIEW"') == pr
+
+
+# --------------------------------------------------------------------------- #
+# Review-round fixes: JS keywords, worktree flows, renames, blast-radius honesty
+# --------------------------------------------------------------------------- #
+
+
+def test_lint_fragments_catches_stray_script_and_style(tabs, run_script):
+    tabs.joinpath("01-summary.html").write_text(
+        "<!-- tab: Summary -->\n<p>fine</p>\n"
+        '<div class="viz" data-render="treemap"></div>\n'
+        '<script type="application/json">{"items":[]}</script>\n', encoding="utf-8")
+    tabs.joinpath("05-flow-impact.html").write_text(
+        "<!-- tab: Flow Impact -->\n<script>alert(1)</script>\n<style>body{}</style>\n", encoding="utf-8")
+
+    result = run_script(SCRIPTS / "lint_fragments.py", "--tabs-dir", tabs, expect_rc=1)
+
+    report = json.loads(result.stdout)
+    problems = {(p["fragment"], p["problem"].split(" ")[0]) for p in report["problems"]}
+    assert ("05-flow-impact.html", "executable") in problems
+    assert ("05-flow-impact.html", "<style>") in problems
+    assert all(p[0] != "01-summary.html" for p in problems), "the JSON data block is legal"
+
+
+def test_diff_reports_a_docs_only_diff_as_an_error(repo, tabs, run_script):
+    """Regenerated docs alone are not a reviewable change."""
+    repo.write("src/core.py", BASE_CORE)
+    repo.write("docs/codemap.html", "<html>old</html>\n")
+    repo.commit("base")
+    repo.write("docs/codemap.html", "<html>new</html>\n")
+    repo.commit("only regenerate the atlas")
+
+    result = run_script(SCRIPTS / "analyze_diff.py", repo.path, "--tabs-dir", tabs,
+                        "--base", "HEAD~1", expect_rc=1)
+
+    assert "generated report docs" in json.loads(result.stdout)["error"]

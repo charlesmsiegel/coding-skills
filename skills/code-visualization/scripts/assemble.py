@@ -14,6 +14,10 @@ Line 1 of each fragment must be:   <!-- tab: Human Readable Title -->
 The rest of the file is the panel's inner HTML.
 Fragments are assembled in filename order. A fragment whose body is empty
 (after the tab comment) is skipped.
+
+--title/--label/--meta/--subtitle are HTML-escaped. --footer is injected as
+raw HTML (it legitimately carries entities and links) — escape it yourself if
+it ever contains untrusted text.
 """
 import argparse
 import html
@@ -76,7 +80,7 @@ def main() -> int:
     out_html = (
         tpl.replace("<!--DOC_TITLE-->", html.escape(args.title))
         .replace("<!--DOC_LABEL-->", html.escape(args.label))
-        .replace("<!--DOC_SUBTITLE-->", args.subtitle)
+        .replace("<!--DOC_SUBTITLE-->", html.escape(args.subtitle))
         .replace("<!--DOC_META-->", html.escape(args.meta))
         .replace("<!--DOC_FOOTER-->", args.footer)
         .replace("<!--TABS_NAV-->", "\n".join(nav_parts))
