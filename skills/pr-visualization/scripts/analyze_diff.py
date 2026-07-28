@@ -15,6 +15,7 @@ from collections import defaultdict
 from pathlib import Path
 
 from common import bar_cell, esc, git, is_test_path, json_block, write_fragment
+from coverage_data import artifact_age_days, discover, parse as parse_coverage, resolve_paths
 from diffutil import (def_patterns_for, is_generated_doc, parse_diff, resolve_base,
                       untracked_file_diffs)
 
@@ -322,6 +323,41 @@ def main() -> int:
                     if uncovered else
                     f"<div class='callout good'><b>{esc(cov_note)}</b></div>")
 
+    # ---- measured coverage of changed files (existing artifact only) ----
+    coverage_of_changed, coverage_meta, coverage_html = [], None, ""
+    artifacts, cov_hints = discover(repo)
+    if artifacts:
+        artifact, cov_kind = artifacts[0]
+        resolved = resolve_paths(parse_coverage(artifact, cov_kind),
+                                 [r["fd"].path for r in changed_src])
+        age = artifact_age_days(artifact)
+        coverage_meta = {"artifact": str(artifact), "format": cov_kind,
+                         "artifact_age_days": round(age, 1)}
+        for r in changed_src:
+            p = r["fd"].path
+            if p in resolved:
+                covered, total = resolved[p]
+                pct = round(100.0 * covered / total, 1) if total else 0.0
+                coverage_of_changed.append({"path": p, "line_coverage_pct": pct})
+            else:
+                coverage_of_changed.append({"path": p, "line_coverage_pct": None})
+        crows = "".join(
+            f"<tr><td><code>{esc(c['path'])}</code></td>"
+            + (f"<td class='num'>{c['line_coverage_pct']:.0f}%</td>"
+               if c["line_coverage_pct"] is not None else
+               "<td class='num'><span class='badge warn'>not measured</span></td>")
+            + "</tr>"
+            for c in coverage_of_changed)
+        age_warn = (f" The artifact is ~{age:.0f} days old — it predates this change, so treat these "
+                    f"numbers as the coverage the changed code STARTED from, not what it has now."
+                    if age > 1 else "")
+        coverage_html = f"""
+<h2>Measured coverage of changed files</h2>
+<p class="dim">From <code>{esc(str(artifact))}</code> ({esc(cov_kind)}); rendered, not re-run.{esc(age_warn)}</p>
+<div class="tbl-wrap"><table class="sortable">
+<thead><tr><th>Changed file</th><th class="num">Line coverage</th></tr></thead>
+<tbody>{crows}</tbody></table></div>
+"""
 
     body2 = f"""
 {contract_callout}
@@ -331,6 +367,7 @@ def main() -> int:
 <p class="dim">Match is heuristic: a changed test counts as covering a source file if it shares a name stem or mentions the file's changed symbols. {esc(cov_note)}</p>
 {test_callout}
 {f'<div class="tbl-wrap"><table class="sortable"><thead><tr><th>Changed file — no test change found</th><th class="num">+/−</th><th>Risk signals</th></tr></thead><tbody>{unc_rows}</tbody></table></div>' if uncovered else ''}
+{coverage_html}
 """
     write_fragment(tabs, "03-contracts-tests.html", "Contracts & Tests", body2)
 
@@ -360,6 +397,10 @@ def main() -> int:
         summary["unreadable_test_files"] = unreadable_tests
     if untracked_skipped:
         summary["untracked_files_skipped"] = untracked_skipped
+    if coverage_meta:
+        summary["coverage"] = coverage_meta | {"changed_files": coverage_of_changed}
+    elif cov_hints:
+        summary["coverage_hints"] = cov_hints
     print(json.dumps(summary, indent=2))
     return 0
 

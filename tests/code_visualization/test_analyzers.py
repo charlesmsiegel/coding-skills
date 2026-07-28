@@ -449,3 +449,76 @@ def test_hotspots_reports_shallow_history_flag(repo, tabs, run_script):
     assert summary["shallow_history"] is False
 
 
+# --------------------------------------------------------------------------- #
+# Coverage tab (renders existing artifacts; never runs tests)
+# --------------------------------------------------------------------------- #
+
+COBERTURA = """<?xml version="1.0"?>
+<coverage>
+  <packages><package name="src"><classes>
+    <class filename="src/core.py"><lines>
+      <line number="1" hits="1"/><line number="2" hits="1"/>
+      <line number="3" hits="0"/><line number="4" hits="0"/>
+    </lines></class>
+    <class filename="src/util.py"><lines>
+      <line number="1" hits="1"/><line number="2" hits="1"/>
+    </lines></class>
+  </classes></package></packages>
+</coverage>
+"""
+
+
+def test_coverage_tab_renders_cobertura(repo, tabs, run_script, fragment):
+    repo.write("src/core.py", "def f(x):\n    if x:\n        return 1\n    return 0\n")
+    repo.write("src/util.py", "def g():\n    return 2\n")
+    repo.write("coverage.xml", COBERTURA)
+
+    summary = json.loads(run_script(SCRIPTS / "analyze_coverage.py", repo.path, "--tabs-dir", tabs).stdout)
+
+    assert summary["format"] == "cobertura"
+    assert summary["files_measured"] == 2
+    assert summary["overall_line_coverage_pct"] == 66.7  # 4 of 6 lines
+    assert fragment.title(tabs / "09-coverage.html") == "Coverage"
+    assert "50%" in fragment.body(tabs / "09-coverage.html")  # core.py 2/4
+
+
+def test_coverage_absent_asks_instead_of_fabricating(repo, tabs, run_script):
+    repo.write("src/core.py", "def f():\n    return 1\n")
+
+    result = run_script(SCRIPTS / "analyze_coverage.py", repo.path, "--tabs-dir", tabs)
+
+    summary = json.loads(result.stdout)
+    assert "ask_user" in summary
+    assert not (tabs / "09-coverage.html").exists()
+
+
+def test_coverage_hints_at_convertible_artifacts(repo, tabs, run_script):
+    repo.write("src/core.py", "def f():\n    return 1\n")
+    repo.write(".coverage", "sqlite-ish blob")
+
+    summary = json.loads(run_script(SCRIPTS / "analyze_coverage.py", repo.path, "--tabs-dir", tabs).stdout)
+
+    assert any("coverage xml" in h for h in summary["hints"])
+
+
+def test_coverage_lcov_and_unmeasured_files(repo, tabs, run_script):
+    repo.write("src/a.js", "export const a = () => 1;\n")
+    repo.write("src/b.js", "export const b = () => { if (x) { return 1; } return 2; };\n")
+    repo.write("lcov.info", "SF:src/a.js\nDA:1,1\nDA:2,0\nend_of_record\n")
+
+    summary = json.loads(run_script(SCRIPTS / "analyze_coverage.py", repo.path, "--tabs-dir", tabs).stdout)
+
+    assert summary["format"] == "lcov"
+    assert summary["files_measured"] == 1
+    assert "src/b.js" in summary["unmeasured_complex"]
+
+
+def test_extraction_gives_coverage_tab_its_canonical_prefix(tmp_path, tabs, run_script):
+    tabs.joinpath("01-overview.html").write_text("<!-- tab: Overview -->\n<p>o</p>\n", encoding="utf-8")
+    tabs.joinpath("09-coverage.html").write_text("<!-- tab: Coverage -->\n<p>c</p>\n", encoding="utf-8")
+    atlas = tmp_path / "codemap.html"
+    run_script(SCRIPTS / "assemble.py", "--tabs-dir", tabs, "--out", atlas, "--title", "T")
+
+    result = run_script(SCRIPTS / "extract_tabs.py", atlas, "--out-dir", tmp_path / "rec")
+
+    assert json.loads(result.stdout)["fragments"] == ["01-overview.html", "09-coverage.html"]

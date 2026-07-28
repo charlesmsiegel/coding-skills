@@ -420,3 +420,32 @@ def test_lint_fragments_catches_stray_script_and_style(tabs, run_script):
     assert all(p[0] != "01-summary.html" for p in problems), "the JSON data block is legal"
 
 
+def test_changed_file_coverage_is_reported_when_an_artifact_exists(repo, tabs, run_script):
+    make_pr(repo)
+    repo.write("coverage.xml", """<?xml version="1.0"?>
+<coverage><packages><package name="src"><classes>
+  <class filename="src/core.py"><lines>
+    <line number="1" hits="1"/><line number="2" hits="0"/>
+  </lines></class>
+</classes></package></packages></coverage>
+""")
+
+    summary = json.loads(
+        run_script(SCRIPTS / "analyze_diff.py", repo.path, "--tabs-dir", tabs, "--base", "HEAD~1").stdout
+    )
+
+    assert summary["coverage"]["format"] == "cobertura"
+    entries = {c["path"]: c["line_coverage_pct"] for c in summary["coverage"]["changed_files"]}
+    assert entries["src/core.py"] == 50.0
+    body = (tabs / "03-contracts-tests.html").read_text(encoding="utf-8")
+    assert "Measured coverage of changed files" in body
+
+
+def test_no_coverage_artifact_means_no_coverage_key(repo, tabs, run_script):
+    make_pr(repo)
+
+    summary = json.loads(
+        run_script(SCRIPTS / "analyze_diff.py", repo.path, "--tabs-dir", tabs, "--base", "HEAD~1").stdout
+    )
+
+    assert "coverage" not in summary
