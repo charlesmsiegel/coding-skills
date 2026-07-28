@@ -20,37 +20,64 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("repo")
     ap.add_argument("--tabs-dir", required=True)
+    ap.add_argument("--exclude", default="",
+                    help="comma-separated extra directory names to skip (e.g. generated,migrations)")
     ap.add_argument("--since", default="24 months ago")
     args = ap.parse_args()
+    extra_exclude = {d.strip() for d in args.exclude.split(",") if d.strip()}
     repo = Path(args.repo).resolve()
     tabs = Path(args.tabs_dir)
 
     try:
         git(repo, "rev-parse", "--git-dir")
+        # git log paths are relative to the repo TOPLEVEL. When the analyzed
+        # directory is a subdirectory of a larger repo, they must be re-based
+        # onto it — matching them against subdir-relative paths silently gives
+        # every file churn 0 and a confidently wrong tab.
+        prefix = git(repo, "rev-parse", "--show-prefix").strip()
     except Exception:
         write_fragment(tabs, "04-hotspots.html", "Hotspots", "")
         print(json.dumps({"error": "not a git repository; hotspots skipped"}))
         return 0
 
-    log = git(repo, "log", f"--since={args.since}", "--name-only",
-              "--no-merges", "--pretty=format:@@%H|%an")
+    try:
+        shallow = git(repo, "rev-parse", "--is-shallow-repository").strip() == "true"
+    except Exception:
+        shallow = False
+
+    # quotepath=false keeps non-ASCII paths literal (not octal-escaped), so
+    # they match the filesystem walk instead of silently getting churn 0.
+    log = git(repo, "-c", "core.quotepath=false", "log", f"--since={args.since}",
+              "--name-only", "--no-merges", "--pretty=format:@@%H|%an")
     churn = defaultdict(int)
     authors = defaultdict(set)
-    commits = 0
-    cur_author = None
+    touched_commits = set()
+    cur_sha, cur_author = None, None
     for line in log.splitlines():
         if line.startswith("@@"):
-            commits += 1
-            cur_author = line.split("|", 1)[1] if "|" in line else "?"
+            sha_author = line[2:].split("|", 1)
+            cur_sha = sha_author[0]
+            cur_author = sha_author[1] if len(sha_author) > 1 else "?"
         elif line.strip():
-            churn[line.strip()] += 1
+            path = line.strip()
+            if prefix:
+                if not path.startswith(prefix):
+                    continue  # outside the analyzed subtree
+                path = path[len(prefix):]
+            churn[path] += 1
+            if cur_sha:
+                touched_commits.add(cur_sha)
             if cur_author:
-                authors[line.strip()].add(cur_author)
+                authors[path].add(cur_author)
+    commits = len(touched_commits)
 
     rows = []
-    for rel, p in walk_source(repo):
+    unranked_churned = []  # churned files outside CODE_LANGS (.tf/.sql/.proto/...)
+    for rel, p in walk_source(repo, extra_exclude=extra_exclude):
         lang = detect_lang(rel)
         if lang not in CODE_LANGS:
+            if churn.get(rel, 0) > 0:
+                unranked_churned.append({"path": rel, "churn": churn[rel], "lang": lang})
             continue
         c = churn.get(rel, 0)
         loc, branches, depth = loc_and_complexity(read_text(p))
@@ -84,6 +111,13 @@ def main() -> int:
         f"<td class='num' data-sort='{r['score']}'>{bar_cell(r['score'], max_score, 'bad')}</td></tr>"
         for r in top[:25])
 
+    unranked_churned.sort(key=lambda r: -r["churn"])
+    churn_note = ""
+    if unranked_churned:
+        top_unranked = ", ".join(f"{r['path']} ({r['churn']})" for r in unranked_churned[:3])
+        churn_note = (f" {len(unranked_churned)} frequently-changed non-code file(s) "
+                      f"(config/SQL/proto/docs) are not ranked here — top: {esc(top_unranked)}.")
+
     stable = sorted((r for r in src_rows if r["churn"] == 0 and r["branches"] > 30),
                     key=lambda r: -r["branches"])[:8]
     stable_html = ""
@@ -98,6 +132,7 @@ def main() -> int:
   <div class="kpi warn"><div class="n">{esc(top[0]['path'].split('/')[-1]) if top else '–'}</div><div class="l">top hotspot</div></div>
 </div>
 <div class="callout"><b>How to read this:</b> files that are both <i>complex</i> and <i>frequently changed</i> are where defects concentrate — complexity makes mistakes likely, churn gives them opportunities. Prioritize refactoring and review attention here, not on complex-but-stable code.</div>
+{'<div class="callout warn"><b>Shallow clone:</b> history is truncated at the clone depth, so commit counts undercount the true churn. Deepen the clone (<code>git fetch --unshallow</code>) for accurate numbers.</div>' if shallow else ''}
 
 <h2>Churn × size map</h2>
 <p class="dim">Area = lines of code · color = commit count since {esc(args.since)} · hover for details.</p>
@@ -105,7 +140,7 @@ def main() -> int:
 <script type="application/json">{json_block(treemap)}</script>
 
 <h2>Hotspot ranking</h2>
-<p class="dim">Score = commits × (branch points + 1). Tests excluded.</p>
+<p class="dim">Score = commits × (branch points + 1). Tests excluded.{churn_note}</p>
 <div class="tbl-wrap"><table class="sortable">
 <thead><tr><th>File</th><th class="num">Commits</th><th class="num">Branches</th><th class="num">LOC</th><th class="num">Authors</th><th class="num">Hotspot score</th></tr></thead>
 <tbody>{tbl}</tbody></table></div>
@@ -115,8 +150,10 @@ def main() -> int:
 
     print(json.dumps({
         "commits_analyzed": commits, "since": args.since,
+        "shallow_history": shallow,
         "top_hotspots": [{k: r[k] for k in ("path", "churn", "branches", "loc", "authors", "score")} for r in top[:12]],
         "complex_dormant": [r["path"] for r in stable],
+        "churned_but_unranked": unranked_churned[:10],
     }, indent=2))
     return 0
 

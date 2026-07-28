@@ -420,3 +420,32 @@ def test_extraction_preserves_canonical_numbering_when_a_tab_was_dropped(tmp_pat
     ]
 
 
+def test_hotspots_correct_when_target_is_a_subdirectory_of_a_repo(repo, tabs, run_script):
+    # git log paths are toplevel-relative; analyzing a subdirectory used to
+    # match them against subdir-relative paths, giving every file churn 0 and
+    # a confidently wrong tab.
+    for i in range(3):
+        repo.write("service/api.py", f"def handler(x):\n    if x:\n        return {i}\n    return 0\n")
+        repo.commit(f"change {i}")
+    repo.write("unrelated/other.py", "x = 1\n")
+    repo.commit("outside the subtree")
+
+    summary = json.loads(
+        run_script(SCRIPTS / "analyze_hotspots.py", repo.path / "service", "--tabs-dir", tabs).stdout
+    )
+
+    by_path = {h["path"]: h for h in summary["top_hotspots"]}
+    assert by_path["api.py"]["churn"] == 3
+    assert "unrelated/other.py" not in by_path
+    assert summary["commits_analyzed"] == 3  # the outside-subtree commit is not counted
+
+
+def test_hotspots_reports_shallow_history_flag(repo, tabs, run_script):
+    repo.write("a.py", "x = 1\n")
+    repo.commit("one")
+
+    summary = json.loads(run_script(SCRIPTS / "analyze_hotspots.py", repo.path, "--tabs-dir", tabs).stdout)
+
+    assert summary["shallow_history"] is False
+
+
