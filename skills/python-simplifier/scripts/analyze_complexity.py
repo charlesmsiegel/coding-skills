@@ -10,7 +10,7 @@ import json
 import argparse
 from pathlib import Path
 from dataclasses import dataclass, asdict
-from typing import Iterator
+from common import SEVERITY_ICONS, configure_output, find_python_files, warn_detector_error
 
 
 @dataclass
@@ -226,20 +226,13 @@ def analyze_file(filepath: Path, config: Config) -> list[ComplexityIssue]:
             issue_type="syntax_error", value=0, threshold=0,
             severity="high", suggestion=f"Fix syntax: {e.msg}"
         )]
-    except Exception:
+    except Exception as exc:
+        warn_detector_error(filepath, exc)
         return []
 
 
-def find_python_files(path: Path) -> Iterator[Path]:
-    if path.is_file() and path.suffix == '.py':
-        yield path
-    elif path.is_dir():
-        for p in path.rglob('*.py'):
-            if '.venv' not in p.parts and 'node_modules' not in p.parts and '__pycache__' not in p.parts:
-                yield p
-
-
 def main():
+    configure_output()
     parser = argparse.ArgumentParser(description="Analyze Python code complexity")
     parser.add_argument('path', nargs='?', default='.', help='File or directory')
     parser.add_argument('--format', choices=['text', 'json'], default='text')
@@ -247,19 +240,21 @@ def main():
     parser.add_argument('--max-nesting', type=int, default=4)
     parser.add_argument('--max-function-lines', type=int, default=50)
     parser.add_argument('--max-params', type=int, default=5)
-    
+    parser.add_argument('--ignore', type=str, default='', help='Comma-separated issue types to ignore')
+
     args = parser.parse_args()
-    
+    ignore = set(args.ignore.split(',')) if args.ignore else set()
+
     config = Config(
         max_complexity=args.max_complexity,
         max_nesting=args.max_nesting,
         max_function_lines=args.max_function_lines,
         max_params=args.max_params
     )
-    
+
     all_issues = []
     for filepath in find_python_files(Path(args.path)):
-        all_issues.extend(analyze_file(filepath, config))
+        all_issues.extend(i for i in analyze_file(filepath, config) if i.issue_type not in ignore)
     
     all_issues.sort(key=lambda x: (x.severity != 'high', x.severity != 'medium', x.file, x.line))
     
@@ -270,7 +265,7 @@ def main():
             print("✅ No complexity issues found!")
             return
         
-        severity_icons = {'high': '🔴', 'medium': '🟡', 'low': '🟢'}
+        severity_icons = SEVERITY_ICONS
         print(f"Found {len(all_issues)} complexity issue(s):\n")
         for issue in all_issues:
             icon = severity_icons[issue.severity]

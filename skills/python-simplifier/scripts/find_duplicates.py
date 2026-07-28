@@ -9,9 +9,9 @@ import json
 import hashlib
 import argparse
 from pathlib import Path
-from dataclasses import dataclass, asdict
-from typing import Iterator
+from dataclasses import dataclass
 from collections import defaultdict
+from common import configure_output, find_python_files, warn_detector_error, warn_unparseable
 
 
 @dataclass
@@ -125,17 +125,12 @@ def analyze_file(filepath: Path, min_lines: int) -> list[dict]:
         collector = DuplicateCollector(str(filepath), lines, min_lines)
         collector.visit(tree)
         return collector.blocks
-    except (SyntaxError, Exception):
+    except (SyntaxError, ValueError) as exc:
+        warn_unparseable(filepath, exc)
         return []
-
-
-def find_python_files(path: Path) -> Iterator[Path]:
-    if path.is_file() and path.suffix == '.py':
-        yield path
-    elif path.is_dir():
-        for p in path.rglob('*.py'):
-            if '.venv' not in p.parts and 'node_modules' not in p.parts and '__pycache__' not in p.parts:
-                yield p
+    except Exception as exc:
+        warn_detector_error(filepath, exc)
+        return []
 
 
 def find_duplicates(path: Path, min_lines: int) -> list[DuplicateGroup]:
@@ -165,17 +160,42 @@ def find_duplicates(path: Path, min_lines: int) -> list[DuplicateGroup]:
     return duplicates
 
 
+def to_findings(duplicates: list[DuplicateGroup]) -> list[dict]:
+    """Render groups in the flat findings shape every other detector emits,
+    anchored at the first occurrence, so format_findings/analyze_all can show
+    a real location and description instead of '?:?'."""
+    findings = []
+    for dup in duplicates:
+        first, rest = dup.occurrences[0], dup.occurrences[1:]
+        others = ", ".join(f"{o['file']}:{o['line']}" for o in rest)
+        findings.append({
+            'file': first['file'],
+            'line': first['line'],
+            'smell_type': 'duplicate_code',
+            'description': (f"{len(dup.occurrences)} structurally identical ~{dup.lines}-line "
+                            f"{first['type']} blocks; also at {others}"),
+            'suggestion': 'Extract the shared logic into one function/class.',
+            'severity': 'high' if len(dup.occurrences) >= 3 else 'medium',
+            'code_snippet': dup.occurrences[0]['preview'].split('\n')[0][:80],
+            'occurrences': dup.occurrences,
+        })
+    return findings
+
+
 def main():
+    configure_output()
     parser = argparse.ArgumentParser(description="Detect duplicate code in Python")
     parser.add_argument('path', nargs='?', default='.', help='File or directory')
     parser.add_argument('--format', choices=['text', 'json'], default='text')
     parser.add_argument('--min-lines', type=int, default=5)
-    
+    parser.add_argument('--ignore', type=str, default='', help='Comma-separated smell types to ignore')
+
     args = parser.parse_args()
-    duplicates = find_duplicates(Path(args.path), args.min_lines)
-    
+    ignore = set(args.ignore.split(',')) if args.ignore else set()
+    duplicates = [] if 'duplicate_code' in ignore else find_duplicates(Path(args.path), args.min_lines)
+
     if args.format == 'json':
-        print(json.dumps([asdict(d) for d in duplicates], indent=2))
+        print(json.dumps(to_findings(duplicates), indent=2))
     else:
         if not duplicates:
             print("✅ No duplicate code found!")

@@ -10,6 +10,7 @@ import argparse
 import subprocess
 from pathlib import Path
 from datetime import datetime
+from common import SEVERITY_ICONS, configure_output
 
 
 def run_analyzer(script_name: str, path: str) -> dict:
@@ -31,112 +32,61 @@ def run_analyzer(script_name: str, path: str) -> dict:
         return {'issues': [], 'error': str(e)[:200]}
 
 
-def generate_report(path: str, skip_duplicates: bool = False) -> dict:
+# category -> (script, progress label). One row per detector analyze_all runs;
+# find_redundant_comments and find_parameter_objects' diff lens are opt-in only.
+ANALYZERS = [
+    ('complexity', 'analyze_complexity.py', 'Analyzing complexity'),
+    ('code_smells', 'find_code_smells.py', 'Finding code smells'),
+    ('overengineering', 'find_overengineering.py', 'Detecting over-engineering'),
+    ('design_smells', 'find_design_smells.py', 'Finding classic design smells'),
+    ('pattern_issues', 'find_pattern_issues.py', 'Finding design-pattern issues'),
+    ('dead_code', 'find_dead_code.py', 'Finding dead code'),
+    ('unpythonic', 'find_unpythonic.py', 'Detecting unpythonic patterns'),
+    ('coupling', 'find_coupling_issues.py', 'Analyzing coupling/cohesion'),
+    ('mutation_hazards', 'find_mutation_hazards.py', 'Finding mutation hazards'),
+    ('exception_issues', 'find_exception_issues.py', 'Finding exception issues'),
+    ('global_state', 'find_global_state.py', 'Finding global state'),
+    ('parameter_objects', 'find_parameter_objects.py', 'Finding data clumps'),
+    ('boolean_params', 'find_boolean_params.py', 'Finding boolean-flag parameters'),
+    ('return_issues', 'find_return_issues.py', 'Finding return-statement problems'),
+    ('loop_simplifications', 'find_loop_simplifications.py', 'Finding loop simplifications'),
+    ('naming_issues', 'find_naming_issues.py', 'Finding naming issues'),
+    ('comment_smells', 'find_comment_smells.py', 'Finding comment smells'),
+    ('resource_leaks', 'find_resource_leaks.py', 'Finding resource leaks'),
+    ('security', 'find_security_issues.py', 'Finding security issues'),
+    ('import_cycles', 'find_import_cycles.py', 'Finding import cycles / god modules'),
+    ('debug_leftovers', 'find_debug_leftovers.py', 'Finding debug leftovers'),
+    ('outdated_idioms', 'find_outdated_idioms.py', 'Finding outdated idioms'),
+    ('missing_docstrings', 'find_missing_docstrings.py', 'Finding missing docstrings'),
+    ('type_gaps', 'find_type_gaps.py', 'Finding type-annotation gaps'),
+    ('dependency_issues', 'find_dependency_issues.py', 'Checking dependency hygiene'),
+    ('untested_modules', 'find_untested_modules.py', 'Finding untested modules'),
+    ('test_smells', 'find_test_smells.py', 'Finding test smells'),
+    ('ai_scaffolding', 'find_ai_scaffolding.py', 'Finding AI scaffolding/placeholders'),
+    ('duplicate_definitions', 'find_duplicate_definitions.py', 'Finding duplicate definitions / merge artifacts'),
+    ('unawaited_coroutines', 'find_unawaited_coroutines.py', 'Finding unawaited coroutines'),
+    ('local_imports', 'find_local_imports.py', 'Finding non-top-level imports'),
+    ('duplicates', 'find_duplicates.py', 'Finding duplicates'),
+]
+
+CATEGORIES = [category for category, _, _ in ANALYZERS]
+
+
+def generate_report(path: str, skip: set | None = None) -> dict:
+    skip = skip or set()
     results = {}
-
-    print("🔍 Analyzing complexity...", file=sys.stderr)
-    results['complexity'] = run_analyzer('analyze_complexity.py', path)
-
-    print("🔍 Finding code smells...", file=sys.stderr)
-    results['code_smells'] = run_analyzer('find_code_smells.py', path)
-
-    print("🔍 Detecting over-engineering...", file=sys.stderr)
-    oe_result = run_analyzer('find_overengineering.py', path)
-    results['overengineering'] = oe_result.get('issues', []) if isinstance(oe_result, dict) else oe_result
-
-    print("🔍 Finding classic design smells...", file=sys.stderr)
-    results['design_smells'] = run_analyzer('find_design_smells.py', path)
-
-    print("🔍 Finding design-pattern issues...", file=sys.stderr)
-    results['pattern_issues'] = run_analyzer('find_pattern_issues.py', path)
-
-    print("🔍 Finding dead code...", file=sys.stderr)
-    results['dead_code'] = run_analyzer('find_dead_code.py', path)
-
-    print("🔍 Detecting unpythonic patterns...", file=sys.stderr)
-    results['unpythonic'] = run_analyzer('find_unpythonic.py', path)
-
-    print("🔍 Analyzing coupling/cohesion...", file=sys.stderr)
-    results['coupling'] = run_analyzer('find_coupling_issues.py', path)
-
-    print("🔍 Finding mutation hazards...", file=sys.stderr)
-    results['mutation_hazards'] = run_analyzer('find_mutation_hazards.py', path)
-
-    print("🔍 Finding exception issues...", file=sys.stderr)
-    results['exception_issues'] = run_analyzer('find_exception_issues.py', path)
-
-    print("🔍 Finding global state...", file=sys.stderr)
-    results['global_state'] = run_analyzer('find_global_state.py', path)
-
-    print("🔍 Finding data clumps...", file=sys.stderr)
-    results['parameter_objects'] = run_analyzer('find_parameter_objects.py', path)
-
-    print("🔍 Finding boolean-flag parameters...", file=sys.stderr)
-    results['boolean_params'] = run_analyzer('find_boolean_params.py', path)
-
-    print("🔍 Finding return-statement problems...", file=sys.stderr)
-    results['return_issues'] = run_analyzer('find_return_issues.py', path)
-
-    print("🔍 Finding loop simplifications...", file=sys.stderr)
-    results['loop_simplifications'] = run_analyzer('find_loop_simplifications.py', path)
-
-    print("🔍 Finding naming issues...", file=sys.stderr)
-    results['naming_issues'] = run_analyzer('find_naming_issues.py', path)
-
-    print("🔍 Finding comment smells...", file=sys.stderr)
-    results['comment_smells'] = run_analyzer('find_comment_smells.py', path)
-
-    print("🔍 Finding resource leaks...", file=sys.stderr)
-    results['resource_leaks'] = run_analyzer('find_resource_leaks.py', path)
-
-    print("🔍 Finding security issues...", file=sys.stderr)
-    results['security'] = run_analyzer('find_security_issues.py', path)
-
-    print("🔍 Finding import cycles / god modules...", file=sys.stderr)
-    results['import_cycles'] = run_analyzer('find_import_cycles.py', path)
-
-    print("🔍 Finding debug leftovers...", file=sys.stderr)
-    results['debug_leftovers'] = run_analyzer('find_debug_leftovers.py', path)
-
-    print("🔍 Finding outdated idioms...", file=sys.stderr)
-    results['outdated_idioms'] = run_analyzer('find_outdated_idioms.py', path)
-
-    print("🔍 Finding missing docstrings...", file=sys.stderr)
-    results['missing_docstrings'] = run_analyzer('find_missing_docstrings.py', path)
-
-    print("🔍 Finding type-annotation gaps...", file=sys.stderr)
-    results['type_gaps'] = run_analyzer('find_type_gaps.py', path)
-
-    print("🔍 Checking dependency hygiene...", file=sys.stderr)
-    results['dependency_issues'] = run_analyzer('find_dependency_issues.py', path)
-
-    print("🔍 Finding untested modules...", file=sys.stderr)
-    results['untested_modules'] = run_analyzer('find_untested_modules.py', path)
-
-    print("🔍 Finding test smells...", file=sys.stderr)
-    results['test_smells'] = run_analyzer('find_test_smells.py', path)
-
-    print("🔍 Finding AI scaffolding/placeholders...", file=sys.stderr)
-    results['ai_scaffolding'] = run_analyzer('find_ai_scaffolding.py', path)
-
-    print("🔍 Finding duplicate definitions / merge artifacts...", file=sys.stderr)
-    results['duplicate_definitions'] = run_analyzer('find_duplicate_definitions.py', path)
-
-    print("🔍 Finding unawaited coroutines...", file=sys.stderr)
-    results['unawaited_coroutines'] = run_analyzer('find_unawaited_coroutines.py', path)
-
-    print("🔍 Finding non-top-level imports...", file=sys.stderr)
-    results['local_imports'] = run_analyzer('find_local_imports.py', path)
-
-    if not skip_duplicates:
-        print("🔍 Finding duplicates...", file=sys.stderr)
-        results['duplicates'] = run_analyzer('find_duplicates.py', path)
+    for category, script, label in ANALYZERS:
+        if category in skip:
+            continue
+        print(f"🔍 {label}...", file=sys.stderr)
+        results[category] = run_analyzer(script, path)
 
     report = {
         'meta': {
             'analyzed_path': path,
             'timestamp': datetime.now().isoformat(),
             'analyzers_run': list(results.keys()),
+            'analyzers_skipped': sorted(skip),
             # category -> error string for every analyzer that did not complete.
             # A zero count for one of these categories means "unknown", not "clean".
             'analyzer_errors': {}
@@ -199,7 +149,7 @@ def print_text_report(report: dict):
     print(f"Total issues found: {summary['total_issues']}")
     print()
 
-    severity_icons = {'high': '🔴', 'medium': '🟡', 'low': '🟢'}
+    severity_icons = SEVERITY_ICONS
     print("By severity:")
     for sev, count in summary['by_severity'].items():
         if count > 0:
@@ -330,6 +280,7 @@ def print_text_report(report: dict):
 
 
 def main():
+    configure_output()
     parser = argparse.ArgumentParser(
         description="Comprehensive Python code analyzer",
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -376,11 +327,21 @@ Examples:
     )
     parser.add_argument('path', nargs='?', default='.', help='File or directory')
     parser.add_argument('--format', choices=['text', 'json'], default='text')
-    parser.add_argument('--skip-duplicates', action='store_true')
+    parser.add_argument('--skip', type=str, default='',
+                        help='Comma-separated analyzer categories to skip '
+                             f"(choices: {', '.join(CATEGORIES)})")
+    parser.add_argument('--skip-duplicates', action='store_true',
+                        help='Shorthand for --skip duplicates (the slowest analyzer)')
     parser.add_argument('--output', '-o', type=str, help='Output file')
 
     args = parser.parse_args()
-    report = generate_report(args.path, skip_duplicates=args.skip_duplicates)
+    skip = set(args.skip.split(',')) if args.skip else set()
+    if args.skip_duplicates:
+        skip.add('duplicates')
+    unknown = skip - set(CATEGORIES)
+    if unknown:
+        parser.error(f"--skip names unknown categories: {', '.join(sorted(unknown))}")
+    report = generate_report(args.path, skip=skip)
 
     if args.format == 'json':
         output = json.dumps(report, indent=2)
@@ -392,7 +353,7 @@ Examples:
         sys.stdout = old_stdout
 
     if args.output:
-        Path(args.output).write_text(output)
+        Path(args.output).write_text(output, encoding="utf-8")
         print(f"Report saved to {args.output}", file=sys.stderr)
     else:
         print(output)

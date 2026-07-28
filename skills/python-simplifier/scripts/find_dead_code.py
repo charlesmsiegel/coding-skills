@@ -9,8 +9,9 @@ import json
 import argparse
 from pathlib import Path
 from dataclasses import dataclass, asdict
-from typing import Iterator, Set
+from typing import Set
 from collections import defaultdict
+from common import configure_output, find_python_files, warn_detector_error, warn_unparseable
 
 
 @dataclass
@@ -218,36 +219,39 @@ def analyze_file(filepath: Path) -> list[DeadCodeIssue]:
         redundant.visit(tree)
         
         return tracker.issues + redundant.issues
-    except (SyntaxError, Exception):
+    except (SyntaxError, ValueError) as exc:
+        warn_unparseable(filepath, exc)
+        return []
+    except Exception as exc:
+        warn_detector_error(filepath, exc)
         return []
 
 
-def find_python_files(path: Path) -> Iterator[Path]:
-    if path.is_file() and path.suffix == '.py':
-        yield path
-    elif path.is_dir():
-        for p in path.rglob('*.py'):
-            if '.venv' not in p.parts and 'node_modules' not in p.parts and '__pycache__' not in p.parts:
-                yield p
-
-
 def main():
+    configure_output()
     parser = argparse.ArgumentParser(description="Detect dead and unused code")
     parser.add_argument('path', nargs='?', default='.', help='File or directory')
     parser.add_argument('--format', choices=['text', 'json'], default='text')
     parser.add_argument('--min-confidence', type=int, default=60)
-    
+    parser.add_argument('--ignore', type=str, default='', help='Comma-separated issue types to ignore')
+
     args = parser.parse_args()
-    
+    ignore = set(args.ignore.split(',')) if args.ignore else set()
+
     all_issues = []
     for filepath in find_python_files(Path(args.path)):
-        all_issues.extend(analyze_file(filepath))
-    
+        all_issues.extend(i for i in analyze_file(filepath) if i.issue_type not in ignore)
+
     all_issues = [i for i in all_issues if i.confidence >= args.min_confidence]
     all_issues.sort(key=lambda x: (-x.confidence, x.file, x.line))
-    
+
     if args.format == 'json':
-        print(json.dumps([asdict(i) for i in all_issues], indent=2))
+        # severity travels with the finding so standalone output renders the
+        # same as analyze_all's aggregation (confidence maps onto severity).
+        print(json.dumps([
+            {**asdict(i), 'severity': 'high' if i.confidence >= 90 else ('medium' if i.confidence >= 70 else 'low')}
+            for i in all_issues
+        ], indent=2))
     else:
         if not all_issues:
             print("✅ No dead code found!")

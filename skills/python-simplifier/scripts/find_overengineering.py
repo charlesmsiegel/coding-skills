@@ -8,11 +8,11 @@ Finds: YAGNI violations, speculative generality, premature abstraction,
 import ast
 import json
 import argparse
-import contextlib
 from pathlib import Path
 from dataclasses import dataclass, asdict
-from typing import Iterator
 from collections import defaultdict
+from common import (SEVERITY_ICONS, configure_output, find_python_files,
+                    warn_detector_error, warn_unparseable)
 
 
 @dataclass
@@ -38,12 +38,15 @@ class ProjectAnalyzer:
         self.issues: list[OverEngineeringIssue] = []
 
     def analyze_file(self, filepath: Path):
-        # Unreadable/unparseable files are skipped by design.
-        with contextlib.suppress(Exception):
+        try:
             source = filepath.read_text(encoding='utf-8', errors='replace')
             tree = ast.parse(source, filename=str(filepath))
             visitor = ClassCollector(str(filepath), source.splitlines(), self)
             visitor.visit(tree)
+        except (SyntaxError, ValueError, OSError) as exc:
+            warn_unparseable(filepath, exc)
+        except Exception as exc:
+            warn_detector_error(filepath, exc)
 
     def detect_issues(self):
         # Single-implementation abstract classes
@@ -214,45 +217,35 @@ class ClassCollector(ast.NodeVisitor):
                     self.analyzer.thin_wrappers.append((node.name, self.filename, node.lineno, wrapped_attr))
 
 
-def find_python_files(path: Path) -> Iterator[Path]:
-    if path.is_file() and path.suffix == '.py':
-        yield path
-    elif path.is_dir():
-        for p in path.rglob('*.py'):
-            if '.venv' not in p.parts and 'node_modules' not in p.parts and '__pycache__' not in p.parts:
-                yield p
-
-
 def main():
+    configure_output()
     parser = argparse.ArgumentParser(description="Detect over-engineering patterns")
     parser.add_argument('path', nargs='?', default='.', help='File or directory')
     parser.add_argument('--format', choices=['text', 'json'], default='text')
-    
+    parser.add_argument('--ignore', type=str, default='', help='Comma-separated issue types to ignore')
+
     args = parser.parse_args()
-    
+    ignore = set(args.ignore.split(',')) if args.ignore else set()
+
     analyzer = ProjectAnalyzer()
     for filepath in find_python_files(Path(args.path)):
         analyzer.analyze_file(filepath)
     analyzer.detect_issues()
-    
-    issues = analyzer.issues
+
+    issues = [i for i in analyzer.issues if i.issue_type not in ignore]
     issues.sort(key=lambda x: (x.severity != 'high', x.severity != 'medium', x.file, x.line))
-    
+
     if args.format == 'json':
-        print(json.dumps({
-            'issues': [asdict(i) for i in issues],
-            'stats': {
-                'total_classes': len(analyzer.classes),
-                'abstract_classes': len(analyzer.abstract_classes)
-            }
-        }, indent=2))
+        # Flat findings list, like every other detector (stats live in the
+        # text report only — aggregators consume findings, not stats).
+        print(json.dumps([asdict(i) for i in issues], indent=2))
     else:
         if not issues:
             print("✅ No over-engineering issues found!")
             print(f"\nStats: {len(analyzer.classes)} classes, {len(analyzer.abstract_classes)} abstract")
             return
         
-        severity_icons = {'high': '🔴', 'medium': '🟡', 'low': '🟢'}
+        severity_icons = SEVERITY_ICONS
         by_type = defaultdict(int)
         for issue in issues:
             by_type[issue.issue_type] += 1

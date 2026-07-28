@@ -2443,6 +2443,25 @@ def test_callback_field_use_is_not_a_temporary_field(tmp_path):
 
 
 # --------------------------------------------------------------------------- #
+# Shared plumbing (scripts/common.py): console encoding, error surfacing,
+# vendored-dir exclusion, and the first-commit diff fallback
+# --------------------------------------------------------------------------- #
+
+
+def test_analyze_all_output_file_is_utf8(tmp_path):
+    (tmp_path / "sample.py").write_text("x = 1\n")
+    out = tmp_path / "report.txt"
+    result = subprocess.run(
+        [sys.executable, str(SCRIPTS_DIR / "analyze_all.py"), str(tmp_path),
+         "--skip-duplicates", "--output", str(out)],
+        capture_output=True, text=True, timeout=600,
+        env={**os.environ, "PYTHONIOENCODING": "cp1252"},
+    )
+    assert result.returncode == 0, result.stderr[:800]
+    out.read_text(encoding="utf-8")  # must decode; emoji land here regardless of console
+
+
+# --------------------------------------------------------------------------- #
 # Detector-noise fixes: magic numbers, data_class, unpythonic, and the
 # unified --ignore / flat-JSON interface
 # --------------------------------------------------------------------------- #
@@ -2533,6 +2552,67 @@ def test_x_plus_y_rewrite_suggestion_removed(tmp_path):
     (tmp_path / "sample.py").write_text("def f(x, y):\n    x = x + y\n    return x\n")
     findings = run_detector("find_unpythonic.py", tmp_path)
     assert "augmented_assignment" not in {f["pattern_type"] for f in findings}
+
+
+IGNORE_INTERFACE = [
+    ("analyze_complexity.py", "def f(a, b, c, d, e, g, h, i):\n    return a\n", "parameter_count"),
+    ("find_dead_code.py", "import os\n\nx = 1\n", "unused_import"),
+    ("find_unpythonic.py", "def f(d):\n    return sorted(d.keys())\n", "sorted_dict_keys"),
+]
+
+
+@pytest.mark.parametrize("script,code,finding_type", IGNORE_INTERFACE)
+def test_ignore_flag_on_previously_missing_detectors(tmp_path, script, code, finding_type):
+    (tmp_path / "sample.py").write_text(code)
+    type_field = {"analyze_complexity.py": "issue_type", "find_dead_code.py": "issue_type",
+                  "find_unpythonic.py": "pattern_type"}[script]
+    fired = {f[type_field] for f in run_detector(script, tmp_path)}
+    assert finding_type in fired, f"expected {finding_type}, got {fired}"
+    suppressed = {f[type_field] for f in run_detector(script, tmp_path, "--ignore", finding_type)}
+    assert finding_type not in suppressed
+
+
+def test_find_duplicates_emits_flat_findings(tmp_path):
+    body = "    a = 1\n    b = a + 2\n    c = b * a\n    d = c - a\n    return d\n"
+    (tmp_path / "one.py").write_text(f"def first(x):\n{body}")
+    (tmp_path / "two.py").write_text(f"def second(y):\n{body}")
+    findings = run_detector("find_duplicates.py", tmp_path)
+    assert findings, "duplicate pair must be reported"
+    f = findings[0]
+    assert {"file", "line", "smell_type", "description", "severity"} <= f.keys()
+    assert f["smell_type"] == "duplicate_code"
+    assert f["line"] > 0 and f["file"].endswith(".py")
+    assert "also at" in f["description"]
+
+
+def test_find_overengineering_emits_flat_list(tmp_path):
+    (tmp_path / "sample.py").write_text(
+        "from abc import ABC, abstractmethod\n"
+        "class Base(ABC):\n"
+        "    @abstractmethod\n"
+        "    def run(self):\n"
+        "        ...\n"
+        "class Only(Base):\n"
+        "    def run(self):\n"
+        "        return 1\n"
+    )
+    findings = run_detector("find_overengineering.py", tmp_path)
+    assert isinstance(findings, list) and findings
+    assert {"file", "line", "issue_type", "severity"} <= findings[0].keys()
+
+
+def test_analyze_all_skip_flag(tmp_path):
+    (tmp_path / "sample.py").write_text("def f(x):\n    return eval(x)\n")
+    result = subprocess.run(
+        [sys.executable, str(SCRIPTS_DIR / "analyze_all.py"), str(tmp_path),
+         "--format", "json", "--skip", "duplicates,security"],
+        capture_output=True, text=True, timeout=600,
+    )
+    assert result.returncode == 0, result.stderr[:500]
+    report = json.loads(result.stdout)
+    assert "security" not in report["categories"]
+    assert "duplicates" not in report["categories"]
+    assert set(report["meta"]["analyzers_skipped"]) == {"duplicates", "security"}
 
 
 # --------------------------------------------------------------------------- #
