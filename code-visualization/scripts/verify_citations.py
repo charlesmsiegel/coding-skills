@@ -26,8 +26,7 @@ import sys
 from collections import defaultdict
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-from common import LANG_BY_EXT, walk_source  # noqa: E402
+from common import LANG_BY_EXT, walk_source
 
 KNOWN_EXTS = set(LANG_BY_EXT) | {".txt", ".cfg", ".ini", ".lock", ".gradle", ".mod", ".sum",
                                  ".graphql", ".env", ".properties", ".adoc", ".xml", ".sql"}

@@ -25,8 +25,7 @@ import re
 import sys
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-from common import git  # noqa: E402
+from common import git
 
 MARKER_RE = re.compile(r"^(<{7}|={7}|>{7})( |$)", re.M)
 SHA_RE = re.compile(r"\b[0-9a-f]{7,40}\b")
@@ -72,11 +71,7 @@ def main() -> int:
         }
         if merge_last:
             for i, p in enumerate(parents, 1):
-                try:
-                    ours_theirs = git(repo, "cat-file", "-e", f"{p}:{rel}", check=False)
-                    out["last_commit_touching_codemap"][f"parent{i}"] = p[:12]
-                except Exception:
-                    pass
+                out["last_commit_touching_codemap"][f"parent{i}"] = p[:12]
 
     # vintage from meta line
     meta = re.search(r'<div class="doc-meta">(.*?)</div>', html, re.S)
@@ -84,12 +79,11 @@ def main() -> int:
     out["meta"] = meta_text[:200]
     meta_sha = None
     for cand in SHA_RE.findall(meta_text):
-        try:
-            git(repo, "rev-parse", "--verify", "--quiet", f"{cand}^{{commit}}")
+        # Probing: most tokens in the meta line are not shas, so a failure here
+        # is the expected answer ("not a commit"), not an error worth surfacing.
+        if git(repo, "rev-parse", "--verify", "--quiet", f"{cand}^{{commit}}", check=False).strip():
             meta_sha = cand
             break
-        except Exception:
-            continue
     head = git(repo, "rev-parse", "--short", "HEAD").strip()
     out["head"] = head
     if meta_sha:
@@ -97,12 +91,14 @@ def main() -> int:
         behind = git(repo, "rev-list", "--count", f"{meta_sha}..HEAD").strip()
         out["commits_since_codemap"] = int(behind)
         try:
-            names = [l for l in git(repo, "diff", "--name-only", f"{meta_sha}..HEAD").splitlines() if l.strip()]
+            diff = git(repo, "diff", "--name-only", f"{meta_sha}..HEAD")
+            names = [line for line in diff.splitlines() if line.strip()]
             real = [n for n in names if not re.match(r"^docs/(codemap\.html|pr-[^/]+\.html)$", n)]
             out["files_changed_since"] = len(real)
             out["generated_docs_changed_since"] = len(names) - len(real)
-        except Exception:
-            pass
+        except RuntimeError as e:
+            # Falls back to the commit count for the staleness verdict below.
+            out["diff_note"] = f"file-level diff unavailable: {e}"
 
     if merge_last:
         out["verdict"] = "merge-resolution-suspect"

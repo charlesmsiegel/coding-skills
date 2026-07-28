@@ -62,7 +62,6 @@ def main() -> int:
     raw = git(repo, "diff", "--no-color",
               merge_base if args.worktree else f"{merge_base}..{args.head}")
     fds = parse_diff(raw)
-    excluded_docs = [f.path for f in fds if is_generated_doc(f.path)]
     fds = [f for f in fds if not is_generated_doc(f.path)]
     changed_files = {fd.path for fd in fds}
 

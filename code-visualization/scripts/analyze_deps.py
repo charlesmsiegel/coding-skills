@@ -16,7 +16,7 @@ import sys
 from collections import defaultdict
 from pathlib import Path
 
-from common import (bar_cell, detect_lang, esc, is_test_path, json_block,
+from common import (bar_cell, detect_lang, esc, json_block,
                     loc_and_complexity, read_text, walk_source, write_fragment)
 
 JS_EXTS = [".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".vue", ".svelte"]
@@ -267,15 +267,19 @@ def main() -> int:
 
         def strongconnect(v):
             work = [(v, iter(sorted(adj[v])))]
-            index[v] = low[v] = counter[0]; counter[0] += 1
-            stack.append(v); onstack.add(v)
+            index[v] = low[v] = counter[0]
+            counter[0] += 1
+            stack.append(v)
+            onstack.add(v)
             while work:
                 node, it = work[-1]
                 advanced = False
                 for w in it:
                     if w not in index:
-                        index[w] = low[w] = counter[0]; counter[0] += 1
-                        stack.append(w); onstack.add(w)
+                        index[w] = low[w] = counter[0]
+                        counter[0] += 1
+                        stack.append(w)
+                        onstack.add(w)
                         work.append((w, iter(sorted(adj[w]))))
                         advanced = True
                         break
@@ -289,7 +293,9 @@ def main() -> int:
                 if low[node] == index[node]:
                     comp = []
                     while True:
-                        w = stack.pop(); onstack.discard(w); comp.append(w)
+                        w = stack.pop()
+                        onstack.discard(w)
+                        comp.append(w)
                         if w == node:
                             break
                     if len(comp) > 1:

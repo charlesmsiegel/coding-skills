@@ -106,7 +106,8 @@ def main() -> int:
     else:
         raw = git(repo, "diff", "--no-color", f"{merge_base}..{args.head}")
         head_desc = args.head
-        commits = [l for l in git(repo, "log", "--oneline", f"{merge_base}..{args.head}").splitlines() if l.strip()]
+        commits = [line for line in git(repo, "log", "--oneline", f"{merge_base}..{args.head}").splitlines()
+                   if line.strip()]
 
     fds = parse_diff(raw)
     excluded_docs = [f.path for f in fds if is_generated_doc(f.path)]
@@ -166,11 +167,14 @@ def main() -> int:
     changed_src = [r for r in file_rows if r["cat"] == "source" and r["fd"].status != "D" and not r["fd"].binary]
     changed_tests = [r["fd"].path for r in file_rows if r["cat"] == "test"]
     test_text = ""
+    unreadable_tests = []
     for p in changed_tests:
         try:
             test_text += git(repo, "show", f"{args.head}:{p}") if not args.worktree else (repo / p).read_text(errors="replace")
-        except Exception:
-            pass
+        except (RuntimeError, OSError):
+            # Every unread test file weakens the coverage heuristic below, so the
+            # summary reports them rather than silently under-counting coverage.
+            unreadable_tests.append(p)
     uncovered, covered = [], []
     for r in changed_src:
         stem = Path(r["fd"].path).stem.lower()
@@ -330,6 +334,8 @@ def main() -> int:
         "source_files_without_test_changes": [r["fd"].path for r in uncovered],
         "risky_added_lines": sorted(risk_hits_global, key=lambda h: -h["count"])[:30],
     }
+    if unreadable_tests:
+        summary["unreadable_test_files"] = unreadable_tests
     print(json.dumps(summary, indent=2))
     return 0
 

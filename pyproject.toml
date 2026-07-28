@@ -2,7 +2,9 @@
 name = "coding-skills"
 version = "0.1.0"
 description = "Agentic skills to help with AI coding (stdlib-only detectors + judgment guides)"
-requires-python = ">=3.11"
+# 3.12+: the code-visualization scripts use PEP 701 f-strings (nested same-quote
+# expressions), which are a SyntaxError on 3.11.
+requires-python = ">=3.12"
 # The detectors are deliberately stdlib-only; there are no runtime dependencies.
 dependencies = []
 

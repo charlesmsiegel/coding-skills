@@ -61,11 +61,11 @@ def main() -> int:
     test_ratio = (100.0 * test_loc / (test_loc + src_loc)) if (test_loc + src_loc) else 0.0
 
     lang_rows = "\n".join(
-        f"<tr><td>{esc(l)}</td><td class='num'>{n:,}</td>"
-        f"<td class='num'>{lang_files[l]:,}</td>"
+        f"<tr><td>{esc(lang)}</td><td class='num'>{n:,}</td>"
+        f"<td class='num'>{lang_files[lang]:,}</td>"
         f"<td>{bar_cell(n, max_lang)}</td>"
         f"<td class='num'>{100.0*n/total_loc:.1f}%</td></tr>"
-        for l, n in top_langs[:12]
+        for lang, n in top_langs[:12]
     )
     dir_rows = "\n".join(
         f"<tr><td><code>{esc(d)}/</code></td><td class='num'>{n:,}</td>"
@@ -89,7 +89,7 @@ def main() -> int:
 <div class="kpis">
   <div class="kpi accent"><div class="n">{len(files):,}</div><div class="l">source files</div></div>
   <div class="kpi"><div class="n">{total_loc:,}</div><div class="l">lines of code</div></div>
-  <div class="kpi"><div class="n">{len([l for l in top_langs if l[0] in CODE_LANGS]):,}</div><div class="l">languages</div></div>
+  <div class="kpi"><div class="n">{len([lang for lang in top_langs if lang[0] in CODE_LANGS]):,}</div><div class="l">languages</div></div>
   <div class="kpi {'good' if test_ratio >= 25 else 'warn'}"><div class="n">{test_ratio:.0f}%</div><div class="l">test code share</div></div>
 </div>
 
@@ -125,7 +125,7 @@ def main() -> int:
         "total_loc": total_loc,
         "source_files": len(files),
         "test_loc_share_pct": round(test_ratio, 1),
-        "languages": {l: n for l, n in top_langs[:8]},
+        "languages": {lang: n for lang, n in top_langs[:8]},
         "top_dirs": dict(top_dirs[:10]),
         "largest_files": [{"path": r, "loc": n} for r, _, n, _, _, _ in biggest[:10]],
         "most_branch_heavy": [{"path": r, "branches": b, "loc": n} for r, _, n, b, _, _ in most_complex[:10]],
