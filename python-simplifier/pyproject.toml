@@ -1,0 +1,21 @@
+[project]
+name = "python-simplifier"
+version = "0.1.0"
+description = "Agentic skill: critically review and simplify Python code (stdlib-only detectors + judgment guides)"
+requires-python = ">=3.11"
+# The detectors are deliberately stdlib-only; there are no runtime dependencies.
+dependencies = []
+
+[project.optional-dependencies]
+dev = ["pytest", "ruff"]
+
+[tool.ruff]
+line-length = 120
+
+[tool.ruff.lint]
+# Correctness-focused floor (the ratchet starts here and only tightens):
+# E4/E7/E9 = pycodestyle errors, F = pyflakes (undefined names, unused imports).
+select = ["E4", "E7", "E9", "F"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

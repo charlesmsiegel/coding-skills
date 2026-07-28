@@ -1,0 +1,60 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  # Manual fallback: creates the tag (pointed at the dispatched ref) along
+  # with the release, for environments that can't push tags directly.
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to create (e.g. v0.1.0)"
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Mirror the upload contract enforced by the Skills API / claude.ai:
+      # one SKILL.md with name + description frontmatter, description <= 1024 chars.
+      - name: Validate SKILL.md frontmatter
+        run: |
+          python - <<'EOF'
+          import re, sys
+          content = open("SKILL.md").read()
+          m = re.match(r"^---\n(.*?)\n---", content, re.DOTALL)
+          assert m, "SKILL.md has no YAML frontmatter"
+          fm = m.group(1)
+          name = re.search(r"^name:\s*(.+)$", fm, re.MULTILINE)
+          desc = re.search(r"^description:\s*(.+)$", fm, re.MULTILINE)
+          assert name and desc, "frontmatter must contain name and description"
+          if len(desc.group(1)) > 1024:
+              sys.exit(f"description is {len(desc.group(1))} chars; the Skills API limit is 1024")
+          EOF
+
+      # Package only the skill content (SKILL.md, LICENSE, references/, scripts/) —
+      # not the repo's tests, CI config, or packaging metadata.
+      - name: Build python-simplifier.skill
+        run: |
+          mkdir -p stage/python-simplifier
+          cp SKILL.md LICENSE stage/python-simplifier/
+          cp -r references scripts stage/python-simplifier/
+          find stage -type d -name __pycache__ -prune -exec rm -rf {} +
+          (cd stage && zip -r ../python-simplifier.skill python-simplifier)
+          unzip -l python-simplifier.skill
+
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag || github.ref_name }}
+        run: |
+          # --target only applies when the tag doesn't exist yet (dispatch path).
+          gh release create "$TAG" python-simplifier.skill \
+            --target "$GITHUB_SHA" \
+            --title "python-simplifier $TAG" \
+            --notes "Agent skill for critically reviewing and simplifying Python code. Download \`python-simplifier.skill\` and install it in Claude Code (\`~/.claude/skills/\`) or upload it to claude.ai."
