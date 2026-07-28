@@ -1,0 +1,23 @@
+{
+  "skill_name": "pr-visualization",
+  "evals": [
+    {
+      "id": 1,
+      "prompt": "Review PR #212 on this repo (checked out on branch pr-212). The author's description says 'refactor only, no behavior change'. Is that true?",
+      "expected_output": "Writes the behavioral summary from the diff BEFORE reading the author's description, then diffs the two — any undisclosed behavior change is a headline finding; follows untouched callers from blast radius into the code; report lands at docs/pr-212.html with a verdict-led summary; the caveat on the name-based blast radius travels into the walkthrough; step 7 refreshes docs/codemap.html with the code-visualization template so the atlas keeps its own theme.",
+      "files": []
+    },
+    {
+      "id": 2,
+      "prompt": "quick sanity check on my uncommitted changes before i push? i'm on main. some of the files are brand new",
+      "expected_output": "Uses --worktree (which must include the untracked new files and fall back to HEAD as base on a mainline checkout); produces a proportionate report — a small diff gets a short report, empty fragments dropped rather than padded; if a coverage artifact exists, the changed files' measured coverage appears with its age caveat.",
+      "files": []
+    },
+    {
+      "id": 3,
+      "prompt": "what does this branch change vs main? it's mostly a big file rename/move plus a couple of small edits. is it safe to merge?",
+      "expected_output": "Renames are surfaced with old→new paths, and the report says what rename-safety the tooling can NOT check (stale path-based references, imports) instead of calling silence proof of safety; the verdict distinguishes the mechanical move from the behavioral edits; no heuristic miss is presented as evidence of absence.",
+      "files": []
+    }
+  ]
+}

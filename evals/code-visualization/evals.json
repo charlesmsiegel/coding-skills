@@ -1,0 +1,23 @@
+{
+  "skill_name": "code-visualization",
+  "evals": [
+    {
+      "id": 1,
+      "prompt": "help me understand this repo before i start working on it — it's a ~40-file flask app i just inherited, cloned at ./inventory-service. make me one of those atlas things",
+      "expected_output": "Runs all four analyzers (inventory, deps, hotspots, coverage — asking about coverage only if no artifact is found), reads the code where the summaries point, writes the five judgment tabs with file:line citations, runs verify_citations and lint_fragments before assembling to docs/codemap.html with the commit sha in --meta, and presents 2-4 sentences led by the risk headline. Findings over descriptions: every judgment tab surfaces something checkable.",
+      "files": []
+    },
+    {
+      "id": 2,
+      "prompt": "is docs/codemap.html still accurate? we merged like 15 PRs since it was generated, including that big storage refactor",
+      "expected_output": "Runs check_codemap_state.py first and acts on the verdict; given large drift (a refactor touching files the judgment tabs discuss), chooses rerun-and-reconcile over revise-in-place: regenerates fresh, then uses the old atlas as a findings checklist — every old risk either survives or is explicitly closed with the resolving sha. Does not patch citations around a stale narrative.",
+      "files": []
+    },
+    {
+      "id": 3,
+      "prompt": "Map the architecture of this Dart/Flutter app for our new hire.",
+      "expected_output": "Degrades honestly: Dart is outside the dependency extractor's languages, and the inventory reports the unrecognized-language exclusion — the atlas must say the automated graph is partial for this repo rather than presenting an empty graph as low coupling; judgment tabs carry the analysis weight, and the coverage/eval discovery step still runs (asking the user if artifacts aren't found).",
+      "files": []
+    }
+  ]
+}

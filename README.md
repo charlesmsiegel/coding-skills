@@ -28,6 +28,7 @@ skills/<skill-name>/     one directory per skill — exactly what ships
   assets/                templates and other bundled files, if any
 tests/<skill_name>/      that skill's tests (underscored, so it's importable)
 tests/conftest.py        shared fixtures: throwaway git repos, script runners
+evals/<skill-name>/      judgment-half eval prompts (evals.json + fixtures)
 pyproject.toml           shared dev tooling config (pytest, ruff)
 .github/workflows/       CI (lint + tests + ratchet) and per-skill releases
 ```

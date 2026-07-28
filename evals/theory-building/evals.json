@@ -1,0 +1,23 @@
+{
+  "skill_name": "theory-building",
+  "evals": [
+    {
+      "id": 1,
+      "prompt": "Add retry-with-backoff to our payment webhook handler (handler.py attached). Requirements just say 'make it retry on failure'. Ship it.",
+      "expected_output": "States which reading of the underdetermined request it chose (what counts as failure, idempotency assumptions, retry budget) and which it rejected; checks for an existing retry facility in the stdlib/manifest/repo before writing one; ends with a filled-in 7-field theory note (Theory/Instead of/Reused/New concept/Assumes/Cost/Watch) whose Watch line aims at the genuinely riskiest part (e.g. duplicate webhook delivery), not boilerplate. A hollow note that restates the diff is a fail.",
+      "files": ["fixtures/handler.py"]
+    },
+    {
+      "id": 2,
+      "prompt": "This legacy module (scheduler.py, no docs, original author gone) needs a new job priority level added. Just make it work.",
+      "expected_output": "Recovers and states the module's theory in a sentence before editing; prefers the change the existing structure anticipates over a parallel bolt-on path; if the theory can't be recovered for some part, says so and shrinks the change rather than refactoring on a guess; does not restructure code it doesn't understand; theory note records what was assumed about the inherited design.",
+      "files": ["fixtures/scheduler.py"]
+    },
+    {
+      "id": 3,
+      "prompt": "Write a helper that checks whether a string is a valid semver version. Tests too.",
+      "expected_output": "Gate 2 fires: checks for an existing semver capability (packaging.version / a manifest dependency / an existing helper in the repo) before writing one, by reading the manifest rather than from memory; if writing it anyway, tests include cases pattern-completion would miss (empty, pre-release/build metadata, adversarial inputs) and the note names what no test pins down. Proportionality: this is small, so a one-line theory note is correct — a full ceremony note is itself a miss.",
+      "files": []
+    }
+  ]
+}

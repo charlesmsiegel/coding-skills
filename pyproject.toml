@@ -13,6 +13,8 @@ dev = ["pytest", "ruff"]
 
 [tool.ruff]
 line-length = 120
+# Eval fixtures are intentionally-bad code the skills are asked to criticize.
+extend-exclude = ["evals/*/fixtures"]
 
 [tool.ruff.lint]
 # Correctness-focused floor (the ratchet starts here and only tightens):
