@@ -15,7 +15,13 @@ from collections import defaultdict
 from pathlib import Path
 
 from common import detect_lang, esc, git, is_test_path, json_block, read_text, walk_source, write_fragment
-from diffutil import def_patterns_for, is_generated_doc, parse_diff, resolve_base
+from diffutil import (def_patterns_for, is_generated_doc, parse_diff, resolve_base,
+                      untracked_file_diffs)
+
+CAVEAT = ("Caller matching is textual (name( / .name) with no import resolution: "
+          "a same-named attribute or symbol in an unrelated module counts as a "
+          "caller, and dynamic dispatch/reflection are invisible. Use it to aim "
+          "review attention, never as proof of safety or of impact.")
 
 GENERIC_NAMES = {"main", "init", "new", "get", "set", "run", "call", "update", "create",
                  "delete", "add", "remove", "start", "stop", "read", "write", "close",
@@ -58,10 +64,16 @@ def main() -> int:
     repo = Path(args.repo).resolve()
     tabs = Path(args.tabs_dir)
 
-    base, merge_base, _ = resolve_base(repo, args.base, args.head)
-    raw = git(repo, "diff", "--no-color",
+    if args.worktree and args.head != "HEAD":
+        ap.error("--head cannot be combined with --worktree: the working tree IS the head side")
+
+    base, merge_base, _ = resolve_base(repo, args.base, args.head, worktree=args.worktree)
+    raw = git(repo, "-c", "core.quotepath=false", "diff", "--no-color",
               merge_base if args.worktree else f"{merge_base}..{args.head}")
     fds = parse_diff(raw)
+    if args.worktree:
+        fds += untracked_file_diffs(repo)[0]
+    excluded_docs = [f.path for f in fds if is_generated_doc(f.path)]
     fds = [f for f in fds if not is_generated_doc(f.path)]
     changed_files = {fd.path for fd in fds}
 
@@ -74,12 +86,22 @@ def main() -> int:
             if len(name) <= 2 or name.lower() in GENERIC_NAMES or name.startswith("__"):
                 continue
             symdefs.setdefault(name, (fd.path, kind))
+    total_symbols = len(symdefs)
     symdefs = dict(list(symdefs.items())[: args.max_symbols])
+    truncated = total_symbols - len(symdefs)
 
+    renames = [{"from": f.old_path, "to": f.path} for f in fds if f.status == "R"]
     if not symdefs:
+        rename_note = ""
+        if renames:
+            rename_note = ("<div class='callout warn'><b>Renamed files:</b> " +
+                           ", ".join(f"<code>{esc(r['from'])}</code> → <code>{esc(r['to'])}</code>" for r in renames[:8]) +
+                           ". A pure rename changes no symbol names, so it is invisible to this tab — but every "
+                           "path-based reference (imports, configs, docs) to the old path is now stale and is not traced here.</div>")
         write_fragment(tabs, "04-blast-radius.html", "Blast Radius",
-                       "<div class='callout good'><b>No named function/class definitions were changed in supported languages</b>, so there is no symbol-level blast radius to trace. Behavioral impact, if any, flows through data/config/edited call sites — see the Footprint and Flow Impact tabs.</div>")
-        print(json.dumps({"symbols": {}, "note": "no changed symbols detected"}))
+                       "<div class='callout good'><b>No named function/class definitions were changed in supported languages</b>, so there is no symbol-level blast radius to trace. Behavioral impact, if any, flows through data/config/edited call sites — see the Footprint and Flow Impact tabs.</div>" + rename_note)
+        print(json.dumps({"symbols": {}, "note": "no changed symbols detected",
+                          "renames": renames, "excluded_generated_docs": excluded_docs}))
         return 0
 
     # scan the head worktree for call sites
@@ -94,32 +116,35 @@ def main() -> int:
             continue
         pats = def_pats_cache.setdefault(Path(rel).suffix, def_patterns_for(rel))
         for line in text.splitlines():
-            is_def = any(pt.match(line) for pt in pats)
+            # Names DEFINED on this line: a definition of the same name in any
+            # file (override, reimplementation) is not a call of the changed one.
+            def_names = {m.group("name") for pt in pats if (m := pt.match(line))}
             for name, cre in call_res.items():
                 if name in line and cre.search(line):
-                    if is_def and symdefs[name][0] == rel:
-                        continue  # the definition itself
+                    if name in def_names:
+                        continue
                     callers[name][rel] += 1
 
     rows = []
     graph_nodes, graph_links = {}, defaultdict(int)
     for name, (deffile, kind) in symdefs.items():
         cfiles = callers.get(name, {})
-        outside = {f: c for f, c in cfiles.items() if f not in changed_files}
+        # "Untouched" splits into production callers (where regressions hide)
+        # and test callers (which will at least run in CI) — conflating them
+        # inflates the headline.
+        outside = {f: c for f, c in cfiles.items() if f not in changed_files and not is_test_path(f)}
+        outside_tests = {f: c for f, c in cfiles.items() if f not in changed_files and is_test_path(f)}
         inside = {f: c for f, c in cfiles.items() if f in changed_files and f != deffile}
-        tests = {f: c for f, c in cfiles.items() if is_test_path(f)}
         rows.append({"name": name, "file": deffile, "kind": kind,
                      "callers": len(cfiles), "outside": len(outside),
-                     "inside": len(inside), "test_callers": len(tests),
+                     "inside": len(inside), "test_callers": len(outside_tests),
                      "outside_files": sorted(outside, key=lambda f: -outside[f]),
                      })
         graph_nodes.setdefault(deffile, {"id": deffile, "label": Path(deffile).name,
                                          "group": "changed", "size": 1})
         for f in cfiles:
             g = "changed" if f in changed_files else ("test (untouched)" if is_test_path(f) else "untouched caller")
-            node = graph_nodes.setdefault(f, {"id": f, "label": Path(f).name, "group": g, "size": 1})
-            if g == "changed":
-                node["group"] = "changed"
+            graph_nodes.setdefault(f, {"id": f, "label": Path(f).name, "group": g, "size": 1})
             graph_nodes[f]["size"] += cfiles[f]
             if f != deffile:
                 graph_links[(f, deffile)] += cfiles[f]
@@ -149,30 +174,39 @@ def main() -> int:
         f"<td>{caller_list(r)}</td></tr>"
         for r in rows[:30])
 
-    headline = (f"<div class='callout warn'><b>{len(risky)} changed symbol{'s reach' if len(risky)!=1 else ' reaches'} call sites this PR never touched.</b> Those callers silently inherit the new behavior — they are where regressions hide, and their absence from the diff means no reviewer will look at them unless prompted. Verify each untouched caller still holds its assumptions.</div>"
+    headline = (f"<div class='callout warn'><b>{len(risky)} changed symbol{'s reach' if len(risky)!=1 else ' reaches'} non-test call sites this PR never touched.</b> Those callers silently inherit the new behavior — they are where regressions hide, and their absence from the diff means no reviewer will look at them unless prompted. Verify each untouched caller still holds its assumptions. The list is name-matched, so same-named symbols from unrelated modules may appear in it; confirm each caller actually uses the changed definition before acting.</div>"
                 if risky else
                 "<div class='callout good'><b>All detected call sites of changed symbols are inside this diff.</b> The change is self-contained at the symbol level (name-match analysis; dynamic dispatch and reflection are invisible to it).</div>")
+    truncation_note = (f"<p class='dim'>{truncated} further changed symbol(s) beyond the "
+                       f"--max-symbols={args.max_symbols} cap were NOT traced.</p>" if truncated else "")
 
     body = f"""
 <div class="kpis">
-  <div class="kpi accent"><div class="n">{len(symdefs)}</div><div class="l">changed symbols traced</div></div>
-  <div class="kpi {'bad' if risky else 'good'}"><div class="n">{sum(r['outside'] for r in rows)}</div><div class="l">untouched caller files</div></div>
-  <div class="kpi"><div class="n">{sum(r['test_callers'] for r in rows)}</div><div class="l">test caller files</div></div>
+  <div class="kpi accent"><div class="n">{len(symdefs)}{f' of {total_symbols}' if truncated else ''}</div><div class="l">changed symbols traced</div></div>
+  <div class="kpi {'bad' if risky else 'good'}"><div class="n">{sum(r['outside'] for r in rows)}</div><div class="l">untouched caller files (non-test)</div></div>
+  <div class="kpi"><div class="n">{sum(r['test_callers'] for r in rows)}</div><div class="l">untouched test caller files</div></div>
 </div>
 {headline}
+{truncation_note}
 <h2>Caller graph</h2>
 <p class="dim">Arrows point from caller to changed definition. Node color: changed in this diff vs untouched. Matching is textual (<code>name(</code> / <code>.name</code>) — precise enough to point a reviewer, not a proof.</p>
 <div class="viz" data-render="forcegraph" style="height:560px"></div>
 <script type="application/json">{json_block(graph)}</script>
 <h2>Symbols, ordered by untouched callers</h2>
 <div class="tbl-wrap"><table class="sortable">
-<thead><tr><th>Symbol</th><th>Defined in</th><th class="num">Caller files</th><th class="num">Untouched</th><th class="num">In tests</th><th>Untouched callers</th></tr></thead>
+<thead><tr><th>Symbol</th><th>Defined in</th><th class="num">Caller files</th><th class="num">Untouched (non-test)</th><th class="num">In tests</th><th>Untouched callers</th></tr></thead>
 <tbody>{tbl}</tbody></table></div>
 """
     write_fragment(tabs, "04-blast-radius.html", "Blast Radius", body)
 
     print(json.dumps({
-        "base": base, "symbols_traced": len(symdefs),
+        "base": base,
+        "symbols_traced": len(symdefs),
+        "symbols_total": total_symbols,
+        "symbols_not_traced": truncated,
+        "caveat": CAVEAT,
+        "excluded_generated_docs": excluded_docs,
+        "renames": renames,
         "symbols": [{k: r[k] for k in ("name", "file", "kind", "callers", "outside", "test_callers")} | {"untouched_callers": r["outside_files"][:10]}
                     for r in rows[:25]],
     }, indent=2))

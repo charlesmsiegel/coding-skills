@@ -180,6 +180,24 @@ def test_diff_fails_loudly_on_an_unresolvable_base(repo, tabs, run_script):
     assert list(tabs.iterdir()) == [], "a failed run must not leave half a report behind"
 
 
+def test_diff_reports_a_docs_only_diff_as_a_note_not_a_failure(repo, tabs, run_script):
+    """Regenerated docs alone are a legitimate (empty-after-exclusion) outcome:
+    exit 0 with a note, matching analyze_blast_radius's convention — a docs-only
+    PR must not read as an analyzer failure."""
+    repo.write("src/core.py", BASE_CORE)
+    repo.write("docs/codemap.html", "<html>old</html>\n")
+    repo.commit("base")
+    repo.write("docs/codemap.html", "<html>new</html>\n")
+    repo.commit("only regenerate the atlas")
+
+    result = run_script(SCRIPTS / "analyze_diff.py", repo.path, "--tabs-dir", tabs,
+                        "--base", "HEAD~1", expect_rc=0)
+
+    summary = json.loads(result.stdout)
+    assert "generated report docs" in summary["note"]
+    assert summary["totals"]["files"] == 0
+
+
 # --------------------------------------------------------------------------- #
 # Blast radius
 # --------------------------------------------------------------------------- #
@@ -261,6 +279,111 @@ def test_assemble_differs_only_in_its_default_label():
 # --------------------------------------------------------------------------- #
 
 
+def test_js_control_flow_keywords_are_not_symbols(repo, tabs, run_script):
+    # `for (` / `while (` / `switch (` match the method-shorthand shape; they
+    # used to surface as changed signatures and junk blast-radius symbols.
+    repo.write("src/app.js", "export function handler(x) { return x; }\n")
+    repo.commit("base")
+    repo.write("src/app.js",
+               "export function handler(x) {\n"
+               "  for (const item of x) {\n"
+               "    while (item.busy) {\n"
+               "      switch (item.kind) {\n"
+               "        default: break;\n"
+               "      }\n"
+               "    }\n"
+               "  }\n"
+               "  return x;\n"
+               "}\n")
+    repo.commit("add loops")
+
+    result = run_script(SCRIPTS / "analyze_diff.py", repo.path, "--tabs-dir", tabs, "--base", "HEAD~1")
+    summary = json.loads(result.stdout)
+    sig_names = {s["name"] for s in summary["signature_changes"]} | set(summary["new_symbols"])
+    assert not {"for", "while", "switch"} & sig_names
+
+    result = run_script(SCRIPTS / "analyze_blast_radius.py", repo.path, "--tabs-dir", tabs, "--base", "HEAD~1")
+    blast = json.loads(result.stdout)
+    traced = {s["name"] for s in blast.get("symbols", [])}
+    assert not {"for", "while", "switch"} & traced
+
+
+def test_worktree_on_mainline_reviews_uncommitted_changes(repo, tabs, run_script):
+    # "Review my uncommitted changes" on a checkout of main used to raise from
+    # base auto-detection (every candidate's merge-base IS HEAD).
+    repo.git("checkout", "-qb", "main")
+    repo.write("src/core.py", BASE_CORE)
+    repo.commit("base")
+    repo.write("src/core.py", BASE_CORE + "\n\ndef fresh(x):\n    return x + 1\n")
+    repo.write("src/brand_new.py", "def created(y):\n    return y * 2\n")  # untracked
+
+    result = run_script(SCRIPTS / "analyze_diff.py", repo.path, "--tabs-dir", tabs, "--worktree")
+
+    summary = json.loads(result.stdout)
+    paths = {f["path"] for f in summary["risk_ordered_files"]}
+    assert "src/core.py" in paths
+    assert "src/brand_new.py" in paths, "untracked files must be part of a worktree review"
+
+
+def test_head_with_worktree_is_rejected(repo, tabs, run_script):
+    repo.write("a.py", "x = 1\n")
+    repo.commit("base")
+
+    result = run_script(SCRIPTS / "analyze_diff.py", repo.path, "--tabs-dir", tabs,
+                        "--worktree", "--head", "HEAD~1", expect_rc=2)
+
+    assert "--worktree" in result.stderr
+
+
+def test_renames_are_reported(repo, tabs, run_script):
+    repo.write("src/old_name.py", BASE_CORE)
+    repo.commit("base")
+    repo.git("mv", "src/old_name.py", "src/new_name.py")
+    repo.commit("rename")
+
+    result = run_script(SCRIPTS / "analyze_diff.py", repo.path, "--tabs-dir", tabs, "--base", "HEAD~1")
+
+    summary = json.loads(result.stdout)
+    assert {"from": "src/old_name.py", "to": "src/new_name.py"} in summary["renames"]
+
+
+def test_blast_radius_reports_truncation_and_caveat(repo, tabs, run_script):
+    files = {}
+    for i in range(6):
+        files[f"src/mod{i}.py"] = f"def widget_fn_{i}(x):\n    return x\n"
+        repo.write(f"src/mod{i}.py", files[f"src/mod{i}.py"])
+    repo.commit("base")
+    for i in range(6):
+        repo.write(f"src/mod{i}.py", f"def widget_fn_{i}(x, y=0):\n    return x + y\n")
+    repo.commit("change all")
+
+    result = run_script(SCRIPTS / "analyze_blast_radius.py", repo.path, "--tabs-dir", tabs,
+                        "--base", "HEAD~1", "--max-symbols", "3")
+
+    summary = json.loads(result.stdout)
+    assert summary["symbols_traced"] == 3
+    assert summary["symbols_total"] == 6
+    assert summary["symbols_not_traced"] == 3
+    assert "name-match" in summary["caveat"] or "textual" in summary["caveat"]
+    body = (tabs / "04-blast-radius.html").read_text(encoding="utf-8")
+    assert "3 of 6" in body
+
+
+def test_same_named_def_in_another_file_is_not_a_caller(repo, tabs, run_script):
+    repo.write("src/alpha.py", "def compute_widget(x):\n    return x\n")
+    repo.write("src/beta.py", "def compute_widget(x):\n    return x * 2\n")
+    repo.commit("base")
+    repo.write("src/alpha.py", "def compute_widget(x, y=0):\n    return x + y\n")
+    repo.commit("change alpha's")
+
+    result = run_script(SCRIPTS / "analyze_blast_radius.py", repo.path, "--tabs-dir", tabs, "--base", "HEAD~1")
+
+    summary = json.loads(result.stdout)
+    row = next(s for s in summary["symbols"] if s["name"] == "compute_widget")
+    assert "src/beta.py" not in row["untouched_callers"], \
+        "a same-named definition elsewhere is not a call site"
+
+
 def test_lint_fragments_catches_stray_script_and_style(tabs, run_script):
     tabs.joinpath("01-summary.html").write_text(
         "<!-- tab: Summary -->\n<p>fine</p>\n"
@@ -278,15 +401,3 @@ def test_lint_fragments_catches_stray_script_and_style(tabs, run_script):
     assert all(p[0] != "01-summary.html" for p in problems), "the JSON data block is legal"
 
 
-def test_diff_reports_a_docs_only_diff_as_an_error(repo, tabs, run_script):
-    """Regenerated docs alone are not a reviewable change."""
-    repo.write("src/core.py", BASE_CORE)
-    repo.write("docs/codemap.html", "<html>old</html>\n")
-    repo.commit("base")
-    repo.write("docs/codemap.html", "<html>new</html>\n")
-    repo.commit("only regenerate the atlas")
-
-    result = run_script(SCRIPTS / "analyze_diff.py", repo.path, "--tabs-dir", tabs,
-                        "--base", "HEAD~1", expect_rc=1)
-
-    assert "generated report docs" in json.loads(result.stdout)["error"]

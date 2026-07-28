@@ -15,7 +15,8 @@ from collections import defaultdict
 from pathlib import Path
 
 from common import bar_cell, esc, git, is_test_path, json_block, write_fragment
-from diffutil import def_patterns_for, is_generated_doc, parse_diff, resolve_base
+from diffutil import (def_patterns_for, is_generated_doc, parse_diff, resolve_base,
+                      untracked_file_diffs)
 
 CONFIG_EXT = {".yaml", ".yml", ".toml", ".ini", ".env", ".cfg", ".conf", ".properties", ".json"}
 DOC_EXT = {".md", ".rst", ".txt", ".adoc"}
@@ -26,8 +27,11 @@ MANIFESTS = {"package.json", "package-lock.json", "yarn.lock", "pnpm-lock.yaml",
 
 RISK_PATTERNS = [
     ("security", 3, re.compile(r"\b(auth|password|passwd|token|secret|credential|permission|privilege|jwt|oauth|csrf|cors|sanitiz|escape|crypt)\w*", re.I)),
-    ("injection-surface", 3, re.compile(r"\b(eval|exec)\s*\(|pickle\.loads|yaml\.load\s*\(|subprocess|shell\s*=\s*True|innerHTML|dangerouslySetInnerHTML|f(?:ormat)?[\"']*\s*%\s*|execute\s*\(\s*f?[\"'].*(SELECT|INSERT|UPDATE|DELETE)", re.I)),
-    ("concurrency", 2, re.compile(r"\b(lock|mutex|rlock|semaphore|atomic|threading|thread\b|goroutine|channel|asyncio|await|async |volatile|synchronized)", re.I)),
+    # NB: no bare await/async or %-format tokens here — on an async codebase or
+    # printf-style logging they fire on nearly every line and flatten the
+    # risk ordering into noise.
+    ("injection-surface", 3, re.compile(r"\b(eval|exec)\s*\(|pickle\.loads|yaml\.load\s*\(|subprocess|shell\s*=\s*True|innerHTML|dangerouslySetInnerHTML|execute\s*\(\s*f?[\"'].*(SELECT|INSERT|UPDATE|DELETE)", re.I)),
+    ("concurrency", 2, re.compile(r"\b(lock|mutex|rlock|semaphore|atomic|threading|thread\b|goroutine|channel|volatile|synchronized|create_task|gather\s*\(|run_in_executor)", re.I)),
     ("transactions", 2, re.compile(r"\b(transaction|commit|rollback|savepoint|isolation)", re.I)),
     ("error-swallowing", 3, re.compile(r"except\s*(\w+\s*)?:\s*(pass|\.\.\.)\s*$|catch\s*\([^)]*\)\s*\{\s*\}|\.catch\(\s*\(\)\s*=>\s*\{?\s*\}?\s*\)")),
     ("retries/timeouts", 1, re.compile(r"\b(retry|retries|backoff|timeout|deadline)", re.I)),
@@ -98,25 +102,37 @@ def main() -> int:
     repo = Path(args.repo).resolve()
     tabs = Path(args.tabs_dir)
 
-    base, merge_base, note = resolve_base(repo, args.base, args.head)
+    if args.worktree and args.head != "HEAD":
+        ap.error("--head cannot be combined with --worktree: the working tree IS the head side")
+
+    base, merge_base, note = resolve_base(repo, args.base, args.head, worktree=args.worktree)
+    untracked_skipped = []
     if args.worktree:
-        raw = git(repo, "diff", "--no-color", merge_base)
+        raw = git(repo, "-c", "core.quotepath=false", "diff", "--no-color", merge_base)
         head_desc = "working tree"
         commits = []
     else:
-        raw = git(repo, "diff", "--no-color", f"{merge_base}..{args.head}")
+        raw = git(repo, "-c", "core.quotepath=false", "diff", "--no-color", f"{merge_base}..{args.head}")
         head_desc = args.head
         commits = [line for line in git(repo, "log", "--oneline", f"{merge_base}..{args.head}").splitlines()
                    if line.strip()]
 
     fds = parse_diff(raw)
+    if args.worktree:
+        # git diff never lists untracked files — the brand-new files in an
+        # uncommitted change would otherwise be invisible to the review.
+        untracked, untracked_skipped = untracked_file_diffs(repo)
+        fds += untracked
     excluded_docs = [f.path for f in fds if is_generated_doc(f.path)]
     fds = [f for f in fds if not is_generated_doc(f.path)]
     if not fds:
+        # A legitimate outcome (docs-only or empty change), not a failure:
+        # exit 0 with a note, matching analyze_blast_radius's convention.
         msg = ("diff contains only generated report docs (excluded): " + ", ".join(excluded_docs)
                if excluded_docs else "empty diff")
-        print(json.dumps({"error": msg, "base": base, "head": head_desc}))
-        return 1
+        print(json.dumps({"note": msg, "base": base, "head": head_desc,
+                          "totals": {"files": 0}}, indent=2))
+        return 0
 
     total_add = sum(f.adds for f in fds)
     total_del = sum(f.dels for f in fds)
@@ -209,7 +225,8 @@ def main() -> int:
         aw = 100.0 * fd.adds / max_ch
         dw = 100.0 * fd.dels / max_ch
         status = {"A": "<span class='badge good'>new</span>", "D": "<span class='badge bad'>deleted</span>",
-                  "R": "<span class='badge neutral'>renamed</span>"}.get(fd.status, "")
+                  "R": f"<span class='badge neutral'>renamed</span> <span class='dim'>← {esc(fd.old_path)}</span>"
+                  }.get(fd.status, "")
         ftbl.append(
             f"<tr><td><code>{esc(fd.path)}</code> {status}</td>"
             f"<td><span class='badge {CAT_BADGE.get(r['cat'],'neutral')}'>{esc(r['cat'])}</span></td>"
@@ -305,6 +322,7 @@ def main() -> int:
                     if uncovered else
                     f"<div class='callout good'><b>{esc(cov_note)}</b></div>")
 
+
     body2 = f"""
 {contract_callout}
 {f'<div class="tbl-wrap"><table><thead><tr><th>File</th><th>Kind</th><th class="num">+/−</th></tr></thead><tbody>{cf_rows}</tbody></table></div>' if contract_files else ''}
@@ -333,9 +351,15 @@ def main() -> int:
         "contract_files": [r["fd"].path for r in contract_files],
         "source_files_without_test_changes": [r["fd"].path for r in uncovered],
         "risky_added_lines": sorted(risk_hits_global, key=lambda h: -h["count"])[:30],
+        # Renames matter even with zero changed lines: every path-based
+        # reference (imports, configs, docs) to the old path is now stale.
+        "renames": [{"from": f.old_path, "to": f.path} for f in fds if f.status == "R"],
+        "binary_files": [f.path for f in fds if f.binary],
     }
     if unreadable_tests:
         summary["unreadable_test_files"] = unreadable_tests
+    if untracked_skipped:
+        summary["untracked_files_skipped"] = untracked_skipped
     print(json.dumps(summary, indent=2))
     return 0
 

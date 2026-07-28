@@ -136,23 +136,13 @@ def test_parse_diff_handles_several_files_in_one_diff(diffutil):
     assert [f.path for f in fds] == ["src/core.py", "new.py", "gone.py"]
 
 
-@pytest.mark.xfail(
-    reason="known gap: git omits the +++ line for binary files, so parse_diff "
-           "never sets .path and the final `if f.path` filter drops them — a "
-           "changed binary asset is invisible in the report",
-    strict=False,
-)
 def test_parse_diff_reports_binary_files(diffutil):
+    """Binary records have no +++/--- lines; the path must be recovered from
+    the 'diff --git' header so a binary-only PR doesn't parse to an empty diff."""
     fds = diffutil.parse_diff(BINARY)
 
     assert [f.path for f in fds] == ["blob.bin"]
     assert fds[0].binary is True
-
-
-def test_binary_only_diff_is_currently_reported_as_empty(diffutil):
-    """Pins the blast radius of the gap above: a binary-only change parses to
-    nothing at all, which analyze_diff then reports as an empty diff."""
-    assert diffutil.parse_diff(BINARY) == []
 
 
 @pytest.mark.parametrize("path, has_patterns", [("a.py", True), ("a.ts", True), ("a.qqq", False)])
