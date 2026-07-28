@@ -4,26 +4,28 @@ A repository of agentic skills to help with AI coding.
 
 ## Skills
 
-- **[python-simplifier](python-simplifier/)** — critically review and simplify Python
-  code: deterministic AST detectors (`scripts/`) plus judgment guides (`references/`).
-- **[theory-building](theory-building/)** — governs code being written *now*: state the
-  theory, reuse before inventing, abstract over repetition, treat tests as a floor.
-  Guides only, no scripts.
-- **[code-visualization](code-visualization/)** — builds a single-file tabbed HTML
-  "codebase atlas" (dependency graph with cycle detection, churn×complexity hotspots,
-  inventory, plus judgment tabs).
-- **[pr-visualization](pr-visualization/)** — builds a single-file tabbed HTML review
-  report for a PR, branch, or diff (change footprint, contracts, test delta, blast
-  radius). Step 7 refreshes the codemap atlas and expects **code-visualization** to be
-  installed as a sibling — which it is here.
+- **[python-simplifier](skills/python-simplifier/)** — critically review and simplify
+  Python code: deterministic AST detectors (`scripts/`) plus judgment guides
+  (`references/`).
+- **[theory-building](skills/theory-building/)** — governs code being written *now*:
+  state the theory, reuse before inventing, abstract over repetition, treat tests as a
+  floor. Guides only, no scripts.
+- **[code-visualization](skills/code-visualization/)** — builds a single-file tabbed
+  HTML "codebase atlas" (dependency graph with cycle detection, churn×complexity
+  hotspots, inventory, plus judgment tabs).
+- **[pr-visualization](skills/pr-visualization/)** — builds a single-file tabbed HTML
+  review report for a PR, branch, or diff (change footprint, contracts, test delta,
+  blast radius). Step 7 refreshes the codemap atlas and expects **code-visualization**
+  to be installed as a sibling — which it is here.
 
 ## Layout
 
 ```
-<skill-name>/            one directory per skill — exactly what ships
+skills/<skill-name>/     one directory per skill — exactly what ships
   SKILL.md               name + description frontmatter (description <= 1024 chars)
   scripts/               executable detectors/tools, if the skill has any
   references/            judgment guides loaded on demand
+  assets/                templates and other bundled files, if any
 tests/<skill_name>/      that skill's tests (underscored, so it's importable)
 pyproject.toml           shared dev tooling config (pytest, ruff)
 .github/workflows/       CI (lint + tests + ratchet) and per-skill releases
@@ -52,7 +54,9 @@ every skill's own `scripts/` directory.
 
 ## Releasing a skill
 
-Tag `<skill>-v<version>` (e.g. `python-simplifier-v0.1.0`). The release workflow
-validates the skill's frontmatter, packages `SKILL.md`, `LICENSE`, `references/`, and
-`scripts/` into `<skill>.skill`, and attaches it to a GitHub release. Install the
-artifact in Claude Code (`~/.claude/skills/`) or upload it to claude.ai.
+Tag `<skill>-v<version>` (e.g. `python-simplifier-v0.1.0`) — the tag names the
+directory under `skills/`. The release workflow validates that skill's frontmatter,
+packages `SKILL.md`, `LICENSE`, `references/`, `scripts/`, and `assets/` into
+`<skill>.skill`, and attaches it to a GitHub release. The archive unpacks to
+`<skill>/`, without the `skills/` prefix, so the artifact drops straight into Claude
+Code (`~/.claude/skills/`) or uploads to claude.ai.

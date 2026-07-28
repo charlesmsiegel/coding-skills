@@ -31,17 +31,18 @@ jobs:
             echo "::error::tag '$TAG' is not of the form <skill>-v<version>"
             exit 1
           fi
-          if [ ! -f "$skill/SKILL.md" ]; then
-            echo "::error::tag '$TAG' names skill '$skill', but $skill/SKILL.md does not exist"
+          if [ ! -f "skills/$skill/SKILL.md" ]; then
+            echo "::error::tag '$TAG' names skill '$skill', but skills/$skill/SKILL.md does not exist"
             exit 1
           fi
           echo "SKILL=$skill" >> "$GITHUB_ENV"
+          echo "SKILL_DIR=skills/$skill" >> "$GITHUB_ENV"
 
       # Mirror the upload contract enforced by the Skills API / claude.ai:
       # one SKILL.md with name + description frontmatter, description <= 1024 chars.
       - name: Validate SKILL.md frontmatter
         run: |
-          python - "$SKILL/SKILL.md" <<'EOF'
+          python - "$SKILL_DIR/SKILL.md" <<'EOF'
           import re, sys
           content = open(sys.argv[1]).read()
           m = re.match(r"^---\n(.*?)\n---", content, re.DOTALL)
@@ -59,9 +60,9 @@ jobs:
       - name: Build ${{ env.SKILL }}.skill
         run: |
           mkdir -p "stage/$SKILL"
-          cp "$SKILL/SKILL.md" LICENSE "stage/$SKILL/"
+          cp "$SKILL_DIR/SKILL.md" LICENSE "stage/$SKILL/"
           for dir in references scripts assets; do
-            if [ -d "$SKILL/$dir" ]; then cp -r "$SKILL/$dir" "stage/$SKILL/"; fi
+            if [ -d "$SKILL_DIR/$dir" ]; then cp -r "$SKILL_DIR/$dir" "stage/$SKILL/"; fi
           done
           find stage -type d -name __pycache__ -prune -exec rm -rf {} +
           (cd stage && zip -r "../$SKILL.skill" "$SKILL")

@@ -7,7 +7,7 @@ on:
 
 env:
   # The detectors live in the python-simplifier skill; they police every skill's code.
-  DETECTORS: python-simplifier/scripts
+  DETECTORS: skills/python-simplifier/scripts
 
 jobs:
   checks:
@@ -28,14 +28,14 @@ jobs:
       - name: Smoke tests (every detector fires on its fixture, quiet on clean code)
         run: pytest -q
 
-      # The ratchet (python-simplifier/references/messy-repo-runbook.md, Phase 5):
+      # The ratchet (skills/python-simplifier/references/messy-repo-runbook.md, Phase 5):
       # every bug-class detector is currently clean on this repo's own code, and it
       # stays that way. If one reports anything, a real defect class has crept back in.
       - name: Ratchet — bug-class detectors stay clean on our own code
         run: |
           set -e
-          # Every skill that ships Python: */scripts next to a SKILL.md.
-          targets=$(for skill in */SKILL.md; do
+          # Every skill that ships Python: scripts/ next to a SKILL.md.
+          targets=$(for skill in skills/*/SKILL.md; do
             dir="$(dirname "$skill")/scripts"
             if [ -d "$dir" ]; then echo "$dir"; fi
           done)
@@ -58,7 +58,7 @@ jobs:
 
       - name: Full analyzer report (informational)
         run: |
-          for skill in */SKILL.md; do
+          for skill in skills/*/SKILL.md; do
             dir="$(dirname "$skill")/scripts"
             [ -d "$dir" ] || continue
             echo "::group::$dir"
