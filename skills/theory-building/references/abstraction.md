@@ -4,6 +4,7 @@
 
 - [Why generated code repeats](#why-generated-code-repeats)
 - [Factorization vs. abstraction](#factorization-vs-abstraction)
+- [The reader has to be able to check it](#the-reader-has-to-be-able-to-check-it)
 - [The reuse search](#the-reuse-search)
 - [Tests that attack the theory](#tests-that-attack-the-theory)
 
@@ -59,12 +60,38 @@ expressible, and a fourth case is written by adding a policy rather than a param
 4. **Illegal states unrepresentable, ideally.** The strongest form: the type system
    refuses the combinations that shouldn't exist.
 
+All four presuppose something worth making explicit: **you cannot judge structure without
+the theory.** Naur's formulation is that "the very notion of qualities such as simplicity
+and good structure can only be understood in terms of the theory of the program, since
+they characterize the actual program text in relation to such program texts that might
+have been written to achieve the same execution behaviour." Simplicity is not a property
+of the text you can read off it. It is a relation between the text and the model it is
+supposed to express — which is why "clean up this code" is unanswerable until someone
+says what the code is *for*, and why tidying an unfamiliar module is so reliably a
+downgrade.
+
 ### When the concept won't come
 
 Say so. "These three branches clearly share something I can't name yet; leaving them
 explicit" is a better handoff than a wrapper that pretends the work is done. Honest
 duplication is cheap to fix once the concept appears. A false abstraction has to be
 dismantled first, and by then it has callers.
+
+### The reader has to be able to check it
+
+An abstraction the reviewer cannot evaluate has not been delivered, only deposited. This
+is not hypothetical fastidiousness: in a study of beginners working with generated code,
+participants who hit unfamiliar language features — `lambda`, `map`, `try`/`except` —
+could not validate *or* repair code that was otherwise correct, and whether a construct
+counted as familiar varied by nothing more principled than which school had taught it:
+the same feature read as familiar to 37.5% of students at one institution and 60.6% at
+another that covered it. Comprehension, not correctness, was the binding constraint.
+
+The rule that falls out is narrow and worth following: **write in the dialect of the
+surrounding code.** Reach past it when the clearer construct genuinely is clearer, and
+when you do, spend one clause saying why. The cost of an unusual construct is not
+elegance points — it is the reviewer's ability to catch you being wrong, which is the one
+safeguard the whole handoff rests on.
 
 ## The reuse search
 

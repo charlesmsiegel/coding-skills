@@ -11,14 +11,16 @@ lose. Writing it down is what creates it.
 ## Contents
 
 - [What a theory answers](#what-a-theory-answers)
-- [The prediction test](#the-prediction-test)
+- [The two tests](#the-two-tests)
+- [Say which reading you took](#say-which-reading-you-took)
 - [Worked examples](#worked-examples)
 - [Failure modes](#failure-modes)
 - [Where the note lives](#where-the-note-lives)
 
 ## What a theory answers
 
-Three questions. Anything else is commentary.
+Four questions. Anything else is commentary. The first three are Naur's own test for
+whether a person *has* the theory; the fourth is where his first question bottoms out.
 
 1. **What does this model?** Which part of the world is being represented, and what
    simplification is being made about it. "Every event has exactly one owner" is a
@@ -26,22 +28,51 @@ Three questions. Anything else is commentary.
 2. **Why this shape?** Why these types, these boundaries, this split into functions.
    Especially: what alternative was rejected and why. The rejected alternative is the
    single most useful sentence for whoever extends the code next.
-3. **Where does it stop?** The inputs the model is designed for, and the point past which
+3. **What change does it absorb?** Given the next requirement someone will plausibly
+   ask for, does the model already have a place for it? Naur treats this as the
+   defining capability — "a person having the theory must already be prepared to respond
+   to the kinds of questions and demands that may give rise to program modifications."
+4. **Where does it stop?** The inputs the model is designed for, and the point past which
    it is not merely untested but *wrong*.
 
-## The prediction test
+## The two tests
 
-A theory predicts; an ad-hoc answer only responds. The test:
+A theory predicts; an ad-hoc answer only responds. Two checks, failing differently:
 
-> Pick an input nobody wrote a test for. Does the stated theory tell you what the code
-> does with it?
+> **Prediction.** Pick an input nobody wrote a test for. Does the stated theory tell you
+> what the code does with it?
 
 If yes, the theory is real, and untested inputs have a good chance of working — which is
 the actual reason a theory matters. If the answer is "run it and see," what exists is a
 pile of cases that happen to pass, and every new requirement is a coin flip.
 
-This is also the sharpest available check on generated code, because a pile of cases and
-a designed model look identical when both are green.
+> **Modification rehearsal.** Name the next feature someone will ask for. Does it land as
+> an extension, or does it need a special case welded to the side?
+
+The second catches what the first misses: a model can cover every input and still have no
+room to grow, which is the state a codebase is in right before its structure starts
+dying. A theory that accounts only for what was already built is a description.
+
+Both are the sharpest available checks on generated code, because a pile of cases and a
+designed model look identical when both are green.
+
+## Say which reading you took
+
+A request almost never determines a single theory. "Cache the user lookups" admits at
+least a per-request cache, a process-wide cache with a TTL, and a write-through cache with
+invalidation — all faithful to the words, with completely different failure modes. The
+code implements exactly one and gives no sign that the others were ever live.
+
+This gap is the normal case rather than an edge case; a study of beginners prompting a
+code model found both sides systematically misreading each other, with participants
+convinced they had described the problem "the best way to say it" while the model built
+something else. The person reading your diff has the same problem in reverse: they cannot
+recover the readings you discarded.
+
+So state the one you took and the one you rejected. One clause each is enough — *"process
+wide with a 60s TTL, not per-request, because the hit rate across requests is the whole
+point"* — and it is the sentence that stops someone re-litigating the design six months
+later without knowing it was ever litigated.
 
 ## Worked examples
 
@@ -93,6 +124,12 @@ name could belong to any program in any domain is a sign the modeling step was s
 here too; a trivial thing gets one line.
 
 ## Where the note lives
+
+One test decides what goes in, from Cockburn's commentary on Naur: include **that which
+helps the next reader build an adequate theory of the program.** Not what the code does —
+they can read that, and a note that restates it burns the attention you were trying to
+save. What they could not have reconstructed. The same rule sets you free at the other
+end: documentation "cannot — and so need not — say everything."
 
 In the response, so it's read now — and somewhere durable, so it survives:
 

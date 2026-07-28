@@ -1,6 +1,6 @@
 ---
 name: theory-building
-description: Guard against the "black box" failure mode in generated code — code that compiles, passes its tests, and is still stupid. Use whenever writing or finishing a non-trivial piece of code (a new module, class, service, schema, or any change spanning more than a couple of functions), whenever handing code back to someone who will not read every line, whenever tests pass and the work feels done, whenever introducing a helper or abstraction, and whenever asked "is this good code", "does this look right", "ship it", or "just make it work". Applies to every language. Enforces four gates — state the theory, reuse before inventing, abstraction over repetition-with-variants, and tests as a floor not a bar — then produces a short theory note so a human can review in minutes instead of skipping review entirely. Distinct from python-simplifier / django-simplifier, which critique code the user brings; this one governs code being produced right now.
+description: Guard against the "black box" failure mode in generated code — code that compiles, passes its tests, and is still stupid. Use whenever writing or finishing a non-trivial piece of code (a new module, class, service, schema, or any change spanning more than a couple of functions), whenever modifying code whose design you do not already understand, whenever handing code back to someone who will not read every line, whenever tests pass and the work feels done, whenever introducing a helper or abstraction, and whenever asked "is this good code", "does this look right", "ship it", or "just make it work". Applies to every language. Enforces four gates — state the theory, reuse before inventing, abstraction over repetition-with-variants, and tests as a floor not a bar — then produces a short theory note so a human can review in minutes instead of skipping review entirely. Distinct from python-simplifier / django-simplifier, which critique code the user brings; this one governs code being produced right now.
 ---
 
 # Theory Building
@@ -10,6 +10,13 @@ code is a lossy serialization of it. Peter Naur's argument in *Programming as Th
 Building* is that a program's real content lives in the builders' mental model of how
 the world maps onto the code — and that when the model is lost, the surviving text
 degrades no matter how correct it was.
+
+Naur's evidence for this is worth holding onto, because it is a finding rather than a
+metaphor. A team inheriting a compiler was given full documentation, annotated program
+texts, extensive written design discussion, *and* direct access to the original authors.
+They still proposed extensions that "effectively destroyed its power and simplicity,"
+while the authors "were able to spot these cases instantly" and offered solutions framed
+entirely within the existing structure. The text was complete. The theory was not in it.
 
 This matters more, not less, when a model writes the code. Neural networks are strong at
 reproducing patterns with variants and weak at forming a *new* abstraction that did not
@@ -30,20 +37,41 @@ skipped and most often expensive.
 
 ### Gate 1 — State the theory
 
-In three sentences or fewer, before or immediately after writing: what mental model does
-this code embody? What real-world thing does each type and each function correspond to?
-Where is the boundary of the model — the inputs it is *designed* to handle, as opposed
-to the ones a test happened to cover?
+Naur's test for whether someone *has* a theory is behavioral, not textual. Three
+capabilities, and the third is the one nobody checks:
 
-If the theory can't be stated, there isn't one. What exists instead is an ad-hoc answer
-shaped like code, and it will not survive contact with the next requirement. Write the
-theory down where it lives with the code — module docstring, header comment, ADR, PR
-description — because it is precisely the artifact that gets lost when only the diff is
-delivered.
+1. **Map it to the world.** For each part of the code, name the aspect of the problem it
+   matches — and conversely, for each aspect of the problem, say where it lives in the
+   code. Include where the model *stops*: the inputs it is designed for, as opposed to
+   the ones a test happened to cover.
+2. **Justify it.** Say why each part is what it is, and what alternative was rejected.
+   Naur is blunt that this bottoms out in judgment rather than derivable rules — which is
+   exactly why it has to be recorded rather than re-derived later by someone with less
+   context.
+3. **Absorb a change.** Take a plausible next requirement and say how the theory
+   accommodates it. "In a certain sense there can be no question of a theory
+   modification, only of a program modification" — someone who holds the theory is
+   *already* prepared for the demands that will arrive.
 
-A theory predicts. Test it: *given an input nobody wrote a test for, does the theory tell
-you what the code will do?* If the honest answer is "run it and see," the code is a
-black box that happens to be readable.
+In three sentences or fewer, before or immediately after writing. If the theory can't be
+stated, there isn't one. What exists instead is an ad-hoc answer shaped like code, and it
+will not survive contact with the next requirement. Write it down where it lives with the
+code — module docstring, header comment, ADR, PR description — because it is precisely
+the artifact that gets lost when only the diff is delivered.
+
+Two cheap checks, and they fail differently:
+
+- **Prediction.** Given an input nobody wrote a test for, does the theory tell you what
+  the code does? If the honest answer is "run it and see," the code is a black box that
+  happens to be readable.
+- **Modification rehearsal.** Name the next feature someone will plausibly ask for. Does
+  it land as a natural extension, or does it need a special case bolted to the side? A
+  theory that only accounts for what was already built is a description, not a theory.
+
+One more thing the request itself cannot supply: **which reading you chose.** A prompt or
+ticket almost always underdetermines the model — it admits several coherent theories, and
+the code silently implements one of them. The reader cannot recover the discarded readings
+from the text, so say which one you took and which you rejected.
 
 ### Gate 2 — Reuse before inventing
 
@@ -102,6 +130,61 @@ So don't stop at green. Do this instead:
 - **Note deliberately untested territory.** "Retries under partial network failure are
   untested" is worth more to a reviewer than another passing assertion.
 
+## Changing code whose theory you don't have
+
+Most work is not new code. It's a modification to code whose builders are gone, or were
+never human — and that puts you permanently in the position of Naur's second team: fluent
+in the text, without the theory behind it. Naur is uncomfortably direct about this;
+rebuilding a theory from the documentation alone is "strictly impossible," and doing it
+from the text is "a difficult, frustrating, and time consuming activity."
+
+The decision this changes is sharper than it looks. A requested modification can usually
+be implemented **many different ways, all correct**. Some extend the existing theory
+naturally; others are, in Naur's phrase, "unintegrated patches on the main part of the
+program." Both pass the tests. Only someone holding the theory can tell them apart — which
+is why a diff that looks locally reasonable is the normal way good structure dies. One
+system he describes accumulated a decade of such changes until "the original powerful
+structure was still visible, but made entirely ineffective by amorphous additions."
+
+So before changing code you didn't write:
+
+- **Recover the theory first, and write the one sentence.** What does this module think
+  the world is? Read for the model, not the syntax. Check the sentence against the code
+  rather than against what the code should have been.
+- **Prefer the change the existing structure already anticipates.** If a facility is
+  there, use it. The instinct to add a parallel path beside it is exactly the failure
+  Naur's inheritors kept making with full documentation in hand.
+- **When you can't find the theory, say so and shrink the change.** An honest "I could not
+  determine why this retries twice, so I left it and added the new case alongside" is
+  worth more than a confident refactor built on a guessed model.
+- **Don't restructure what you don't understand.** Tidying code whose theory you haven't
+  recovered is how power and simplicity get destroyed by someone being helpful.
+
+Naur's own conclusion is more radical than most teams will accept — that discarding the
+text and re-solving the problem often beats reviving it, "at no higher, and possibly
+lower, cost." That is rarely your call to make unilaterally. Surface it as an option with
+its reasoning; don't act on it. See `references/inherited-code.md`.
+
+## Write so the reviewer can check you
+
+A theory that only you can verify hasn't been handed over. This is measurable: in a study
+of 120 students prompting a code model, participants judged the generated code correct
+61.8% of the time — and roughly one in eleven of those judgments was wrong. Readers of
+generated code are not a reliable check, and unfamiliar constructs make it worse: five
+participants could not validate *or* repair otherwise-working code because it used
+features they didn't know, and whether a feature counted as familiar tracked nothing more
+principled than whether their school had taught it (the same construct read as familiar
+to 37.5% of students at one institution and 60.6% at another that covered it).
+
+Cleverness therefore has a specific cost: it converts a reviewer into a spectator.
+
+- **Write in the dialect of the surrounding code**, not the most elegant one available.
+- **If an unusual construct genuinely earns its place, say why in one clause** — the note
+  is what keeps the reader able to check it.
+- **When a second attempt produces the same wrong output, stop rewording and restate the
+  model.** In that study, repeated identical wrong generations preceded a fifth of all
+  abandonments. Re-prompting a wrong theory just re-renders it.
+
 ## Performance is a theory choice
 
 Quality constraints usually cannot be reached by tuning generated code, because they are
@@ -121,12 +204,19 @@ copy in the code or PR:
 
 ```
 Theory:      what this models, in a sentence or two
+Instead of:  the other coherent reading of the request, and why not it
 Reused:      existing library/module used instead of writing new code
 New concept: any abstraction introduced, and its name in the domain
 Assumes:     conditions relied on that no test enforces
 Cost:        complexity / allocations / round trips that matter
 Watch:       the part most likely to be wrong, and why
 ```
+
+There is one criterion for what belongs in it, from Alistair Cockburn's commentary on
+Naur: write **that which helps the next reader build an adequate theory of the program.**
+Not what the code does — they can read that. What they could not have reconstructed. The
+liberating half of the same rule is that the note "cannot — and so need not — say
+everything"; completeness was never the goal.
 
 The **Watch** line matters most. It aims a reviewer's limited attention at the place it
 pays, which is the honest alternative to both "read all 800 lines" and "don't look."
@@ -143,6 +233,14 @@ up. Anything that promises freedom from thinking should be treated as probably s
 including this skill: a checklist run mechanically produces theory notes that are as
 hollow as the code they describe. The gates are prompts for judgment, not a substitute.
 
+Naur would go further, and he is worth taking seriously against his own admirers. A
+theory, he argues, "has no inherent division into parts and no inherent ordering," so
+"for the primary activity of the programming there can be no right method" — no sequence
+of steps that mechanically yields good solutions. What methods are actually good for, on
+his account, is the *education* of the people using them. Read these gates that way:
+scaffolding that teaches what to attend to, discarded once attending is automatic. Four
+gates in a fixed order is already a small lie about how theories get built.
+
 ## An honest limit
 
 A model auditing its own abstractions is partly circular — the same weakness that
@@ -151,8 +249,29 @@ This skill narrows the gap; it doesn't close it. The theory note exists precisel
 a human still needs to look, and its job is to make looking cheap enough to actually
 happen.
 
+And the human looking is not a reliable backstop either — the 9% of confident-and-wrong
+correctness judgments above is the measured version of that. Two unreliable readers do
+not make a reliable review. What they can do is fail *differently*, which is the entire
+value on offer here: the note says where to look, so the human's attention lands where
+the model's self-assessment is weakest.
+
+## Sources
+
+- Peter Naur, "Programming as Theory Building" (1985), reprinted in *Computing: A Human
+  Activity* (1992) and in Alistair Cockburn's *Agile Software Development*, whose
+  commentary supplies the documentation criterion used above.
+  <https://pages.cs.wisc.edu/~remzi/Naur.pdf>
+- Nguyen, Babe, Zi, Guha, Anderson & Feldman, "How Beginning Programmers and Code LLMs
+  (Mis)read Each Other" (2024). <https://arxiv.org/abs/2401.15232> — source of the
+  review-reliability and unfamiliar-construct figures. Scope worth keeping in view: 120
+  students who had taken one CS course, working on small problems with a 2022-era model.
+  It measures novices, not senior reviewers, and the numbers are cited here as evidence
+  that reading generated code is harder than it feels — not as a constant.
+
 ## References
 
 - `references/theory-note.md` — writing the theory, worked examples, common failure modes
 - `references/abstraction.md` — factorization vs. abstraction, the reuse search, tests
   that attack the theory
+- `references/inherited-code.md` — recovering a theory from existing code, patch vs.
+  natural extension, working in parallel without fragmenting the theory
