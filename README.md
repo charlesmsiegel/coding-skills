@@ -65,6 +65,17 @@ subprocess over a throwaway git repo built in `tmp_path`, and both what it print
 are asserted. A test marked `xfail` records a known defect rather than a passing
 assertion that the wrong behavior is correct; check its reason before "fixing" it.
 
+## Installing locally
+
+```bash
+./install.sh --claude              # ~/.claude/skills/
+./install.sh --claude --codex      # both ~/.claude/skills/ and ~/.codex/skills/
+./install.sh --kiro --dest ~/proj  # ~/proj/.kiro/skills/ (per-project install)
+```
+
+Each skill is replaced wholesale on re-install (stale files removed) and the
+copy mirrors the release artifact: skill directory plus LICENSE, minus caches.
+
 ## Releasing a skill
 
 Tag `<skill>-v<version>` (e.g. `python-simplifier-v0.1.0`) — the tag names the
