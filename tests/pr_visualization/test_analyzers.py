@@ -384,6 +384,25 @@ def test_same_named_def_in_another_file_is_not_a_caller(repo, tabs, run_script):
         "a same-named definition elsewhere is not a call site"
 
 
+def test_step7_assemble_with_cv_template_produces_atlas_theme(repo, tabs, run_script, tmp_path):
+    # Step 7 reassembles the codemap with THIS skill's assembler but must pass
+    # the code-visualization template — otherwise every PR run reskins the
+    # committed atlas (this assembler's default is the PR report theme).
+    tabs.joinpath("01-overview.html").write_text("<!-- tab: Overview -->\n<p>atlas</p>\n", encoding="utf-8")
+    out = tmp_path / "codemap.html"
+    cv_template = SKILLS / "code-visualization" / "assets" / "template.html"
+
+    run_script(SCRIPTS / "assemble.py", "--tabs-dir", tabs, "--out", out,
+               "--title", "T", "--label", "CODEBASE ATLAS", "--template", cv_template)
+
+    html = out.read_text(encoding="utf-8")
+    # The atlas template is dark-default with a light media block; the PR
+    # template is the inverse and carries diff-snippet styles the atlas lacks.
+    assert "color-scheme: light){" in html
+    assert "diff-snippet" not in html
+    assert "CODEBASE ATLAS" in html
+
+
 def test_lint_fragments_catches_stray_script_and_style(tabs, run_script):
     tabs.joinpath("01-summary.html").write_text(
         "<!-- tab: Summary -->\n<p>fine</p>\n"

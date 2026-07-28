@@ -11,7 +11,7 @@ The atlas exists to help a reader *catch errors and poor design*, not to admire 
 
 ## Workflow
 
-Let `SKILL=/path/to/this/skill` and pick a working dir, e.g. `WORK=/home/claude/atlas-<repo>`, with `TABS=$WORK/tabs`.
+Let `SKILL=/path/to/this/skill` and pick a scratch working dir for intermediate files (any temp location works, e.g. `WORK=<temp>/atlas-<repo>`), with `TABS=$WORK/tabs`. Commands below are POSIX-shell shaped; adapt paths/variables to your shell (PowerShell: `$env:TEMP`, `${SKILL}`).
 
 ### 1. Locate the repo
 
@@ -21,14 +21,17 @@ The target is a local directory (uploaded, cloned, or already present). If the u
 
 ```bash
 mkdir -p $TABS
-python3 $SKILL/scripts/analyze_inventory.py <repo> --tabs-dir $TABS
-python3 $SKILL/scripts/analyze_deps.py      <repo> --tabs-dir $TABS
-python3 $SKILL/scripts/analyze_hotspots.py  <repo> --tabs-dir $TABS   # add --since "12 months ago" to tune the window
+python $SKILL/scripts/analyze_inventory.py <repo> --tabs-dir $TABS
+python $SKILL/scripts/analyze_deps.py      <repo> --tabs-dir $TABS
+python $SKILL/scripts/analyze_hotspots.py  <repo> --tabs-dir $TABS   # add --since "12 months ago" to tune the window
 ```
+
 
 Each writes its tab fragment and prints a JSON summary to stdout. **Read those summaries** — they are input for your judgment tabs: cycles found by `analyze_deps` need semantic explanation in the Boundaries tab; top hotspots from `analyze_hotspots` deserve a look when you assess risks; the largest/branch-heaviest files from `analyze_inventory` tell you where to spend reading time.
 
-Dependency extraction covers Python, JS/TS, Go, Rust, Java/Kotlin, Ruby. For other languages the graph may be sparse — note that honestly in the Overview rather than presenting an empty graph as "no coupling". `analyze_deps.py --depth N` overrides module grouping depth if the auto-chosen granularity looks wrong (too few or too many nodes).
+Dependency extraction covers Python, JS/TS, Go, Rust, Java/Kotlin, Ruby. For other languages the graph may be sparse — note that honestly in the Overview rather than presenting an empty graph as "no coupling". Each summary also reports what was *excluded* (unrecognized-language files, >2 MB files, churned non-code files) — carry those caveats into the judgment tabs instead of letting a sparse tab read as a small codebase.
+
+Useful knobs: `analyze_deps.py --depth N` overrides module grouping depth when the auto-chosen granularity looks wrong; `--max-nodes N` caps the graph size; every analyzer takes `--exclude dir1,dir2` to skip generated code (`*.pb.go` trees, `migrations/`, `openapi/`) that would otherwise swamp size and churn rankings.
 
 ### 3. Read the code
 
@@ -53,10 +56,16 @@ Read `$SKILL/references/llm-tabs.md` for the fragment format, available styled p
 Judgment tabs are full of `file:line` claims; check them mechanically before shipping:
 
 ```bash
-python3 $SKILL/scripts/verify_citations.py <repo> --tabs-dir $TABS --fragments 01,05,06,07,08
+python $SKILL/scripts/verify_citations.py <repo> --tabs-dir $TABS --fragments 01,05,06,07,08
 ```
 
-Exit 1 means hard breaks (missing/ambiguous files, lines out of range) — fix the fragments. Exit 0 is necessary, not sufficient: the JSON echoes the **current content of every cited line** (`cited_content`); skim it and confirm each line still supports the sentence around it. Rewrite bare filenames the verifier had to disambiguate (e.g. `termui.py` → `src/click/termui.py`) so future verification stays unambiguous.
+Exit 1 means hard breaks (missing/ambiguous files, lines out of range) — fix the fragments. Exit 0 is necessary, not sufficient: the JSON echoes the **current content of every cited line** (`cited_content`); skim it and confirm each line still supports the sentence around it. Also check `citations_skipped` — tokens that look like citations but weren't verified (unknown extension, odd format); rewrite them as `path/file.ext:LINE` so they get checked. Rewrite bare filenames the verifier had to disambiguate (e.g. `termui.py` → `src/click/termui.py`) so future verification stays unambiguous.
+
+Then lint the fragment protocol mechanically — a stray `<script>` in a judgment tab would ship and execute:
+
+```bash
+python $SKILL/scripts/lint_fragments.py --tabs-dir $TABS
+```
 
 ### 6. Assemble and deliver
 
@@ -64,7 +73,7 @@ The atlas's canonical home is **inside the repo at `docs/codemap.html`** — it'
 
 ```bash
 mkdir -p <repo>/docs
-python3 $SKILL/scripts/assemble.py --tabs-dir $TABS \
+python $SKILL/scripts/assemble.py --tabs-dir $TABS \
   --out <repo>/docs/codemap.html \
   --title "<repo> — Codebase Atlas" \
   --subtitle "One-sentence description of the system" \
@@ -82,18 +91,18 @@ Open the result once (at minimum grep that your Mermaid blocks and JSON blocks m
 
 (The pr-visualization skill performs the small-drift revision below automatically as its step 7 whenever it reviews a change in a repo that has a `docs/codemap.html` — after larger drift, or when no PR report is involved, run it from here.)
 
-An existing atlas has gone stale after merges. Start with the trust check — `python3 $SKILL/scripts/check_codemap_state.py <repo>` — because how to update depends on its verdict: `stale` permits either path below; `merge-resolution-suspect` means the codemap was last changed by a merge commit (hand-resolved conflict or a silent auto-splice of two branches' revisions) and demands full re-verification with reconciliation against both merge parents' versions, or a rebuild; `conflict-markers` means the file is corrupt — always rebuild, using both parents' extracted versions as findings checklists. Then pick between two ways to bring it current:
+An existing atlas has gone stale after merges. Start with the trust check — `python $SKILL/scripts/check_codemap_state.py <repo>` (add `--codemap path/to.html` if the atlas lives somewhere nonstandard; exit codes: 0 `current`, 2 `missing`, 1 everything needing action — so don't chain it with `&&`). How to update depends on its verdict: `current` needs nothing; `unknown-vintage` (no parseable sha) means verify everything as if stale; `stale` permits either path below; `merge-resolution-suspect` means the codemap was last changed by a merge commit (hand-resolved conflict or a silent auto-splice of two branches' revisions) and demands full re-verification with reconciliation against both merge parents' versions, or a rebuild; `conflict-markers` means the file is corrupt — always rebuild, using both parents' extracted versions as findings checklists. Then pick between two ways to bring it current:
 
-**Default: rerun from scratch, then reconcile.** Judgment tabs written by revising old claims inherit their framing — the classic failure is patched citations wrapped around a now-wrong narrative. So for anything beyond small drift (many merges, refactors, or changes touching files the judgment tabs discuss), regenerate: run the full workflow above against the current code *without re-reading the old judgment tabs first*. Then use the old atlas as a **findings checklist, not a draft**: extract it (`extract_tabs.py <repo>/docs/codemap.html --out-dir /tmp/old-tabs`) and compare finding-by-finding — every risk, cycle explanation, and invariant in the old atlas must be either present in the new one or deliberately closed ("resolved by <sha>"), and closures are worth a line in the new atlas since "risk #2 from last time is fixed" is information a fresh atlas can't otherwise express. This reconciliation pass is what protects against fresh-run variance silently dropping coverage.
+**Default: rerun from scratch, then reconcile.** Judgment tabs written by revising old claims inherit their framing — the classic failure is patched citations wrapped around a now-wrong narrative. So for anything beyond small drift (many merges, refactors, or changes touching files the judgment tabs discuss), regenerate: run the full workflow above against the current code *without re-reading the old judgment tabs first*. Then use the old atlas as a **findings checklist, not a draft**: extract it (`extract_tabs.py <repo>/docs/codemap.html --out-dir <WORK>/old-tabs`) and compare finding-by-finding — every risk, cycle explanation, and invariant in the old atlas must be either present in the new one or deliberately closed ("resolved by <sha>"), and closures are worth a line in the new atlas since "risk #2 from last time is fixed" is information a fresh atlas can't otherwise express. This reconciliation pass is what protects against fresh-run variance silently dropping coverage.
 
 **Optimization for small drift: revise in place.** When the delta since the old atlas is small relative to what the judgment tabs discuss (a few merged PRs, no structural change), revision is cheaper and keeps continuity:
 
-1. Recover fragments from the canonical location: `python3 $SKILL/scripts/extract_tabs.py <repo>/docs/codemap.html --out-dir $TABS` (fall back to wherever the user says the atlas lives). The printed `meta` holds the sha the atlas was generated at (per the meta convention).
+1. Recover fragments from the canonical location: `python $SKILL/scripts/extract_tabs.py <repo>/docs/codemap.html --out-dir $TABS` (fall back to wherever the user says the atlas lives). Fragments come back with their canonical numbering — an atlas that dropped a tab (e.g. no Hotspots) leaves a gap rather than shifting later tabs — so the analyzer re-runs and `--fragments` lists below stay correct. The printed `meta` holds the sha the atlas was generated at (per the meta convention).
 2. Regenerate the automated tabs by re-running the three analyzers with the same `--tabs-dir` — they overwrite fragments 02–04 with fresh data. Never hand-edit automated tabs.
 3. Find what moved: `git diff --stat <old-sha>..HEAD`, `git log --oneline <old-sha>..HEAD`. A pr-visualization report for the merged change is a ready-made list of behavioral changes to fold in. Any file that both changed and is cited or discussed in a judgment tab needs its claims re-checked against the code, not just re-cited.
 4. Verify every citation (the "make sure it's right" step, not optional):
    ```bash
-   python3 $SKILL/scripts/verify_citations.py <repo> --tabs-dir $TABS --fragments 01,05,06,07,08
+   python $SKILL/scripts/verify_citations.py <repo> --tabs-dir $TABS --fragments 01,05,06,07,08
    ```
    Fix hard breaks (exit 1). For every citation in a file the diff touched, compare `cited_content` against the claim — line numbers frequently survive while the code at them changes meaning.
 5. Revise: update stale findings, delete resolved ones (a fixed risk should disappear, noted once as closed, not linger), add findings the new analyzer data or diff introduces. If little changed, say so — a near-identical atlas after a small diff is the correct output.

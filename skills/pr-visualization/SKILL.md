@@ -9,13 +9,13 @@ Produce **two deliverables**: the PR review report (one self-contained tabbed HT
 
 ## Workflow
 
-Let `SKILL=/path/to/this/skill`, `CVSKILL=/path/to/the/code-visualization/skill` (sibling install, used in step 7), `WORK=/home/claude/pr-review-<name>`, `TABS=$WORK/tabs`.
+Let `SKILL=/path/to/this/skill` and `CVSKILL=/path/to/the/code-visualization/skill` (used in step 7 — normally installed as a sibling of this skill, so try `$SKILL/../code-visualization` first and fall back to searching the skills install dir). Pick a scratch working dir for intermediate files (any temp location, e.g. `WORK=<temp>/pr-review-<name>`), with `TABS=$WORK/tabs`. Commands are POSIX-shell shaped; adapt to your shell.
 
 ### 1. Establish the diff
 
 You need a local git repo containing both sides of the change:
 
-- **Branch/PR checked out locally**: nothing to do. Scripts auto-detect the base (merge-base with origin/main, origin/master, main, master, develop). Pass `--base <ref>` when auto-detection is wrong or the diff is a commit range (`--base HEAD~5`), and `--worktree` to include uncommitted changes.
+- **Branch/PR checked out locally**: nothing to do. Scripts auto-detect the base (merge-base with, in order: origin/main, origin/master, main, master, origin/develop, develop). Pass `--base <ref>` when auto-detection is wrong, `--head <ref>` when the head isn't HEAD, or both for a commit range (`--base HEAD~5`). `--worktree` reviews uncommitted changes (untracked files included; on a mainline checkout the base falls back to HEAD itself; `--head` is rejected with it — the worktree IS the head).
 - **GitHub PR URL**: clone the repo, then `git fetch origin pull/<N>/head:pr-<N> && git checkout pr-<N>`. If the user pasted the PR description, keep it — the Summary tab compares claims against the actual diff.
 - **Patch file only**: `git init` a repo, commit the pre-images if available, apply the patch; if pre-images aren't available, note that blast radius and test-delta analysis will be partial.
 
@@ -23,11 +23,11 @@ You need a local git repo containing both sides of the change:
 
 ```bash
 mkdir -p $TABS
-python3 $SKILL/scripts/analyze_diff.py         <repo> --tabs-dir $TABS [--base REF] [--worktree]
-python3 $SKILL/scripts/analyze_blast_radius.py <repo> --tabs-dir $TABS [--base REF] [--worktree]
+python $SKILL/scripts/analyze_diff.py         <repo> --tabs-dir $TABS [--base REF] [--worktree]
+python $SKILL/scripts/analyze_blast_radius.py <repo> --tabs-dir $TABS [--base REF] [--worktree]
 ```
 
-Each writes its fragment(s) and prints a JSON summary to stdout. **Read the summaries** — they are the skeleton of your judgment tabs: `analyze_diff` gives the risk-ordered file list with reasons, signature changes, risky added lines (with file:line), and source files lacking test changes; `analyze_blast_radius` lists changed symbols and their *untouched* callers. Signature/symbol tracing covers Python, JS/TS, Go, Rust, Ruby, Java-family; for other languages those sections degrade honestly.
+Each writes its fragment(s) and prints a JSON summary to stdout. **Read the summaries** — they are the skeleton of your judgment tabs: `analyze_diff` gives the risk-ordered file list with reasons, signature changes, renames, risky added lines (with file:line), and source files lacking test changes; `analyze_blast_radius` lists changed symbols and their *untouched* callers, with a `caveat` field and truncation counts you must respect — repeat its caveat when you cite its numbers. Signature/symbol tracing covers Python, JS/TS, Go, Rust, Ruby, Java, Kotlin, Scala, and C#; for other languages those sections degrade honestly. Both analyzers exit 0 with a JSON `note` on an empty or docs-only diff — that is an answer ("nothing reviewable changed"), not a failure.
 
 ### 3. Read the diff
 
@@ -50,7 +50,7 @@ Read `$SKILL/references/llm-tabs.md` first (fragment format, styled primitives i
 Judgment tabs assert `file:line` facts; check them before assembling:
 
 ```bash
-python3 $SKILL/scripts/verify_citations.py <repo> --tabs-dir $TABS --fragments 01,05,06
+python $SKILL/scripts/verify_citations.py <repo> --tabs-dir $TABS --fragments 01,05,06
 ```
 
 Fix hard breaks (exit 1: missing/ambiguous paths, out-of-range lines), then skim the `cited_content` the JSON echoes for each citation and confirm the quoted reality still matches your claim. Prefer full paths over bare filenames so citations resolve unambiguously.
@@ -61,7 +61,7 @@ The report's canonical home is **inside the repo at `docs/pr-<number>.html`**, u
 
 ```bash
 mkdir -p <repo>/docs
-python3 $SKILL/scripts/assemble.py --tabs-dir $TABS \
+python $SKILL/scripts/assemble.py --tabs-dir $TABS \
   --out <repo>/docs/pr-<number>.html \
   --title "<repo>#<PR or branch> — Review" \
   --subtitle "One-line description of the change" \
@@ -82,7 +82,7 @@ A PR report and a stale atlas is half-finished work: if `<repo>/docs/codemap.htm
 **First, check whether the existing codemap can be trusted:**
 
 ```bash
-python3 $SKILL/scripts/check_codemap_state.py <repo>
+python $SKILL/scripts/check_codemap_state.py <repo>
 ```
 
 Act on the verdict:
@@ -95,13 +95,13 @@ Act on the verdict:
 
 ```bash
 ATABS=$WORK/atlas-tabs
-python3 $SKILL/scripts/extract_tabs.py <repo>/docs/codemap.html --out-dir $ATABS   # prints old sha in meta
-python3 $CVSKILL/scripts/analyze_inventory.py <repo> --tabs-dir $ATABS   # regenerate automated tabs 02-04
-python3 $CVSKILL/scripts/analyze_deps.py      <repo> --tabs-dir $ATABS
-python3 $CVSKILL/scripts/analyze_hotspots.py  <repo> --tabs-dir $ATABS
+python $SKILL/scripts/extract_tabs.py <repo>/docs/codemap.html --out-dir $ATABS   # prints old sha in meta
+python $CVSKILL/scripts/analyze_inventory.py <repo> --tabs-dir $ATABS   # regenerate automated tabs 02-04
+python $CVSKILL/scripts/analyze_deps.py      <repo> --tabs-dir $ATABS
+python $CVSKILL/scripts/analyze_hotspots.py  <repo> --tabs-dir $ATABS
 ```
 
-Then revise the atlas's judgment tabs using your PR findings: fold in new behavior and new risks, close resolved ones ("resolved by <sha>", then remove), re-check every atlas claim that cites a file this PR touched — the Blast Radius and risky-lines summaries tell you which. Verify (`verify_citations.py <repo> --tabs-dir $ATABS --fragments 01,05,06,07,08`), fix breaks, compare `cited_content` for touched files, then reassemble with `$SKILL/scripts/assemble.py` to `<repo>/docs/codemap.html` with `--label "CODEBASE ATLAS"` and `--meta "updated <date> · <old-sha> → <new-sha> · …"`.
+Then revise the atlas's judgment tabs using your PR findings: fold in new behavior and new risks, close resolved ones ("resolved by <sha>", then remove), re-check every atlas claim that cites a file this PR touched — the Blast Radius and risky-lines summaries tell you which. Verify (`verify_citations.py <repo> --tabs-dir $ATABS --fragments 01,05,06,07,08`), fix breaks, compare `cited_content` for touched files, then reassemble to `<repo>/docs/codemap.html` with `--label "CODEBASE ATLAS"`, `--template $CVSKILL/assets/template.html` and `--meta "updated <date> · <old-sha> → <new-sha> · …"`. The `--template` matters: this skill's assembler defaults to the PR report theme, and without the override every PR run would reskin the atlas — a large, meaningless diff on a committed artifact.
 
 If little in the atlas is affected (a docs-only PR, a leaf-module fix), a near-identical codemap with a fresh sha is the correct output — the sha bump is the point, since it's what keeps future updates' diffs small and keeps the `check_codemap_state.py` verdict clean for the next PR. If the code-visualization skill isn't installed, revise only the judgment tabs, leave 02–04 untouched, and add a visible note in the atlas Overview that automated tabs date from the old sha.
 

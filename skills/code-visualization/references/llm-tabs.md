@@ -10,16 +10,19 @@ Write each tab as a fragment file in the tabs dir. Format:
 <p>...</p>
 ```
 
+`scripts/lint_fragments.py --tabs-dir TABS` is the mechanical check of this protocol (tab header on line 1, no `<style>`, no `<script>` except the JSON data blocks described below, each paired with a `.viz` container) — run it before assembling.
+
 Use the primitives from the template (they're already styled — no `<style>` blocks in fragments):
 
 - `<div class="card">`, `<div class="card hero">` — the hero card for the single most important takeaway of a tab
 - `<div class="callout">` / `callout warn` / `callout bad` / `callout good` — findings, ranked by severity
 - `<span class="badge good|warn|bad|accent|neutral">` — inline status markers
-- `<div class="kpis"><div class="kpi"><div class="n">42</div><div class="l">label</div></div></div>` — headline numbers
-- `<div class="grid cols-2">` / `cols-3` — side-by-side layout
-- `<div class="tbl-wrap"><table class="sortable">...</table></div>` — tables (add `class="num"` to numeric `th`/`td`)
+- `<div class="kpis"><div class="kpi"><div class="n">42</div><div class="l">label</div></div></div>` — headline numbers; add `good|warn|bad|accent` on the `.kpi` to color the number
+- `<div class="grid cols-2">` / `cols-3` — side-by-side layout; bare `grid` (no `cols-*`) stacks children in one column
+- `<div class="tbl-wrap"><table class="sortable">...</table></div>` — tables (add `class="num"` to numeric `th`/`td`); when a cell's text isn't a plain number (`1.2k`, `n/a`), put the raw value in `data-sort` on the `td` so sorting stays numeric
+- `<div class="bar"><i style="width:63%"></i></div>` — inline fill bar for table cells; `bar warn|bad|good` recolors the fill
 - `<details><summary>...</summary><div class="body">...</div></details>` — secondary material
-- `class="dim"` for secondary text; `<code>` for identifiers and paths
+- `class="dim"` for secondary text, `class="faint"` for tertiary; `<code>` for identifiers and paths
 
 For diagrams, use Mermaid inside a pan/zoom wrapper:
 
@@ -34,10 +37,37 @@ sequenceDiagram
 
 Mermaid caveats: escape `<` and `>` in labels or avoid them; `stateDiagram-v2` transition labels break on colons/parentheses — use `flowchart LR` with quoted edge labels (`|"label"|`) when labels need punctuation. Keep each diagram under ~15 participants/nodes; split large flows into several diagrams.
 
+For quantitative structure, the template ships two data-driven renderers. Each is a `<div class="viz" data-render="...">` whose **immediately following sibling** is a `<script type="application/json">` data block; a `style="height:...px"` on the `.viz` div sizes the canvas (set one — the box collapses without it). Both get tooltips, and the force graph gets pan/zoom and node drag, for free.
+
+Treemap — `value` drives area, `metric` drives heat color (`metricMax` pins the color scale; it defaults to the max metric present):
+
+```html
+<div class="viz" data-render="treemap" style="height:480px"></div>
+<script type="application/json">
+{"valueLabel":"lines","metricLabel":"churn","metricMax":40,
+ "items":[{"name":"api/orders.py","value":812,"metric":31,"meta":"12 commits/90d"},
+          {"name":"api/auth.py","value":214,"metric":4}]}
+</script>
+```
+
+Force graph — node color is auto-assigned per `group`, radius scales with `size`, `weight` thickens an edge, `cycle: true` draws it red; `fanIn`/`fanOut`/`meta` feed the tooltip and `legendExtra` (an HTML string) appends to the legend:
+
+```html
+<div class="viz" data-render="forcegraph" style="height:560px"></div>
+<script type="application/json">
+{"nodes":[{"id":"api","label":"api","group":"web","size":1200,"fanIn":0,"fanOut":3,"meta":"entry layer"},
+          {"id":"store","label":"store","group":"data","size":400,"fanIn":3,"fanOut":1}],
+ "links":[{"source":"api","target":"store","weight":12},
+          {"source":"store","target":"api","weight":1,"cycle":true}],
+ "legendExtra":"<span>red edge = cycle</span>"}
+</script>
+```
+
 Ground every claim in the code: cite file paths (and line numbers when specific) in `<code>` so a reader can verify. Prefer "X is enforced only in `api/orders.py:142`" over "X is mostly enforced." When you are unsure, say so with a `badge warn` marked "unverified" rather than asserting.
 
 
-**Citation format** (machine-checkable): cite files inside `<code>` as `path/from/repo/root.py`, with lines as `path.py:142` or `path.py:140-152`. `scripts/verify_citations.py` parses exactly these forms and checks them against the repo — full paths beat bare filenames (bare names get flagged when several files share them). When you deliberately cite a file that no longer exists (a removed or renamed artifact), the verifier will flag it as missing — that flag then serves as confirmation of the removal, not an error to fix.
+**Citation format** (machine-checkable): cite files inside `<code>` as `path/from/repo/root.py`, with lines as `path.py:142` or `path.py:140-152`. `scripts/verify_citations.py` parses exactly these forms and checks them against the repo — full paths beat bare filenames (bare names get flagged when several files share them). This is an atlas of the code as it stands: cite only files that exist now. If a removal or rename is worth mentioning, describe it in prose without a `<code>` path, so every citation stays verifiable.
+
 ---
 
 ## Tab 1 — Overview (file `01-overview.html`)
