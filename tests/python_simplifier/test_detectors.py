@@ -8,6 +8,7 @@ detectors' own path-based skip rules (e.g. files under a "tests" segment).
 
 import ast
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -30,6 +31,14 @@ def run_detector(script: str, target: Path, *extra: str) -> list[dict]:
 
 def smell_types(findings: list[dict]) -> set[str]:
     return {f["smell_type"] for f in findings}
+
+
+def ends_with_path(reported: str, suffix: str) -> bool:
+    """Suffix-match a reported path, which uses the host OS separator (``\\`` on Windows).
+
+    The suffix is always spelled with ``/`` so the assertions read the same everywhere.
+    """
+    return reported.replace(os.sep, "/").endswith(suffix)
 
 
 # (detector script, {relative path: file content}, smell types that must fire)
@@ -520,8 +529,8 @@ def test_dotted_test_import_does_not_bless_same_stem_module(tmp_path):
     (tests_dir / "test_u.py").write_text("from pkg1 import util\n\ndef test_x():\n    assert util.helper() == 1\n")
     findings = run_detector("find_untested_modules.py", tmp_path)
     untested_files = {f["file"] for f in findings if f["smell_type"] == "untested_module"}
-    assert any(f.endswith("pkg2/util.py") for f in untested_files)
-    assert not any(f.endswith("pkg1/util.py") for f in untested_files)
+    assert any(ends_with_path(f, "pkg2/util.py") for f in untested_files)
+    assert not any(ends_with_path(f, "pkg1/util.py") for f in untested_files)
 
 
 def _git(repo: Path, *args: str) -> None:
