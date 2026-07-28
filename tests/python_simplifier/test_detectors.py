@@ -2448,6 +2448,46 @@ def test_callback_field_use_is_not_a_temporary_field(tmp_path):
 # --------------------------------------------------------------------------- #
 
 
+def test_text_output_survives_cp1252_console(tmp_path):
+    # On Windows stdout often defaults to cp1252; the severity icons must
+    # degrade instead of raising UnicodeEncodeError.
+    (tmp_path / "sample.py").write_text("import pdb\n\ndef f():\n    pdb.set_trace()\n")
+    result = subprocess.run(
+        [sys.executable, str(SCRIPTS_DIR / "find_debug_leftovers.py"), str(tmp_path)],
+        capture_output=True, text=True, timeout=120,
+        env={**os.environ, "PYTHONIOENCODING": "cp1252"},
+    )
+    assert result.returncode == 0, result.stderr[:500]
+    assert "pdb_trace" in result.stdout
+
+
+def test_unparseable_file_is_noted_on_stderr_not_silently_skipped(tmp_path):
+    (tmp_path / "broken.py").write_text("def f(:\n")
+    (tmp_path / "good.py").write_text("def g():\n    return eval('1')\n")
+    result = subprocess.run(
+        [sys.executable, str(SCRIPTS_DIR / "find_security_issues.py"), str(tmp_path),
+         "--format", "json"],
+        capture_output=True, text=True, timeout=120,
+    )
+    assert result.returncode == 0, result.stderr[:500]
+    findings = json.loads(result.stdout)
+    assert "eval_exec" in smell_types(findings), "good file must still be analyzed"
+    assert "broken.py" in result.stderr, "the skipped file must be named on stderr"
+
+
+def test_vendored_dirs_excluded_only_below_the_scanned_root(tmp_path):
+    # A repo that happens to LIVE inside a directory named 'build' is still
+    # scanned; a .venv INSIDE the repo is not.
+    repo = tmp_path / "build" / "myrepo"
+    (repo / ".venv").mkdir(parents=True)
+    (repo / "sample.py").write_text("def f(x):\n    return eval(x)\n")
+    (repo / ".venv" / "vendored.py").write_text("def f(x):\n    return eval(x)\n")
+    findings = run_detector("find_security_issues.py", repo)
+    files = {f["file"] for f in findings}
+    assert any(ends_with_path(f, "myrepo/sample.py") for f in files)
+    assert not any(".venv" in f for f in files)
+
+
 def test_analyze_diff_single_commit_repo_uses_empty_tree_base(tmp_path):
     # A repo whose HEAD is the first commit has no HEAD~1; with no main/master
     # branch to diff against either, the fallback must diff against the empty
@@ -2645,51 +2685,538 @@ def test_analyze_all_skip_flag(tmp_path):
 # --------------------------------------------------------------------------- #
 
 
+def issue_types(findings: list[dict]) -> set[str]:
+    return {f["issue_type"] for f in findings}
+
+
+def pattern_types(findings: list[dict]) -> set[str]:
+    return {f["pattern_type"] for f in findings}
+
+
 # ---- analyze_complexity --------------------------------------------------- #
+
+
+def test_deeply_nested_function_exceeds_nesting_threshold(tmp_path):
+    # Five nested ifs exceed the default max_nesting of 4.
+    (tmp_path / "sample.py").write_text(
+        "def route(a):\n"
+        "    if a:\n"
+        "        if a > 1:\n"
+        "            if a > 2:\n"
+        "                if a > 3:\n"
+        "                    if a > 4:\n"
+        "                        return a\n"
+        "    return 0\n"
+    )
+    assert "nesting_depth" in issue_types(run_detector("analyze_complexity.py", tmp_path))
+
+
+def test_simple_function_has_no_complexity_findings(tmp_path):
+    # A two-line function is under every default threshold.
+    (tmp_path / "sample.py").write_text(
+        "def add(first, second):\n"
+        "    return first + second\n"
+    )
+    assert run_detector("analyze_complexity.py", tmp_path) == []
 
 
 # ---- find_boolean_params -------------------------------------------------- #
 
 
+def test_positional_boolean_defaults_are_flagged(tmp_path):
+    (tmp_path / "sample.py").write_text(
+        "def render(data, plain=True, compact=False):\n"
+        "    return (data, plain, compact)\n"
+    )
+    found = smell_types(run_detector("find_boolean_params.py", tmp_path))
+    assert {"multiple_boolean_flags", "boolean_positional_param"} <= found
+
+
+def test_single_keyword_only_boolean_is_not_flagged(tmp_path):
+    # One keyword-only flag is already self-documenting at every call site.
+    (tmp_path / "sample.py").write_text(
+        "def render(data, *, verbose=False):\n"
+        "    return (data, verbose)\n"
+    )
+    assert run_detector("find_boolean_params.py", tmp_path) == []
+
+
 # ---- find_code_smells ----------------------------------------------------- #
+
+
+def test_code_smells_fire_on_bare_except_and_mutable_default(tmp_path):
+    (tmp_path / "sample.py").write_text(
+        "def load(parse, p, opts={}):\n"
+        "    try:\n"
+        "        return parse(p, opts)\n"
+        "    except:\n"
+        "        return None\n"
+        "\n"
+        "def is_dict(x):\n"
+        "    return type(x) == dict\n"
+    )
+    found = smell_types(run_detector("find_code_smells.py", tmp_path))
+    assert {"bare_except", "mutable_default", "type_comparison"} <= found
+
+
+def test_specific_except_and_isinstance_are_not_smells(tmp_path):
+    # `except Exception:` is the suggested fix for bare_except and isinstance
+    # is the suggested fix for type_comparison; neither may re-fire.
+    (tmp_path / "sample.py").write_text(
+        "def load(parse, p):\n"
+        "    try:\n"
+        "        return parse(p)\n"
+        "    except Exception:\n"
+        "        return None\n"
+        "\n"
+        "def is_dict(x):\n"
+        "    return isinstance(x, dict)\n"
+    )
+    assert run_detector("find_code_smells.py", tmp_path) == []
 
 
 # ---- find_comment_smells -------------------------------------------------- #
 
 
+def test_comment_smells_fire_on_todo_and_commented_out_code(tmp_path):
+    (tmp_path / "sample.py").write_text(
+        "def f(x):\n"
+        "    # TODO: rewrite this parser\n"
+        "    # result = compute(x)\n"
+        "    return x\n"
+    )
+    found = smell_types(run_detector("find_comment_smells.py", tmp_path))
+    assert {"todo_comment", "commented_out_code"} <= found
+
+
+def test_pragmas_and_keyword_prose_are_not_commented_out_code(tmp_path):
+    # "# return early" parses as a Return node but is prose; pragma comments
+    # (noqa / type:) are tool directives, not dead code.
+    (tmp_path / "sample.py").write_text(
+        "def scale(value):\n"
+        "    # noqa: E501\n"
+        "    # type: ignore[arg-type]\n"
+        "    # return early\n"
+        "    # doubles the incoming measurement\n"
+        "    return value * 2\n"
+    )
+    assert run_detector("find_comment_smells.py", tmp_path) == []
+
+
 # ---- find_coupling_issues ------------------------------------------------- #
+
+
+def test_feature_envy_and_message_chain_are_flagged(tmp_path):
+    (tmp_path / "sample.py").write_text(
+        "class Report:\n"
+        "    def __init__(self):\n"
+        "        self.title = ''\n"
+        "\n"
+        "    def summarize(self, order):\n"
+        "        return order.subtotal + order.tax + order.shipping\n"
+        "\n"
+        "    def cursor(self):\n"
+        "        return self.conf.db.pool.conn.cursor\n"
+    )
+    found = issue_types(run_detector("find_coupling_issues.py", tmp_path))
+    assert {"feature_envy", "message_chain"} <= found
+
+
+def test_small_cohesive_class_is_not_flagged(tmp_path):
+    # Every method works on the same attribute: LCOM is 0 and nothing is
+    # delegated, so no coupling finding may fire.
+    (tmp_path / "sample.py").write_text(
+        "class Tally:\n"
+        "    def __init__(self):\n"
+        "        self.count = 0\n"
+        "\n"
+        "    def increment(self):\n"
+        "        self.count += 1\n"
+        "\n"
+        "    def current(self):\n"
+        "        return self.count\n"
+    )
+    assert run_detector("find_coupling_issues.py", tmp_path) == []
 
 
 # ---- find_dead_code ------------------------------------------------------- #
 
 
+def test_dead_code_fires_on_unused_import_unreachable_and_constant_condition(tmp_path):
+    (tmp_path / "sample.py").write_text(
+        "import os\n"
+        "import sys\n"
+        "\n"
+        "def f():\n"
+        "    return 1\n"
+        "    print(2)\n"
+        "\n"
+        "if True:\n"
+        "    x = os.sep\n"
+    )
+    found = issue_types(run_detector("find_dead_code.py", tmp_path))
+    assert {"unused_import", "unreachable_code", "constant_condition"} <= found
+
+
+def test_used_import_called_function_and_used_param_are_not_dead(tmp_path):
+    # Everything is referenced: the import is used, the function is called and
+    # its parameter is read — no finding may fire at the default confidence.
+    (tmp_path / "sample.py").write_text(
+        "import os\n"
+        "\n"
+        "def helper(flag):\n"
+        "    if flag:\n"
+        "        return os.sep\n"
+        "    return ''\n"
+        "\n"
+        "RESULT = helper(True)\n"
+    )
+    assert run_detector("find_dead_code.py", tmp_path) == []
+
+
 # ---- find_duplicates ------------------------------------------------------ #
+
+
+def test_duplicates_below_min_lines_are_not_reported(tmp_path):
+    # Identical 4-line functions sit below the default --min-lines of 5;
+    # reporting every tiny idiom as a duplicate would be pure noise.
+    body = "    a = x + 1\n    b = a * 2\n    return b\n"
+    (tmp_path / "one.py").write_text(f"def first(x):\n{body}")
+    (tmp_path / "two.py").write_text(f"def second(x):\n{body}")
+    assert run_detector("find_duplicates.py", tmp_path) == []
 
 
 # ---- find_loop_simplifications -------------------------------------------- #
 
 
+def test_loop_simplifications_fire_on_known_bad_loops(tmp_path):
+    (tmp_path / "sample.py").write_text(
+        "def f(items):\n"
+        "    out = []\n"
+        "    for x in items:\n"
+        "        out.append(x * 2)\n"
+        "    s = ''\n"
+        "    for x in items:\n"
+        "        s += f'{x},'\n"
+        "    found = False\n"
+        "    for x in items:\n"
+        "        if x > 3:\n"
+        "            found = True\n"
+        "            break\n"
+        "    return out, s, found\n"
+    )
+    found = smell_types(run_detector("find_loop_simplifications.py", tmp_path))
+    assert {"loop_to_comprehension", "string_concat_in_loop", "manual_any_all"} <= found
+
+
+def test_loops_with_early_exit_or_side_effects_are_not_comprehensions(tmp_path):
+    # A break or an extra side-effecting statement cannot be expressed as a
+    # comprehension, and a numeric accumulator is not string concatenation.
+    (tmp_path / "sample.py").write_text(
+        "def g(items, target, log):\n"
+        "    out = []\n"
+        "    for x in items:\n"
+        "        out.append(x)\n"
+        "        if x == target:\n"
+        "            break\n"
+        "    for x in items:\n"
+        "        log(x)\n"
+        "        out.append(x)\n"
+        "    total = 0\n"
+        "    for x in items:\n"
+        "        total += x\n"
+        "    return out, total\n"
+    )
+    assert run_detector("find_loop_simplifications.py", tmp_path) == []
+
+
 # ---- find_mutation_hazards ------------------------------------------------ #
+
+
+def test_mutation_hazards_fire_on_shared_and_aliased_state(tmp_path):
+    (tmp_path / "sample.py").write_text(
+        "class Registry:\n"
+        "    entries = []\n"
+        "\n"
+        "def collect(item, acc=[]):\n"
+        "    acc.append(item)\n"
+        "    return acc\n"
+        "\n"
+        "def prune(items):\n"
+        "    for item in items:\n"
+        "        items.remove(item)\n"
+    )
+    findings = run_detector("find_mutation_hazards.py", tmp_path)
+    found = smell_types(findings)
+    assert {"mutable_class_attribute", "mutated_default_arg", "modify_during_iteration"} <= found
+    assert all(ends_with_path(f["file"], "sample.py") for f in findings)
+
+
+def test_instance_state_classvar_snapshot_and_rebound_default_are_safe(tmp_path):
+    # A per-instance list initialized in __init__, an explicit ClassVar, a
+    # snapshot iteration (list(...)), a mutate-then-break loop, and a default
+    # rebound to a fresh copy are all safe patterns that must not be flagged.
+    (tmp_path / "sample.py").write_text(
+        "from typing import ClassVar\n"
+        "\n"
+        "class Widget:\n"
+        "    registry: ClassVar[list] = []\n"
+        "\n"
+        "    def __init__(self):\n"
+        "        self.items = []\n"
+        "\n"
+        "def prune(items):\n"
+        "    for item in list(items):\n"
+        "        items.remove(item)\n"
+        "\n"
+        "def drop_first(items, target):\n"
+        "    for item in items:\n"
+        "        if item == target:\n"
+        "            items.remove(item)\n"
+        "            break\n"
+        "\n"
+        "def collect(item, acc=[]):\n"
+        "    acc = list(acc)\n"
+        "    acc.append(item)\n"
+        "    return acc\n"
+    )
+    assert run_detector("find_mutation_hazards.py", tmp_path) == []
 
 
 # ---- find_naming_issues --------------------------------------------------- #
 
 
+def test_naming_issues_fire_on_case_violations_and_builtin_shadowing(tmp_path):
+    (tmp_path / "sample.py").write_text(
+        "def parseValue(input):\n"
+        "    return input\n"
+        "\n"
+        "class http_client:\n"
+        "    pass\n"
+    )
+    found = smell_types(run_detector("find_naming_issues.py", tmp_path))
+    assert {"non_snake_case_function", "shadows_builtin", "non_pascal_case_class"} <= found
+
+
+def test_pep8_names_and_self_cls_params_are_not_flagged(tmp_path):
+    # snake_case functions, PascalCase classes, dunders, and the conventional
+    # self/cls parameters are all compliant.
+    (tmp_path / "sample.py").write_text(
+        "class HttpClient:\n"
+        "    def __init__(self):\n"
+        "        self.timeout = None\n"
+        "\n"
+        "    def parse_value(self, data):\n"
+        "        return data\n"
+        "\n"
+        "    @classmethod\n"
+        "    def from_url(cls, url):\n"
+        "        return cls()\n"
+    )
+    assert run_detector("find_naming_issues.py", tmp_path) == []
+
+
 # ---- find_overengineering ------------------------------------------------- #
+
+
+def test_abstract_class_without_implementations_is_flagged(tmp_path):
+    (tmp_path / "sample.py").write_text(
+        "from abc import ABC, abstractmethod\n"
+        "\n"
+        "class Renderer(ABC):\n"
+        "    @abstractmethod\n"
+        "    def render(self):\n"
+        "        ...\n"
+    )
+    assert "unused_abstraction" in issue_types(run_detector("find_overengineering.py", tmp_path))
+
+
+def test_abstraction_with_two_implementations_is_earned(tmp_path):
+    # Two concrete implementations justify the abstract base: neither
+    # unused_abstraction nor single_implementation may fire.
+    (tmp_path / "sample.py").write_text(
+        "from abc import ABC, abstractmethod\n"
+        "\n"
+        "class Shape(ABC):\n"
+        "    @abstractmethod\n"
+        "    def area(self):\n"
+        "        ...\n"
+        "\n"
+        "class Circle(Shape):\n"
+        "    def __init__(self, radius):\n"
+        "        self.radius = radius\n"
+        "\n"
+        "    def area(self):\n"
+        "        return self.radius * self.radius\n"
+        "\n"
+        "class Square(Shape):\n"
+        "    def __init__(self, side):\n"
+        "        self.side = side\n"
+        "\n"
+        "    def area(self):\n"
+        "        return self.side * self.side\n"
+    )
+    assert run_detector("find_overengineering.py", tmp_path) == []
 
 
 # ---- find_parameter_objects ----------------------------------------------- #
 
 
+def test_parameter_group_recurring_in_three_functions_is_a_data_clump(tmp_path):
+    (tmp_path / "sample.py").write_text(
+        "def connect(host, port, timeout):\n"
+        "    return (host, port, timeout)\n"
+        "\n"
+        "def ping(host, port, timeout):\n"
+        "    return (host, port, timeout)\n"
+        "\n"
+        "def close_conn(host, port, timeout):\n"
+        "    return (host, port, timeout)\n"
+    )
+    assert "data_clump" in smell_types(run_detector("find_parameter_objects.py", tmp_path))
+
+
+def test_parameter_group_in_only_two_functions_is_not_a_clump(tmp_path):
+    # Two co-occurrences sit below the MIN_FUNCS threshold of 3; extracting a
+    # parameter object for a pair of functions would be premature.
+    (tmp_path / "sample.py").write_text(
+        "def connect(host, port, timeout):\n"
+        "    return (host, port, timeout)\n"
+        "\n"
+        "def ping(host, port, timeout):\n"
+        "    return (host, port, timeout)\n"
+    )
+    assert run_detector("find_parameter_objects.py", tmp_path) == []
+
+
 # ---- find_return_issues --------------------------------------------------- #
+
+
+def test_return_issues_fire_on_mixed_returns_and_boolean_ladder(tmp_path):
+    (tmp_path / "sample.py").write_text(
+        "def lookup(d, k):\n"
+        "    if k in d:\n"
+        "        return d[k]\n"
+        "    return\n"
+        "\n"
+        "def is_big(x):\n"
+        "    if x > 10:\n"
+        "        return True\n"
+        "    return False\n"
+    )
+    found = smell_types(run_detector("find_return_issues.py", tmp_path))
+    assert {"inconsistent_returns", "return_bool_condition"} <= found
+
+
+def test_generator_bare_return_and_same_bool_paths_are_not_flagged(tmp_path):
+    # A bare return in a generator is the idiomatic early exit, and returning
+    # the SAME bool on both paths is not `return <condition>`.
+    (tmp_path / "sample.py").write_text(
+        "def stream(items):\n"
+        "    if not items:\n"
+        "        return\n"
+        "    yield from items\n"
+        "\n"
+        "def confirmed(flag):\n"
+        "    if flag:\n"
+        "        return True\n"
+        "    return True\n"
+    )
+    assert run_detector("find_return_issues.py", tmp_path) == []
 
 
 # ---- find_unpythonic ------------------------------------------------------ #
 
 
+def test_unpythonic_fires_on_range_len_and_literal_comparisons(tmp_path):
+    (tmp_path / "sample.py").write_text(
+        "def f(items, x):\n"
+        "    for i in range(len(items)):\n"
+        "        print(items[i])\n"
+        "    if x == True:\n"
+        "        return 1\n"
+        "    if x == None:\n"
+        "        return 2\n"
+        "    return 0\n"
+    )
+    found = pattern_types(run_detector("find_unpythonic.py", tmp_path))
+    assert {"range_len_loop", "compare_to_true", "compare_none_equality"} <= found
+
+
+def test_enumerate_and_is_none_are_already_pythonic(tmp_path):
+    # The suggested fixes — enumerate() and `is None` — must not re-fire.
+    (tmp_path / "sample.py").write_text(
+        "def g(items, x):\n"
+        "    for i, item in enumerate(items):\n"
+        "        print(i, item)\n"
+        "    if x is None:\n"
+        "        return None\n"
+        "    return x\n"
+    )
+    assert run_detector("find_unpythonic.py", tmp_path) == []
+
+
 # ---- format_findings ------------------------------------------------------ #
+
+
+FORMAT_FIXTURE = [
+    {"file": "src/sample.py", "line": 3, "smell_type": "bare_except",
+     "description": "Bare except catches everything",
+     "suggestion": "Catch a specific exception type", "severity": "high"},
+    {"file": "src/sample.py", "line": 9, "pattern_type": "range_len_loop",
+     "description": "Using range(len()) instead of enumerate", "severity": "low"},
+]
+
+
+def _run_formatter(*extra: str, stdin_text: str | None = None) -> str:
+    result = subprocess.run(
+        [sys.executable, str(SCRIPTS_DIR / "format_findings.py"), *extra],
+        capture_output=True, text=True, timeout=60, input=stdin_text,
+    )
+    assert result.returncode == 0, f"format_findings exited {result.returncode}: {result.stderr[:500]}"
+    return result.stdout
+
+
+def test_format_findings_list_from_stdin_has_location_and_description():
+    out = _run_formatter(stdin_text=json.dumps(FORMAT_FIXTURE))
+    assert "sample.py:3" in out
+    assert "Bare except catches everything" in out
+    assert "range_len_loop" in out
+
+
+def test_format_findings_cards_and_json_from_file(tmp_path):
+    src = tmp_path / "findings.json"
+    src.write_text(json.dumps(FORMAT_FIXTURE))
+    cards = _run_formatter(str(src), "--format", "cards")
+    assert "`src/sample.py:3`" in cards
+    assert "Bare except catches everything" in cards
+    assert "Catch a specific exception type" in cards
+    tickets = json.loads(_run_formatter(str(src), "--format", "json"))
+    assert len(tickets) == 2
+    assert tickets[0]["location"] == "src/sample.py:3"          # high sorts first
+    assert tickets[0]["description"] == "Bare except catches everything"
+    assert tickets[1]["smell"] == "range_len_loop"              # pattern_type honored
+
+
+def test_format_findings_min_severity_filters_low_findings():
+    out = _run_formatter("--min-severity", "high", stdin_text=json.dumps(FORMAT_FIXTURE))
+    assert "bare_except" in out
+    assert "range_len_loop" not in out
 
 
 # ---- run_external_tools --------------------------------------------------- #
 
 
+def test_run_external_tools_reports_every_tool_as_run_or_missing(tmp_path):
+    # Structural contract only: no external tool is assumed installed. Each
+    # requested tool must land in exactly one of tools_run / missing_tools.
+    (tmp_path / "sample.py").write_text('"""Tiny module."""\n\nX = 1\n')
+    report = run_detector("run_external_tools.py", tmp_path, "--tools", "ruff,black")
+    assert {"tools_run", "missing_tools", "findings"} <= report.keys()
+    assert isinstance(report["findings"], list)
+    ran = set(report["tools_run"])
+    missing = {m["name"] for m in report["missing_tools"]}
+    assert ran | missing == {"ruff", "black"}
+    assert not (ran & missing)
+    for m in report["missing_tools"]:
+        assert m["install"].startswith("pip install ")
