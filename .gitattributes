@@ -1,0 +1,3 @@
+# Shell scripts must check out with LF everywhere — bash rejects CRLF lines
+# ($'\r': command not found), including on Windows under Git Bash.
+*.sh text eol=lf
