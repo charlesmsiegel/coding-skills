@@ -340,7 +340,8 @@ def test_assembled_atlas_round_trips_back_to_fragments(tmp_path, tabs, run_scrip
     extracted = json.loads(result.stdout)
     assert extracted["title"] == "demo — Codebase Atlas"
     assert extracted["meta"] == "generated at deadbee"
-    # Fragments come back in display order, renumbered contiguously.
+    # Known tabs keep their canonical prefix; a custom tab ("risks" is not a
+    # canonical atlas tab) takes the first free slot at its display position.
     assert extracted["fragments"] == ["01-overview.html", "02-risks.html"]
     assert fragment.title(recovered / "01-overview.html") == "Overview"
     assert "body one" in fragment.body(recovered / "01-overview.html")
@@ -390,3 +391,32 @@ def test_assemble_defaults_to_the_atlas_label(tmp_path, tabs, run_script):
     run_script(SCRIPTS / "assemble.py", "--tabs-dir", tabs, "--out", atlas, "--title", "T")
 
     assert "CODEBASE ATLAS" in atlas.read_text(encoding="utf-8")
+
+
+def test_extraction_preserves_canonical_numbering_when_a_tab_was_dropped(tmp_path, tabs, run_script):
+    # An atlas without git history legitimately has no Hotspots (04). Under
+    # display-order renumbering, extraction used to shift flows/boundaries/...
+    # down one slot; re-running the analyzers then wrote a NEW 04-hotspots
+    # beside the shifted 04-flows and the documented
+    # `--fragments 01,05,06,07,08` verified the wrong set, silently skipping
+    # Critical Flows. Canonical prefixes must survive the round trip.
+    for name, title in [
+        ("01-overview.html", "Overview"), ("02-inventory.html", "Inventory"),
+        ("03-dependencies.html", "Dependencies"),  # 04-hotspots deliberately absent
+        ("05-flows.html", "Critical Flows"), ("06-boundaries.html", "Boundaries &amp; Ownership"),
+        ("07-invariants.html", "Invariants &amp; Risks"), ("08-glossary.html", "Glossary"),
+    ]:
+        tabs.joinpath(name).write_text(f"<!-- tab: {title} -->\n<p>{name}</p>\n", encoding="utf-8")
+    atlas = tmp_path / "codemap.html"
+    run_script(SCRIPTS / "assemble.py", "--tabs-dir", tabs, "--out", atlas, "--title", "T")
+
+    recovered = tmp_path / "recovered"
+    result = run_script(SCRIPTS / "extract_tabs.py", atlas, "--out-dir", recovered)
+
+    extracted = json.loads(result.stdout)
+    assert extracted["fragments"] == [
+        "01-overview.html", "02-inventory.html", "03-dependencies.html",
+        "05-flows.html", "06-boundaries.html", "07-invariants.html", "08-glossary.html",
+    ]
+
+
