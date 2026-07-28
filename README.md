@@ -27,6 +27,7 @@ skills/<skill-name>/     one directory per skill — exactly what ships
   references/            judgment guides loaded on demand
   assets/                templates and other bundled files, if any
 tests/<skill_name>/      that skill's tests (underscored, so it's importable)
+tests/conftest.py        shared fixtures: throwaway git repos, script runners
 pyproject.toml           shared dev tooling config (pytest, ruff)
 .github/workflows/       CI (lint + tests + ratchet) and per-skill releases
 ```
@@ -51,6 +52,12 @@ be zipped and installed on its own, so the duplication is deliberate, not drift.
 
 CI also runs a ratchet: python-simplifier's bug-class detectors must stay silent on
 every skill's own `scripts/` directory.
+
+The visualization skills are tested through their CLIs — each analyzer runs as a
+subprocess over a throwaway git repo built in `tmp_path`, and both what it prints
+(the JSON the agent reads) and what it writes (the HTML fragment the reader sees)
+are asserted. A test marked `xfail` records a known defect rather than a passing
+assertion that the wrong behavior is correct; check its reason before "fixing" it.
 
 ## Releasing a skill
 
