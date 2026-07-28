@@ -9,8 +9,11 @@ each changed .py file and keeps only findings that land on lines the diff touche
 
 Whole-repo / architecture detectors (find_import_cycles, find_dependency_issues,
 find_untested_modules, find_duplicates, find_dead_code, find_overengineering,
-find_coupling_issues) need the full tree to be correct, so they are deliberately
-NOT part of the diff lens — run them with analyze_all.py against the whole repo.
+find_coupling_issues, find_parameter_objects) need the full tree to be correct,
+so they are deliberately NOT part of the diff lens — run them with
+analyze_all.py against the whole repo. find_redundant_comments is opt-in here
+for the same reason it is opt-in everywhere: it is noisy by design
+(--include-redundant-comments enables it).
 
 Usage:
   python analyze_diff.py                 # working tree vs. the merge-base with the default branch
@@ -29,6 +32,7 @@ import argparse
 import subprocess
 from pathlib import Path
 from collections import defaultdict, Counter
+from common import SEVERITY_ICONS, configure_output
 
 # Per-file detectors only. Each is meaningful on a single file and reports a line
 # within that file. Whole-repo detectors are excluded on purpose (see module docstring).
@@ -56,17 +60,20 @@ DIFF_SAFE_SCRIPTS = [
     "find_ai_scaffolding.py",
     "find_duplicate_definitions.py",
     "find_unawaited_coroutines.py",
-    "find_redundant_comments.py",
     "find_local_imports.py",
 ]
 
-_ICON = {"high": "🔴", "medium": "🟡", "low": "🟢"}
+# Noisy-by-design detectors that only run when explicitly requested.
+OPT_IN_SCRIPTS = ["find_redundant_comments.py"]
+
+_ICON = SEVERITY_ICONS
 _HUNK = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")
 
 
-def _git(args):
+def _git(args, input_text=None):
     try:
-        r = subprocess.run(["git", *args], capture_output=True, text=True, timeout=60)
+        r = subprocess.run(["git", *args], capture_output=True, text=True, timeout=60,
+                           input=input_text)
         if r.returncode != 0:
             return None
         return r.stdout
@@ -88,7 +95,12 @@ def resolve_base(explicit):
     # Fall back to the previous commit, then the empty tree (first commit).
     if _git(["rev-parse", "HEAD~1"]) is not None:
         return "HEAD~1"
-    return _git(["hash-object", "-t", "tree", "/dev/null"]).strip() if _git(["rev-parse", "HEAD"]) else None
+    if _git(["rev-parse", "HEAD"]) is None:
+        return None
+    # mktree on empty stdin yields the empty-tree id portably (no /dev/null,
+    # correct under both SHA-1 and SHA-256 repos).
+    empty_tree = _git(["mktree"], input_text="")
+    return empty_tree.strip() if empty_tree else None
 
 
 def changed_lines(base):
@@ -255,7 +267,8 @@ def run_detector(script, filepath):
     return (data if isinstance(data, list) else data.get("issues", [])), None
 
 
-def collect(base, all_lines):
+def collect(base, all_lines, scripts=None):
+    scripts = scripts if scripts is not None else DIFF_SAFE_SCRIPTS
     files, rels, hunks_by_file = changed_lines(base)
     if files is None:
         return None, None
@@ -277,7 +290,7 @@ def collect(base, all_lines):
             accepted = _expand_to_definitions(filepath, lines | seeds) - (seeds - lines)
         to_base = _line_mapper(file_hunks)
         baseline = None  # computed lazily — only when a gated finding appears
-        for script in DIFF_SAFE_SCRIPTS:
+        for script in scripts:
             issues, error = run_detector(script, filepath)
             if error is not None:
                 # Detector failures bypass the changed-line filter: the reader
@@ -356,6 +369,7 @@ def print_text(files, findings, base):
 
 
 def main():
+    configure_output()
     parser = argparse.ArgumentParser(
         description="Run the file-level detectors against only the changed lines of a diff (CR review lens)",
     )
@@ -364,6 +378,8 @@ def main():
     parser.add_argument("--format", choices=["text", "json"], default="text")
     parser.add_argument("--all-lines", action="store_true",
                         help="Report findings on every line of each changed file, not just changed lines")
+    parser.add_argument("--include-redundant-comments", action="store_true",
+                        help="Also run find_redundant_comments.py (noisy by design, opt-in everywhere)")
     args = parser.parse_args()
 
     if _git(["rev-parse", "--is-inside-work-tree"]) is None:
@@ -378,7 +394,8 @@ def main():
             print("Could not resolve a base ref to diff against.", file=sys.stderr)
         sys.exit(1)
 
-    files, findings = collect(base, args.all_lines)
+    scripts = DIFF_SAFE_SCRIPTS + (OPT_IN_SCRIPTS if args.include_redundant_comments else [])
+    files, findings = collect(base, args.all_lines, scripts)
     if files is None:
         print(f"git diff against '{base}' failed; refusing to report a falsely clean review.", file=sys.stderr)
         sys.exit(1)

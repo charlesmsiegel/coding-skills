@@ -2448,6 +2448,29 @@ def test_callback_field_use_is_not_a_temporary_field(tmp_path):
 # --------------------------------------------------------------------------- #
 
 
+def test_analyze_diff_single_commit_repo_uses_empty_tree_base(tmp_path):
+    # A repo whose HEAD is the first commit has no HEAD~1; with no main/master
+    # branch to diff against either, the fallback must diff against the empty
+    # tree (portably — no /dev/null) instead of crashing.
+    def git(*args):
+        subprocess.run(["git", "-C", str(tmp_path), *args], check=True,
+                       capture_output=True, timeout=60)
+    git("init", "-q", "-b", "trunk")
+    git("config", "user.email", "t@t.co")
+    git("config", "user.name", "t")
+    git("config", "commit.gpgsign", "false")
+    (tmp_path / "sample.py").write_text("def f(x):\n    return eval(x)\n")
+    git("add", "-A")
+    git("commit", "-qm", "first")
+    result = subprocess.run(
+        [sys.executable, str(SCRIPTS_DIR / "analyze_diff.py"), "--format", "json"],
+        capture_output=True, text=True, timeout=600, cwd=str(tmp_path),
+    )
+    assert result.returncode == 0, result.stderr[:500]
+    findings = json.loads(result.stdout)
+    assert smell_types([f for f in findings if "smell_type" in f]) >= {"eval_exec"}
+
+
 def test_analyze_all_output_file_is_utf8(tmp_path):
     (tmp_path / "sample.py").write_text("x = 1\n")
     out = tmp_path / "report.txt"

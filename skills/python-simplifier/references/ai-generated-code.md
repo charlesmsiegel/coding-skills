@@ -130,9 +130,11 @@ python scripts/analyze_diff.py --format json | python scripts/format_findings.py
 ```
 
 Architecture and whole-repo checks (`find_import_cycles`, `find_dependency_issues`,
-`find_untested_modules`, `find_duplicates`) need the full tree — run those with
+`find_untested_modules`, `find_duplicates`, `find_dead_code`, `find_overengineering`,
+`find_coupling_issues`, `find_parameter_objects`) need the full tree — run those with
 `analyze_all.py` separately; the diff lens deliberately covers only the per-file
-detectors.
+detectors. `find_redundant_comments` is opt-in on the diff lens too
+(`--include-redundant-comments`) because it is noisy by design.
 
 A CR-review checklist for AI code:
 
