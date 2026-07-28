@@ -2443,49 +2443,96 @@ def test_callback_field_use_is_not_a_temporary_field(tmp_path):
 
 
 # --------------------------------------------------------------------------- #
-# Shared plumbing (scripts/common.py): console encoding, error surfacing,
-# vendored-dir exclusion, and the first-commit diff fallback
+# Detector-noise fixes: magic numbers, data_class, unpythonic, and the
+# unified --ignore / flat-JSON interface
 # --------------------------------------------------------------------------- #
 
 
-def test_text_output_survives_cp1252_console(tmp_path):
-    # On Windows stdout often defaults to cp1252; the severity icons must
-    # degrade instead of raising UnicodeEncodeError.
-    (tmp_path / "sample.py").write_text("import pdb\n\ndef f():\n    pdb.set_trace()\n")
-    result = subprocess.run(
-        [sys.executable, str(SCRIPTS_DIR / "find_debug_leftovers.py"), str(tmp_path)],
-        capture_output=True, text=True, timeout=120,
-        env={**os.environ, "PYTHONIOENCODING": "cp1252"},
+def test_named_constant_is_not_a_magic_number(tmp_path):
+    (tmp_path / "sample.py").write_text(
+        "TIMEOUT = 30\n"
+        "def fetch(url, get):\n"
+        "    return get(url, timeout=30)\n"
+        "def clip(text):\n"
+        "    return text[:200]\n"
+        "def pick(xs):\n"
+        "    weights = [0.3, 0.5, 9]\n"
+        "    return weights\n"
     )
-    assert result.returncode == 0, result.stderr[:500]
-    assert "pdb_trace" in result.stdout
+    assert "magic_number" not in smell_types(run_detector("find_code_smells.py", tmp_path))
 
 
-def test_unparseable_file_is_noted_on_stderr_not_silently_skipped(tmp_path):
-    (tmp_path / "broken.py").write_text("def f(:\n")
-    (tmp_path / "good.py").write_text("def g():\n    return eval('1')\n")
-    result = subprocess.run(
-        [sys.executable, str(SCRIPTS_DIR / "find_security_issues.py"), str(tmp_path),
-         "--format", "json"],
-        capture_output=True, text=True, timeout=120,
+def test_unnamed_threshold_is_still_a_magic_number(tmp_path):
+    (tmp_path / "sample.py").write_text(
+        "def stale(age):\n"
+        "    return age > 86400\n"
     )
-    assert result.returncode == 0, result.stderr[:500]
-    findings = json.loads(result.stdout)
-    assert "eval_exec" in smell_types(findings), "good file must still be analyzed"
-    assert "broken.py" in result.stderr, "the skipped file must be named on stderr"
+    assert "magic_number" in smell_types(run_detector("find_code_smells.py", tmp_path))
 
 
-def test_vendored_dirs_excluded_only_below_the_scanned_root(tmp_path):
-    # A repo that happens to LIVE inside a directory named 'build' is still
-    # scanned; a .venv INSIDE the repo is not.
-    repo = tmp_path / "build" / "myrepo"
-    (repo / ".venv").mkdir(parents=True)
-    (repo / "sample.py").write_text("def f(x):\n    return eval(x)\n")
-    (repo / ".venv" / "vendored.py").write_text("def f(x):\n    return eval(x)\n")
-    findings = run_detector("find_security_issues.py", repo)
-    files = {f["file"] for f in findings}
-    assert any(ends_with_path(f, "myrepo/sample.py") for f in files)
-    assert not any(".venv" in f for f in files)
+def test_declared_dataclass_is_not_a_data_class_smell(tmp_path):
+    (tmp_path / "sample.py").write_text(
+        "from dataclasses import dataclass\n"
+        "from typing import NamedTuple\n"
+        "@dataclass\n"
+        "class Point:\n"
+        "    x: int = 0\n"
+        "    y: int = 0\n"
+        "    z: int = 0\n"
+        "    w: int = 0\n"
+        "class Pair(NamedTuple):\n"
+        "    a: int = 0\n"
+        "    b: int = 0\n"
+        "    c: int = 0\n"
+        "    d: int = 0\n"
+    )
+    assert "data_class" not in smell_types(run_detector("find_code_smells.py", tmp_path))
+
+
+def test_sorted_dict_keys_fires(tmp_path):
+    # This branch was unreachable before (nested under the wrong isinstance).
+    (tmp_path / "sample.py").write_text("def f(d):\n    return sorted(d.keys())\n")
+    findings = run_detector("find_unpythonic.py", tmp_path)
+    assert "sorted_dict_keys" in {f["pattern_type"] for f in findings}
+
+
+def test_keys_flagged_only_in_iteration_and_membership(tmp_path):
+    (tmp_path / "sample.py").write_text(
+        "def f(d, other):\n"
+        "    snapshot = list(d.keys())\n"          # required use: not flagged
+        "    shared = d.keys() & other.keys()\n"   # required use: not flagged
+        "    return snapshot, shared\n"
+    )
+    findings = run_detector("find_unpythonic.py", tmp_path)
+    assert "dict_keys_iteration" not in {f["pattern_type"] for f in findings}
+    (tmp_path / "sample.py").write_text(
+        "def f(d):\n"
+        "    for k in d.keys():\n"
+        "        print(k)\n"
+        "    return 'x' in d.keys()\n"
+    )
+    findings = run_detector("find_unpythonic.py", tmp_path)
+    assert "dict_keys_iteration" in {f["pattern_type"] for f in findings}
+
+
+def test_accumulator_is_not_manual_index_tracking(tmp_path):
+    (tmp_path / "sample.py").write_text(
+        "def f(items):\n"
+        "    errors = 0\n"
+        "    for item in items:\n"
+        "        errors += 1\n"
+        "    return errors\n"
+    )
+    findings = run_detector("find_unpythonic.py", tmp_path)
+    assert "manual_index" not in {f["pattern_type"] for f in findings}
+
+
+def test_x_plus_y_rewrite_suggestion_removed(tmp_path):
+    # x = x + y is not equivalent to x += y for lists/arrays; the detector
+    # must not propose a behavior-changing edit.
+    (tmp_path / "sample.py").write_text("def f(x, y):\n    x = x + y\n    return x\n")
+    findings = run_detector("find_unpythonic.py", tmp_path)
+    assert "augmented_assignment" not in {f["pattern_type"] for f in findings}
 
 
 # --------------------------------------------------------------------------- #

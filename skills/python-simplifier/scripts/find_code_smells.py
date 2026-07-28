@@ -10,8 +10,8 @@ import json
 import argparse
 from pathlib import Path
 from dataclasses import dataclass, asdict
-from typing import Iterator
 from collections import defaultdict
+from common import SEVERITY_ICONS, configure_output, find_python_files, warn_detector_error, warn_unparseable
 
 
 @dataclass
@@ -25,8 +25,28 @@ class CodeSmell:
     code_snippet: str = ""
 
 
+# Classes with these decorators/bases are data containers on purpose.
+DATA_CLASS_MARKERS = frozenset({
+    "dataclass", "attrs", "attr", "define", "frozen",
+    "NamedTuple", "TypedDict", "Protocol",
+    "Enum", "IntEnum", "StrEnum", "Flag", "IntFlag",
+    "BaseModel",  # pydantic
+})
+
+
+def _unwrap_negative(node: ast.AST) -> ast.AST:
+    """-5 parses as UnaryOp(USub, Constant(5)); return the inner constant."""
+    if isinstance(node, ast.UnaryOp) and isinstance(node.op, (ast.USub, ast.UAdd)):
+        return node.operand
+    return node
+
+
 class CodeSmellDetector(ast.NodeVisitor):
-    MAGIC_NUMBER_WHITELIST = frozenset({0, 1, -1, 2, 10, 100, 1000, 24, 60, 365, 0.0, 1.0, 0.5})
+    # Values so conventional a name would add nothing.
+    MAGIC_NUMBER_WHITELIST = frozenset({
+        10, 100, 1000, 24, 60, 365,
+        16, 32, 64, 128, 255, 256, 512, 1024,
+    })
 
     def __init__(self, filename: str, source_lines: list[str], ignore: set[str] = None):
         self.filename = filename
@@ -35,6 +55,47 @@ class CodeSmellDetector(ast.NodeVisitor):
         self.ignore = ignore or set()
         self.current_class = None
         self.class_info: dict[str, dict] = {}
+        self._named_constants: set[int] = set()
+
+    def visit_Module(self, node: ast.Module):
+        # A literal is only "magic" when nothing names it. Collect the node
+        # ids of literals that already have a name or a self-explaining
+        # position, so visit_Constant can skip them:
+        #   NAME = 30              the assignment names it
+        #   def f(timeout=30)      the parameter names it
+        #   get(url, timeout=30)   the keyword names it
+        #   text[:200]             slice bounds
+        #   [1, 30, 5] / {...}     data tables, not control values
+        for parent in ast.walk(node):
+            if isinstance(parent, (ast.Assign, ast.AnnAssign)):
+                targets = parent.targets if isinstance(parent, ast.Assign) else [parent.target]
+                value = _unwrap_negative(getattr(parent, "value", None))
+                if isinstance(value, ast.Constant) and any(isinstance(t, ast.Name) for t in targets):
+                    self._named_constants.add(id(value))
+            elif isinstance(parent, ast.keyword):
+                value = _unwrap_negative(parent.value)
+                if isinstance(value, ast.Constant):
+                    self._named_constants.add(id(value))
+            elif isinstance(parent, ast.arguments):
+                for default in [*parent.defaults, *parent.kw_defaults]:
+                    default = _unwrap_negative(default) if default else default
+                    if isinstance(default, ast.Constant):
+                        self._named_constants.add(id(default))
+            elif isinstance(parent, ast.Subscript):
+                for sub in ast.walk(parent.slice):
+                    if isinstance(sub, ast.Constant):
+                        self._named_constants.add(id(sub))
+            elif isinstance(parent, (ast.List, ast.Tuple, ast.Set)):
+                for elt in parent.elts:
+                    elt = _unwrap_negative(elt)
+                    if isinstance(elt, ast.Constant):
+                        self._named_constants.add(id(elt))
+            elif isinstance(parent, ast.Dict):
+                for elt in [*parent.keys, *parent.values]:
+                    elt = _unwrap_negative(elt) if elt else elt
+                    if isinstance(elt, ast.Constant):
+                        self._named_constants.add(id(elt))
+        self.generic_visit(node)
 
     def _get_line(self, lineno: int) -> str:
         if 0 < lineno <= len(self.source_lines):
@@ -88,12 +149,13 @@ class CodeSmellDetector(ast.NodeVisitor):
         self.generic_visit(node)
 
     def visit_Constant(self, node: ast.Constant):
-        if isinstance(node.value, (int, float)) and not isinstance(node.value, bool):
-            if node.value not in self.MAGIC_NUMBER_WHITELIST:
-                if abs(node.value) > 2:
-                    self._add(node.lineno, "magic_number",
-                        f"Magic number {node.value}",
-                        "Extract to named constant", "low")
+        if (isinstance(node.value, (int, float)) and not isinstance(node.value, bool)
+                and id(node) not in self._named_constants
+                and node.value not in self.MAGIC_NUMBER_WHITELIST
+                and abs(node.value) > 2):
+            self._add(node.lineno, "magic_number",
+                f"Magic number {node.value}",
+                "Extract to named constant", "low")
         self.generic_visit(node)
 
     def visit_Compare(self, node: ast.Compare):
@@ -141,8 +203,25 @@ class CodeSmellDetector(ast.NodeVisitor):
                 f"Class {node.name} has {len(methods)} methods and {len(attributes)} attributes",
                 "Split into smaller focused classes", "high")
         
-        # Data class
-        if len(attributes) > 3 and len(non_dunder) == 0:
+        # Data class — but a class already declared as one (@dataclass,
+        # NamedTuple, TypedDict, Enum, pydantic model, ...) is the fix applied,
+        # not the smell.
+        marker_names = set()
+        for dec in node.decorator_list:
+            target = dec.func if isinstance(dec, ast.Call) else dec
+            if isinstance(target, ast.Name):
+                marker_names.add(target.id)
+            elif isinstance(target, ast.Attribute):
+                marker_names.add(target.attr)
+        for base in node.bases:
+            if isinstance(base, ast.Name):
+                marker_names.add(base.id)
+            elif isinstance(base, ast.Attribute):
+                marker_names.add(base.attr)
+            elif isinstance(base, ast.Subscript) and isinstance(base.value, ast.Name):
+                marker_names.add(base.value.id)
+        is_declared_data = bool(marker_names & DATA_CLASS_MARKERS)
+        if len(attributes) > 3 and len(non_dunder) == 0 and not is_declared_data:
             self._add(node.lineno, "data_class",
                 f"Class {node.name} has only data, no behavior methods",
                 "Consider using @dataclass or namedtuple", "low")
@@ -176,20 +255,16 @@ def analyze_file(filepath: Path, ignore: set[str]) -> list[CodeSmell]:
         detector = CodeSmellDetector(str(filepath), lines, ignore)
         detector.visit(tree)
         return detector.issues
-    except (SyntaxError, Exception):
+    except (SyntaxError, ValueError) as exc:
+        warn_unparseable(filepath, exc)
+        return []
+    except Exception as exc:
+        warn_detector_error(filepath, exc)
         return []
 
 
-def find_python_files(path: Path) -> Iterator[Path]:
-    if path.is_file() and path.suffix == '.py':
-        yield path
-    elif path.is_dir():
-        for p in path.rglob('*.py'):
-            if '.venv' not in p.parts and 'node_modules' not in p.parts and '__pycache__' not in p.parts:
-                yield p
-
-
 def main():
+    configure_output()
     parser = argparse.ArgumentParser(description="Detect code smells in Python")
     parser.add_argument('path', nargs='?', default='.', help='File or directory')
     parser.add_argument('--format', choices=['text', 'json'], default='text')
@@ -222,7 +297,7 @@ def main():
             print(f"  {smell}: {count}")
         print()
         
-        severity_icons = {'high': '🔴', 'medium': '🟡', 'low': '🟢'}
+        severity_icons = SEVERITY_ICONS
         for issue in all_issues:
             icon = severity_icons[issue.severity]
             print(f"{icon} [{issue.severity.upper()}] {issue.file}:{issue.line}")

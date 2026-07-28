@@ -9,8 +9,8 @@ import json
 import argparse
 from pathlib import Path
 from dataclasses import dataclass, asdict
-from typing import Iterator
 from collections import defaultdict
+from common import SEVERITY_ICONS, configure_output, find_python_files, warn_detector_error, warn_unparseable
 
 
 @dataclass
@@ -22,6 +22,12 @@ class UnpythonicPattern:
     before: str
     after: str
     severity: str
+
+
+def _is_keys_call(expr: ast.AST) -> bool:
+    """True for a bare `<something>.keys()` call."""
+    return (isinstance(expr, ast.Call) and isinstance(expr.func, ast.Attribute)
+            and expr.func.attr == 'keys' and not expr.args and not expr.keywords)
 
 
 class UnpythonicDetector(ast.NodeVisitor):
@@ -50,23 +56,49 @@ class UnpythonicDetector(ast.NodeVisitor):
                                 "for item in x: ... or for i, item in enumerate(x):",
                                 "medium")
         
-        # Manual index tracking
+        # Manual index tracking. A bare `count += 1` is an accumulator, not an
+        # index — only flag when the incremented name actually subscripts
+        # something inside the same loop.
         for stmt in node.body:
-            if isinstance(stmt, ast.AugAssign):
-                if isinstance(stmt.op, ast.Add):
-                    if isinstance(stmt.value, ast.Constant) and stmt.value.value == 1:
-                        if isinstance(stmt.target, ast.Name):
-                            self._add(node.lineno, "manual_index",
-                                "Manual index tracking instead of enumerate()",
-                                "i = 0; for x in items: i += 1",
-                                "for i, x in enumerate(items):",
-                                "low")
-                            break
-        
+            if (isinstance(stmt, ast.AugAssign) and isinstance(stmt.op, ast.Add)
+                    and isinstance(stmt.value, ast.Constant) and stmt.value.value == 1
+                    and isinstance(stmt.target, ast.Name)):
+                counter = stmt.target.id
+                used_as_index = any(
+                    isinstance(sub, ast.Subscript)
+                    and isinstance(sub.slice, ast.Name) and sub.slice.id == counter
+                    for sub in ast.walk(node)
+                )
+                if used_as_index:
+                    self._add(node.lineno, "manual_index",
+                        "Manual index tracking instead of enumerate()",
+                        "i = 0; for x in items: use(seq[i]); i += 1",
+                        "for i, x in enumerate(items):",
+                        "low")
+                    break
+
+        # Iterating d.keys() directly
+        if _is_keys_call(node.iter):
+            self._add(node.lineno, "dict_keys_iteration",
+                "Iterating .keys() is unnecessary — iterating a dict yields its keys",
+                "for k in d.keys():", "for k in d:", "low")
+
+        self.generic_visit(node)
+
+    def visit_comprehension(self, node: ast.comprehension):
+        if _is_keys_call(node.iter):
+            self._add(node.iter.lineno, "dict_keys_iteration",
+                "Iterating .keys() is unnecessary — iterating a dict yields its keys",
+                "[f(k) for k in d.keys()]", "[f(k) for k in d]", "low")
         self.generic_visit(node)
 
     def visit_Compare(self, node: ast.Compare):
-        for i, (op, comparator) in enumerate(zip(node.ops, node.comparators)):
+        for op, comparator in zip(node.ops, node.comparators):
+            # Membership against .keys() — `k in d` does the same, faster.
+            if isinstance(op, (ast.In, ast.NotIn)) and _is_keys_call(comparator):
+                self._add(node.lineno, "dict_keys_iteration",
+                    "Membership test against .keys() is unnecessary — test the dict",
+                    "if k in d.keys():", "if k in d:", "low")
             if isinstance(op, ast.Eq):
                 if isinstance(comparator, ast.Constant):
                     if comparator.value is True:
@@ -89,44 +121,20 @@ class UnpythonicDetector(ast.NodeVisitor):
         self.generic_visit(node)
 
     def visit_Call(self, node: ast.Call):
-        if isinstance(node.func, ast.Attribute):
-            if node.func.attr == 'keys':
-                self._add(node.lineno, "dict_keys_iteration",
-                    "Using .keys() is usually unnecessary",
-                    "for k in d.keys():", "for k in d:", "low")
-            
-            if isinstance(node.func, ast.Name) and node.func.id == 'sorted':
-                if node.args:
-                    arg = node.args[0]
-                    if isinstance(arg, ast.Call):
-                        if isinstance(arg.func, ast.Attribute) and arg.func.attr == 'keys':
-                            self._add(node.lineno, "sorted_dict_keys",
-                                "sorted(d.keys()) is redundant",
-                                "sorted(d.keys())", "sorted(d)", "low")
-        
+        if isinstance(node.func, ast.Name) and node.func.id == 'sorted' and node.args:
+            if _is_keys_call(node.args[0]):
+                self._add(node.lineno, "sorted_dict_keys",
+                    "sorted(d.keys()) is redundant",
+                    "sorted(d.keys())", "sorted(d)", "low")
         self.generic_visit(node)
 
     # Exception-swallowing (bare/narrow `except: pass`) is detected by
     # find_exception_issues.py (swallowed_exception) — the dedicated owner —
     # so it is intentionally not duplicated here.
-
-    def visit_Assign(self, node: ast.Assign):
-        if len(node.targets) == 1:
-            target = node.targets[0]
-            if isinstance(target, ast.Name) and isinstance(node.value, ast.BinOp):
-                if isinstance(node.value.left, ast.Name):
-                    if target.id == node.value.left.id:
-                        op_map = {
-                            ast.Add: '+=', ast.Sub: '-=', ast.Mult: '*=',
-                            ast.Div: '/=', ast.Mod: '%=', ast.FloorDiv: '//='
-                        }
-                        op_type = type(node.value.op)
-                        if op_type in op_map:
-                            self._add(node.lineno, "augmented_assignment",
-                                f"Use {op_map[op_type]} instead of explicit assignment",
-                                f"x = x {op_map[op_type][0]} y",
-                                f"x {op_map[op_type]} y", "low")
-        self.generic_visit(node)
+    #
+    # `x = x + y` is deliberately NOT rewritten to `x += y`: for lists and
+    # arrays += mutates in place through every alias, so the "cleanup" changes
+    # behavior. A rule this skill cannot apply safely is not worth reporting.
 
     def visit_Import(self, node: ast.Import):
         if len(node.names) > 1:
@@ -145,30 +153,28 @@ def analyze_file(filepath: Path) -> list[UnpythonicPattern]:
         detector = UnpythonicDetector(str(filepath), lines)
         detector.visit(tree)
         return detector.issues
-    except (SyntaxError, Exception):
+    except (SyntaxError, ValueError) as exc:
+        warn_unparseable(filepath, exc)
+        return []
+    except Exception as exc:
+        warn_detector_error(filepath, exc)
         return []
 
 
-def find_python_files(path: Path) -> Iterator[Path]:
-    if path.is_file() and path.suffix == '.py':
-        yield path
-    elif path.is_dir():
-        for p in path.rglob('*.py'):
-            if '.venv' not in p.parts and 'node_modules' not in p.parts and '__pycache__' not in p.parts:
-                yield p
-
-
 def main():
+    configure_output()
     parser = argparse.ArgumentParser(description="Detect unpythonic patterns")
     parser.add_argument('path', nargs='?', default='.', help='File or directory')
     parser.add_argument('--format', choices=['text', 'json'], default='text')
-    
+    parser.add_argument('--ignore', type=str, default='', help='Comma-separated pattern types to ignore')
+
     args = parser.parse_args()
-    
+    ignore = set(args.ignore.split(',')) if args.ignore else set()
+
     all_issues = []
     for filepath in find_python_files(Path(args.path)):
-        all_issues.extend(analyze_file(filepath))
-    
+        all_issues.extend(i for i in analyze_file(filepath) if i.pattern_type not in ignore)
+
     all_issues.sort(key=lambda x: (x.severity != 'high', x.severity != 'medium', x.file, x.line))
     
     if args.format == 'json':
@@ -188,7 +194,7 @@ def main():
             print(f"  {t}: {c}")
         print()
         
-        severity_icons = {'high': '🔴', 'medium': '🟡', 'low': '🟢'}
+        severity_icons = SEVERITY_ICONS
         
         for issue in all_issues:
             icon = severity_icons[issue.severity]
