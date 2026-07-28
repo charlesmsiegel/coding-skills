@@ -21,8 +21,9 @@ import json
 import argparse
 from pathlib import Path
 from dataclasses import dataclass, asdict
-from typing import Iterator
 from collections import defaultdict
+from common import (SEVERITY_ICONS, configure_output, find_python_files,
+                    warn_unparseable)
 
 
 @dataclass
@@ -213,7 +214,8 @@ def _walk_scopes(tree, filename, lines, ignore):
 def analyze_file(filepath: Path, ignore: set) -> list:
     try:
         source = filepath.read_text(encoding="utf-8", errors="replace")
-    except Exception:
+    except OSError as exc:
+        warn_unparseable(filepath, exc)
         return []
 
     lines = source.splitlines()
@@ -225,23 +227,17 @@ def analyze_file(filepath: Path, ignore: set) -> list:
     # Attempt AST parse; if it fails, return only conflict findings
     try:
         tree = ast.parse(source, filename=filename)
-    except Exception:
+    except (SyntaxError, ValueError) as exc:
+        if not conflict_issues:  # conflict markers already explain the parse failure
+            warn_unparseable(filepath, exc)
         return conflict_issues
 
     dup_issues = _walk_scopes(tree, filename, lines, ignore)
     return conflict_issues + dup_issues
 
 
-def find_python_files(path: Path) -> Iterator[Path]:
-    if path.is_file() and path.suffix == ".py":
-        yield path
-    elif path.is_dir():
-        for p in path.rglob("*.py"):
-            if ".venv" not in p.parts and "node_modules" not in p.parts and "__pycache__" not in p.parts:
-                yield p
-
-
 def main():
+    configure_output()
     parser = argparse.ArgumentParser(
         description="Detect duplicate definitions and merge artifacts in Python"
     )
@@ -269,7 +265,7 @@ def main():
         for s, c in sorted(by_type.items(), key=lambda x: -x[1]):
             print(f"  {s}: {c}")
         print()
-        icons = {"high": "🔴", "medium": "🟡", "low": "🟢"}
+        icons = SEVERITY_ICONS
         for i in all_issues:
             print(f"{icons[i.severity]} [{i.severity.upper()}] {i.file}:{i.line}")
             print(f"   {i.smell_type}: {i.description}")

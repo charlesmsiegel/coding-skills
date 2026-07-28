@@ -24,9 +24,10 @@ import sys
 import json
 import argparse
 from pathlib import Path
+from common import SEVERITY_ICONS, configure_output
 
 _SEV_RANK = {"high": 0, "medium": 1, "low": 2}
-_ICON = {"high": "🔴", "medium": "🟡", "low": "🟢"}
+_ICON = SEVERITY_ICONS
 
 
 def _flatten(data):
@@ -121,6 +122,7 @@ def _render_json(issues):
 
 
 def main():
+    configure_output()
     parser = argparse.ArgumentParser(description="Format analyzer findings (does not create tickets)")
     parser.add_argument("input", nargs="?", help="JSON file (defaults to stdin)")
     parser.add_argument("--format", choices=["list", "cards", "json"], default="list")

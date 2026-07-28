@@ -30,8 +30,9 @@ import argparse
 import contextlib
 import subprocess
 from collections import defaultdict
+from common import SEVERITY_ICONS, configure_output
 
-_ICON = {"high": "🔴", "medium": "🟡", "low": "🟢"}
+_ICON = SEVERITY_ICONS
 _MYPY_RE = re.compile(r"^(?P<file>[^:]+):(?P<line>\d+):(?:(?P<col>\d+):)?\s*(?P<level>error|note|warning):\s*(?P<msg>.*?)(?:\s+\[(?P<code>[\w-]+)\])?$")
 _FLAKE8_RE = re.compile(r"^(?P<file>[^:]+):(?P<line>\d+):(?P<col>\d+):\s*(?P<code>\w+)\s+(?P<msg>.*)$")
 
@@ -199,6 +200,7 @@ def apply_fixes(available, path):
 
 
 def main():
+    configure_output()
     parser = argparse.ArgumentParser(description="Run installed Python quality tools and normalize their output")
     parser.add_argument("path", nargs="?", default=".", help="File or directory")
     parser.add_argument("--format", choices=["text", "json"], default="text")

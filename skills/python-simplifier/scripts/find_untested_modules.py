@@ -17,8 +17,9 @@ import argparse
 import contextlib
 from pathlib import Path
 from dataclasses import dataclass, asdict
-from typing import Iterator, Set, List, Tuple, Optional
+from typing import Set, List, Tuple, Optional
 from collections import defaultdict
+from common import SEVERITY_ICONS, configure_output, find_python_files, warn_detector_error, warn_unparseable
 
 
 @dataclass
@@ -35,15 +36,6 @@ class CodeSmell:
 # ---------------------------------------------------------------------------
 # Shared helpers (verbatim contract from find_global_state.py)
 # ---------------------------------------------------------------------------
-
-def find_python_files(path: Path) -> Iterator[Path]:
-    if path.is_file() and path.suffix == ".py":
-        yield path
-    elif path.is_dir():
-        for p in path.rglob("*.py"):
-            if ".venv" not in p.parts and "node_modules" not in p.parts and "__pycache__" not in p.parts:
-                yield p
-
 
 def _get_line(lines: List[str], lineno: int) -> str:
     if 0 < lineno <= len(lines):
@@ -299,7 +291,11 @@ def analyze(root: Path, ignore: Set[str]) -> List[CodeSmell]:
             try:
                 source = sp.read_text(encoding="utf-8", errors="replace")
                 tree = ast.parse(source, filename=str(sp))
-            except (SyntaxError, Exception):
+            except (SyntaxError, ValueError) as exc:
+                warn_unparseable(sp, exc)
+                continue
+            except Exception as exc:
+                warn_detector_error(sp, exc)
                 continue
 
             if not _has_definitions(tree):
@@ -324,6 +320,7 @@ def analyze(root: Path, ignore: Set[str]) -> List[CodeSmell]:
 
 
 def main():
+    configure_output()
     parser = argparse.ArgumentParser(
         description="Identify source modules with no test coverage references"
     )
@@ -354,7 +351,7 @@ def main():
         for s, c in sorted(by_type.items(), key=lambda x: -x[1]):
             print(f"  {s}: {c}")
         print()
-        icons = {"high": "🔴", "medium": "🟡", "low": "🟢"}
+        icons = SEVERITY_ICONS
         for i in all_issues:
             print(f"{icons[i.severity]} [{i.severity.upper()}] {i.file}:{i.line}")
             print(f"   {i.smell_type}: {i.description}")

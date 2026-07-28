@@ -22,8 +22,8 @@ import json
 import argparse
 from pathlib import Path
 from dataclasses import dataclass, asdict
-from typing import Iterator
 from collections import defaultdict
+from common import SEVERITY_ICONS, configure_output, find_python_files, warn_detector_error, warn_unparseable
 
 
 @dataclass
@@ -338,20 +338,16 @@ def analyze_file(filepath: Path, ignore: set) -> list:
         detector = ExceptionIssueDetector(str(filepath), lines, ignore)
         detector.visit(tree)
         return detector.issues
-    except (SyntaxError, Exception):
+    except (SyntaxError, ValueError) as exc:
+        warn_unparseable(filepath, exc)
+        return []
+    except Exception as exc:
+        warn_detector_error(filepath, exc)
         return []
 
 
-def find_python_files(path: Path) -> Iterator[Path]:
-    if path.is_file() and path.suffix == ".py":
-        yield path
-    elif path.is_dir():
-        for p in path.rglob("*.py"):
-            if ".venv" not in p.parts and "node_modules" not in p.parts and "__pycache__" not in p.parts:
-                yield p
-
-
 def main():
+    configure_output()
     parser = argparse.ArgumentParser(description="Detect exception-handling hazards in Python")
     parser.add_argument("path", nargs="?", default=".", help="File or directory")
     parser.add_argument("--format", choices=["text", "json"], default="text")
@@ -383,7 +379,7 @@ def main():
             print(f"  {smell}: {count}")
         print()
 
-        severity_icons = {"high": "🔴", "medium": "🟡", "low": "🟢"}
+        severity_icons = SEVERITY_ICONS
         for issue in all_issues:
             icon = severity_icons[issue.severity]
             print(f"{icon} [{issue.severity.upper()}] {issue.file}:{issue.line}")

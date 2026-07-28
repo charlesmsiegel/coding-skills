@@ -19,9 +19,9 @@ import json
 import argparse
 from pathlib import Path
 from dataclasses import dataclass, asdict
-from typing import Iterator
 from itertools import combinations
 from collections import defaultdict
+from common import configure_output, find_python_files, warn_detector_error, warn_unparseable
 
 
 @dataclass
@@ -56,7 +56,11 @@ def _collect(path: Path):
         try:
             source = filepath.read_text(encoding="utf-8", errors="replace")
             tree = ast.parse(source, filename=str(filepath))
-        except (SyntaxError, Exception):
+        except (SyntaxError, ValueError) as exc:
+            warn_unparseable(filepath, exc)
+            continue
+        except Exception as exc:
+            warn_detector_error(filepath, exc)
             continue
         for node in ast.walk(tree):
             if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
@@ -104,16 +108,8 @@ def detect(path: Path, ignore: set):
     return issues
 
 
-def find_python_files(path: Path) -> Iterator[Path]:
-    if path.is_file() and path.suffix == ".py":
-        yield path
-    elif path.is_dir():
-        for p in path.rglob("*.py"):
-            if ".venv" not in p.parts and "node_modules" not in p.parts and "__pycache__" not in p.parts:
-                yield p
-
-
 def main():
+    configure_output()
     parser = argparse.ArgumentParser(description="Detect data clumps (recurring parameter groups)")
     parser.add_argument("path", nargs="?", default=".", help="File or directory")
     parser.add_argument("--format", choices=["text", "json"], default="text")

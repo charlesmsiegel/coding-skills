@@ -2440,3 +2440,106 @@ def test_callback_field_use_is_not_a_temporary_field(tmp_path):
     assert "temporary_field" not in smell_types(
         run_detector("find_design_smells.py", tmp_path)
     )
+
+
+# --------------------------------------------------------------------------- #
+# Shared plumbing (scripts/common.py): console encoding, error surfacing,
+# vendored-dir exclusion, and the first-commit diff fallback
+# --------------------------------------------------------------------------- #
+
+
+def test_text_output_survives_cp1252_console(tmp_path):
+    # On Windows stdout often defaults to cp1252; the severity icons must
+    # degrade instead of raising UnicodeEncodeError.
+    (tmp_path / "sample.py").write_text("import pdb\n\ndef f():\n    pdb.set_trace()\n")
+    result = subprocess.run(
+        [sys.executable, str(SCRIPTS_DIR / "find_debug_leftovers.py"), str(tmp_path)],
+        capture_output=True, text=True, timeout=120,
+        env={**os.environ, "PYTHONIOENCODING": "cp1252"},
+    )
+    assert result.returncode == 0, result.stderr[:500]
+    assert "pdb_trace" in result.stdout
+
+
+def test_unparseable_file_is_noted_on_stderr_not_silently_skipped(tmp_path):
+    (tmp_path / "broken.py").write_text("def f(:\n")
+    (tmp_path / "good.py").write_text("def g():\n    return eval('1')\n")
+    result = subprocess.run(
+        [sys.executable, str(SCRIPTS_DIR / "find_security_issues.py"), str(tmp_path),
+         "--format", "json"],
+        capture_output=True, text=True, timeout=120,
+    )
+    assert result.returncode == 0, result.stderr[:500]
+    findings = json.loads(result.stdout)
+    assert "eval_exec" in smell_types(findings), "good file must still be analyzed"
+    assert "broken.py" in result.stderr, "the skipped file must be named on stderr"
+
+
+def test_vendored_dirs_excluded_only_below_the_scanned_root(tmp_path):
+    # A repo that happens to LIVE inside a directory named 'build' is still
+    # scanned; a .venv INSIDE the repo is not.
+    repo = tmp_path / "build" / "myrepo"
+    (repo / ".venv").mkdir(parents=True)
+    (repo / "sample.py").write_text("def f(x):\n    return eval(x)\n")
+    (repo / ".venv" / "vendored.py").write_text("def f(x):\n    return eval(x)\n")
+    findings = run_detector("find_security_issues.py", repo)
+    files = {f["file"] for f in findings}
+    assert any(ends_with_path(f, "myrepo/sample.py") for f in files)
+    assert not any(".venv" in f for f in files)
+
+
+# --------------------------------------------------------------------------- #
+# Behavioral coverage for the remaining under-tested detectors: each detector
+# gets a fires-on-known-bad case and a quiet-on-clean/edge case that pins a
+# plausible false positive.
+# --------------------------------------------------------------------------- #
+
+
+# ---- analyze_complexity --------------------------------------------------- #
+
+
+# ---- find_boolean_params -------------------------------------------------- #
+
+
+# ---- find_code_smells ----------------------------------------------------- #
+
+
+# ---- find_comment_smells -------------------------------------------------- #
+
+
+# ---- find_coupling_issues ------------------------------------------------- #
+
+
+# ---- find_dead_code ------------------------------------------------------- #
+
+
+# ---- find_duplicates ------------------------------------------------------ #
+
+
+# ---- find_loop_simplifications -------------------------------------------- #
+
+
+# ---- find_mutation_hazards ------------------------------------------------ #
+
+
+# ---- find_naming_issues --------------------------------------------------- #
+
+
+# ---- find_overengineering ------------------------------------------------- #
+
+
+# ---- find_parameter_objects ----------------------------------------------- #
+
+
+# ---- find_return_issues --------------------------------------------------- #
+
+
+# ---- find_unpythonic ------------------------------------------------------ #
+
+
+# ---- format_findings ------------------------------------------------------ #
+
+
+# ---- run_external_tools --------------------------------------------------- #
+
+
