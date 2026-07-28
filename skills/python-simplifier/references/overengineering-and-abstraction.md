@@ -35,44 +35,29 @@ strategy, wrapper, mixin, decorator, and layer, ask:
   they often name a place to put code rather than a real concept. What does it
   actually *do*? If you can't say, it may not deserve to be a thing.
 
-## Specific patterns to hunt
+## The named anti-patterns live elsewhere
 
-(For the design-pattern-shaped cases — hand-rolled singletons, builders that are
-keyword arguments in disguise, strategy-class hierarchies that are functions in
-costume — see the pattern→simpler map in `design-patterns.md` and run
-`find_pattern_issues.py`.)
+The pattern-by-pattern list is deliberately not repeated here. The structural
+cases — single-impl interface, one-type factory, one-entry strategy, thin
+wrapper, never-varied config, speculative generality, deep inheritance — are
+`SKILL.md`'s "Over-engineering anti-patterns" table, each with its fix. The
+design-pattern-shaped cases (hand-rolled singletons, fluent builders,
+strategy-class hierarchies) are the pattern→simpler map in `design-patterns.md`.
+And the classic-catalog treatment of the overlapping smells — lazy class,
+speculative generality, middle man — is in `refactoring-catalog.md`, with the
+spot/diagnostic/fix/ignore-when protocol for each.
 
-**Single-implementation interface / ABC / Protocol.** An abstract base with exactly
-one concrete subclass is a future-proofing tax. Merge them. (Tests are not a second
-implementation — a mock does not justify an interface; patch the concrete class or
-inject a callable.)
+Three judgment nuances those lists don't carry:
 
-**Factory that builds one type.** `def make_widget(): return Widget()` is just
-`Widget()` with extra steps. Direct instantiation.
-
-**Strategy with one strategy.** A strategy object/registry with a single entry is a
-function. Call the function.
-
-**Thin wrapper / middle man.** A class whose methods only forward to another object
-adds a name and a hop and nothing else. Use the wrapped object directly. (If the
-wrapper exists to *narrow* a wide interface to the three methods you use, that can
-be legitimate — judge by whether it removes confusion.)
-
-**Configuration that is never varied.** A parameter, setting, or hook that every
-caller passes the same value for is not configuration, it's noise. Hardcode the
-value and delete the parameter until a second value is real.
-
-**Premature parameterization.** Functions sprout `**kwargs`, optional flags, and
-"extensibility hooks" for callers that don't exist. Each one is a path you now have
-to keep working and reason about. Remove parameters with one effective value.
-
-**Deep inheritance.** Four-plus levels, or inheritance used to share helper code
-rather than to model an is-a relationship, is a smell. Prefer composition: pass the
-collaborator in. (See `patterns-and-consistency.md`.)
-
-**Layers that only pass data through.** A "service" that calls a "repository" that
-calls an "adapter" that calls the ORM, each adding nothing but a signature, is
-ceremony. Collapse layers that don't transform, validate, or decide.
+- **A mock is not a second implementation.** Tests never justify keeping a
+  single-impl interface — patch the concrete class or inject a callable instead.
+- **A wrapper that narrows can be legitimate.** A wrapper that only forwards is a
+  middle man; one that exists to narrow a wide interface down to the few methods
+  callers actually use may earn its keep. Judge by whether it removes confusion.
+- **Layers that only pass data through.** A "service" that calls a "repository"
+  that calls an "adapter" that calls the ORM, each adding nothing but a
+  signature, is ceremony no single-class detector flags. Collapse layers that
+  don't transform, validate, or decide.
 
 ## DRY, correctly: duplication vs the wrong abstraction
 
@@ -103,4 +88,3 @@ library (`itertools`, `collections`, `functools`, `pathlib`, `dataclasses`,
 `enum`) → a plain function → a small dataclass. Reach for a new class hierarchy,
 metaclass, decorator framework, or plugin system **last**, and only with a concrete,
 present reason. The burden of proof is on the abstraction, not on its removal.
-```

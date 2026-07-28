@@ -80,7 +80,7 @@ python scripts/analyze_all.py . --format json > report.json
 # Complexity & structure
 python scripts/analyze_complexity.py .         # Cyclomatic/cognitive complexity, nesting, size
 python scripts/find_duplicates.py .            # AST-normalized duplicate blocks
-python scripts/find_coupling_issues.py .       # Feature envy, low cohesion (LCOM), message chains
+python scripts/find_coupling_issues.py .       # Feature envy, low cohesion (LCOM), message chains, middle man
 
 # Smells, dead code, over-engineering
 python scripts/find_code_smells.py .           # Mutable defaults, bare excepts, magic numbers, god classes
@@ -109,11 +109,11 @@ python scripts/find_ai_scaffolding.py .        # NotImplementedError stubs, pass
 python scripts/find_duplicate_definitions.py . # Same name defined twice (later silently wins); merge-conflict markers
 python scripts/find_unawaited_coroutines.py .  # async call created and discarded (silent no-op)
 python scripts/find_local_imports.py .         # Imports inside functions / not at top of file (circular-import workarounds)
-python scripts/find_redundant_comments.py .    # Comments that just narrate the next line (NOISY — opt-in, not in analyze_all)
+python scripts/find_redundant_comments.py .    # Comments that just narrate the next line (NOISY — opt-in everywhere: not in analyze_all, --include-redundant-comments in analyze_diff)
 
 # Design & simplification
 python scripts/find_pattern_issues.py .        # Design-pattern issues both ways: hand-rolled singletons/builders/iterators/memoize → Python-native form; string state machines, try/finally cleanup → the missing pattern
-python scripts/find_parameter_objects.py .     # Data clumps: parameter groups recurring across functions
+python scripts/find_parameter_objects.py .     # Data clumps: parameter groups recurring across functions (whole-tree; not in the diff lens)
 python scripts/find_boolean_params.py .        # Boolean flag parameters at definitions
 python scripts/find_return_issues.py .         # Inconsistent returns, if/else-returns-bool
 python scripts/find_loop_simplifications.py .  # Loop→comprehension, += string concat, manual any()/all()
@@ -132,8 +132,11 @@ python scripts/format_findings.py report.json                       # markdown l
 
 All detectors share one interface: `--format text|json`, `--ignore type1,type2`, and
 🔴/🟡/🟢 severities. JSON output is a flat list of findings; `analyze_all.py`
-aggregates them. They are deliberately conservative (false negatives over false
-positives) so the output stays trustworthy.
+aggregates them and can drop whole categories with `--skip cat1,cat2`
+(`--skip-duplicates` is shorthand for the slowest one). They are deliberately
+conservative (false negatives over false positives) so the output stays
+trustworthy; a file that fails to parse or crashes a detector is named on stderr
+rather than silently reported clean.
 
 ## Use the repo's own tools when they exist
 
@@ -168,8 +171,9 @@ python scripts/analyze_diff.py --format json | python scripts/format_findings.py
 ```
 
 Whole-repo detectors (import cycles, dependency hygiene, untested modules, duplicate
-code) need the full tree — run those with `analyze_all.py` separately. See
-`references/ai-generated-code.md` for the AI-CR review stance.
+code, dead code, over-engineering, coupling, data clumps) need the full tree — run
+those with `analyze_all.py` separately. See `references/ai-generated-code.md` for
+the AI-CR review stance.
 
 ## Reference index (load on demand)
 
@@ -177,14 +181,14 @@ Keep `SKILL.md` lean; pull in depth only when a review needs it.
 
 | Load this when… | File |
 |---|---|
-| Starting any review — the master stance, workflow, critical-questions checklist, triage | `references/critical-review-guide.md` |
+| Reading a file critically — the per-function critical-questions checklist and the finding-triage rubric | `references/critical-review-guide.md` |
 | Deciding whether an abstraction should exist; DRY vs the wrong abstraction; YAGNI | `references/overengineering-and-abstraction.md` |
 | Diagnosing design smells — the full classic catalog (bloaters, OO abusers, change preventers, dispensables, couplers) and triaging detector candidates | `references/refactoring-catalog.md` |
 | Executing a fix — the named refactoring techniques, safe step-by-step mechanics, Python equivalents of the classic moves | `references/refactoring-techniques.md` |
 | Judging names, comments, and function shape; deleting comments that lie | `references/naming-comments-readability.md` |
 | Choosing the right Python pattern AND making the codebase use it consistently | `references/patterns-and-consistency.md` |
 | Judging design patterns (GoF + Python-specific): when a pattern is warranted, when it's ceremony, the Python-native form of each, smell→pattern and pattern→simpler maps | `references/design-patterns.md` |
-| You want concrete before/after idiom swaps | `references/python-idioms.md` |
+| You want concrete before/after idiom swaps (the modernization set — f-strings, builtin generics, pathlib — lives in the typing guide's table instead) | `references/python-idioms.md` |
 | Cleaning up a whole poorly-written-but-working repo from cold — the phased campaign (run it, net it, normalize, triage, ratchet) | `references/messy-repo-runbook.md` |
 | Building the test safety net before refactoring — coverage maps, characterization & golden-master tests, spotting hollow tests | `references/safety-net-and-testing.md` |
 | Adopting type hints incrementally, modernizing dated idioms, and fixing a dishonest dependency manifest | `references/typing-and-modernization.md` |
@@ -258,8 +262,9 @@ Ruff rule sets — naming (`N`), flake8-builtins (`A`), commented-out code (`ERA
 TODOs (`TD`), some return/loop simplifications (`RET`, `SIM`, `PERF`), boolean traps
 (`FBT`), debug leftovers (`T10`/`T20`), outdated idioms (`UP` pyupgrade), missing
 docstrings (`D`), missing annotations (`ANN`), and security (`S`/bandit). If the repo
-already runs those Ruff rules, disable the matching detector via `--ignore` (or skip
-it in the analyzer) to avoid double-reporting — or better, run the real tools with
+already runs those Ruff rules, disable the matching detector via `--ignore` (or drop
+its whole category with `analyze_all.py --skip`) to avoid double-reporting — or
+better, run the real tools with
 `run_external_tools.py` (above) and lean on the detectors only for what the tools
 don't cover. The unique value here is the **bug-finding and design detectors**
 (mutation hazards, exception chaining, global state, resource leaks, import cycles,
@@ -267,4 +272,3 @@ unawaited coroutines, data clumps, coupling, duplication), the **repo-level chec
 (dependency hygiene, untested-module and test-smell detection that scaffold a safety
 net), the **AI-code tells** (scaffolding, duplicate definitions, fake robustness),
 plus the **judgment guides** — which no linter provides.
-```

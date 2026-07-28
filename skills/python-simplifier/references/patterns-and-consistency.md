@@ -102,4 +102,3 @@ For any piece of code, ask: **is this the right pattern for the job, and is it t
 *same* way the rest of the codebase solves this?** If it's a worse pattern, replace
 it. If it's a different-but-equal pattern, converge it to the canonical one. Either
 way the codebase gets more predictable — and predictable is simpler.
-```

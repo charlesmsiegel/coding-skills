@@ -85,4 +85,3 @@ understand it at a glance and change it safely?** If understanding it requires y
 its author, to be in the room, it isn't done. Prefer the version with fewer
 concepts, plainer names, and flatter structure — even when a denser version would
 have impressed you.
-```

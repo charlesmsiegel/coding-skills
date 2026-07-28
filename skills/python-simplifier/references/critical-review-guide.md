@@ -1,56 +1,9 @@
 # Critical Review Guide
 
-This is the master guide for the judgment-based half of the skill. The scripts in
-`scripts/` find what can be found mechanically. This file (and the others in
-`references/`) is for everything that needs a reading brain: whether an
-abstraction earns its keep, whether two pieces of "duplication" are really the
-same thing, whether a pattern is the *right* pattern, whether a name tells the
-truth.
-
-## The stance: assume the code is guilty
-
-Approach every file as if it is **too complicated until proven otherwise.** Most
-code can be smaller, flatter, and more direct than it is. Your default question is
-not "is this acceptable?" but "**why isn't this simpler?**" If you can't answer
-that with a concrete reason (a real requirement, a measured constraint), the code
-should change.
-
-Be specific and unsparing in what you flag, but hold two hard limits:
-
-1. **Behavior is sacred.** Simplification must never change what the code does.
-   If a piece of code is untested, the *first* action is a characterization test
-   that pins current behavior — then refactor under it. Never refactor blind.
-2. **Simpler, not cleverer.** The goal is code a tired junior can read at 5pm, not
-   a showcase of techniques. A clever one-liner that needs a comment lost.
-
-## The workflow
-
-1. **Run the scripts first.** Start with `python scripts/analyze_all.py <path>`.
-   Triage the deterministic findings before reading anything by hand — never spend
-   judgment on what a tool already caught.
-2. **Find the hot files.** Refactoring effort should follow change frequency, not
-   line count. Get the churn list and read the most-changed files first:
-   ```bash
-   git log --since="1 year ago" --name-only --pretty=format: \
-     | grep '\.py$' | sort | uniq -c | sort -rn | head -30
-   ```
-   A file that is *both* high-churn and high-complexity is the top target. **Do not
-   refactor cold code** — ugly code that never changes and blocks nothing is not a
-   priority.
-3. **Read with the judgment guides open.** For the hot files, walk the relevant
-   reference:
-   - `overengineering-and-abstraction.md` — does each abstraction justify itself?
-   - `refactoring-catalog.md` — design smells (feature envy, divergent change,
-     primitive obsession, ...) and the refactoring each one wants.
-   - `patterns-and-consistency.md` — is this the right pattern, applied the *same*
-     way as the rest of the codebase?
-   - `naming-comments-readability.md` — do the names and comments tell the truth?
-   - `python-idioms.md` — concrete before/after idiom swaps.
-4. **Produce a findings artifact.** One smell, one entry, one small PR. Render any
-   script's JSON into a list/cards/JSON file with `scripts/format_findings.py`. That
-   artifact is the output — do not create tickets in a tracker on your own. If the
-   user wants findings filed, ask which ticket software or MCP to use (Jira, Linear,
-   GitHub Issues, Asana, a connected MCP, ...) and create them through that tool.
+The reviewer stance, the workflow, and the output/ticketing rules live in
+`SKILL.md`, along with the routing table for every file in `references/` — start
+there. This file adds the two tools used during the read itself: the questions to
+ask of every piece of code, and the rubric for ranking what they turn up.
 
 ## The critical-questions checklist
 
@@ -109,9 +62,6 @@ Priority buckets: **P0** correctness bugs found during review → fix now;
 the enforcing rule; **high value** hot + complex code, god classes, the
 duplicated core logic; **low** cosmetic issues in cold code → maybe never.
 
-## The ratchet
-
-Every time a *class* of problem is cleared, turn on the check that prevents its
-return (a Ruff rule, a complexity gate, one of these scripts wired into CI). A
-review that doesn't leave enforcement behind just resets the clock.
-```
+When a class of problem is cleared, turn on the check that prevents its return
+(`SKILL.md`, workflow step 5) — a review that doesn't leave enforcement behind
+just resets the clock.
