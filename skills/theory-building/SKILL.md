@@ -92,6 +92,11 @@ faculty that produces confident, plausible, non-existent methods. Open the manif
 the installed source, run `--help`. If a reimplementation turns up, delete it and use the
 original; that deletion is usually the highest-value edit in the change.
 
+When a library covers most of the need but not all, wrap it and note the gap rather than
+reimplement: the missing piece goes on the note's **Assumes** or **Watch** line so nobody
+mistakes the wrapper for full coverage. The full search order and synonym tactics are in
+`references/abstraction.md`.
+
 ### Gate 3 — Abstraction, not repetition-with-variants
 
 Duplication in generated code is rarely laziness. It's a **signal that a concept is
@@ -100,13 +105,15 @@ thing all three have in common.
 
 Factorization is not abstraction. Hoisting three similar blocks into one function with
 five boolean parameters removes characters and adds nothing; the concept is still
-missing, now with a worse call site. A real abstraction passes these:
+missing, now with a worse call site. A real abstraction passes four checks:
 
 - **It has a name in the domain.** Not `handleDataV2` or `processItems` — a noun or verb
   a domain expert would recognize. If naming it is hard, the concept isn't found yet.
 - **It makes unwritten cases expressible.** A good abstraction covers cases nobody
   implemented, because it captures the rule rather than the instances.
 - **It reduces the number of things to hold in mind**, not just the line count.
+- **Ideally, it makes illegal states unrepresentable** — the strongest form, where the
+  type itself refuses the combinations that shouldn't exist.
 
 When the concept won't come, say so explicitly rather than papering over it with a
 parameterized wrapper. Named, honest duplication is repairable later; a false
@@ -130,6 +137,8 @@ So don't stop at green. Do this instead:
 - **Note deliberately untested territory.** "Retries under partial network failure are
   untested" is worth more to a reviewer than another passing assertion.
 
+Concrete prompts for attacking the theory are in `references/abstraction.md`.
+
 ## Changing code whose theory you don't have
 
 Most work is not new code. It's a modification to code whose builders are gone, or were
@@ -142,9 +151,10 @@ The decision this changes is sharper than it looks. A requested modification can
 be implemented **many different ways, all correct**. Some extend the existing theory
 naturally; others are, in Naur's phrase, "unintegrated patches on the main part of the
 program." Both pass the tests. Only someone holding the theory can tell them apart — which
-is why a diff that looks locally reasonable is the normal way good structure dies. One
-system he describes accumulated a decade of such changes until "the original powerful
-structure was still visible, but made entirely ineffective by amorphous additions."
+is why a diff that looks locally reasonable is the normal way good structure dies. A
+large real-time system he describes accumulated a decade of such changes until "the
+original powerful structure was still visible, but made entirely ineffective by amorphous
+additions."
 
 So before changing code you didn't write:
 
@@ -169,8 +179,8 @@ its reasoning; don't act on it. See `references/inherited-code.md`.
 
 A theory that only you can verify hasn't been handed over. This is measurable: in a study
 of 120 students prompting a code model, participants judged the generated code correct
-61.8% of the time — and roughly one in eleven of those judgments was wrong. Readers of
-generated code are not a reliable check, and unfamiliar constructs make it worse: five
+61.8% of the time — and roughly one in eleven (9%) of those judgments was wrong. Readers
+of generated code are not a reliable check, and unfamiliar constructs make it worse: five
 participants could not validate *or* repair otherwise-working code because it used
 features they didn't know, and whether a feature counted as familiar tracked nothing more
 principled than whether their school had taught it (the same construct read as familiar
@@ -184,16 +194,6 @@ Cleverness therefore has a specific cost: it converts a reviewer into a spectato
 - **When a second attempt produces the same wrong output, stop rewording and restate the
   model.** In that study, repeated identical wrong generations preceded a fifth of all
   abandonments. Re-prompting a wrong theory just re-renders it.
-
-## Performance is a theory choice
-
-Quality constraints usually cannot be reached by tuning generated code, because they are
-properties of the theory rather than of the text. An O(n²) shape does not become O(n log n)
-through micro-optimization; it becomes so by choosing a different model of the problem.
-
-State the characteristics the theory implies — complexity, allocations, round trips,
-lock scope — and when a real constraint conflicts with them, redesign rather than patch.
-Patching a wrong theory to hit a number is how the spaghetti starts.
 
 ## The theory note
 
@@ -218,15 +218,29 @@ Not what the code does — they can read that. What they could not have reconstr
 liberating half of the same rule is that the note "cannot — and so need not — say
 everything"; completeness was never the goal.
 
+The **Cost** line is where performance lives, because performance is a theory choice: an
+O(n²) shape becomes O(n log n) by choosing a different model, not by tuning the text.
+State what the theory implies — complexity, allocations, round trips, lock scope — and
+when a real constraint conflicts, redesign rather than patch; patching a wrong theory to
+hit a number is how the spaghetti starts.
+
 The **Watch** line matters most. It aims a reviewer's limited attention at the place it
 pays, which is the honest alternative to both "read all 800 lines" and "don't look."
+
+A filled-in note, the hollow note that mechanical use produces, and how this template
+relates to Gate 1's three sentences are all in `references/theory-note.md`.
 
 ## Proportionality
 
 These gates scale with stakes, and applying them to a five-line throwaway script is its
-own kind of failure. A one-off analysis or a scratch file needs a one-line theory note at
-most. A shared module, anything with a persistence format, anything others will extend,
-anything that will run unattended — full gates.
+own kind of failure. Three tiers:
+
+- **Throwaway** — a one-off analysis, a scratch file: a one-line theory note at most.
+- **Ordinary shared code** — anything another person or agent will touch: Gate 2's reuse
+  check always, because it is cheap and catches the most expensive failure, plus Gate 1's
+  one-sentence theory.
+- **Load-bearing** — modules others extend, persistence formats, anything that runs
+  unattended: all four gates and the full note.
 
 If a task is being executed on autopilot, that's the signal to slow down, not to speed
 up. Anything that promises freedom from thinking should be treated as probably stupid,
@@ -268,10 +282,12 @@ the model's self-assessment is weakest.
   It measures novices, not senior reviewers, and the numbers are cited here as evidence
   that reading generated code is harder than it feels — not as a constant.
 
-## References
+## Reference index (load on demand)
 
-- `references/theory-note.md` — writing the theory, worked examples, common failure modes
-- `references/abstraction.md` — factorization vs. abstraction, the reuse search, tests
-  that attack the theory
-- `references/inherited-code.md` — recovering a theory from existing code, patch vs.
-  natural extension, working in parallel without fragmenting the theory
+Keep `SKILL.md` lean; pull in depth only when the change needs it.
+
+| Load this when… | File |
+|---|---|
+| Writing the theory or the note — a filled-in note beside a hollow one, the four questions a theory answers, worked prose theories, failure modes, where the note lives | `references/theory-note.md` |
+| Judging an abstraction or running the reuse search — factorization vs. abstraction, the four checks in full, the search order with synonym tactics, test prompts that attack the theory | `references/abstraction.md` |
+| Modifying code whose theory you don't hold — the recovery reading order, patch vs. natural extension, rebuilding behind the interface, parallel work fragmenting a theory | `references/inherited-code.md` |

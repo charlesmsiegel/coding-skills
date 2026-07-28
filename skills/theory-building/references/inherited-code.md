@@ -1,37 +1,21 @@
 # Working in code whose theory you don't have
 
-## Contents
-
-- [The position you are always in](#the-position-you-are-always-in)
-- [Recovering a theory from the text](#recovering-a-theory-from-the-text)
-- [Patch vs. natural extension](#patch-vs-natural-extension)
-- [How structure actually dies](#how-structure-actually-dies)
-- [When rebuilding beats reviving](#when-rebuilding-beats-reviving)
-- [Parallel work fragments the theory](#parallel-work-fragments-the-theory)
-
 ## The position you are always in
 
-Naur reports a team that inherited a working compiler and was given every artifact a
-handover is supposed to consist of: full documentation, annotated program texts, extensive
-written design discussion, and access to the original authors for advice. They were
-competent and motivated. They still repeatedly proposed extensions that ignored facilities
-already in the structure — facilities "discussed at length in its documentation" — and
-that would have been added as patches which "effectively destroyed its power and
-simplicity." The original authors "were able to spot these cases instantly."
-
-Nothing was missing from the documents. The theory simply wasn't in them.
-
-This is the ordinary condition of an agent editing a codebase: fluent in the text, without
-the model behind it, and — worse — with no felt sense of the difference, because the text
-reads perfectly well either way. Naur calls reconstructing a theory from documentation
-alone "strictly impossible," and from the text "a difficult, frustrating, and time
-consuming activity." Assume you are doing the difficult version, badly, and act
-accordingly.
+The compiler handover in SKILL.md — full documentation, annotated texts, access to the
+original authors, and inheritors who still kept proposing structure-destroying patches —
+is the ordinary condition of an agent editing a codebase: fluent in the text, without the
+model behind it, and, worse, with no felt sense of the difference, because the text reads
+perfectly well either way. The inheritors' proposals ignored facilities "discussed at
+length in its documentation"; nothing was missing from the documents. The theory simply
+wasn't in them. Assume you are doing the reconstruction Naur calls "a difficult,
+frustrating, and time consuming activity," badly, and act accordingly.
 
 He also names the trap that follows: the new programmer "is likely to feel torn between
 loyalty to the existing program text, with whatever obscurities and weaknesses it may
-contain, and the new theory that he or she has to build up." The resolution is not to pick
-a side silently. It is to notice which one you are serving in a given edit, and say so.
+contain, and the new theory that he or she has to build up." The resolution is not to
+pick a side silently. It is to notice which one you are serving in a given edit, and say
+so.
 
 ## Recovering a theory from the text
 
@@ -54,11 +38,9 @@ Read for the model, not the syntax. In rough order of yield:
 Then write the one sentence: *this module thinks the world is ___.* Check it against the
 code, not against what the code ought to have been. If two sentences are needed and they
 don't compose, you've found a module with two theories in it — which is a finding worth
-reporting, and usually the real cause of whatever bug you were sent to fix.
-
-If the sentence won't come, say that plainly. "I could not determine why this path retries
-twice; I preserved it and added the new case beside it" is an honest handoff. A confident
-refactor built on a guessed model is not.
+reporting, and usually the real cause of whatever bug you were sent to fix. If the
+sentence won't come at all, SKILL.md's rule applies: say so plainly and shrink the
+change.
 
 ## Patch vs. natural extension
 
@@ -92,9 +74,10 @@ What can be done mechanically is to force the choice into the open:
 
 ## How structure actually dies
 
-Not by one bad commit. Naur followed a compiler through roughly ten years of maintenance
-by people without its theory and found that "the original powerful structure was still
-visible, but made entirely ineffective by amorphous additions of many different kinds."
+Not by one bad commit. Naur describes a large real-time system that went through roughly
+ten years of modification by people without its theory, at the end of which "the original
+powerful structure was still visible, but made entirely ineffective by amorphous
+additions of many different kinds."
 
 Every one of those additions passed review. Each was locally reasonable — that is the
 point, and the reason "does this diff look fine?" is the wrong question. The right one is
@@ -107,14 +90,10 @@ does this change extend, and does the module have more or fewer concepts afterwa
 
 ## When rebuilding beats reviving
 
-Naur's most-ignored conclusion is that revival is often the worse deal — that the existing
-text should sometimes be discarded and the problem solved afresh, "at no higher, and
-possibly lower, cost" than reconstructing a theory to fit code nobody understands.
-
-Take it seriously as an *option to surface*, never as a unilateral action. Rewrites destroy
-undocumented behavior that real users depend on, and the second system will be built by
-someone who also lacks the original theory. Say what a rewrite would cost and what it would
-buy; the choice belongs to the people who own the consequences.
+SKILL.md covers Naur's conclusion — discarding the text and re-solving often costs no
+more — and why it is an option to surface, never a unilateral action. Name two costs when
+surfacing it: rewrites destroy undocumented behavior real users depend on, and the second
+system will be built by someone who also lacks the original theory.
 
 The honest middle path, when a module's theory is unrecoverable and the change is large:
 rebuild that module behind its current interface, with characterization tests pinning the
@@ -140,3 +119,8 @@ with it."
 If work has already fanned out without one, expect the seams at the boundaries: two names
 for one concept, two error conventions, two ideas about who owns validation. Reconciling
 those is theory work, and it does not happen by merging cleanly.
+
+---
+
+Sources: Peter Naur, "Programming as Theory Building" (1985); Alistair Cockburn's
+commentary in *Agile Software Development*, source of the parallel-work gloss.

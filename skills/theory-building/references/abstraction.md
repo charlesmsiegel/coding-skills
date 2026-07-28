@@ -1,13 +1,5 @@
 # Abstraction, reuse, and tests that attack the theory
 
-## Contents
-
-- [Why generated code repeats](#why-generated-code-repeats)
-- [Factorization vs. abstraction](#factorization-vs-abstraction)
-- [The reader has to be able to check it](#the-reader-has-to-be-able-to-check-it)
-- [The reuse search](#the-reuse-search)
-- [Tests that attack the theory](#tests-that-attack-the-theory)
-
 ## Why generated code repeats
 
 Producing the next plausible token given surrounding context is an operation that
@@ -77,21 +69,9 @@ explicit" is a better handoff than a wrapper that pretends the work is done. Hon
 duplication is cheap to fix once the concept appears. A false abstraction has to be
 dismantled first, and by then it has callers.
 
-### The reader has to be able to check it
-
-An abstraction the reviewer cannot evaluate has not been delivered, only deposited. This
-is not hypothetical fastidiousness: in a study of beginners working with generated code,
-participants who hit unfamiliar language features — `lambda`, `map`, `try`/`except` —
-could not validate *or* repair code that was otherwise correct, and whether a construct
-counted as familiar varied by nothing more principled than which school had taught it:
-the same feature read as familiar to 37.5% of students at one institution and 60.6% at
-another that covered it. Comprehension, not correctness, was the binding constraint.
-
-The rule that falls out is narrow and worth following: **write in the dialect of the
-surrounding code.** Reach past it when the clearer construct genuinely is clearer, and
-when you do, spend one clause saying why. The cost of an unusual construct is not
-elegance points — it is the reviewer's ability to catch you being wrong, which is the one
-safeguard the whole handoff rests on.
+One more constraint on any abstraction introduced: the reviewer must be able to evaluate
+it, or it was deposited rather than delivered — see SKILL.md's "Write so the reviewer
+can check you" for the dialect rule and the evidence behind it.
 
 ## The reuse search
 
@@ -104,25 +84,15 @@ path manipulation, string casing, set operations, binary search, LRU caching, ba
 retry-with-backoff, temp files, atomic writes, comparison keys, priority queues — all
 routinely rewritten badly.
 
-**2. Dependencies already present.** Read the manifest — don't recall it:
+**2. Dependencies already present.** Read the actual manifest — `package.json`,
+`pyproject.toml`, `go.mod`, `Cargo.toml`, `pom.xml`, `build.gradle`, whichever the repo
+has — rather than recalling it. Then read the installed package's actual source or its
+help output. Recollection of an API surface is the exact faculty that generates
+confident, plausible, non-existent methods. Anything asserted about a library's behavior
+should come from something read in this session.
 
-```bash
-cat package.json pyproject.toml go.mod Cargo.toml pom.xml build.gradle 2>/dev/null
-```
-
-Then read the installed package's actual source or `--help`. Recollection of an API
-surface is the exact faculty that generates confident, plausible, non-existent methods.
-Anything asserted about a library's behavior should come from something read in this
-session.
-
-**3. The repository.** Grep the concept *and its synonyms* before adding a function:
-
-```bash
-grep -rn "def .*retry\|def .*backoff" --include=*.py .
-rg "fn (parse|read|load)_config" -t rust
-```
-
-Search the vocabulary, not just the name being introduced: `duration`/`interval`/
+**3. The repository.** Search the repo for the concept *and its synonyms* before adding a
+function — the vocabulary, not just the name being introduced. `duration`/`interval`/
 `timeout`/`ttl` are the same concept under four names, and a codebase with all four has a
 naming problem worth fixing while you're here.
 
@@ -133,7 +103,9 @@ earlier decisions.
 When the search finds an existing implementation, **delete the new one and use the
 original.** That deletion is usually the highest-value edit in the change — it removes
 code, removes a second thing to maintain, and removes a future divergence where two
-implementations of one concept drift apart.
+implementations of one concept drift apart. When it finds a partial match — a library
+covering most of the need — wrap it and record the gap on the note's **Assumes** or
+**Watch** line, rather than reimplement for the sake of the missing part.
 
 ## Tests that attack the theory
 
@@ -166,3 +138,7 @@ And state what's deliberately untested. "Retries under partial network failure a
 untested; the theory assumes the transport classifies errors correctly" tells a reviewer
 more than another passing assertion — it points at the boundary of the model, which is
 where the next bug is going to come from.
+
+---
+
+Sources: Peter Naur, "Programming as Theory Building" (1985).

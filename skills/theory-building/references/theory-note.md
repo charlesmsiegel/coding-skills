@@ -8,15 +8,6 @@ codebase that was never designed — the text is intact and the theory is gone.
 Generated code starts in that state. No one ever held the theory, so there is nothing to
 lose. Writing it down is what creates it.
 
-## Contents
-
-- [What a theory answers](#what-a-theory-answers)
-- [The two tests](#the-two-tests)
-- [Say which reading you took](#say-which-reading-you-took)
-- [Worked examples](#worked-examples)
-- [Failure modes](#failure-modes)
-- [Where the note lives](#where-the-note-lives)
-
 ## What a theory answers
 
 Four questions. Anything else is commentary. The first three are Naur's own test for
@@ -35,46 +26,22 @@ whether a person *has* the theory; the fourth is where his first question bottom
 4. **Where does it stop?** The inputs the model is designed for, and the point past which
    it is not merely untested but *wrong*.
 
-## The two tests
-
-A theory predicts; an ad-hoc answer only responds. Two checks, failing differently:
-
-> **Prediction.** Pick an input nobody wrote a test for. Does the stated theory tell you
-> what the code does with it?
-
-If yes, the theory is real, and untested inputs have a good chance of working — which is
-the actual reason a theory matters. If the answer is "run it and see," what exists is a
-pile of cases that happen to pass, and every new requirement is a coin flip.
-
-> **Modification rehearsal.** Name the next feature someone will ask for. Does it land as
-> an extension, or does it need a special case welded to the side?
-
-The second catches what the first misses: a model can cover every input and still have no
-room to grow, which is the state a codebase is in right before its structure starts
-dying. A theory that accounts only for what was already built is a description.
-
-Both are the sharpest available checks on generated code, because a pile of cases and a
+Check the result with SKILL.md's two Gate 1 tests — prediction and modification
+rehearsal. They matter most here, on generated code, because a pile of cases and a
 designed model look identical when both are green.
 
 ## Say which reading you took
 
-A request almost never determines a single theory. "Cache the user lookups" admits at
-least a per-request cache, a process-wide cache with a TTL, and a write-through cache with
-invalidation — all faithful to the words, with completely different failure modes. The
-code implements exactly one and gives no sign that the others were ever live.
+Gate 1 requires naming the reading you chose; here is what that looks like. "Cache the
+user lookups" admits at least a per-request cache, a process-wide cache with a TTL, and a
+write-through cache with invalidation — all faithful to the words, with completely
+different failure modes. The code implements exactly one and gives no sign the others
+were ever live; a study of beginners prompting a code model found exactly this gap, each
+side convinced it had understood the other. One clause per side is enough — *"process-wide
+with a 60s TTL, not per-request, because the hit rate across requests is the whole
+point"* — the sentence that stops the design being re-litigated blind six months later.
 
-This gap is the normal case rather than an edge case; a study of beginners prompting a
-code model found both sides systematically misreading each other, with participants
-convinced they had described the problem "the best way to say it" while the model built
-something else. The person reading your diff has the same problem in reverse: they cannot
-recover the readings you discarded.
-
-So state the one you took and the one you rejected. One clause each is enough — *"process
-wide with a 60s TTL, not per-request, because the hit rate across requests is the whole
-point"* — and it is the sentence that stops someone re-litigating the design six months
-later without knowing it was ever litigated.
-
-## Worked examples
+## Worked examples: the prose theory
 
 **Thin — a shape, not a theory**
 
@@ -105,6 +72,62 @@ nobody spends a day discovering it.
 
 Two sentences. Names the model, the consequence, and the breaking condition.
 
+## Worked example: the full note
+
+The change: add client-side rate limiting to a service's outbound client for a
+third-party API, after the provider started returning 429s.
+
+```
+Theory:      Rate is a property of the API key, not of the caller — one shared
+             token bucket per key, process-wide, so N workers can't multiply the
+             budget. Callers block with a deadline rather than error, because our
+             callers are batch jobs that prefer late to failed.
+Instead of:  A limiter per call site (simpler, but N workers × limit = a ban), or
+             erroring when out of budget (right for interactive callers; ours aren't).
+Reused:      `limits` (already in pyproject.toml) for the bucket math; new code is
+             ~30 lines of wiring around it.
+New concept: RateBudget — the per-key budget a caller acquires from before sending.
+Assumes:     Single process. The budget is not shared across hosts; a second
+             instance silently halves the headroom, and nothing detects that.
+Cost:        One lock acquisition per request — negligible next to the network call.
+Watch:       X-RateLimit-Remaining headers are ignored; we trust the configured
+             limit. If the provider lowers limits dynamically, this breaks first.
+```
+
+Every line carries something the diff cannot: the per-key-not-per-caller decision, the
+rejected error-on-exhaustion design, the multi-instance trap, the header deliberately
+not read. A reviewer who reads only this knows where to look.
+
+## The hollow version
+
+The same change, the same template, filled in mechanically:
+
+```
+Theory:      Adds a rate limiter so we don't exceed the API's rate limits.
+Instead of:  Not rate limiting, which causes 429 errors.
+Reused:      Standard library.
+New concept: RateLimiter class for rate limiting.
+Assumes:     The API enforces rate limits.
+Cost:        Minimal overhead.
+Watch:       Nothing in particular; tests pass.
+```
+
+The test that separates the two: cover the diff and ask what the note tells you that the
+code could not. The real note answers "what happens when a second instance starts" and
+"why block instead of error"; the hollow one answers nothing, because every line is
+derivable from the diff or the ticket in seconds. A hollow note is worse than none — it
+spends the reviewer's trust while aiming their attention nowhere.
+
+## The three sentences and the seven fields
+
+Gate 1's theory statement — three sentences or fewer — and this template are not two
+artifacts. The three sentences *are* the **Theory** line; the note starts by pasting
+them. The other six fields carry what a theory statement, and a diff, cannot: the
+rejected reading (**Instead of**), the search that was run (**Reused**), the concept that
+now exists (**New concept**), and the boundaries no test enforces (**Assumes**, **Cost**,
+**Watch**). If writing the note feels like starting over, Gate 1 was skipped; done
+honestly, it is one minute of transcription plus six honest lines.
+
 ## Failure modes
 
 **Restating the code.** "Loops over users and calls the API for each" is a description of
@@ -125,13 +148,9 @@ here too; a trivial thing gets one line.
 
 ## Where the note lives
 
-One test decides what goes in, from Cockburn's commentary on Naur: include **that which
-helps the next reader build an adequate theory of the program.** Not what the code does —
-they can read that, and a note that restates it burns the attention you were trying to
-save. What they could not have reconstructed. The same rule sets you free at the other
-end: documentation "cannot — and so need not — say everything."
-
-In the response, so it's read now — and somewhere durable, so it survives:
+The criterion for what goes in — Cockburn's "that which helps the next reader build an
+adequate theory of the program" — is in SKILL.md. What follows is where the note goes:
+in the response, so it's read now, and somewhere durable, so it survives.
 
 - **Module docstring / header comment** for a theory that governs one file.
 - **ADR or design doc** for one spanning several modules; link it from the code.
@@ -140,3 +159,9 @@ In the response, so it's read now — and somewhere durable, so it survives:
 - **The test file** for boundary conditions. A test named
   `test_null_is_explicit_unset_not_missing` documents the theory and enforces it at once,
   which is the only form of documentation that can't silently rot.
+
+---
+
+Sources: Peter Naur, "Programming as Theory Building" (1985); Nguyen et al., "How
+Beginning Programmers and Code LLMs (Mis)read Each Other" (2024, arXiv:2401.15232) —
+120 novices on small problems, cited as evidence that readings diverge, not as a constant.
