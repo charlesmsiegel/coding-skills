@@ -1,0 +1,67 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  # The detectors live in the python-simplifier skill; they police every skill's code.
+  DETECTORS: python-simplifier/scripts
+
+jobs:
+  checks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dev tooling
+        run: python -m pip install --quiet pytest ruff
+
+      - name: Lint (ruff)
+        run: ruff check .
+
+      - name: Smoke tests (every detector fires on its fixture, quiet on clean code)
+        run: pytest -q
+
+      # The ratchet (python-simplifier/references/messy-repo-runbook.md, Phase 5):
+      # every bug-class detector is currently clean on this repo's own code, and it
+      # stays that way. If one reports anything, a real defect class has crept back in.
+      - name: Ratchet — bug-class detectors stay clean on our own code
+        run: |
+          set -e
+          # Every skill that ships Python: */scripts next to a SKILL.md.
+          targets=$(for skill in */SKILL.md; do
+            dir="$(dirname "$skill")/scripts"
+            if [ -d "$dir" ]; then echo "$dir"; fi
+          done)
+          echo "Ratchet targets: $targets"
+          failed=0
+          for s in find_mutation_hazards find_exception_issues find_global_state \
+                   find_resource_leaks find_security_issues find_debug_leftovers \
+                   find_duplicate_definitions find_unawaited_coroutines \
+                   find_local_imports find_import_cycles find_dependency_issues; do
+            for target in $targets; do
+              n=$(python "$DETECTORS/$s.py" "$target" --format json | python -c "import sys,json;print(len(json.load(sys.stdin)))")
+              if [ "$n" != "0" ]; then
+                echo "::error::$s reports $n finding(s) on $target — the ratchet only tightens"
+                python "$DETECTORS/$s.py" "$target"
+                failed=1
+              fi
+            done
+          done
+          exit $failed
+
+      - name: Full analyzer report (informational)
+        run: |
+          for skill in */SKILL.md; do
+            dir="$(dirname "$skill")/scripts"
+            [ -d "$dir" ] || continue
+            echo "::group::$dir"
+            python "$DETECTORS/analyze_all.py" "$dir" --skip-duplicates || true
+            echo "::endgroup::"
+          done
