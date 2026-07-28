@@ -118,6 +118,96 @@ def test_deps_extracts_javascript_imports(repo, tabs, run_script):
 
 
 # --------------------------------------------------------------------------- #
+# Module grouping
+#
+# The failure these pin down: a repo whose code lives under two arms used to
+# collapse to one node per arm, so a 12-module monorepo rendered as two boxes
+# and one arrow. Grouping has to peel packaging directories (src/, app/) while
+# keeping directories that merely sound structural but actually hold code.
+# --------------------------------------------------------------------------- #
+
+
+def _write_tree(repo, arms, ext="py", files_per_module=3):
+    for arm, modules in arms.items():
+        for module in modules:
+            for i in range(files_per_module):
+                repo.write(f"{arm}/{module}/f{i}.{ext}", "x = 1\n" * 40)
+
+
+def test_deps_splits_a_two_arm_monorepo_into_submodules(repo, tabs, run_script):
+    _write_tree(repo, {
+        "frontend/src": ["components", "pages", "hooks", "api", "state", "utils"],
+        "backend/app": ["routers", "services", "models", "db", "auth", "tasks"],
+    })
+
+    summary = json.loads(run_script(SCRIPTS / "analyze_deps.py", repo.path, "--tabs-dir", tabs).stdout)
+
+    displays = {m["display"] for m in summary["module_list"]}
+    assert displays == {
+        "frontend/components", "frontend/pages", "frontend/hooks",
+        "frontend/api", "frontend/state", "frontend/utils",
+        "backend/routers", "backend/services", "backend/models",
+        "backend/db", "backend/auth", "backend/tasks",
+    }
+    assert summary["top_level_arms"] == ["backend", "frontend"]
+    assert sorted(summary["structural_dirs_peeled"]) == ["app", "src"]
+
+
+def test_deps_strips_src_and_repo_name_from_module_names(repo, tabs, run_script):
+    name = Path(repo.path).name
+    _write_tree(repo, {f"src/{name}": ["core", "api", "cli", "db", "render", "utils"]})
+
+    summary = json.loads(run_script(SCRIPTS / "analyze_deps.py", repo.path, "--tabs-dir", tabs).stdout)
+
+    modules = {m["display"]: m["id"] for m in summary["module_list"]}
+    assert set(modules) == {"core", "api", "cli", "db", "render", "utils"}
+    # The id keeps the real path so citations elsewhere in the atlas resolve.
+    assert modules["core"] == f"src/{name}/core"
+
+
+def test_deps_keeps_a_structural_sounding_dir_that_holds_code(repo, tabs, run_script):
+    # "app" is a structural hint, but this one is a module: the code is in it,
+    # not merely under it. The pass-through check has to override the name.
+    repo.write("backend/app/handlers.py", "x = 1\n" * 200)
+    repo.write("backend/app/models.py", "x = 1\n" * 200)
+    repo.write("backend/app/helpers/tiny.py", "x = 1\n")
+
+    summary = json.loads(run_script(SCRIPTS / "analyze_deps.py", repo.path, "--tabs-dir", tabs).stdout)
+
+    ids = {m["id"] for m in summary["module_list"]}
+    assert "backend/app" in ids
+
+
+def test_deps_does_not_over_split_a_flat_repo(repo, tabs, run_script):
+    for i in range(8):
+        repo.write(f"pkg/f{i}.py", "x = 1\n" * 40)
+
+    summary = json.loads(run_script(SCRIPTS / "analyze_deps.py", repo.path, "--tabs-dir", tabs).stdout)
+
+    assert [m["display"] for m in summary["module_list"]] == ["pkg"]
+
+
+def test_deps_assigns_loose_files_to_the_directory_holding_them(repo, tabs, run_script):
+    repo.write("main.py", "x = 1\n" * 10)
+    _write_tree(repo, {"frontend/src": ["a", "b"], "backend/app": ["c", "d"]})
+
+    summary = json.loads(run_script(SCRIPTS / "analyze_deps.py", repo.path, "--tabs-dir", tabs).stdout)
+
+    by_display = {m["display"]: m for m in summary["module_list"]}
+    assert by_display["(root)"]["files"] == 1
+    assert sum(m["files"] for m in summary["module_list"]) == 13
+
+
+def test_deps_depth_override_counts_only_non_structural_dirs(repo, tabs, run_script):
+    _write_tree(repo, {"frontend/src": ["components", "pages"], "backend/app": ["routers", "db"]})
+
+    summary = json.loads(
+        run_script(SCRIPTS / "analyze_deps.py", repo.path, "--tabs-dir", tabs, "--depth", "1").stdout)
+
+    assert {m["display"] for m in summary["module_list"]} == {"frontend", "backend"}
+
+
+# --------------------------------------------------------------------------- #
 # Hotspots (churn x complexity, so it needs real git history)
 # --------------------------------------------------------------------------- #
 

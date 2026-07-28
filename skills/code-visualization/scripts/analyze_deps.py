@@ -123,13 +123,156 @@ def go_module_path(repo: Path):
     return None
 
 
+# ---------------------------------------------------------------- module tree
+# Directory names that are packaging structure rather than a unit of design:
+# nobody calls "src" a module. The repo's own name is added at runtime, so
+# src/<reponame>/core reads as "core". These are hints, not a verdict — a
+# directory only gets peeled if it is ALSO a pass-through (see peelable).
+STRUCTURAL_HINTS = {
+    "src", "lib", "libs", "source", "sources", "app", "apps",
+    "pkg", "packages", "internal", "cmd", "main",
+    "java", "kotlin", "scala",
+}
+# Grouping targets. Below MIN the graph is too coarse to show design (a
+# frontend/backend monorepo rendering as two boxes); above MAX it is unreadable.
+TARGET_MIN, TARGET_MAX = 12, 30
+OWN_CODE_FLOOR = 0.10  # a dir holding this share of its subtree's LOC is real
+
+
+def normalize_name(name: str) -> str:
+    return re.sub(r"[-_. ]", "", name).lower()
+
+
+def build_dir_tree(locs):
+    """Map every directory to its own LOC, subtree LOC, and child directories.
+
+    "own" counts only files sitting directly in the directory; "sub" counts the
+    whole subtree. The ratio between them is what separates a pass-through
+    wrapper from a directory that actually holds code.
+    """
+    nodes = defaultdict(lambda: {"own": 0, "sub": 0, "kids": set()})
+    nodes[""]  # the repo root always exists, even for an empty repo
+    for rel, n in locs.items():
+        parts = rel.split("/")
+        cur = ""
+        nodes[cur]["sub"] += n
+        for seg in parts[:-1]:
+            parent = cur
+            cur = f"{cur}/{seg}" if cur else seg
+            nodes[parent]["kids"].add(cur)
+            nodes[cur]["sub"] += n
+        nodes[cur]["own"] += n
+    return nodes
+
+
+def peelable(d, nodes, hints, chains=True):
+    """True if d is structure to descend past rather than a module in its own right.
+
+    Three conditions, all required. It must have somewhere to descend to; it
+    must be nearly empty of its own code (this is what keeps a directory named
+    "services" full of .py files from being mistaken for a wrapper); and it must
+    either carry a structural name or be a single-child link in a chain like
+    frontend/ -> src/ or Java's com/example/.
+
+    chains=False drops that last clause, keeping single-child directories as
+    modules. --depth uses it so that asking for depth 1 on a frontend/backend
+    repo yields the two arms rather than diving straight through them.
+    """
+    if d == "":
+        return True  # the repo root is never a module
+    info = nodes[d]
+    if not info["kids"]:
+        return False
+    if info["own"] / max(info["sub"], 1) >= OWN_CODE_FLOOR:
+        return False
+    name = normalize_name(d.rsplit("/", 1)[-1])
+    return name in hints or (chains and len(info["kids"]) == 1)
+
+
+def expand(d, nodes, hints, chains=True):
+    """Resolve d to the frontier nodes it stands for, peeling structural dirs.
+
+    A peeled directory is dropped unless it holds loose files of its own, in
+    which case it stays behind to catch them — no file is ever orphaned.
+    """
+    out, stack = [], [d]
+    while stack:
+        cur = stack.pop()
+        if peelable(cur, nodes, hints, chains):
+            stack.extend(nodes[cur]["kids"])
+            if nodes[cur]["own"] > 0:
+                out.append(cur)
+        else:
+            out.append(cur)
+    return out
+
+
+def split_children(d, nodes, hints, chains=True):
+    return {n for k in nodes[d]["kids"] for n in expand(k, nodes, hints, chains)}
+
+
+def partition_modules(nodes, hints):
+    """Choose the module set: peel to the top-level arms, then split the biggest.
+
+    Splitting the largest node repeatedly (rather than applying one uniform
+    depth) lets a deep arm decompose while a shallow one stays whole, which is
+    what a mixed monorepo needs.
+    """
+    frontier = set(expand("", nodes, hints))
+    while len(frontier) < TARGET_MIN:
+        for n in sorted((m for m in frontier if nodes[m]["kids"]),
+                        key=lambda m: -nodes[m]["sub"]):
+            repl = split_children(n, nodes, hints)
+            if nodes[n]["own"] > 0:
+                repl.add(n)
+            if not repl - frontier:
+                continue  # already split; splitting again adds nothing
+            merged = (frontier - {n}) | repl
+            if len(merged) <= TARGET_MAX:
+                frontier = merged
+                break
+        else:
+            break  # nothing left that fits the budget
+    return frontier
+
+
+def partition_at_depth(nodes, hints, depth):
+    """--depth override: fixed nesting depth, ignoring structurally-named dirs.
+
+    Only hint-named wrappers are free here; every other directory costs a level.
+    That keeps the knob usable in the coarsening direction, which is the reason
+    anyone reaches for it.
+    """
+    out = set()
+
+    def collect(d, remaining):
+        children = split_children(d, nodes, hints, chains=False) if remaining > 0 else set()
+        if not children:
+            out.add(d)
+            return
+        for child in children:
+            collect(child, remaining - 1)
+        if nodes[d]["own"] > 0:
+            out.add(d)
+
+    for seed in expand("", nodes, hints, chains=False):
+        if seed == "":
+            out.add(seed)  # loose root files; never recurse from the root twice
+        else:
+            collect(seed, depth - 1)
+    return out
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("repo")
     ap.add_argument("--tabs-dir", required=True)
     ap.add_argument("--exclude", default="",
                     help="comma-separated extra directory names to skip (e.g. generated,migrations)")
-    ap.add_argument("--depth", type=int, default=0, help="module grouping depth below source root (0=auto)")
+    ap.add_argument("--depth", type=int, default=0,
+                    help="fixed module nesting depth, counting only non-structural "
+                         "directories (0=auto: split the largest module until the "
+                         "graph holds 12-30 nodes)")
     ap.add_argument("--max-nodes", type=int, default=55)
     args = ap.parse_args()
     extra_exclude = {d.strip() for d in args.exclude.split(",") if d.strip()}
@@ -215,54 +358,49 @@ def main() -> int:
                 if t and t != rel:
                     edges[rel].add(t)
 
-    # ---- detect source root & module grouping ----
-    code_loc_by_top = defaultdict(int)
-    for rel, n in locs.items():
-        code_loc_by_top[rel.split("/")[0] if "/" in rel else "(root)"] += n
-    total = sum(code_loc_by_top.values()) or 1
-    root = ""
-    top_sorted = sorted(code_loc_by_top.items(), key=lambda kv: -kv[1])
-    if top_sorted and top_sorted[0][0] != "(root)" and top_sorted[0][1] / total > 0.55:
-        root = top_sorted[0][0]
-        inner = defaultdict(int)
-        for rel, n in locs.items():
-            if rel.startswith(root + "/"):
-                sub = rel[len(root) + 1:]
-                inner[sub.split("/")[0] if "/" in sub else "(files)"] += n
-        if root in ("src", "lib", "app") and inner:
-            best = max(inner.items(), key=lambda kv: kv[1])
-            if best[0] != "(files)" and best[1] / total > 0.55:
-                root = f"{root}/{best[0]}"
+    # ---- module grouping ----
+    hints = set(STRUCTURAL_HINTS) | {normalize_name(repo.name)}
+    tree = build_dir_tree(locs)
+    frontier = (partition_at_depth(tree, hints, args.depth) if args.depth > 0
+                else partition_modules(tree, hints))
+    # Longest prefix wins, so a file in frontend/api lands in frontend/api even
+    # when its parent frontend/ is also a module (holding loose files).
+    by_depth = sorted(frontier, key=len, reverse=True)
+    dir_cache = {}
 
-    def module_of(rel, depth):
-        r = rel
-        if root and r.startswith(root + "/"):
-            r = r[len(root) + 1:]
-            prefix = root + "/"
-        else:
-            prefix = ""
-        parts = r.split("/")
-        if len(parts) == 1:
-            return prefix + parts[0] if not prefix else prefix.rstrip("/")
-        return prefix + "/".join(parts[:depth])
+    def module_of(rel):
+        d = rel.rsplit("/", 1)[0] if "/" in rel else ""
+        if d not in dir_cache:
+            dir_cache[d] = next(
+                (m for m in by_depth if m == "" or d == m or d.startswith(m + "/")), "")
+        return dir_cache[d]
 
-    depth = args.depth
-    if depth == 0:
-        depth = 1
-        mods = {module_of(r, 1) for r in paths}
-        if len(mods) < 6 and len(paths) > 25:
-            depth = 2
+    def display_of(m):
+        """Module path with the structural segments dropped, for reading."""
+        if m == "":
+            return "(root)"
+        segs = [s for s in m.split("/") if normalize_name(s) not in hints]
+        return "/".join(segs) or m
+
+    def group_of(m):
+        """Colour key: the arm a module belongs to (frontend/, backend/, ...)."""
+        if m == "":
+            return "(root)"
+        return display_of(m).split("/")[0]
 
     mod_loc, mod_files = defaultdict(int), defaultdict(int)
     for rel, n in locs.items():
-        m = module_of(rel, depth)
+        m = module_of(rel)
         mod_loc[m] += n
         mod_files[m] += 1
+    frontier = {m for m in frontier if mod_files.get(m)}  # drop emptied nodes
+    peeled = sorted({s for m in frontier for s in m.split("/")
+                     if normalize_name(s) in hints})
     keep = {m for m, _ in sorted(mod_loc.items(), key=lambda kv: -kv[1])[: args.max_nodes - 1]}
     lump = len(mod_loc) > len(keep)
 
     def mod_key(rel):
-        m = module_of(rel, depth)
+        m = module_of(rel)
         return m if m in keep else "(other)"
 
     mod_edges = defaultdict(int)
@@ -349,11 +487,16 @@ def main() -> int:
     for m in all_mods:
         if m == "(other)" and not lump:
             continue
+        disp = "(other)" if m == "(other)" else display_of(m)
+        # The node id stays the real directory path so citations elsewhere in
+        # the atlas resolve; only the label and tooltip drop the structure.
         nodes.append({
-            "id": m, "label": m.split("/")[-1] if m != "(other)" else "(other)",
-            "group": ("cycle" if m in cyc_members else (m.split("/")[0] if "/" in m else (root or "modules"))),
+            "id": m, "label": disp.split("/")[-1],
+            "group": ("cycle" if m in cyc_members else
+                      ("(other)" if m == "(other)" else group_of(m))),
             "size": mod_loc.get(m, 1), "fanIn": mod_fan_in.get(m, 0), "fanOut": mod_fan_out.get(m, 0),
-            "meta": f"{mod_files.get(m,0)} files" + (f" · in dependency cycle #{scc_of[m]+1}" if m in cyc_members else ""),
+            "meta": (f"{m or '(repo root)'} · {mod_files.get(m,0)} files"
+                     + (f" · in dependency cycle #{scc_of[m]+1}" if m in cyc_members else "")),
         })
     links = [
         {"source": a, "target": b, "weight": w,
@@ -395,12 +538,14 @@ def main() -> int:
         for f, n in hub_out)
 
     edge_count = sum(1 for _ in ((s, t) for s, d in edges.items() for t in d))
+    arms = sorted({n["group"] for n in nodes if n["group"] not in ("cycle", "(other)")}
+                  | {group_of(m) for m in cyc_members if m != "(other)"})
     body = f"""
 <div class="kpis">
   <div class="kpi accent"><div class="n">{len(nodes)}</div><div class="l">modules</div></div>
   <div class="kpi"><div class="n">{edge_count:,}</div><div class="l">file-level imports</div></div>
   <div class="kpi {'bad' if sccs else 'good'}"><div class="n">{len(sccs)}</div><div class="l">cycles</div></div>
-  <div class="kpi"><div class="n">{esc(root) if root else '·'}</div><div class="l">source root</div></div>
+  <div class="kpi"><div class="n">{len(arms)}</div><div class="l">top-level {'arm' if len(arms)==1 else 'arms'}</div></div>
 </div>
 {cyc_html}
 <h2>Module import graph</h2>
@@ -428,9 +573,16 @@ def main() -> int:
     write_fragment(Path(args.tabs_dir), "03-dependencies.html", "Dependencies", body)
 
     summary = {
-        "source_root": root or "(repo root)",
-        "module_depth": depth,
+        "top_level_arms": arms,
+        "structural_dirs_peeled": peeled,
         "modules": len(nodes),
+        # Listed so you can judge the grouping: if these read as structure
+        # rather than units of design, re-run with --depth N.
+        "module_list": sorted(
+            ({"id": m or "(repo root)", "display": display_of(m),
+              "files": mod_files.get(m, 0), "loc": mod_loc.get(m, 0)}
+             for m in frontier),
+            key=lambda d: -d["loc"]),
         "import_edges": edge_count,
         "module_cycles": sccs,
         "file_cycles": sorted(file_sccs, key=len, reverse=True)[:6],

@@ -33,7 +33,9 @@ Each writes its tab fragment and prints a JSON summary to stdout. **Read those s
 
 Dependency extraction covers Python, JS/TS, Go, Rust, Java/Kotlin, Ruby. For other languages the graph may be sparse — note that honestly in the Overview rather than presenting an empty graph as "no coupling". Each summary also reports what was *excluded* (unrecognized-language files, >2 MB files, churned non-code files) — carry those caveats into the judgment tabs instead of letting a sparse tab read as a small codebase.
 
-Useful knobs: `analyze_deps.py --depth N` overrides module grouping depth when the auto-chosen granularity looks wrong; `--max-nodes N` caps the graph size; every analyzer takes `--exclude dir1,dir2` to skip generated code (`*.pb.go` trees, `migrations/`, `openapi/`) that would otherwise swamp size and churn rankings.
+**Check the module grouping before you trust the dependency graph.** `analyze_deps` prints `module_list` — read it against what you know of the repo. The grouping is wrong if modules are named for packaging rather than design (`src`, `app`, a lone repo-name directory), if a subsystem you know exists is missing, or if a codebase you have reason to think is large came back as a handful of nodes. Re-run with `--depth N` (counts nesting levels, skipping structurally-named directories: `--depth 1` on a `frontend/`+`backend/` repo gives the two arms, `--depth 2` gives the modules inside each). If the graph still can't be made to reflect the real structure, say so in the Overview rather than presenting a misleadingly simple picture as the architecture.
+
+Other knobs: `--max-nodes N` caps the graph size; every analyzer takes `--exclude dir1,dir2` to skip generated code (`*.pb.go` trees, `migrations/`, `openapi/`) that would otherwise swamp size and churn rankings.
 
 ### 3. Read the code
 
