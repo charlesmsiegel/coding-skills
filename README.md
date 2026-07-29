@@ -15,8 +15,8 @@ A repository of agentic skills to help with AI coding.
   hotspots, inventory, plus judgment tabs).
 - **[pr-visualization](skills/pr-visualization/)** — builds a single-file tabbed HTML
   review report for a PR, branch, or diff (change footprint, contracts, test delta,
-  blast radius). Step 7 refreshes the codemap atlas and expects **code-visualization**
-  to be installed as a sibling — which it is here.
+  blast radius). It never touches `docs/codemap.html` — refreshing the atlas belongs to
+  **code-visualization**.
 
 ## Layout
 

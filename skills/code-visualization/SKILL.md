@@ -95,7 +95,7 @@ Open the result once (at minimum grep that your Mermaid blocks and JSON blocks m
 
 ## When the codebase has moved on: rerun vs. revise
 
-(The pr-visualization skill performs the small-drift revision below automatically as its step 7 whenever it reviews a change in a repo that has a `docs/codemap.html` — after larger drift, or when no PR report is involved, run it from here.)
+(Reviewing a PR does not update the atlas — pr-visualization deliberately leaves `docs/codemap.html` alone. Every atlas update, small drift or large, runs from here.)
 
 An existing atlas has gone stale after merges. Start with the trust check — `python $SKILL/scripts/check_codemap_state.py <repo>` (add `--codemap path/to.html` if the atlas lives somewhere nonstandard; exit codes: 0 `current`, 2 `missing`, 1 everything needing action — so don't chain it with `&&`). How to update depends on its verdict: `current` needs nothing; `unknown-vintage` (no parseable sha) means verify everything as if stale; `stale` permits either path below; `merge-resolution-suspect` means the codemap was last changed by a merge commit (hand-resolved conflict or a silent auto-splice of two branches' revisions) and demands full re-verification with reconciliation against both merge parents' versions, or a rebuild; `conflict-markers` means the file is corrupt — always rebuild, using both parents' extracted versions as findings checklists. Then pick between two ways to bring it current:
 

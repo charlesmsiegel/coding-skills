@@ -4,7 +4,7 @@
     {
       "id": 1,
       "prompt": "Review PR #212 on this repo (checked out on branch pr-212). The author's description says 'refactor only, no behavior change'. Is that true?",
-      "expected_output": "Writes the behavioral summary from the diff BEFORE reading the author's description, then diffs the two — any undisclosed behavior change is a headline finding; follows untouched callers from blast radius into the code; report lands at docs/pr-212.html with a verdict-led summary; the caveat on the name-based blast radius travels into the walkthrough; step 7 refreshes docs/codemap.html with the code-visualization template so the atlas keeps its own theme.",
+      "expected_output": "Writes the behavioral summary from the diff BEFORE reading the author's description, then diffs the two — any undisclosed behavior change is a headline finding; follows untouched callers from blast radius into the code; report lands at docs/pr-212.html with a verdict-led summary; the caveat on the name-based blast radius travels into the walkthrough; docs/codemap.html is left untouched — atlas refreshes are not part of a PR review.",
       "files": []
     },
     {

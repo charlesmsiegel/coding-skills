@@ -384,10 +384,11 @@ def test_same_named_def_in_another_file_is_not_a_caller(repo, tabs, run_script):
         "a same-named definition elsewhere is not a call site"
 
 
-def test_step7_assemble_with_cv_template_produces_atlas_theme(repo, tabs, run_script, tmp_path):
-    # Step 7 reassembles the codemap with THIS skill's assembler but must pass
-    # the code-visualization template — otherwise every PR run reskins the
-    # committed atlas (this assembler's default is the PR report theme).
+def test_assemble_template_override_beats_the_pr_report_theme(repo, tabs, run_script, tmp_path):
+    # --template fully replaces the bundled theme rather than layering on it:
+    # pointed at the code-visualization template, this assembler emits the atlas
+    # theme, not its own default. Nothing in the PR workflow writes an atlas —
+    # this pins the flag's semantics for anyone reusing the assembler.
     tabs.joinpath("01-overview.html").write_text("<!-- tab: Overview -->\n<p>atlas</p>\n", encoding="utf-8")
     out = tmp_path / "codemap.html"
     cv_template = SKILLS / "code-visualization" / "assets" / "template.html"
