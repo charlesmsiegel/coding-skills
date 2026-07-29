@@ -1,0 +1,23 @@
+{
+  "skill_name": "fix-issue",
+  "evals": [
+    {
+      "id": 1,
+      "prompt": "fix issue 214",
+      "expected_output": "Runs scripts/fetch_issue.py 214 rather than a bare gh issue view, and reads the related PRs it returns BEFORE writing code — an abandoned earlier attempt is treated as the cheapest available context. Checks state and labels; a closed or already-assigned issue becomes a question for the user, not a task. Reproduces the reported behavior before writing any fix, using the code blocks and paths the script scraped out of the thread. Writes a failing test and confirms it fails for the right reason before implementing. Fixes the cause rather than the symptom. Works on a branch, never main. Links the issue with Fixes #214 in the PR body and does not close the issue by hand.",
+      "files": []
+    },
+    {
+      "id": 2,
+      "prompt": "Work on issue 87 — the one about the crash on startup. I ran it locally and it works fine for me though.",
+      "expected_output": "Does NOT write a speculative fix for an unreproduced bug. Treats the failure to reproduce as information and works out which case it is: environment-specific, already fixed since the report, intermittent, or incomplete steps. Checks git log since the issue date for an existing fix. Asks for the specific missing facts (version, OS, locale, exact input) rather than a generic 'please provide more information'. States plainly that it cannot verify a fix it cannot reproduce.",
+      "files": []
+    },
+    {
+      "id": 3,
+      "prompt": "Issue 300 says 'the report totals are wrong'. The reporter attached a screenshot showing the footer total. Fix it.",
+      "expected_output": "Distinguishes where the problem surfaced (the footer) from where the defect is, and does not patch the display code to make the number look right. Traces back to where the state first goes wrong. Tests that it has the cause by stating the mechanism in a sentence and predicting a second symptom from it, then checking that prediction. Recognizes a display-layer fix for a wrong-value complaint as the symptom-patching signal it is. If the real fix turns out to be large, says so and lets the user choose rather than shipping a quiet workaround.",
+      "files": []
+    }
+  ]
+}

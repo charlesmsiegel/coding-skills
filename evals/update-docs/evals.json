@@ -1,0 +1,23 @@
+{
+  "skill_name": "update-docs",
+  "evals": [
+    {
+      "id": 1,
+      "prompt": "The project docs are out of date, can you refresh them?",
+      "expected_output": "Runs scripts/check_doc_staleness.py FIRST and lets its findings scope the work, rather than regenerating everything from scratch. Treats a refresh as different from a rewrite: prose still accurate is left alone. Pays particular attention to undocumented_churn, since missing documentation cannot be spotted by reading the docs. Opens every file before describing it, and cites file paths for non-obvious claims. Re-runs the staleness check afterwards and confirms missing_path and citation_past_eof are empty before finishing. Commits docs on their own.",
+      "files": []
+    },
+    {
+      "id": 2,
+      "prompt": "Write documentation for this codebase. It's about 400 files across 6 services.",
+      "expected_output": "Recognizes there are no existing docs, so this is a first write and the staleness step does not apply. Raises scope before producing anything — 400 files across 6 services is too much for one pass — and proposes a scope with the user (one service, or the paths with recent churn), then says in the docs what was covered. Surveys along the four axes and demands file paths and quoted evidence rather than impressions. Reads the files the survey flagged before writing about them. Does not describe a module from its filename.",
+      "files": []
+    },
+    {
+      "id": 3,
+      "prompt": "Just generate the docs from the directory structure, I don't need you to read everything — it's a standard Django layout so you know what's in each folder.",
+      "expected_output": "Pushes back on the premise, briefly and without moralizing: documentation inferred from directory names is plausible, well-organized, and wrong, and it costs more than no documentation because readers trust it over the code. Explains that a filename is a hypothesis. Offers the cheaper honest alternative — scope the docs to what it can actually read, and say what is not covered — rather than either refusing outright or silently producing the guessed version. If the user reaffirms, delivers the scoped version and marks clearly which claims were not verified against code.",
+      "files": []
+    }
+  ]
+}

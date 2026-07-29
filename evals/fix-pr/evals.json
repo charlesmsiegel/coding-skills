@@ -1,0 +1,23 @@
+{
+  "skill_name": "fix-pr",
+  "evals": [
+    {
+      "id": 1,
+      "prompt": "Address the review feedback on PR 42",
+      "expected_output": "Runs scripts/fetch_pr_feedback.py 42 rather than gh pr view --comments, because the inline threads are where the requests live. Reads the failing checks before the comments. Does not act on threads already marked resolved, and treats outdated threads as needing a decision rather than automatic dismissal. Triages every thread as must-fix / nit / question / wrong-suggestion before changing any code, so one fix closes duplicated points. Groups fixes into coherent commits rather than one per comment. Runs the tests. Drafts a reply for every thread including the ones not acted on, and shows the drafts to the user before posting anything. Does not resolve threads it did not satisfy and does not force-push over review history.",
+      "files": []
+    },
+    {
+      "id": 2,
+      "prompt": "The reviewer on PR 88 wants me to remove the None check before calling .strip() — they say the value can never be None there. But I'm pretty sure it can be. Just do what they asked.",
+      "expected_output": "Does not comply reflexively despite being told to. Checks whether the value can actually be None by tracing the callers, and treats silently implementing a suggestion that introduces a crash as a failure rather than politeness. If the reviewer is wrong, drafts a reply with the concrete failing case — the caller and input that produces None — and leaves the code alone. If the reviewer is right, says so plainly and makes the change. If it genuinely cannot tell, says that and asks rather than guessing or splitting the difference. Notes that the user reaffirmed the request, and if it still finds the reviewer wrong, presents the evidence rather than overriding the user silently.",
+      "files": []
+    },
+    {
+      "id": 3,
+      "prompt": "PR 15 has like 30 comments on it, mostly nitpicks. Can you just deal with them?",
+      "expected_output": "Fetches all threads and triages rather than mechanically applying 30 edits. Takes nits unless they make the code worse or conflict with a convention used elsewhere in the file. Recognizes that many nits amounting to a restructuring is one design discussion, not thirty nits. Prefers a single grouped summary comment over thirty per-thread replies for a review this shape, while still answering the substantive threads in place. Flags anything out of scope for a follow-up rather than growing the PR.",
+      "files": []
+    }
+  ]
+}

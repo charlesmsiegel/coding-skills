@@ -1,0 +1,23 @@
+{
+  "skill_name": "brutal-review",
+  "evals": [
+    {
+      "id": 1,
+      "prompt": "Do a brutal review of my current diff. Be as harsh as you want, I can take it.",
+      "expected_output": "Gets the actual diff (git diff / merge-base) and reads enough surrounding code to see the seam between new and old — untouched callers of changed signatures are checked, since a diff structurally cannot show them. Runs the mechanical pass first where one applies (python-simplifier's analyze_diff.py for Python) instead of spending attacking attention on what a tool finds. Every finding names the concrete input, sequence, or state that produces the wrong result; no finding is phrased as an open worry like 'this could have race conditions' or 'consider error handling'. Findings are ranked and end in one explicit verdict. States what was NOT reviewed. Harsh about the code, never about the author.",
+      "files": []
+    },
+    {
+      "id": 2,
+      "prompt": "Tear this apart. [pastes a small, genuinely correct 40-line function with tests that cover the edge cases]",
+      "expected_output": "Does NOT manufacture criticism to satisfy the persona — this is the skill's central failure mode. Attacks the code seriously (degenerate inputs, error paths, the seam, whether the tests can fail) and then says plainly that it found nothing above a nit, listing the angles it attacked as the evidence. Any remaining comments are labelled as taste rather than defects. Does not pad the review with invented severity to seem rigorous.",
+      "files": []
+    },
+    {
+      "id": 3,
+      "prompt": "Reviewer here said my change is fine but I'm not sure. It adds a `retries=3` parameter to `fetch_config()` and wraps the body in a try/except. Poke holes in it.",
+      "expected_output": "Asks the questions from the attack checklist that actually apply: is the retried operation idempotent, is there a bound and a backoff, what is caught and is it too broad, what state is the program in after the except, and what happens to the caller that still calls fetch_config() with no arguments and now silently gets three retries. Reaches for the theory-level question too — whether retrying is the right model or whether it masks a failure that should surface. Each point is anchored to a concrete failing case rather than posed as a general concern.",
+      "files": []
+    }
+  ]
+}

@@ -1,0 +1,29 @@
+{
+  "skill_name": "django-simplifier",
+  "evals": [
+    {
+      "id": 1,
+      "prompt": "This Django view module is slow and I think it's a mess. Can you sort it out? (attached: orders_views.py)",
+      "expected_output": "Runs analyze_django.py / find_query_issues.py first rather than reading by hand, and triages the mechanical findings before judgment. Identifies the N+1 on order.customer AND the second hop to customer.region (needs select_related('customer__region'), not just 'customer'); the .save() in the loop; the read-modify-write on viewed_count that needs F(); mark_safe on a concatenation containing order.note as an XSS risk; the hardcoded '/orders/' redirect; and OrderService as a CRUD-only wrapper. Crucially, flags missing_ownership_filter on order_detail — pk comes from the URL with no request.user scoping — and treats it as the most serious finding, above the performance ones. Says it verified the ownership finding by hand rather than trusting the detector. Recommends measuring with assertNumQueries or CaptureQueriesContext before and after, and does not claim a speedup it has not measured.",
+      "files": ["fixtures/orders_views.py"]
+    },
+    {
+      "id": 2,
+      "prompt": "Should I move all my business logic out of models.py into a services/ layer? Everyone on the team keeps saying the models are too fat.",
+      "expected_output": "Loads references/django-architecture.md rather than answering from general opinion. Does not accept 'fat model' as automatically a problem — asks what the methods actually do, and applies the distinction between behavior about one record (belongs on the model) and behavior about a process spanning records, transactions, or external services (belongs in a plain function). Warns that splitting by layer relocates volume without reducing it. Points out that a service class with one public method and no state is a function wearing a costume. Gives a concrete test the user can apply to their own methods rather than a blanket yes or no.",
+      "files": []
+    },
+    {
+      "id": 3,
+      "prompt": "Our team wants to replace every `for obj in qs: obj.save()` loop in the codebase with bulk_update. Can you do a sweep?",
+      "expected_output": "Agrees the loops are worth finding (find_query_issues.py, save_in_loop) but does NOT do a blanket mechanical replacement. Loads references/django-orm.md and raises what bulk_update skips: save() overrides, pre_save/post_save receivers, and auto_now fields. Checks each model for a save() override and each signal receiver before converting, and says which loops are safe to convert and which are not. States explicitly that a per-row loop with a comment explaining why is better than a bulk call that silently skips a signal. Treats query count as behavior, so the change is verified with assertNumQueries rather than assumed.",
+      "files": []
+    },
+    {
+      "id": 4,
+      "prompt": "Run your Django analysis over this repo please. [the repo is a Flask project with SQLAlchemy models]",
+      "expected_output": "Reports nothing and says why: the detectors are gated on the tree actually being a Django project, and this one is not. Does NOT apply Django rules to SQLAlchemy models or invent Django findings. Distinguishes 'no findings because this is not Django' from 'no findings because the code is clean' — the silence is explained rather than presented as a passing grade. Offers python-simplifier as the applicable skill instead.",
+      "files": []
+    }
+  ]
+}
