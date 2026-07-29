@@ -6,7 +6,14 @@ A repository of agentic skills to help with AI coding.
 
 - **[python-simplifier](skills/python-simplifier/)** — critically review and simplify
   Python code: deterministic AST detectors (`scripts/`) plus judgment guides
-  (`references/`).
+  (`references/`). `run_external_tools.py` also drives the real tools when they are
+  installed — ruff, mypy, black, isort, bandit, flake8, plus pip-audit (dependency
+  advisories) and coverage (code that never executes).
+- **[django-simplifier](skills/django-simplifier/)** — the Django-specific companion:
+  N+1 queries, per-row writes, model definition problems, missing object-level
+  authorization, insecure settings, queries hidden in templates, and abstractions that
+  never earned their keep. Detectors share one whole-project class graph and stay
+  silent outside Django projects.
 - **[theory-building](skills/theory-building/)** — governs code being written *now*:
   state the theory, reuse before inventing, abstract over repetition, treat tests as a
   floor. Guides only, no scripts.
@@ -18,6 +25,24 @@ A repository of agentic skills to help with AI coding.
   review report for a PR, branch, or diff (change footprint, contracts, test delta,
   blast radius). It never touches `docs/codemap.html` — refreshing the atlas belongs to
   **code-visualization**.
+
+### Workflow skills
+
+Language-agnostic, and each carries a script only where something is genuinely
+mechanical.
+
+- **[brutal-review](skills/brutal-review/)** — adversarial review of a diff. Every
+  finding must name the input that breaks the code; a complaint with no failing case
+  is cut. Delegates to python-simplifier's `analyze_diff.py` for Python.
+- **[fix-issue](skills/fix-issue/)** — GitHub issue to reviewable PR: reproduce, fail a
+  test, fix the cause. `fetch_issue.py` pulls related PRs and scrapes repro leads out
+  of the thread.
+- **[fix-pr](skills/fix-pr/)** — work through review feedback.
+  `fetch_pr_feedback.py` pulls inline threads with their resolved state, which
+  `gh pr view` cannot show. Complying with a wrong suggestion counts as a failure.
+- **[update-docs](skills/update-docs/)** — build or refresh a project's own
+  documentation skill. `check_doc_staleness.py` checks citations against the tree and
+  infers missing coverage from churn.
 
 ## Layout
 
@@ -58,6 +83,10 @@ except for one line (the `--label` default), also CI-checked. Two files differ o
 purpose and are NOT synced: `assets/template.html` (each skill has its own theme;
 the renderers and placeholders match, which a test pins) and
 `references/llm-tabs.md` (different tab sets).
+
+django-simplifier ships its own copy of python-simplifier's `common.py`, byte-identical
+and CI-enforced, for the same reason: a skill has to be self-contained to be installed
+on its own.
 
 CI also runs a ratchet: python-simplifier's bug-class detectors must stay silent on
 every skill's own `scripts/` directory.

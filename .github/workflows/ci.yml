@@ -45,6 +45,14 @@ jobs:
             exit 1
           fi
 
+      # django-simplifier carries python-simplifier's common.py for the same
+      # reason: it has to be installable on its own.
+      - name: django-simplifier's common.py matches python-simplifier's
+        run: |
+          cmp skills/python-simplifier/scripts/common.py \
+              skills/django-simplifier/scripts/common.py \
+            || { echo "::error::common.py has drifted between the two simplifier skills"; exit 1; }
+
       - name: Smoke tests (every detector fires on its fixture, quiet on clean code)
         run: pytest -q
 
