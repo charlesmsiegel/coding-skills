@@ -42,21 +42,31 @@ RUBY_REQ_RE = re.compile(r"""require_relative\s+['"]([^'"]+)['"]""")
 
 
 def build_python_index(files):
-    idx = {}
+    """Map every importable suffix of a module path to its file.
+
+    sys.path can be rooted anywhere — a package root, a src/ directory, or the
+    script's own directory — so a module is importable under *any* suffix of its
+    path, not just the first few. Every suffix is indexed; a suffix two different
+    files both claim is dropped rather than guessed, because inventing an edge to
+    one of two same-named modules is worse than drawing none. Where the answer is
+    genuinely local (a script importing its neighbour), python_edges resolves
+    against the importing file's own directory first and never consults this.
+    """
+    claims = defaultdict(set)
     for rel in files:
         if not rel.endswith((".py", ".pyi")):
             continue
         parts = rel.rsplit(".", 1)[0].split("/")
         if parts[-1] == "__init__":
             parts = parts[:-1]
-        for skip in range(0, min(3, len(parts))):  # tolerate src/, lib/ prefixes
+        for skip in range(len(parts)):
             key = ".".join(parts[skip:])
-            if key and key not in idx:
-                idx[key] = rel
-    return idx
+            if key:
+                claims[key].add(rel)
+    return {key: next(iter(hits)) for key, hits in claims.items() if len(hits) == 1}
 
 
-def python_edges(rel, text, py_idx):
+def python_edges(rel, text, py_idx, file_set=frozenset()):
     edges = set()
     try:
         tree = ast.parse(text)
@@ -70,10 +80,26 @@ def python_edges(rel, text, py_idx):
     else:
         pkg_parts = pkg_parts[:-1]
 
+    src_dir = "/".join(rel.split("/")[:-1])
+
+    def sibling(cand):
+        """The module a script would import with sys.path[0] = its own dir."""
+        stem = cand.replace(".", "/")
+        for suffix in (".py", ".pyi", "/__init__.py"):
+            hit = f"{src_dir}/{stem}{suffix}" if src_dir else f"{stem}{suffix}"
+            if hit in file_set:
+                return hit
+        return None
+
     def resolve(name):
         for cand in (name, name.rsplit(".", 1)[0] if "." in name else None):
-            if cand and cand in py_idx:
-                return py_idx[cand]
+            if not cand:
+                continue
+            # Neighbour first: two directories each shipping their own common.py
+            # must resolve to the one beside the importer, never to its twin.
+            hit = sibling(cand) or py_idx.get(cand)
+            if hit:
+                return hit
         return None
 
     for node in ast.walk(tree):
@@ -313,7 +339,7 @@ def main() -> int:
     for rel, text in ((rel, read_text(p)) for rel, p in paths.items()):
         ext = "." + rel.rsplit(".", 1)[-1] if "." in rel else ""
         if ext in (".py", ".pyi"):
-            edges[rel] |= python_edges(rel, text, py_idx)
+            edges[rel] |= python_edges(rel, text, py_idx, file_set)
         elif ext in JS_EXTS:
             for spec in JS_IMPORT_RE.findall(text):
                 if spec.startswith("."):

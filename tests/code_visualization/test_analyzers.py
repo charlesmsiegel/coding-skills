@@ -106,6 +106,45 @@ def test_deps_counts_fan_in_for_a_shared_module(repo, tabs, run_script):
     assert fan_in["pkg/util.py"] == 3
 
 
+def test_deps_resolves_an_import_from_a_deeply_nested_package(repo, tabs, run_script):
+    """sys.path can be rooted anywhere, so a module is importable under any
+    suffix of its path — not only the first two or three segments."""
+    repo.write("services/billing/src/pkg/util.py", "def helper():\n    return 1\n")
+    repo.write("services/billing/src/pkg/__init__.py", "")
+    repo.write("services/billing/src/app.py", "from pkg import util\n")
+
+    summary = json.loads(run_script(SCRIPTS / "analyze_deps.py", repo.path, "--tabs-dir", tabs).stdout)
+
+    fan_in = {row["path"]: row["fan_in"] for row in summary["top_fan_in_files"]}
+    assert fan_in.get("services/billing/src/pkg/util.py") == 1
+
+
+def test_deps_resolves_a_sibling_import_to_the_neighbour_not_a_twin(repo, tabs, run_script):
+    """Two directories ship their own copy of a module — a script run from its
+    own directory imports the one beside it, and nothing links the copies."""
+    for skill in ("alpha", "beta"):
+        repo.write(f"skills/{skill}/scripts/common.py", "VALUE = 1\n")
+        repo.write(f"skills/{skill}/scripts/run.py", "import common\n\nprint(common.VALUE)\n")
+
+    summary = json.loads(run_script(SCRIPTS / "analyze_deps.py", repo.path, "--tabs-dir", tabs).stdout)
+
+    fan_in = {row["path"]: row["fan_in"] for row in summary["top_fan_in_files"]}
+    assert fan_in.get("skills/alpha/scripts/common.py") == 1
+    assert fan_in.get("skills/beta/scripts/common.py") == 1
+
+
+def test_deps_leaves_an_ambiguous_import_unresolved(repo, tabs, run_script):
+    """With two candidates and no sibling to prefer, drawing an edge to either
+    would be a guess — and a confidently wrong edge is worse than none."""
+    repo.write("one/helper.py", "VALUE = 1\n")
+    repo.write("two/helper.py", "VALUE = 2\n")
+    repo.write("app/main.py", "import helper\n")
+
+    summary = json.loads(run_script(SCRIPTS / "analyze_deps.py", repo.path, "--tabs-dir", tabs).stdout)
+
+    assert summary["import_edges"] == 0
+
+
 def test_deps_extracts_javascript_imports(repo, tabs, run_script):
     repo.write("src/index.js", "import { thing } from './lib';\n")
     repo.write("src/lib.js", "export const thing = 1;\n")
