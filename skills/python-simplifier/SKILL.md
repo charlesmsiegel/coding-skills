@@ -143,14 +143,30 @@ rather than silently reported clean.
 The detectors above are stdlib-only on purpose, but if the target repo's environment
 already has the real tools, they are stronger — so use them. `run_external_tools.py`
 **detects what is installed in the current environment** (ruff, mypy, black, isort,
-bandit, flake8), runs every available one in non-mutating check mode, and merges the
-output into this skill's findings shape:
+bandit, flake8, pip-audit, coverage), runs every available one in non-mutating check
+mode, and merges the output into this skill's findings shape:
 
 ```bash
 python scripts/run_external_tools.py .                 # run all available (check only)
 python scripts/run_external_tools.py . --format json   # {tools_run, missing_tools, findings}
+python scripts/run_external_tools.py . --tools pip-audit,coverage
 python scripts/run_external_tools.py . --fix           # also run black/isort/ruff --fix (MUTATES)
+python scripts/run_external_tools.py . --run-coverage  # run the test suite first (SLOW, EXECUTES CODE)
 ```
+
+Two of these answer questions the stdlib detectors structurally **cannot**, so reach for
+them rather than assuming the detectors covered it:
+
+- **pip-audit** — known advisories against the pinned dependencies. `find_dependency_issues.py`
+  reads the manifest and can tell you a pin is missing or unpinned; only an advisory
+  database can tell you the pin you *have* is vulnerable. It audits `requirements*.txt`
+  when the repo has one, and otherwise the installed environment — which it labels,
+  because that is a different claim.
+- **coverage** — what actually executed. `find_untested_modules.py` answers "does any test
+  mention this module"; coverage answers "does this code ever run". It reports only the
+  unambiguous cases (a module or function with zero covered statements) and reads existing
+  data. `--run-coverage` runs the suite first under `--source`, which is what makes a
+  never-imported module show up at 0% instead of vanishing from the report.
 
 **When a tool is missing, ask before installing.** The script never installs anything;
 it lists each absent tool with a `pip install` hint under `missing_tools`. When that
@@ -261,7 +277,9 @@ These scripts complement linters; they don't replace them. Some detectors overla
 Ruff rule sets — naming (`N`), flake8-builtins (`A`), commented-out code (`ERA`),
 TODOs (`TD`), some return/loop simplifications (`RET`, `SIM`, `PERF`), boolean traps
 (`FBT`), debug leftovers (`T10`/`T20`), outdated idioms (`UP` pyupgrade), missing
-docstrings (`D`), missing annotations (`ANN`), and security (`S`/bandit). If the repo
+docstrings (`D`), missing annotations (`ANN`), and security (`S`/bandit). Dependency
+advisories and line coverage are not a linter's job at all — those come from pip-audit
+and coverage through `run_external_tools.py`. If the repo
 already runs those Ruff rules, disable the matching detector via `--ignore` (or drop
 its whole category with `analyze_all.py --skip`) to avoid double-reporting — or
 better, run the real tools with

@@ -3204,19 +3204,5 @@ def test_format_findings_min_severity_filters_low_findings():
     assert "range_len_loop" not in out
 
 
-# ---- run_external_tools --------------------------------------------------- #
-
-
-def test_run_external_tools_reports_every_tool_as_run_or_missing(tmp_path):
-    # Structural contract only: no external tool is assumed installed. Each
-    # requested tool must land in exactly one of tools_run / missing_tools.
-    (tmp_path / "sample.py").write_text('"""Tiny module."""\n\nX = 1\n')
-    report = run_detector("run_external_tools.py", tmp_path, "--tools", "ruff,black")
-    assert {"tools_run", "missing_tools", "findings"} <= report.keys()
-    assert isinstance(report["findings"], list)
-    ran = set(report["tools_run"])
-    missing = {m["name"] for m in report["missing_tools"]}
-    assert ran | missing == {"ruff", "black"}
-    assert not (ran & missing)
-    for m in report["missing_tools"]:
-        assert m["install"].startswith("pip install ")
+# run_external_tools lives in tests/python_simplifier/test_external_tools.py —
+# it needs stub-executable fixtures the rest of these detectors have no use for.

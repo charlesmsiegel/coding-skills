@@ -196,12 +196,31 @@ fixtures; the shell-out layer is a few lines and is not mocked.
 bandit, and flake8, merging their output into this skill's findings shape under a
 detect-if-installed → `missing_tools` → ask-before-install contract. Two tools join it:
 
-- **pip-audit** — dependency CVEs and outdated pins. This is the half of
-  `check_dependencies.py` our `find_dependency_issues.py` does not do; that detector
-  reads the manifest and cannot know about advisories.
-- **pytest-cov / coverage** — line coverage, reported as findings on modules below
-  threshold. `find_untested_modules.py` answers "does any test mention this module";
-  coverage answers "is this code executed".
+- **pip-audit** — dependency advisories. This is the half of `check_dependencies.py`
+  our `find_dependency_issues.py` does not do; that detector reads the manifest and
+  cannot know about advisories. It audits `requirements*.txt` when present and the
+  installed environment otherwise, labelling which it did.
+- **coverage** — what actually executed. `find_untested_modules.py` answers "does any
+  test mention this module"; coverage answers "does this code ever run". Reports only
+  the unambiguous cases — a module or function with zero covered statements — because
+  "under-covered" is a reviewer's judgment, not a detector's finding.
+
+**Deviation from the plan above: `pip list --outdated` is not included.** It was listed
+as part of pip-audit's value, but it audits the *interpreter running this script*, not
+the target project, so for an arbitrary path its answer is about the wrong environment.
+The subset that matters — outdated *and* vulnerable — pip-audit already reports with a
+`fix_versions` upgrade target, and unpinned dependencies are already
+`find_dependency_issues.py`'s job. What would be left is "a newer release exists", which
+is true of nearly every package and would dilute the findings.
+
+Two facts about the real tools, both verified against their actual output rather than
+assumed, are load-bearing enough to record:
+
+- coverage's per-function `start_line` only exists in 7.10+. Older versions still list
+  `missing_lines`, and every statement of a fully-uncovered function is missing, so its
+  lowest missing line is the function's first statement.
+- `coverage json` prints "No data to report." to **stdout** and exits 1, so an unmeasured
+  project and a crashed tool are indistinguishable by exit code.
 
 SKILL.md's tool list and its "Relationship to Ruff and type checkers" section are updated
 to name both. Tests extend the existing `run_external_tools` suite.
