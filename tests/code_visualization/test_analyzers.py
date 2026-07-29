@@ -118,6 +118,93 @@ def test_deps_extracts_javascript_imports(repo, tabs, run_script):
 
 
 # --------------------------------------------------------------------------- #
+# Runtime resources
+#
+# An import is not the only way one file depends on another. A rendered template
+# or a prompt read off disk is a dependency by every meaning that matters, and a
+# graph that shows none of it understates coupling exactly where behavior is
+# assembled at runtime.
+# --------------------------------------------------------------------------- #
+
+
+def test_deps_counts_a_loaded_prompt_as_a_dependency(repo, tabs, run_script):
+    repo.write("agent/run.py", "SYSTEM = open('prompts/system.md').read()\n")
+    repo.write("prompts/system.md", "You are helpful.\n")
+
+    summary = json.loads(run_script(SCRIPTS / "analyze_deps.py", repo.path, "--tabs-dir", tabs).stdout)
+
+    assert summary["resource_edges"] == 1
+    assets = {a["path"]: a for a in summary["top_referenced_assets"]}
+    assert assets["prompts/system.md"]["loaded_by"] == ["agent/run.py:1"]
+
+
+def test_deps_makes_a_referenced_asset_a_node_but_not_an_unreferenced_one(repo, tabs, run_script):
+    repo.write("agent/run.py", "T = open('templates/mail.html').read()\n")
+    repo.write("templates/mail.html", "<p>hi</p>\n")
+    repo.write("docs/design.md", "# notes\n")
+
+    summary = json.loads(run_script(SCRIPTS / "analyze_deps.py", repo.path, "--tabs-dir", tabs).stdout)
+    graph_files = summary["asset_nodes"]["paths"]
+
+    assert "templates/mail.html" in graph_files
+    assert "docs/design.md" not in graph_files
+
+
+def test_deps_reports_an_unloaded_prompt_as_an_orphan(repo, tabs, run_script):
+    repo.write("agent/run.py", "SYSTEM = open('prompts/system.md').read()\n")
+    repo.write("prompts/system.md", "You are helpful.\n")
+    repo.write("prompts/retired.md", "old instructions\n")
+
+    summary = json.loads(run_script(SCRIPTS / "analyze_deps.py", repo.path, "--tabs-dir", tabs).stdout)
+
+    assert summary["orphan_assets"] == ["prompts/retired.md"]
+
+
+def test_deps_does_not_call_a_ci_workflow_an_orphan(repo, tabs, run_script):
+    """Files under a dot-directory are loaded by external tooling, not by this
+    codebase; "nothing references it" would be a false alarm every time."""
+    repo.write("tests/run.py", "CFG = open('.github/workflows/ci.yml').read()\n")
+    repo.write(".github/workflows/ci.yml", "on: push\n")
+    repo.write(".github/workflows/release.yml", "on: tag\n")
+
+    summary = json.loads(run_script(SCRIPTS / "analyze_deps.py", repo.path, "--tabs-dir", tabs).stdout)
+
+    assert summary["orphan_assets"] == []
+
+
+def test_deps_finds_a_cycle_between_templates(repo, tabs, run_script, fragment):
+    repo.write("templates/a.html", '{% include "b.html" %}\n')
+    repo.write("templates/b.html", '{% include "a.html" %}\n')
+
+    summary = json.loads(run_script(SCRIPTS / "analyze_deps.py", repo.path, "--tabs-dir", tabs).stdout)
+
+    assert ["templates/a.html", "templates/b.html"] in [sorted(c) for c in summary["file_cycles"]]
+
+
+def test_deps_fragment_shows_the_resource_section_and_distinguishes_the_edges(
+        repo, tabs, run_script, fragment):
+    repo.write("agent/run.py", "SYSTEM = open('prompts/system.md').read()\n")
+    repo.write("prompts/system.md", "You are helpful.\n")
+
+    run_script(SCRIPTS / "analyze_deps.py", repo.path, "--tabs-dir", tabs)
+    body = fragment.body(tabs / "03-dependencies.html")
+
+    assert "Runtime resources" in body
+    assert "prompts/system.md" in body
+    # The graph has to say which edges are loads rather than imports.
+    assert '"kind":"resource"' in body
+
+
+def test_deps_summary_carries_the_resource_caveat(repo, tabs, run_script):
+    repo.write("agent/run.py", "SYSTEM = open('prompts/system.md').read()\n")
+    repo.write("prompts/system.md", "hi\n")
+
+    summary = json.loads(run_script(SCRIPTS / "analyze_deps.py", repo.path, "--tabs-dir", tabs).stdout)
+
+    assert "textually" in summary["resource_caveat"]
+
+
+# --------------------------------------------------------------------------- #
 # Module grouping
 #
 # The failure these pin down: a repo whose code lives under two arms used to
@@ -205,6 +292,72 @@ def test_deps_depth_override_counts_only_non_structural_dirs(repo, tabs, run_scr
         run_script(SCRIPTS / "analyze_deps.py", repo.path, "--tabs-dir", tabs, "--depth", "1").stdout)
 
     assert {m["display"] for m in summary["module_list"]} == {"frontend", "backend"}
+
+
+# --------------------------------------------------------------------------- #
+# LLM Ops
+#
+# In a codebase whose behavior is partly written in English, the model calls are
+# load-bearing and invisible to an import graph. The tab is facts only — where
+# the model is called, which model, which parameters, fed by which prompt file.
+# --------------------------------------------------------------------------- #
+
+
+def test_llm_tab_reports_call_sites_models_and_prompt_lineage(repo, tabs, run_script, fragment):
+    repo.write("agent/run.py",
+               "import anthropic\n"
+               "SYSTEM = open('prompts/system.md').read()\n"
+               "client = anthropic.Anthropic()\n"
+               "def ask(q):\n"
+               "    return client.messages.create(model='claude-opus-5', max_tokens=512,\n"
+               "                                  system=SYSTEM, messages=[{'role': 'user', 'content': q}])\n")
+    repo.write("prompts/system.md", "You are helpful.\n")
+
+    summary = json.loads(run_script(SCRIPTS / "analyze_llm.py", repo.path, "--tabs-dir", tabs).stdout)
+
+    assert summary["call_sites"] == 1
+    assert summary["providers"] == ["anthropic"]
+    assert "claude-opus-5" in summary["models"]
+    assert summary["prompt_assets"] == {"prompts/system.md": ["agent/run.py"]}
+    assert fragment.title(tabs / "10-llm-ops.html") == "LLM Ops"
+    body = fragment.body(tabs / "10-llm-ops.html")
+    assert "agent/run.py:5" in body
+    assert "prompts/system.md" in body
+
+
+def test_llm_tab_lists_gaps_with_citations(repo, tabs, run_script, fragment):
+    repo.write("agent/run.py",
+               "import anthropic\n"
+               "resp = client.messages.create(model='claude-opus-5', messages=msgs)\n")
+
+    summary = json.loads(run_script(SCRIPTS / "analyze_llm.py", repo.path, "--tabs-dir", tabs).stdout)
+
+    kinds = {g["kind"] for g in summary["gaps"]}
+    assert {"no-max-tokens", "no-timeout-or-retry"} <= kinds
+    assert "agent/run.py:2" in fragment.body(tabs / "10-llm-ops.html")
+
+
+def test_llm_tab_is_dropped_when_the_repo_calls_no_model(repo, tabs, run_script):
+    repo.write("app/math.py", "def add(a, b):\n    return a + b\n")
+
+    summary = json.loads(run_script(SCRIPTS / "analyze_llm.py", repo.path, "--tabs-dir", tabs).stdout)
+
+    assert summary["note"] == "no LLM usage detected"
+    assert not (tabs / "10-llm-ops.html").exists()
+
+
+def test_llm_summary_carries_the_detection_caveat(repo, tabs, run_script):
+    repo.write("agent/run.py", "resp = client.messages.create(model='claude-opus-5', max_tokens=8)\n")
+
+    summary = json.loads(run_script(SCRIPTS / "analyze_llm.py", repo.path, "--tabs-dir", tabs).stdout)
+
+    assert "textually" in summary["caveat"]
+
+
+def test_extract_tabs_gives_the_llm_tab_its_canonical_number(tmp_path, run_script, load_module):
+    extract = load_module(SCRIPTS, "extract_tabs")
+
+    assert extract.CANONICAL_PREFIX["llm-ops"] == 10
 
 
 # --------------------------------------------------------------------------- #

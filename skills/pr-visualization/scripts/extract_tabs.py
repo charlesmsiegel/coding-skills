@@ -25,6 +25,7 @@ CANONICAL_PREFIX = {
     # code-visualization atlas
     "overview": 1, "inventory": 2, "dependencies": 3, "hotspots": 4,
     "flows": 5, "boundaries": 6, "invariants": 7, "glossary": 8, "coverage": 9,
+    "llm-ops": 10,
     # pr-visualization review report
     "summary": 1, "footprint": 2, "contracts-tests": 3, "blast-radius": 4,
     "flow-impact": 5, "review-walkthrough": 6,

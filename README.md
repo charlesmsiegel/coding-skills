@@ -11,8 +11,9 @@ A repository of agentic skills to help with AI coding.
   state the theory, reuse before inventing, abstract over repetition, treat tests as a
   floor. Guides only, no scripts.
 - **[code-visualization](skills/code-visualization/)** — builds a single-file tabbed
-  HTML "codebase atlas" (dependency graph with cycle detection, churn×complexity
-  hotspots, inventory, plus judgment tabs).
+  HTML "codebase atlas" (dependency graph with cycle detection, covering both imports
+  and runtime loads of templates/prompts, churn×complexity hotspots, inventory, LLM
+  call sites and prompt lineage, plus judgment tabs).
 - **[pr-visualization](skills/pr-visualization/)** — builds a single-file tabbed HTML
   review report for a PR, branch, or diff (change footprint, contracts, test delta,
   blast radius). It never touches `docs/codemap.html` — refreshing the atlas belongs to
@@ -48,7 +49,9 @@ python -m ruff check .
 
 code-visualization and pr-visualization each carry their own copy of `common.py`,
 `extract_tabs.py`, `check_codemap_state.py`, `verify_citations.py`,
-`lint_fragments.py`, and `coverage_data.py`. The copies are byte-identical and CI
+`lint_fragments.py`, `coverage_data.py`, `resources.py` (runtime resource
+references — templates, prompts, embedded data), and `llmops.py` (LLM call sites,
+models, prompt lineage). The copies are byte-identical and CI
 enforces it — a skill directory has to be self-contained to be zipped and installed
 on its own, so the duplication is deliberate, not drift. `assemble.py` is identical
 except for one line (the `--label` default), also CI-checked. Two files differ on

@@ -230,6 +230,54 @@ def test_blast_radius_reports_no_callers_for_a_brand_new_symbol(repo, tabs, run_
     assert by_name["brand_new"]["untouched_callers"] == []
 
 
+def test_blast_radius_lists_untouched_loaders_of_a_changed_prompt(repo, tabs, run_script, fragment):
+    """Editing a prompt changes behavior for every file that loads it, and such
+    a diff changes no symbol at all — the tab's usual analysis sees nothing."""
+    repo.write("agent/run.py", "SYSTEM = open('prompts/system.md').read()\n")
+    repo.write("agent/other.py", "TEXT = open('prompts/system.md').read()\n")
+    repo.write("prompts/system.md", "You are helpful.\n")
+    repo.commit("base")
+    repo.write("prompts/system.md", "You are terse.\n")
+    repo.commit("reword the prompt")
+
+    summary = json.loads(
+        run_script(SCRIPTS / "analyze_blast_radius.py", repo.path, "--tabs-dir", tabs, "--base", "HEAD~1").stdout
+    )
+
+    changed = {c["path"]: c for c in summary["changed_resources"]}
+    assert changed["prompts/system.md"]["untouched_loaders"] == ["agent/other.py:1", "agent/run.py:1"]
+    assert "prompts/system.md" in fragment.body(tabs / "04-blast-radius.html")
+
+
+def test_contracts_tab_treats_a_changed_prompt_as_a_contract(repo, tabs, run_script, fragment):
+    repo.write("agent/run.py", "SYSTEM = open('prompts/system.md').read()\n")
+    repo.write("prompts/system.md", "You are helpful.\n")
+    repo.commit("base")
+    repo.write("prompts/system.md", "You are terse. Always answer in one line.\n")
+    repo.commit("reword the prompt")
+
+    summary = json.loads(
+        run_script(SCRIPTS / "analyze_diff.py", repo.path, "--tabs-dir", tabs, "--base", "HEAD~1").stdout
+    )
+
+    assert "prompts/system.md" in summary["prompt_contract_changes"]
+    assert "prompt" in fragment.body(tabs / "03-contracts-tests.html").lower()
+
+
+def test_contracts_tab_reports_a_changed_model_id(repo, tabs, run_script):
+    repo.write("agent/run.py", "resp = client.messages.create(model='claude-sonnet-5', max_tokens=8)\n")
+    repo.commit("base")
+    repo.write("agent/run.py", "resp = client.messages.create(model='claude-opus-5', max_tokens=8)\n")
+    repo.commit("switch model")
+
+    summary = json.loads(
+        run_script(SCRIPTS / "analyze_diff.py", repo.path, "--tabs-dir", tabs, "--base", "HEAD~1").stdout
+    )
+
+    assert summary["llm_changes"]["models_added"] == ["claude-opus-5"]
+    assert summary["llm_changes"]["models_removed"] == ["claude-sonnet-5"]
+
+
 # --------------------------------------------------------------------------- #
 # Report assembly
 # --------------------------------------------------------------------------- #
@@ -256,7 +304,8 @@ def test_shared_scripts_stay_byte_identical_across_the_two_skills():
     Fixing one copy and forgetting the other is the failure this guards: the
     duplication is only safe while the files are actually identical.
     """
-    shared = ["common.py", "extract_tabs.py", "check_codemap_state.py", "verify_citations.py"]
+    shared = ["common.py", "extract_tabs.py", "check_codemap_state.py", "verify_citations.py",
+              "resources.py", "llmops.py"]
     drifted = [
         name for name in shared
         if (SKILLS / "code-visualization" / "scripts" / name).read_bytes()

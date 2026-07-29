@@ -14,6 +14,7 @@ import sys
 from collections import defaultdict
 from pathlib import Path
 
+import resources
 from common import detect_lang, esc, git, is_test_path, json_block, read_text, walk_source, write_fragment
 from diffutil import (def_patterns_for, is_generated_doc, parse_diff, resolve_base,
                       untracked_file_diffs)
@@ -90,6 +91,40 @@ def main() -> int:
     symdefs = dict(list(symdefs.items())[: args.max_symbols])
     truncated = total_symbols - len(symdefs)
 
+    # ---- runtime resources: who loads the templates/prompts this diff edited?
+    # Computed before the symbol analysis returns, because a prompt-only diff
+    # changes no symbol at all and would otherwise leave the tab empty.
+    scan = resources.scan(repo, dict(walk_source(repo)))
+    loaders_of = defaultdict(list)
+    for ref in sorted(scan.refs):
+        loaders_of[ref.dst].append((ref.src, f"{ref.src}:{ref.line}"))
+    changed_resources = []
+    for path in sorted(changed_files & set(loaders_of)):
+        untouched = [cite for src, cite in loaders_of[path] if src not in changed_files]
+        touched = [cite for src, cite in loaders_of[path] if src in changed_files]
+        changed_resources.append({"path": path, "loaders": len(loaders_of[path]),
+                                  "untouched_loaders": untouched, "touched_loaders": touched})
+    res_html = ""
+    if changed_resources:
+        rows = "".join(
+            f"<tr><td><code>{esc(c['path'])}</code></td><td class='num'>{c['loaders']}</td>"
+            f"<td class='num'{' style=color:var(--bad);font-weight:600' if c['untouched_loaders'] else ''}>"
+            f"{len(c['untouched_loaders'])}</td>"
+            f"<td>{' '.join(f'<code>{esc(x)}</code>' for x in c['untouched_loaders'][:10])}"
+            + (f" <span class='dim'>… {len(c['untouched_loaders'])-10} more</span>"
+               if len(c["untouched_loaders"]) > 10 else "") + "</td></tr>"
+            for c in changed_resources)
+        loose = sum(len(c["untouched_loaders"]) for c in changed_resources)
+        res_html = f"""
+<h2>Runtime resources changed</h2>
+<div class="callout {'warn' if loose else 'good'}"><b>{len(changed_resources)} loaded file{'s' if len(changed_resources)!=1 else ''} edited</b> —
+templates, prompts or data this codebase reads at runtime. {loose} loading site{'s' if loose!=1 else ''} outside this diff
+inherit{'' if loose!=1 else 's'} the new content with nothing in the diff to review. {esc(resources.CAVEAT)}</div>
+<div class="tbl-wrap"><table class="sortable">
+<thead><tr><th>Changed file</th><th class="num">Loaders</th><th class="num">Untouched</th><th>Loaded at</th></tr></thead>
+<tbody>{rows}</tbody></table></div>
+"""
+
     renames = [{"from": f.old_path, "to": f.path} for f in fds if f.status == "R"]
     if not symdefs:
         rename_note = ""
@@ -99,9 +134,12 @@ def main() -> int:
                            ". A pure rename changes no symbol names, so it is invisible to this tab — but every "
                            "path-based reference (imports, configs, docs) to the old path is now stale and is not traced here.</div>")
         write_fragment(tabs, "04-blast-radius.html", "Blast Radius",
-                       "<div class='callout good'><b>No named function/class definitions were changed in supported languages</b>, so there is no symbol-level blast radius to trace. Behavioral impact, if any, flows through data/config/edited call sites — see the Footprint and Flow Impact tabs.</div>" + rename_note)
+                       "<div class='callout good'><b>No named function/class definitions were changed in supported languages</b>, so there is no symbol-level blast radius to trace. Behavioral impact, if any, flows through data/config/edited call sites — see the Footprint and Flow Impact tabs.</div>"
+                       + rename_note + res_html)
         print(json.dumps({"symbols": {}, "note": "no changed symbols detected",
-                          "renames": renames, "excluded_generated_docs": excluded_docs}))
+                          "renames": renames, "excluded_generated_docs": excluded_docs,
+                          "changed_resources": changed_resources,
+                          "resource_caveat": resources.CAVEAT}))
         return 0
 
     # scan the head worktree for call sites
@@ -196,6 +234,7 @@ def main() -> int:
 <div class="tbl-wrap"><table class="sortable">
 <thead><tr><th>Symbol</th><th>Defined in</th><th class="num">Caller files</th><th class="num">Untouched (non-test)</th><th class="num">In tests</th><th>Untouched callers</th></tr></thead>
 <tbody>{tbl}</tbody></table></div>
+{res_html}
 """
     write_fragment(tabs, "04-blast-radius.html", "Blast Radius", body)
 
@@ -207,6 +246,10 @@ def main() -> int:
         "caveat": CAVEAT,
         "excluded_generated_docs": excluded_docs,
         "renames": renames,
+        # A prompt or template this diff edited is inherited by every file that
+        # loads it, exactly as a changed signature is inherited by its callers.
+        "changed_resources": changed_resources,
+        "resource_caveat": resources.CAVEAT,
         "symbols": [{k: r[k] for k in ("name", "file", "kind", "callers", "outside", "test_callers")} | {"untouched_callers": r["outside_files"][:10]}
                     for r in rows[:25]],
     }, indent=2))

@@ -35,7 +35,8 @@ jobs:
           CV=skills/code-visualization/scripts
           PR=skills/pr-visualization/scripts
           for f in common.py extract_tabs.py check_codemap_state.py \
-                   verify_citations.py lint_fragments.py coverage_data.py; do
+                   verify_citations.py lint_fragments.py coverage_data.py \
+                   resources.py llmops.py; do
             cmp "$CV/$f" "$PR/$f" || { echo "::error::$f has drifted between the two skills"; exit 1; }
           done
           # assemble.py differs in exactly one line: the --label default.

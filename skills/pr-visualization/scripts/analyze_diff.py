@@ -14,7 +14,9 @@ import sys
 from collections import defaultdict
 from pathlib import Path
 
-from common import bar_cell, esc, git, is_test_path, json_block, write_fragment
+import llmops
+import resources
+from common import bar_cell, esc, git, is_test_path, json_block, walk_source, write_fragment
 from coverage_data import artifact_age_days, discover, parse as parse_coverage, resolve_paths
 from diffutil import (def_patterns_for, is_generated_doc, parse_diff, resolve_base,
                       untracked_file_diffs)
@@ -289,6 +291,60 @@ def main() -> int:
                            f"<td><div class='diff-snippet' style='margin:0'><span class='ln del'>- {esc(s['old'])}</span></div></td></tr>")
         return "".join(out)
 
+    # ---- prompts, templates and model settings are contracts too ----
+    # A prompt is a contract with the model exactly as a schema is a contract
+    # with a consumer: nothing type-checks it, and every loader inherits the edit.
+    res_scan = resources.scan(repo, dict(walk_source(repo)))
+    loaders_of = defaultdict(list)
+    for ref in sorted(res_scan.refs):
+        loaders_of[ref.dst].append(f"{ref.src}:{ref.line}")
+    prompt_changes = [
+        {"path": fd.path, "loaded_by": loaders_of[fd.path][:8],
+         "adds": fd.adds, "dels": fd.dels}
+        for fd in fds if fd.path in loaders_of and not fd.binary
+    ]
+
+    added_models, removed_models, llm_files = set(), set(), set()
+    for fd in fds:
+        if fd.binary:
+            continue
+        added = "\n".join(text for _, text in fd.added_lines())
+        removed = "\n".join(fd.removed_lines())
+        added_models |= {m for _, m in llmops.model_literals(added)}
+        removed_models |= {m for _, m in llmops.model_literals(removed)}
+        if llmops.call_sites(fd.path, added):
+            llm_files.add(fd.path)
+    llm_changes = {"models_added": sorted(added_models - removed_models),
+                   "models_removed": sorted(removed_models - added_models),
+                   "files_with_llm_calls_touched": sorted(llm_files)}
+
+    prompt_html = ""
+    if prompt_changes or any(llm_changes.values()):
+        rows = "".join(
+            f"<tr><td><code>{esc(p['path'])}</code></td>"
+            f"<td class='num'><span class='plusminus'><span class='p'>+{p['adds']}</span> "
+            f"<span class='m'>−{p['dels']}</span></span></td>"
+            f"<td>{' '.join(f'<code>{esc(c)}</code>' for c in p['loaded_by']) or '—'}</td></tr>"
+            for p in prompt_changes)
+        model_note = ""
+        if llm_changes["models_added"] or llm_changes["models_removed"]:
+            model_note = (
+                "<div class='callout warn'><b>Model selection changed</b> — "
+                + ", ".join(f"<code>−{esc(m)}</code>" for m in llm_changes["models_removed"])
+                + (" " if llm_changes["models_removed"] and llm_changes["models_added"] else "")
+                + ", ".join(f"<code>+{esc(m)}</code>" for m in llm_changes["models_added"])
+                + ". Every prompt in the repo was tuned against the old model; nothing in the "
+                  "type system will notice the swap.</div>")
+        table = (f"""<div class="tbl-wrap"><table class="sortable">
+<thead><tr><th>Prompt / template changed</th><th class="num">+/−</th><th>Loaded at</th></tr></thead>
+<tbody>{rows}</tbody></table></div>""" if prompt_changes else "")
+        prompt_html = f"""
+<h2>Prompt &amp; model contracts</h2>
+<p class="dim">Files this codebase loads at runtime, and the model settings it calls with. {esc(resources.CAVEAT)}</p>
+{model_note}
+{table}
+"""
+
     contract_files = [r for r in file_rows if r["cat"] in ("schema/migration", "api-contract", "dependencies")]
     cf_rows = "".join(
         f"<tr><td><code>{esc(r['fd'].path)}</code></td>"
@@ -363,6 +419,7 @@ def main() -> int:
 {contract_callout}
 {f'<div class="tbl-wrap"><table><thead><tr><th>File</th><th>Kind</th><th class="num">+/−</th></tr></thead><tbody>{cf_rows}</tbody></table></div>' if contract_files else ''}
 {sig_section}
+{prompt_html}
 <h2>Test delta</h2>
 <p class="dim">Match is heuristic: a changed test counts as covering a source file if it shares a name stem or mentions the file's changed symbols. {esc(cov_note)}</p>
 {test_callout}
@@ -386,6 +443,11 @@ def main() -> int:
         "removed_symbols": all_sig_deleted[:25],
         "new_symbols": [s["name"] for s in all_sig_new][:40],
         "contract_files": [r["fd"].path for r in contract_files],
+        # A prompt is a contract with the model, and a model swap re-tunes every
+        # prompt in the repo at once — neither shows up as a signature change.
+        "prompt_contract_changes": [p["path"] for p in prompt_changes],
+        "prompt_contract_loaders": {p["path"]: p["loaded_by"] for p in prompt_changes},
+        "llm_changes": llm_changes,
         "source_files_without_test_changes": [r["fd"].path for r in uncovered],
         "risky_added_lines": sorted(risk_hits_global, key=lambda h: -h["count"])[:30],
         # Renames matter even with zero changed lines: every path-based

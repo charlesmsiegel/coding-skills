@@ -1,12 +1,18 @@
 #!/usr/bin/env python3
-"""Dependencies tab: module import graph, cycles, fan-in/fan-out.
+"""Dependencies tab: module dependency graph, cycles, fan-in/fan-out.
 
 Usage: python3 analyze_deps.py REPO_DIR --tabs-dir TABS_DIR [--depth N]
 Emits: TABS_DIR/03-dependencies.html and a JSON summary on stdout.
 
-Supported import extraction: Python (ast), JS/TS (import/require/export-from),
-Go (module-path imports), Rust (use crate::), Java/Kotlin (import pkg.Class),
-Ruby (require_relative). Other languages appear as nodes without edges.
+Two kinds of dependency, both drawn:
+
+  imports   Python (ast), JS/TS (import/require/export-from), Go (module-path
+            imports), Rust (use crate::), Java/Kotlin (import pkg.Class), Ruby
+            (require_relative). Other languages appear as nodes without edges.
+  loads     runtime resource references (resources.py) — a rendered template, a
+            prompt read off disk, an embedded schema. A referenced asset becomes
+            a node; an unreferenced one does not, so a docs directory does not
+            swamp the graph.
 """
 import argparse
 import ast
@@ -16,8 +22,14 @@ import sys
 from collections import defaultdict
 from pathlib import Path
 
+import resources
 from common import (bar_cell, detect_lang, esc, json_block,
                     loc_and_complexity, read_text, walk_source, write_fragment)
+
+# Languages that carry no import syntax we extract; they are still eligible to
+# be *targets* of a load, which is how a template or prompt enters the graph.
+NON_CODE_LANGS = ("Other", "Markdown", "reStructuredText", "JSON", "YAML",
+                  "TOML", "HTML", "CSS")
 
 JS_EXTS = [".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".vue", ".svelte"]
 JS_IMPORT_RE = re.compile(
@@ -278,10 +290,10 @@ def main() -> int:
     extra_exclude = {d.strip() for d in args.exclude.split(",") if d.strip()}
     repo = Path(args.repo).resolve()
 
-    paths, locs = {}, {}
+    paths, locs, all_paths = {}, {}, {}
     for rel, p in walk_source(repo, extra_exclude=extra_exclude):
-        lang = detect_lang(rel)
-        if lang in ("Other", "Markdown", "reStructuredText", "JSON", "YAML", "TOML", "HTML", "CSS"):
+        all_paths[rel] = p
+        if detect_lang(rel) in NON_CODE_LANGS:
             continue
         paths[rel] = p
         locs[rel] = loc_and_complexity(read_text(p))[0]
@@ -358,6 +370,39 @@ def main() -> int:
                 if t and t != rel:
                     edges[rel].add(t)
 
+    # ---- runtime resource references ----
+    # A referenced asset joins the graph as a node (with its own LOC, so a large
+    # prompts/ directory reads as the mass it is); an unreferenced one stays out.
+    scan = resources.scan(repo, all_paths)
+    res_edges = defaultdict(set)
+    for ref in scan.refs:
+        if ref.src != ref.dst:
+            res_edges[ref.src].add(ref.dst)
+    loaders_of = defaultdict(list)  # asset -> ["file:line", ...]
+    for ref in sorted(scan.refs):
+        loaders_of[ref.dst].append(f"{ref.src}:{ref.line}")
+
+    asset_nodes = sorted({d for dsts in res_edges.values() for d in dsts} - file_set)
+    asset_loc = 0
+    for rel in asset_nodes:
+        text = read_text(all_paths[rel])
+        locs[rel] = 0 if "\x00" in text[:1024] else loc_and_complexity(text)[0]
+        asset_loc += locs[rel]
+    node_files = file_set | set(asset_nodes)
+
+    # A prompt or template nothing loads is a finding — but only where we know
+    # what a loaded asset in that directory looks like, so a docs tree full of
+    # never-referenced Markdown is not paraded as dead code.
+    referenced = set(loaders_of)
+    asset_dirs = {rel.rsplit("/", 1)[0] if "/" in rel else "" for rel in asset_nodes}
+    asset_exts = {rel.rsplit(".", 1)[-1] for rel in asset_nodes if "." in rel}
+    orphans = sorted(
+        rel for rel in all_paths
+        if rel not in referenced and rel not in file_set
+        and not rel.startswith(".")  # .github & co are loaded by outside tooling
+        and (rel.rsplit("/", 1)[0] if "/" in rel else "") in asset_dirs
+        and "." in rel and rel.rsplit(".", 1)[-1] in asset_exts)
+
     # ---- module grouping ----
     hints = set(STRUCTURAL_HINTS) | {normalize_name(repo.name)}
     tree = build_dir_tree(locs)
@@ -403,13 +448,14 @@ def main() -> int:
         m = module_of(rel)
         return m if m in keep else "(other)"
 
-    mod_edges = defaultdict(int)
-    for src, dsts in edges.items():
-        ms = mod_key(src)
-        for dst in dsts:
-            md = mod_key(dst)
-            if ms != md:
-                mod_edges[(ms, md)] += 1
+    mod_edges, mod_res_edges = defaultdict(int), defaultdict(int)
+    for counter, graph in ((mod_edges, edges), (mod_res_edges, res_edges)):
+        for src, dsts in graph.items():
+            ms = mod_key(src)
+            for dst in dsts:
+                md = mod_key(dst)
+                if ms != md:
+                    counter[(ms, md)] += 1
 
     # ---- Tarjan SCC (iterative) ----
     def find_sccs(vertices, adj):
@@ -456,30 +502,34 @@ def main() -> int:
                 strongconnect(v)
         return sccs
 
+    # Cycles run over both edge kinds: a pair of templates that include each
+    # other is as circular as a pair of modules that import each other.
     adj = defaultdict(set)
-    for (a, b) in mod_edges:
+    for (a, b) in list(mod_edges) + list(mod_res_edges):
         adj[a].add(b)
     all_mods = sorted(set(mod_loc if not lump else list(keep) + ["(other)"]))
     sccs = find_sccs(all_mods, adj)
 
     file_adj = defaultdict(set)
-    for src, dsts in edges.items():
-        file_adj[src] |= dsts
-    file_sccs = find_sccs(sorted(paths), file_adj)
+    for graph_edges in (edges, res_edges):
+        for src, dsts in graph_edges.items():
+            file_adj[src] |= dsts
+    file_sccs = find_sccs(sorted(node_files), file_adj)
     cyc_members = {m for scc in sccs for m in scc}
     scc_of = {}
     for i, scc in enumerate(sccs):
         for m in scc:
             scc_of[m] = i
 
-    # ---- fan-in/out at file level ----
-    fan_out = {f: len(d) for f, d in edges.items()}
+    # ---- fan-in/out at file level (imports and loads together: a template
+    # rendered from six modules is depended on by six modules) ----
+    fan_out = {f: len(d) for f, d in file_adj.items()}
     fan_in = defaultdict(int)
-    for d in edges.values():
+    for d in file_adj.values():
         for t in d:
             fan_in[t] += 1
     mod_fan_in, mod_fan_out = defaultdict(int), defaultdict(int)
-    for (a, b), w in mod_edges.items():
+    for (a, b) in set(mod_edges) | set(mod_res_edges):
         mod_fan_out[a] += 1
         mod_fan_in[b] += 1
 
@@ -498,13 +548,21 @@ def main() -> int:
             "meta": (f"{m or '(repo root)'} · {mod_files.get(m,0)} files"
                      + (f" · in dependency cycle #{scc_of[m]+1}" if m in cyc_members else "")),
         })
-    links = [
-        {"source": a, "target": b, "weight": w,
-         "cycle": bool(a in cyc_members and b in cyc_members and scc_of.get(a) == scc_of.get(b))}
-        for (a, b), w in mod_edges.items()
-    ]
-    graph = {"nodes": nodes, "links": links,
-             "legendExtra": '<span><i class="sw" style="background:transparent;border:2px solid var(--bad);box-sizing:border-box"></i>red edges = cycle</span>'}
+    links = []
+    for pair in sorted(set(mod_edges) | set(mod_res_edges)):
+        a, b = pair
+        imports, loads = mod_edges.get(pair, 0), mod_res_edges.get(pair, 0)
+        links.append({
+            "source": a, "target": b, "weight": imports + loads,
+            "imports": imports, "loads": loads,
+            "kind": "import" if not loads else ("resource" if not imports else "mixed"),
+            "cycle": bool(a in cyc_members and b in cyc_members and scc_of.get(a) == scc_of.get(b)),
+        })
+    legend = ('<span><i class="sw" style="background:transparent;border:2px solid var(--bad);'
+              'box-sizing:border-box"></i>red edges = cycle</span>')
+    if mod_res_edges:
+        legend += '<span><i class="sw" style="background:var(--text-faint)"></i>dashed edges = runtime load</span>'
+    graph = {"nodes": nodes, "links": links, "legendExtra": legend}
 
     hub_in = sorted(fan_in.items(), key=lambda kv: -kv[1])[:15]
     hub_out = sorted(fan_out.items(), key=lambda kv: -kv[1])[:15]
@@ -538,18 +596,53 @@ def main() -> int:
         for f, n in hub_out)
 
     edge_count = sum(1 for _ in ((s, t) for s, d in edges.items() for t in d))
+    res_count = sum(len(d) for d in res_edges.values())
+
+    top_assets = sorted(loaders_of.items(), key=lambda kv: (-len(kv[1]), kv[0]))[:25]
+    resource_html = ""
+    if scan.refs:
+        asset_rows = "\n".join(
+            f"<tr><td><code>{esc(a)}</code></td><td class='num'>{len(cites)}</td>"
+            f"<td>{' '.join(f'<code>{esc(c)}</code>' for c in cites[:6])}"
+            + (f" <span class='dim'>… {len(cites)-6} more</span>" if len(cites) > 6 else "")
+            + "</td></tr>"
+            for a, cites in top_assets)
+        orphan_html = ""
+        if orphans:
+            items = " ".join(f"<code>{esc(o)}</code>" for o in orphans[:30])
+            orphan_html = (
+                f"""<div class="callout warn"><b>{len(orphans)} asset{'s' if len(orphans)!=1 else ''} """
+                f"""nothing references</b> — same file type, same directories as the loaded ones, but no """
+                f"""code path names them. Either dead weight or loaded by a computed path this analysis """
+                f"""cannot see.<p style="margin-top:8px">{items}"""
+                + (f" <span class='dim'>… {len(orphans)-30} more</span>" if len(orphans) > 30 else "")
+                + "</p></div>")
+        truncation = ""
+        if scan.truncated["patterns"] or scan.truncated["files"]:
+            truncation = (f" {scan.truncated['patterns']} computed path(s) and "
+                          f"{scan.truncated['files']} file(s) hit the reporting cap.")
+        resource_html = f"""
+<h2>Runtime resources</h2>
+<p class="dim">Files loaded rather than imported — templates, prompts, schemas, embedded data — and the
+code that names them. {esc(resources.CAVEAT)}{esc(truncation)}</p>
+{orphan_html}
+<div class="tbl-wrap"><table class="sortable">
+<thead><tr><th>Asset</th><th class="num">Loaders</th><th>Loaded at</th></tr></thead>
+<tbody>{asset_rows}</tbody></table></div>
+"""
     arms = sorted({n["group"] for n in nodes if n["group"] not in ("cycle", "(other)")}
                   | {group_of(m) for m in cyc_members if m != "(other)"})
     body = f"""
 <div class="kpis">
   <div class="kpi accent"><div class="n">{len(nodes)}</div><div class="l">modules</div></div>
   <div class="kpi"><div class="n">{edge_count:,}</div><div class="l">file-level imports</div></div>
+  <div class="kpi"><div class="n">{res_count:,}</div><div class="l">runtime loads</div></div>
   <div class="kpi {'bad' if sccs else 'good'}"><div class="n">{len(sccs)}</div><div class="l">cycles</div></div>
   <div class="kpi"><div class="n">{len(arms)}</div><div class="l">top-level {'arm' if len(arms)==1 else 'arms'}</div></div>
 </div>
 {cyc_html}
-<h2>Module import graph</h2>
-<p class="dim">Node area = lines of code · arrows point from importer to imported · drag nodes, Ctrl/⌘-scroll to zoom, hover to isolate a neighborhood.</p>
+<h2>Module dependency graph</h2>
+<p class="dim">Node area = lines of code · solid arrows = imports, dashed = runtime loads (a rendered template, a prompt read off disk) · drag nodes, Ctrl/⌘-scroll to zoom, hover to isolate a neighborhood.</p>
 <div class="viz" data-render="forcegraph" style="height:620px"></div>
 <script type="application/json">{json_block(graph)}</script>
 
@@ -569,6 +662,7 @@ def main() -> int:
 <tbody>{out_rows}</tbody></table></div>
 </div>
 </div>
+{resource_html}
 """
     write_fragment(Path(args.tabs_dir), "03-dependencies.html", "Dependencies", body)
 
@@ -588,6 +682,19 @@ def main() -> int:
         "file_cycles": sorted(file_sccs, key=len, reverse=True)[:6],
         "top_fan_in_files": [{"path": f, "fan_in": n, "fan_out": fan_out.get(f, 0)} for f, n in hub_in[:10]],
         "top_fan_out_files": [{"path": f, "fan_out": n, "fan_in": fan_in.get(f, 0)} for f, n in hub_out[:10]],
+        # Runtime loads. Judgment tabs should treat a high-fan-in template or
+        # prompt the way they treat a high-fan-in module, and an orphan asset as
+        # a question to answer rather than a fact to report.
+        "resource_edges": res_count,
+        "resource_kinds": {k: sum(1 for r in scan.refs if r.kind == k)
+                           for k in sorted({r.kind for r in scan.refs})},
+        "loader_roots": scan.roots,
+        "top_referenced_assets": [{"path": a, "loaders": len(c), "loaded_by": c[:6]}
+                                  for a, c in top_assets[:10]],
+        "orphan_assets": orphans[:30],
+        "asset_nodes": {"count": len(asset_nodes), "loc": asset_loc, "paths": asset_nodes[:50]},
+        "resource_truncated": scan.truncated,
+        "resource_caveat": resources.CAVEAT,
     }
     print(json.dumps(summary, indent=2))
     return 0

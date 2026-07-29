@@ -284,6 +284,8 @@ function renderForceGraph(container,data){
     p.setAttribute('stroke-opacity',l.cycle?'0.9':'0.4');
     p.setAttribute('stroke-width',l.cycle?2:Math.min(3,0.7+Math.log2(1+(l.weight||1))*0.5));
     p.setAttribute('fill','none');
+    /* dashed = loaded at runtime (template, prompt, data), not imported */
+    if(l.kind==='resource')p.setAttribute('stroke-dasharray','5 4');
     p.setAttribute('marker-end',l.cycle?'url(#arr-cyc)':'url(#arr)');
     g.appendChild(p);edgeEls.push(p);
   });

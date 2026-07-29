@@ -96,7 +96,7 @@ def load_module():
     friends), so any cached copy is dropped first — otherwise the second
     skill's tests would silently exercise the first skill's code.
     """
-    SHARED_NAMES = ("common", "diffutil", "assemble", "extract_tabs")
+    SHARED_NAMES = ("common", "diffutil", "assemble", "extract_tabs", "resources", "llmops")
 
     def _load(scripts_dir: Path, name: str):
         for cached in SHARED_NAMES:
