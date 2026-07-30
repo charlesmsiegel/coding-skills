@@ -125,8 +125,6 @@ Django is a more likely route in than anything above.
 
 ```bash
 python -m pip install pip-audit && pip-audit -r requirements.txt
-# or, through python-simplifier:
-python ../python-simplifier/scripts/run_external_tools.py . --tools pip-audit
 ```
 
 Check the Django version against the supported-release list. A project on an

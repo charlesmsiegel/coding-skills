@@ -105,5 +105,7 @@ project is harder to reason about than either whole.
 5. **Read every generated migration.** Several of the changes above should produce
    *no* migration; if one appears, something changed that you did not intend.
 
-`python-simplifier`'s `references/typing-and-modernization.md` covers the
-Python-level half of the same job — f-strings, builtin generics, `pathlib`.
+The Python-level half of the same job — f-strings, builtin generics, `pathlib` — is
+out of scope here. If the **python-simplifier** skill is also installed, its typing
+and modernization guide covers it; if it isn't, that half is ordinary Python
+modernization and needs no Django-specific judgment.

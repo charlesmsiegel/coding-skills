@@ -88,9 +88,17 @@ purpose and are NOT synced: `assets/template.html` (each skill has its own theme
 the renderers and placeholders match, which a test pins) and
 `references/llm-tabs.md` (different tab sets).
 
-django-simplifier ships its own copy of python-simplifier's `common.py`, byte-identical
-and CI-enforced, for the same reason: a skill has to be self-contained to be installed
-on its own.
+django-simplifier ships its own copies of python-simplifier's `common.py` and
+`format_findings.py`, byte-identical and CI-enforced, for the same reason: a skill has
+to be self-contained to be installed on its own, and the reporting pipe its SKILL.md
+documents has to work with no sibling skill present.
+
+No skill may reach into another skill's directory. A release archive holds exactly one
+skill, so `../other-skill/scripts/...` is a path that exists only in this monorepo.
+Where a companion genuinely adds something (brutal-review is better with
+python-simplifier's `analyze_diff.py`), the SKILL.md tests for it and documents the
+fallback. `tests/test_standalone_install.py` enforces this by installing each skill
+alone and running what its SKILL.md documents.
 
 CI also runs a ratchet: python-simplifier's bug-class detectors must stay silent on
 every skill's own `scripts/` directory.

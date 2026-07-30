@@ -51,13 +51,17 @@ jobs:
             exit 1
           fi
 
-      # django-simplifier carries python-simplifier's common.py for the same
-      # reason: it has to be installable on its own.
-      - name: django-simplifier's common.py matches python-simplifier's
+      # django-simplifier carries common.py and format_findings.py from
+      # python-simplifier for the same reason: it has to be installable on its own,
+      # and the documented reporting pipe must work with no sibling present.
+      - name: django-simplifier's shared files match python-simplifier's
         run: |
-          cmp skills/python-simplifier/scripts/common.py \
-              skills/django-simplifier/scripts/common.py \
-            || { echo "::error::common.py has drifted between the two simplifier skills"; exit 1; }
+          set -e
+          for f in common.py format_findings.py; do
+            cmp "skills/python-simplifier/scripts/$f" \
+                "skills/django-simplifier/scripts/$f" \
+              || { echo "::error::$f has drifted between the two simplifier skills"; exit 1; }
+          done
 
       - name: Smoke tests (every detector fires on its fixture, quiet on clean code)
         run: pytest -q

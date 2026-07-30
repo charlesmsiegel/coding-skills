@@ -1,6 +1,6 @@
 ---
 name: django-simplifier
-description: Review and simplify Django code — find N+1 queries and per-row writes, model definition problems, fat views, missing object-level authorization, insecure settings, work hidden in templates, and abstractions (abstract models, managers, mixins, signals, service layers) that never earned their keep. Use when the user asks to simplify, refactor, optimize, or review Django code, or mentions models, QuerySets, the ORM, select_related/prefetch_related, views, serializers, forms, signals, middleware, admin, or Django settings. Detectors build one whole-project class graph, so "extended by nobody" and "used once" are facts rather than guesses, and they stay silent on trees that are not Django projects. For general Python analysis use python-simplifier — this skill's findings share its format and pipe into its format_findings.py.
+description: Review and simplify Django code — find N+1 queries and per-row writes, model definition problems, fat views, missing object-level authorization, insecure settings, work hidden in templates, and abstractions (abstract models, managers, mixins, signals, service layers) that never earned their keep. Use when the user asks to simplify, refactor, optimize, or review Django code, or mentions models, QuerySets, the ORM, select_related/prefetch_related, views, serializers, forms, signals, middleware, admin, or Django settings. Detectors build one whole-project class graph, so "extended by nobody" and "used once" are facts rather than guesses, and they stay silent on trees that are not Django projects. For general Python analysis use python-simplifier — this skill's findings share its format, and it bundles its own format_findings.py so it runs standalone.
 ---
 
 # Django Code Simplifier
@@ -10,9 +10,11 @@ issues a query per row reads exactly like a loop that doesn't, and a template ca
 hit the database with nothing in the Python to show for it. This skill finds those
 mechanically, then gives you the judgment to decide what to do.
 
-It is the Django-specific companion to **python-simplifier**. Run that one too —
-complexity, duplication, dead code, exception handling, and resource leaks are not
-Django questions, and this skill does not look for them.
+Its scope is Django. Complexity, duplication, dead code, exception handling, and
+resource leaks are not Django questions and this skill does not look for them — if
+the **python-simplifier** skill is installed, run it too for that half; if it is
+not, say so in the report rather than implying the code was reviewed for it. This
+skill is complete on its own for everything below.
 
 ## Deterministic detectors
 
@@ -37,13 +39,17 @@ python "$SKILL/scripts/find_template_issues.py" .         # queries and relation
 ```
 
 Every detector takes `--format text|json` and `--ignore type1,type2`, emits
-🔴/🟡/🟢 severities, and produces the same flat findings shape as
-python-simplifier — so any of them pipes straight into its reporting tools:
+🔴/🟡/🟢 severities, and produces the same flat findings shape as python-simplifier —
+so any of them pipes straight into the bundled reporter:
 
 ```bash
 python "$SKILL/scripts/analyze_django.py" . --format json \
-  | python ../python-simplifier/scripts/format_findings.py --format cards
+  | python "$SKILL/scripts/format_findings.py" --format cards
 ```
+
+`format_findings.py` is this skill's own copy, so the pipe works whether or not
+python-simplifier is installed. Because the two skills share one findings shape, a
+report from either can be fed to either copy.
 
 `analyze_django.py` builds the project graph **once** and shares it with all six,
 which is most of the runtime on a large project.
@@ -93,7 +99,7 @@ call, and getting it wrong in either direction is expensive — load the guide.
    | sort | uniq -c | sort -rn | head -30`.
 5. **Pin behavior before refactoring.** Django code is heavily coupled to the
    database; a test that exercises the real query is the only safety net that
-   counts. See python-simplifier's `references/safety-net-and-testing.md`.
+   counts. See `references/django-safety-net.md`.
 6. **Ratchet.** `assertNumQueries` around the view that had the N+1 is what stops
    it coming back on the next feature.
 

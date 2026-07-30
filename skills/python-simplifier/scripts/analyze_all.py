@@ -307,7 +307,7 @@ Runs all analysis checks:
   - Security issues (eval/exec, shell=True, unsafe yaml/pickle, secrets)
   - Import cycles & god modules (circular imports, wildcard imports)
   - Debug leftovers (pdb/breakpoint/stray prints)
-  - Outdated idioms (%/format, old typing, os.path, super(args))
+  - Outdated idioms (%%/format, old typing, os.path, super(args))
   - Missing docstrings (public API surface)
   - Type-annotation gaps (missing annotations, Any, broad type:ignore)
   - Dependency hygiene (missing/unused/unpinned deps)
