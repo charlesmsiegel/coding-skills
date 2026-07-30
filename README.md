@@ -55,6 +55,7 @@ skills/<skill-name>/     one directory per skill — exactly what ships
 tests/<skill_name>/      that skill's tests (underscored, so it's importable)
 tests/conftest.py        shared fixtures: throwaway git repos, script runners
 evals/<skill-name>/      judgment-half eval prompts (evals.json + fixtures)
+tools/validate_skills.py structural validation, run by CI and by the release job
 pyproject.toml           shared dev tooling config (pytest, ruff)
 .github/workflows/       CI (lint + tests + ratchet) and per-skill releases
 ```
@@ -74,7 +75,15 @@ subprocess, which is a miserable thing to debug.
 python -m pip install -e ".[dev]"   # pytest + ruff
 python -m pytest                    # all skills' tests
 python -m ruff check .
+python tools/validate_skills.py     # frontmatter, naming, description limit, evals pairing
 ```
+
+`tools/validate_skills.py` is the single definition of a structurally valid skill:
+CI runs it over all nine on every pull request, and the release job runs it on the
+one skill it is about to package. It is stdlib-only, like the detectors, so it runs
+wherever the skills do. Its own rules are tested against deliberately-invalid skills
+in `tests/test_validate_skills.py` — a validator that cannot fail reads as coverage
+without being any.
 
 code-visualization and pr-visualization each carry their own copy of `common.py`,
 `extract_tabs.py`, `check_codemap_state.py`, `verify_citations.py`,
