@@ -38,22 +38,11 @@ jobs:
           echo "SKILL=$skill" >> "$GITHUB_ENV"
           echo "SKILL_DIR=skills/$skill" >> "$GITHUB_ENV"
 
-      # Mirror the upload contract enforced by the Skills API / claude.ai:
-      # one SKILL.md with name + description frontmatter, description <= 1024 chars.
+      # The upload contract enforced by the Skills API / claude.ai. Same script CI
+      # runs on every pull request, so the two cannot drift apart — this used to be
+      # an inline copy that only checked a subset.
       - name: Validate SKILL.md frontmatter
-        run: |
-          python - "$SKILL_DIR/SKILL.md" <<'EOF'
-          import re, sys
-          content = open(sys.argv[1]).read()
-          m = re.match(r"^---\n(.*?)\n---", content, re.DOTALL)
-          assert m, f"{sys.argv[1]} has no YAML frontmatter"
-          fm = m.group(1)
-          name = re.search(r"^name:\s*(.+)$", fm, re.MULTILINE)
-          desc = re.search(r"^description:\s*(.+)$", fm, re.MULTILINE)
-          assert name and desc, "frontmatter must contain name and description"
-          if len(desc.group(1)) > 1024:
-              sys.exit(f"description is {len(desc.group(1))} chars; the Skills API limit is 1024")
-          EOF
+        run: python tools/validate_skills.py --skill "$SKILL"
 
       # Package only the skill content (SKILL.md, LICENSE, references/, scripts/) —
       # not the repo's tests, CI config, or packaging metadata.
