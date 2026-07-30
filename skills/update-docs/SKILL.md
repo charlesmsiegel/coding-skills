@@ -9,12 +9,18 @@ Produce documentation whose claims are **true of the code as it is now**, and ke
 it that way cheaply. Every statement traces to a file that was read; nothing is
 inferred from a directory name.
 
+Let `SKILL=/path/to/this/skill` — the directory holding this SKILL.md. Commands run
+from the repository being documented, not from the skill directory. Needs **Python
+3.11+** and `git`; the churn analysis reads history, so on a shallow clone
+(`git rev-parse --is-shallow-repository` → `true`) the "directories churning with no
+coverage" finding is unreliable — fetch full history or say the check was skipped.
+
 ## First: is this a refresh or a first write?
 
 ```bash
-python scripts/check_doc_staleness.py                       # .claude/skills/documentation
-python scripts/check_doc_staleness.py --docs docs/ --repo .
-python scripts/check_doc_staleness.py --format json
+python "$SKILL/scripts/check_doc_staleness.py"                       # .claude/skills/documentation
+python "$SKILL/scripts/check_doc_staleness.py" --docs docs/ --repo .
+python "$SKILL/scripts/check_doc_staleness.py" --format json
 ```
 
 The script reports four mechanically-checkable things:
@@ -71,7 +77,7 @@ The rules that matter most:
 Re-run the staleness check against what you just wrote:
 
 ```bash
-python scripts/check_doc_staleness.py --format json
+python "$SKILL/scripts/check_doc_staleness.py" --format json
 ```
 
 `missing_path` and `citation_past_eof` must be empty. If you wrote a citation that

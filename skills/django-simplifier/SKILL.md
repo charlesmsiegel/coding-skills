@@ -16,18 +16,24 @@ Django questions, and this skill does not look for them.
 
 ## Deterministic detectors
 
-```bash
-python scripts/analyze_django.py /path/to/project          # everything, one report
-python scripts/analyze_django.py . --format json > report.json
-python scripts/analyze_django.py . --skip templates,overengineering
-python scripts/analyze_django.py . --ignore no_default_ordering
+Let `SKILL=/path/to/this/skill` — the directory holding this SKILL.md. Commands run
+from the Django project being reviewed, not from the skill directory. Needs **Python
+3.11+** and nothing else: the detectors parse source with the stdlib `ast` module and
+never import the project or start Django, so no virtualenv, settings module, or
+database is required.
 
-python scripts/find_query_issues.py .            # N+1, per-row writes, update-without-F, raw SQL
-python scripts/find_model_issues.py .            # __str__, null on text fields, on_delete, related_name, ordering
-python scripts/find_view_issues.py .             # fat views, hardcoded URLs, unnamed routes, ownership checks
-python scripts/find_django_security.py .         # DEBUG, SECRET_KEY, ALLOWED_HOSTS, mark_safe
-python scripts/find_django_overengineering.py .  # abstract models, managers, mixins, signals, services
-python scripts/find_template_issues.py .         # queries and relation walks inside templates
+```bash
+python "$SKILL/scripts/analyze_django.py" /path/to/project          # everything, one report
+python "$SKILL/scripts/analyze_django.py" . --format json > report.json
+python "$SKILL/scripts/analyze_django.py" . --skip templates,overengineering
+python "$SKILL/scripts/analyze_django.py" . --ignore no_default_ordering
+
+python "$SKILL/scripts/find_query_issues.py" .            # N+1, per-row writes, update-without-F, raw SQL
+python "$SKILL/scripts/find_model_issues.py" .            # __str__, null on text fields, on_delete, related_name, ordering
+python "$SKILL/scripts/find_view_issues.py" .             # fat views, hardcoded URLs, unnamed routes, ownership checks
+python "$SKILL/scripts/find_django_security.py" .         # DEBUG, SECRET_KEY, ALLOWED_HOSTS, mark_safe
+python "$SKILL/scripts/find_django_overengineering.py" .  # abstract models, managers, mixins, signals, services
+python "$SKILL/scripts/find_template_issues.py" .         # queries and relation walks inside templates
 ```
 
 Every detector takes `--format text|json` and `--ignore type1,type2`, emits
@@ -35,7 +41,7 @@ Every detector takes `--format text|json` and `--ignore type1,type2`, emits
 python-simplifier — so any of them pipes straight into its reporting tools:
 
 ```bash
-python scripts/analyze_django.py . --format json \
+python "$SKILL/scripts/analyze_django.py" . --format json \
   | python ../python-simplifier/scripts/format_findings.py --format cards
 ```
 

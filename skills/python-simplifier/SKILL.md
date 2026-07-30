@@ -32,6 +32,17 @@ behavior-preserving steps. The burden of proof is on complexity, not on its remo
   abstraction earns its keep, whether duplication is real, whether a pattern is the
   right one applied consistently. **Load the relevant guide** when doing that review.
 
+## Running the scripts
+
+Let `SKILL=/path/to/this/skill` — the directory holding this SKILL.md. The commands
+below run from the project being reviewed, so they need that prefix; `python
+scripts/...` would only work if you had already `cd`'d into the skill itself.
+
+Needs **Python 3.11+** and nothing else — the detectors are stdlib-only, so there is
+nothing to install. `run_external_tools.py` additionally drives ruff, mypy, black,
+isort, bandit, flake8, pip-audit, and coverage *when they are already installed*; it
+reports the ones that are missing rather than failing, and no detector depends on it.
+
 ## Workflow
 
 **Cleaning up a whole poorly-written repo from cold?** The steps below assume the
@@ -41,7 +52,7 @@ before touching anything** (`references/safety-net-and-testing.md`), normalize
 formatting in one behavior-free commit, *then* return here to triage. Refactoring
 without a net violates rule #1.
 
-1. **Run the analyzer.** `python scripts/analyze_all.py <path>` (add `--format json`
+1. **Run the analyzer.** `python "$SKILL/scripts/analyze_all.py" <path>` (add `--format json`
    for tooling). Triage deterministic findings first — don't spend judgment on what a
    tool already caught.
 2. **Find the hot files.** Effort follows *change frequency*, not line count:
@@ -52,8 +63,8 @@ without a net violates rule #1.
    High-churn × high-complexity = top priority. **Don't refactor cold code.**
 3. **Review the hot files with the judgment guides open** (see the reference index).
 4. **Produce a findings artifact.** One smell → one entry → one small PR. Turn any
-   script's JSON into a list/cards/JSON file: `python scripts/analyze_all.py .
-   --format json | python scripts/format_findings.py`. This is the deliverable — see
+   script's JSON into a list/cards/JSON file: `python "$SKILL/scripts/analyze_all.py" .
+   --format json | python "$SKILL/scripts/format_findings.py"`. This is the deliverable — see
    *Output & ticketing* below; never create tickets in a tracker without asking.
 5. **Ratchet.** When a whole class of problem is cleared, turn on the check that keeps
    it gone (a Ruff rule, a complexity gate, one of these scripts in CI).
@@ -74,60 +85,60 @@ let the user import it.
 ## Deterministic scripts
 
 ```bash
-python scripts/analyze_all.py /path           # Run everything, unified report
-python scripts/analyze_all.py . --format json > report.json
+python "$SKILL/scripts/analyze_all.py" /path           # Run everything, unified report
+python "$SKILL/scripts/analyze_all.py" . --format json > report.json
 
 # Complexity & structure
-python scripts/analyze_complexity.py .         # Cyclomatic/cognitive complexity, nesting, size
-python scripts/find_duplicates.py .            # AST-normalized duplicate blocks
-python scripts/find_coupling_issues.py .       # Feature envy, low cohesion (LCOM), message chains, middle man
+python "$SKILL/scripts/analyze_complexity.py" .         # Cyclomatic/cognitive complexity, nesting, size
+python "$SKILL/scripts/find_duplicates.py" .            # AST-normalized duplicate blocks
+python "$SKILL/scripts/find_coupling_issues.py" .       # Feature envy, low cohesion (LCOM), message chains, middle man
 
 # Smells, dead code, over-engineering
-python scripts/find_code_smells.py .           # Mutable defaults, bare excepts, magic numbers, god classes
-python scripts/find_dead_code.py .             # Unused imports/functions/params, unreachable code
-python scripts/find_overengineering.py .       # Single-impl interfaces, factories, thin wrappers (YAGNI)
-python scripts/find_design_smells.py .         # Classic-catalog smells: type-switches, refused bequest, temporary fields, intimacy
-python scripts/find_unpythonic.py .            # range(len), == True/None, manual index tracking
+python "$SKILL/scripts/find_code_smells.py" .           # Mutable defaults, bare excepts, magic numbers, god classes
+python "$SKILL/scripts/find_dead_code.py" .             # Unused imports/functions/params, unreachable code
+python "$SKILL/scripts/find_overengineering.py" .       # Single-impl interfaces, factories, thin wrappers (YAGNI)
+python "$SKILL/scripts/find_design_smells.py" .         # Classic-catalog smells: type-switches, refused bequest, temporary fields, intimacy
+python "$SKILL/scripts/find_unpythonic.py" .            # range(len), == True/None, manual index tracking
 
 # Correctness bugs (these find real bugs, not style)
-python scripts/find_mutation_hazards.py .      # Mutable class attrs, modify-during-iteration, mutated defaults
-python scripts/find_exception_issues.py .      # raise-without-from, unreachable except, BaseException, assert-validation
-python scripts/find_global_state.py .          # Mutated module globals, global-rebinding functions
-python scripts/find_resource_leaks.py .        # open()/socket/tempfile not used as a context manager (fd leaks)
-python scripts/find_security_issues.py .       # eval/exec, shell=True, unsafe yaml/pickle, weak hash, hardcoded secrets
+python "$SKILL/scripts/find_mutation_hazards.py" .      # Mutable class attrs, modify-during-iteration, mutated defaults
+python "$SKILL/scripts/find_exception_issues.py" .      # raise-without-from, unreachable except, BaseException, assert-validation
+python "$SKILL/scripts/find_global_state.py" .          # Mutated module globals, global-rebinding functions
+python "$SKILL/scripts/find_resource_leaks.py" .        # open()/socket/tempfile not used as a context manager (fd leaks)
+python "$SKILL/scripts/find_security_issues.py" .       # eval/exec, shell=True, unsafe yaml/pickle, weak hash, hardcoded secrets
 
 # Architecture & repo structure (cross-file)
-python scripts/find_import_cycles.py .         # Circular imports, god modules, wildcard imports, logic in __init__
-python scripts/find_dependency_issues.py .     # Missing/unused/unpinned third-party deps vs. the manifest
+python "$SKILL/scripts/find_import_cycles.py" .         # Circular imports, god modules, wildcard imports, logic in __init__
+python "$SKILL/scripts/find_dependency_issues.py" .     # Missing/unused/unpinned third-party deps vs. the manifest
 
 # Safety net (build this BEFORE refactoring — see references/safety-net-and-testing.md)
-python scripts/find_untested_modules.py .      # Source modules no test references; "no tests in repo" alarm
-python scripts/find_test_smells.py .           # Assertion-less/trivial tests, over-mocking, logic in tests, silent skips
+python "$SKILL/scripts/find_untested_modules.py" .      # Source modules no test references; "no tests in repo" alarm
+python "$SKILL/scripts/find_test_smells.py" .           # Assertion-less/trivial tests, over-mocking, logic in tests, silent skips
 
 # AI-generated-code tells (see references/ai-generated-code.md)
-python scripts/find_ai_scaffolding.py .        # NotImplementedError stubs, pass/... bodies, placeholder values, unused **kwargs
-python scripts/find_duplicate_definitions.py . # Same name defined twice (later silently wins); merge-conflict markers
-python scripts/find_unawaited_coroutines.py .  # async call created and discarded (silent no-op)
-python scripts/find_local_imports.py .         # Imports inside functions / not at top of file (circular-import workarounds)
-python scripts/find_redundant_comments.py .    # Comments that just narrate the next line (NOISY — opt-in everywhere: not in analyze_all, --include-redundant-comments in analyze_diff)
+python "$SKILL/scripts/find_ai_scaffolding.py" .        # NotImplementedError stubs, pass/... bodies, placeholder values, unused **kwargs
+python "$SKILL/scripts/find_duplicate_definitions.py" . # Same name defined twice (later silently wins); merge-conflict markers
+python "$SKILL/scripts/find_unawaited_coroutines.py" .  # async call created and discarded (silent no-op)
+python "$SKILL/scripts/find_local_imports.py" .         # Imports inside functions / not at top of file (circular-import workarounds)
+python "$SKILL/scripts/find_redundant_comments.py" .    # Comments that just narrate the next line (NOISY — opt-in everywhere: not in analyze_all, --include-redundant-comments in analyze_diff)
 
 # Design & simplification
-python scripts/find_pattern_issues.py .        # Design-pattern issues both ways: hand-rolled singletons/builders/iterators/memoize → Python-native form; string state machines, try/finally cleanup → the missing pattern
-python scripts/find_parameter_objects.py .     # Data clumps: parameter groups recurring across functions (whole-tree; not in the diff lens)
-python scripts/find_boolean_params.py .        # Boolean flag parameters at definitions
-python scripts/find_return_issues.py .         # Inconsistent returns, if/else-returns-bool
-python scripts/find_loop_simplifications.py .  # Loop→comprehension, += string concat, manual any()/all()
-python scripts/find_naming_issues.py .         # Shadowed builtins, non-snake_case funcs, non-PascalCase classes
-python scripts/find_comment_smells.py .        # Commented-out code, TODO/FIXME inventory
-python scripts/find_debug_leftovers.py .       # pdb.set_trace/breakpoint/ipdb, stray debug prints
-python scripts/find_outdated_idioms.py .       # %/format → f-strings, typing.List → list, os.path → pathlib, super(args)
-python scripts/find_missing_docstrings.py .    # Public modules/classes/functions with no docstring
-python scripts/find_type_gaps.py .             # Missing annotations at API boundaries, Any overuse, broad type:ignore
+python "$SKILL/scripts/find_pattern_issues.py" .        # Design-pattern issues both ways: hand-rolled singletons/builders/iterators/memoize → Python-native form; string state machines, try/finally cleanup → the missing pattern
+python "$SKILL/scripts/find_parameter_objects.py" .     # Data clumps: parameter groups recurring across functions (whole-tree; not in the diff lens)
+python "$SKILL/scripts/find_boolean_params.py" .        # Boolean flag parameters at definitions
+python "$SKILL/scripts/find_return_issues.py" .         # Inconsistent returns, if/else-returns-bool
+python "$SKILL/scripts/find_loop_simplifications.py" .  # Loop→comprehension, += string concat, manual any()/all()
+python "$SKILL/scripts/find_naming_issues.py" .         # Shadowed builtins, non-snake_case funcs, non-PascalCase classes
+python "$SKILL/scripts/find_comment_smells.py" .        # Commented-out code, TODO/FIXME inventory
+python "$SKILL/scripts/find_debug_leftovers.py" .       # pdb.set_trace/breakpoint/ipdb, stray debug prints
+python "$SKILL/scripts/find_outdated_idioms.py" .       # %/format → f-strings, typing.List → list, os.path → pathlib, super(args)
+python "$SKILL/scripts/find_missing_docstrings.py" .    # Public modules/classes/functions with no docstring
+python "$SKILL/scripts/find_type_gaps.py" .             # Missing annotations at API boundaries, Any overuse, broad type:ignore
 
 # Format findings as a portable artifact (does NOT create tickets)
-python scripts/format_findings.py report.json                       # markdown list
-<any detector> --format json | python scripts/format_findings.py --format cards
-<any detector> --format json | python scripts/format_findings.py --format json --min-severity high
+python "$SKILL/scripts/format_findings.py" report.json                       # markdown list
+<any detector> --format json | python "$SKILL/scripts/format_findings.py" --format cards
+<any detector> --format json | python "$SKILL/scripts/format_findings.py" --format json --min-severity high
 ```
 
 All detectors share one interface: `--format text|json`, `--ignore type1,type2`, and
@@ -147,11 +158,11 @@ bandit, flake8, pip-audit, coverage), runs every available one in non-mutating c
 mode, and merges the output into this skill's findings shape:
 
 ```bash
-python scripts/run_external_tools.py .                 # run all available (check only)
-python scripts/run_external_tools.py . --format json   # {tools_run, missing_tools, findings}
-python scripts/run_external_tools.py . --tools pip-audit,coverage
-python scripts/run_external_tools.py . --fix           # also run black/isort/ruff --fix (MUTATES)
-python scripts/run_external_tools.py . --run-coverage  # run the test suite first (SLOW, EXECUTES CODE)
+python "$SKILL/scripts/run_external_tools.py" .                 # run all available (check only)
+python "$SKILL/scripts/run_external_tools.py" . --format json   # {tools_run, missing_tools, findings}
+python "$SKILL/scripts/run_external_tools.py" . --tools pip-audit,coverage
+python "$SKILL/scripts/run_external_tools.py" . --fix           # also run black/isort/ruff --fix (MUTATES)
+python "$SKILL/scripts/run_external_tools.py" . --run-coverage  # run the test suite first (SLOW, EXECUTES CODE)
 ```
 
 Two of these answer questions the stdlib detectors structurally **cannot**, so reach for
@@ -181,9 +192,9 @@ For an AI-written feature or CR, review *what changed*, not the legacy around it
 default only the added/modified lines:
 
 ```bash
-python scripts/analyze_diff.py                 # working tree vs. merge-base with the default branch
-python scripts/analyze_diff.py origin/main     # vs. an explicit base ref
-python scripts/analyze_diff.py --format json | python scripts/format_findings.py
+python "$SKILL/scripts/analyze_diff.py"                 # working tree vs. merge-base with the default branch
+python "$SKILL/scripts/analyze_diff.py" origin/main     # vs. an explicit base ref
+python "$SKILL/scripts/analyze_diff.py" --format json | python "$SKILL/scripts/format_findings.py"
 ```
 
 Whole-repo detectors (import cycles, dependency hygiene, untested modules, duplicate

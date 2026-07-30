@@ -69,8 +69,8 @@ Only now is the codebase clean enough that the analyzers' output is signal, not
 noise. Run the full suite and work the deliverable artifact:
 
 ```bash
-python scripts/analyze_all.py . --format json > report.json
-python scripts/format_findings.py report.json --min-severity high
+python "$SKILL/scripts/analyze_all.py" . --format json > report.json
+python "$SKILL/scripts/format_findings.py" report.json --min-severity high
 ```
 
 Triage in this priority order — **correctness before structure before style**:

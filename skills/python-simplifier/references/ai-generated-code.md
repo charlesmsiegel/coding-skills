@@ -124,9 +124,9 @@ files (and, by default, the *added/modified lines*) of a diff, so you review the
 contribution, not the legacy around it.
 
 ```bash
-python scripts/analyze_diff.py                 # working tree vs. the merge-base
-python scripts/analyze_diff.py origin/main     # branch vs. an explicit base
-python scripts/analyze_diff.py --format json | python scripts/format_findings.py
+python "$SKILL/scripts/analyze_diff.py"                 # working tree vs. the merge-base
+python "$SKILL/scripts/analyze_diff.py" origin/main     # branch vs. an explicit base
+python "$SKILL/scripts/analyze_diff.py" --format json | python "$SKILL/scripts/format_findings.py"
 ```
 
 Architecture and whole-repo checks (`find_import_cycles`, `find_dependency_issues`,
