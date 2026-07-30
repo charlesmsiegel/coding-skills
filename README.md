@@ -64,7 +64,11 @@ and uploaded as-is.
 
 ## Development
 
-Requires **Python 3.12+** (the code-visualization scripts use PEP 701 f-strings).
+Requires **Python 3.11+**, and CI runs the suite on 3.11 and 3.12 so it stays that
+way. A skill gets installed next to whatever interpreter the user already has, so
+the scripts stay off PEP 701 f-strings (nested same-quote expressions, backslashes
+in the expression part) — those turn into a `SyntaxError` raised from inside a
+subprocess, which is a miserable thing to debug.
 
 ```bash
 python -m pip install -e ".[dev]"   # pytest + ruff

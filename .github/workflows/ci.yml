@@ -12,12 +12,18 @@ env:
 jobs:
   checks:
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # A skill runs against whatever interpreter the user already has, so the
+        # declared floor (pyproject requires-python) is tested, not just assumed.
+        python-version: ["3.11", "3.12"]
     steps:
       - uses: actions/checkout@v4
 
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.12"
+          python-version: ${{ matrix.python-version }}
 
       - name: Install dev tooling
         run: python -m pip install --quiet pytest ruff

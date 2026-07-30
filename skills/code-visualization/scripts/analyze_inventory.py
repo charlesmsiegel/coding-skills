@@ -13,6 +13,10 @@ from pathlib import Path
 from common import (CODE_LANGS, bar_cell, detect_lang, esc, is_test_path,
                     loc_and_complexity, read_text, walk_source, write_fragment)
 
+# Held as a constant rather than inlined: a double-quoted attribute inside a
+# double-quoted f-string needs a backslash, which is a SyntaxError before 3.12.
+TEST_BADGE = ' <span class="badge neutral">test</span>'
+
 
 def main() -> int:
     ap = argparse.ArgumentParser()
@@ -97,13 +101,13 @@ def main() -> int:
         for d, n in top_dirs
     )
     big_rows = "\n".join(
-        f"<tr><td><code>{esc(rel)}</code>{' <span class=\"badge neutral\">test</span>' if t else ''}</td>"
+        f"<tr><td><code>{esc(rel)}</code>{TEST_BADGE if t else ''}</td>"
         f"<td class='num'>{loc:,}</td><td>{bar_cell(loc, max_loc)}</td>"
         f"<td class='num'>{br}</td></tr>"
         for rel, lang, loc, br, dep, t in biggest
     )
     cx_rows = "\n".join(
-        f"<tr><td><code>{esc(rel)}</code>{' <span class=\"badge neutral\">test</span>' if t else ''}</td>"
+        f"<tr><td><code>{esc(rel)}</code>{TEST_BADGE if t else ''}</td>"
         f"<td class='num'>{br}</td><td>{bar_cell(br, max_br, 'warn')}</td>"
         f"<td class='num'>{loc:,}</td><td class='num'>{dep}</td></tr>"
         for rel, lang, loc, br, dep, t in most_complex
