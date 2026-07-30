@@ -152,6 +152,52 @@ def test_eval_missing_expected_output_is_rejected(skillset):
     assert any("has no expected_output" in e for e in errors)
 
 
+def test_unquoted_hash_in_a_description_is_rejected(skillset):
+    """A regression guard for a real defect: fix-issue's 640-char description was
+    truncated to 241 by any YAML parser, because "the feature in #17" contains ` #`.
+    Nearly 400 characters of trigger phrases were silently dropped on upload."""
+    md = GOOD_FRONTMATTER.replace("a sample.", 'a sample, or "implement the feature in #17".')
+    errors = errors_for(skillset(skill_md=md))
+    assert any("starts a YAML comment" in e for e in errors), errors
+    # ` #17".` — the report has to count this value's loss, not a constant.
+    assert any("6 character(s) would be dropped" in e for e in errors), errors
+
+
+def test_a_quoted_description_may_contain_a_hash(skillset):
+    md = GOOD_FRONTMATTER.replace(
+        "description: A description", "description: 'A #17 description"
+    ).replace("for a sample.", "for a sample.'")
+    assert errors_for(skillset(skill_md=md)) == []
+
+
+def test_a_description_that_is_only_a_comment_is_rejected(skillset):
+    md = GOOD_FRONTMATTER.replace(GOOD_FRONTMATTER.splitlines()[2], "description: # TODO")
+    errors = errors_for(skillset(skill_md=md))
+    assert any("parses as null" in e for e in errors)
+
+
+def test_an_unterminated_quote_is_rejected(skillset):
+    md = GOOD_FRONTMATTER.replace("description: A", "description: 'A")
+    errors = errors_for(skillset(skill_md=md))
+    assert any("unterminated" in e for e in errors)
+
+
+@pytest.mark.parametrize("payload", ["[]", "null", '"a string"'])
+def test_wrongly_shaped_eval_json_is_reported_not_raised(skillset, payload):
+    """Valid JSON of the wrong shape used to raise AttributeError, which aborted
+    the run and hid every other skill's problems behind one traceback."""
+    skill_dir, evals_root = skillset()
+    (evals_root / "sample-skill" / "evals.json").write_text(payload, encoding="utf-8")
+    errors = validate_skills.check_skill(skill_dir, evals_root)
+    assert any("expected an object" in e for e in errors)
+
+
+def test_a_non_object_eval_case_is_reported_not_raised(skillset):
+    evals = {"skill_name": "sample-skill", "evals": ["just a string"]}
+    errors = errors_for(skillset(evals=evals))
+    assert any("expected an object" in e for e in errors)
+
+
 def test_invalid_eval_json_is_reported_not_raised(skillset):
     skill_dir, evals_root = skillset()
     (evals_root / "sample-skill" / "evals.json").write_text("{not json", encoding="utf-8")
