@@ -1,6 +1,6 @@
 ---
 name: brutal-review
-description: Tear a change apart the way a hostile senior reviewer would — hunt for the input that breaks it, not for style. Use when the user wants a harsh, adversarial, or skeptical review of a diff, branch, PR, or pasted change: "brutal review", "tear this apart", "what would a hostile reviewer say", "what edge cases am I missing", "poke holes in this", "be harsh", "what's wrong with this". Language-agnostic. Every criticism must name the concrete input, sequence, or state that breaks the code — a complaint with no failing case is cut before it reaches the user. Produces a ranked findings artifact with a blocking/non-blocking verdict. For "simplify this", "clean this up", or "is this over-engineered", use python-simplifier instead; this skill calls its analyze_diff.py when the diff is Python.
+description: Tear a change apart the way a hostile senior reviewer would — hunt for the input that breaks it, not for style. Use when the user wants a harsh, adversarial, or skeptical review of a diff, branch, PR, or pasted change: "brutal review", "tear this apart", "what would a hostile reviewer say", "what edge cases am I missing", "poke holes in this", "be harsh", "what's wrong with this". Language-agnostic. Every criticism must name the concrete input, sequence, or state that breaks the code — a complaint with no failing case is cut before it reaches the user. Produces a ranked findings artifact with a blocking/non-blocking verdict. For "simplify this", "clean this up", or "is this over-engineered", use python-simplifier instead; this skill uses its analyze_diff.py for Python diffs when that skill happens to be installed, and the repo's own tools otherwise.
 ---
 
 # Brutal Review
@@ -35,6 +35,11 @@ from *how you phrase it*.
 
 ## Workflow
 
+Let `SKILL=/path/to/this/skill` — the directory holding this SKILL.md. Commands run
+from the repository under review, not from the skill directory. Needs `git`; `gh`
+only for the PR form of step 1. This skill ships no detectors of its own, so there
+is nothing to install.
+
 1. **Get the change and its context.** Default to the working diff; take an
    explicit ref, PR, or pasted snippet when given one.
 
@@ -50,15 +55,31 @@ from *how you phrase it*.
    not in the diff.
 
 2. **Run the mechanical pass first, if one applies.** Do not spend attacking
-   attention on what a tool already finds. When the diff is Python:
+   attention on what a tool already finds.
+
+   This skill ships no detectors — it uses whatever the repo or the environment
+   already provides (`ruff`, `eslint`, `go vet`, `clippy`, `mypy`, the project's
+   own `make lint`). Prefer the repo's own configured tools; they encode rules the
+   maintainers agreed to.
+
+   For a Python diff, the **python-simplifier** skill adds a diff-scoped detector
+   pass. It is optional and lives in a separate skill directory, so look before
+   invoking:
 
    ```bash
-   python ../python-simplifier/scripts/analyze_diff.py --format json
+   # sibling install (~/.claude/skills/, ~/.codex/skills/, .kiro/skills/, ...)
+   PS="$(dirname "$SKILL")/python-simplifier"
+   [ -f "$PS/scripts/analyze_diff.py" ] \
+     && python "$PS/scripts/analyze_diff.py" --format json \
+     || echo "python-simplifier not installed — using the repo's own tools only"
    ```
 
-   Triage its output, then move on. Other languages: whatever the repo already
-   runs (`ruff`, `eslint`, `go vet`, `clippy`, `mypy`). Their findings are
-   *inputs* to this review, not the review.
+   If it isn't there, do not go looking for it on the network or reimplement it:
+   run the repo's tools and continue. The mechanical pass is an accelerator, not a
+   precondition — but say which tools actually ran in *Not reviewed*, so a reader
+   can tell a clean mechanical pass from one that never happened.
+
+   Either way their findings are *inputs* to this review, not the review.
 
 3. **Attack the change**, using `references/attack-checklist.md`. Work the angles
    deliberately rather than reading top-to-bottom — reading in file order finds
