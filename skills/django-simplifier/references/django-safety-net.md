@@ -62,8 +62,15 @@ def test_other_users_order_is_404(self):
 - **Query counts shift with the fixture, not only with the code.** A test that
   creates one related object hides an N+1 that appears at two. Create at least two
   rows in any test whose purpose is to detect a per-row query.
-- **`setUpTestData` runs once per class** and its objects are reused. Mutating one
-  in a test leaks into the next; bind per-test copies with `refresh_from_db()`.
+- **`setUpTestData` objects are in-memory copies, not live rows.** Since Django 3.2
+  each attribute it assigns is handed to every test method as a `deepcopy`, so
+  mutating `self.order` does *not* leak into the next test — but it also does not
+  reach the database. A test that sets `self.order.total = 0` and then asserts
+  through a view or a fresh `Order.objects.get(...)` is comparing its local copy
+  against the untouched row. Call `save()` when the change is meant to be visible,
+  or `refresh_from_db()` when you want the row rather than the copy. (On Django
+  before 3.2 the objects really were shared across tests and mutation did leak;
+  that version is long unsupported, so do not carry the old workaround forward.)
 - **Migrations run once for the test database.** A model-field change is a schema
   change, and no test in this file protects you from it — see the migrations rule in
   SKILL.md.

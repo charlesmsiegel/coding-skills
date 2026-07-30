@@ -27,6 +27,7 @@ import re
 import ast
 import sys
 import json
+import shlex
 import tempfile
 import argparse
 import subprocess
@@ -298,8 +299,11 @@ def collect(base, all_lines, scripts=None):
                 findings.append({
                     "file": filepath, "line": 1, "smell_type": "detector_error",
                     "description": f"{script} did not complete ({error}) — its findings for this file are missing",
-                    "suggestion": f"Run `python {Path(__file__).parent / script} {filepath}` "
-                                  f"directly to see the failure.",
+                    # Quoted: a skill installed under a path with a space would
+                    # otherwise emit a command that splits into two arguments —
+                    # broken exactly when the analyzer is already incomplete.
+                    "suggestion": f"Run `python {shlex.quote(str(Path(__file__).parent / script))} "
+                                  f"{shlex.quote(filepath)}` directly to see the failure.",
                     "severity": "medium",
                 })
                 continue

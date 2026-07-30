@@ -69,15 +69,23 @@ is nothing to install.
    ```bash
    # sibling install (~/.claude/skills/, ~/.codex/skills/, .kiro/skills/, ...)
    PS="$(dirname "$SKILL")/python-simplifier"
-   [ -f "$PS/scripts/analyze_diff.py" ] \
-     && python "$PS/scripts/analyze_diff.py" --format json \
-     || echo "python-simplifier not installed — using the repo's own tools only"
+   if [ -f "$PS/scripts/analyze_diff.py" ]; then
+       python "$PS/scripts/analyze_diff.py" --format json    # non-zero here is a real failure
+   else
+       echo "python-simplifier not installed — using the repo's own tools only"
+   fi
    ```
 
-   If it isn't there, do not go looking for it on the network or reimplement it:
-   run the repo's tools and continue. The mechanical pass is an accelerator, not a
-   precondition — but say which tools actually ran in *Not reviewed*, so a reader
-   can tell a clean mechanical pass from one that never happened.
+   Test for the file in its own `if`. Chaining `&& … || …` would report "not
+   installed" when the analyzer *is* installed and exits non-zero — an unresolvable
+   base ref, a broken `git diff` — which turns an incomplete mechanical pass into
+   what looks like an absent optional component.
+
+   If it genuinely isn't there, do not go looking for it on the network or
+   reimplement it: run the repo's tools and continue. The mechanical pass is an
+   accelerator, not a precondition. But the three cases — ran clean, ran and failed,
+   never ran — must not look alike to a reader, so record which one happened in
+   *Not reviewed*.
 
    Either way their findings are *inputs* to this review, not the review.
 

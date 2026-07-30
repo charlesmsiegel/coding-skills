@@ -37,6 +37,34 @@ NAME_RE = re.compile(r"^[a-z0-9]+(-[a-z0-9]+)*$")
 FRONTMATTER_RE = re.compile(r"\A---\n(.*?)\n---\n", re.DOTALL)
 
 
+def parse_scalar(raw: str) -> tuple[str, str | None]:
+    """Read one YAML scalar the way the upload parser will. Returns (value, error).
+
+    This is the whole point of the check, so it has to agree with a real YAML
+    parser rather than with an eyeball. An unquoted ` #` opens a comment, which
+    silently truncates the value — and a description is a trigger surface, so the
+    dropped half is exactly the phrases that stop matching. Rather than quietly
+    apply the truncation, say how much would be lost and to quote the value.
+    """
+    raw = raw.strip()
+    if raw[:1] in {"'", '"'}:
+        quote = raw[0]
+        if len(raw) < 2 or not raw.endswith(quote):
+            return "", f"unterminated {quote}-quoted value"
+        inner = raw[1:-1]
+        # The only escape either style needs here: a doubled quote is a literal one.
+        return inner.replace(quote * 2, quote), None
+    if raw.startswith("#"):
+        return "", "value is a YAML comment, so the key parses as null — quote it if the text is meant literally"
+    head, sep, tail = raw.partition(" #")
+    if sep:
+        return head.rstrip(), (
+            f"unquoted ` #` starts a YAML comment: {len(raw) - len(head.rstrip())} character(s) would be "
+            f"dropped on upload, beginning {(sep + tail)[:40]!r} — wrap the value in single quotes"
+        )
+    return raw, None
+
+
 def parse_frontmatter(text: str) -> tuple[dict[str, str], list[str]]:
     """Parse the flat `key: value` frontmatter block.
 
@@ -56,6 +84,8 @@ def parse_frontmatter(text: str) -> tuple[dict[str, str], list[str]]:
         if line[0].isspace():
             errors.append(f"line {lineno}: indented line — frontmatter must be flat `key: value` scalars")
             continue
+        if line.lstrip().startswith("#"):
+            continue  # a whole-line comment, which YAML ignores
         key, sep, value = line.partition(":")
         if not sep:
             errors.append(f"line {lineno}: not a `key: value` pair: {line.strip()!r}")
@@ -63,7 +93,10 @@ def parse_frontmatter(text: str) -> tuple[dict[str, str], list[str]]:
         key = key.strip()
         if key in fields:
             errors.append(f"line {lineno}: duplicate key {key!r}")
-        fields[key] = value.strip()
+        parsed, error = parse_scalar(value)
+        if error:
+            errors.append(f"line {lineno}: {key}: {error}")
+        fields[key] = parsed
     return fields, errors
 
 
@@ -132,6 +165,12 @@ def check_evals(name: str, eval_dir: Path) -> list[str]:
     except json.JSONDecodeError as exc:
         return [f"evals/{name}/evals.json: invalid JSON ({exc})"]
 
+    # Valid JSON of the wrong shape ([] or null) would otherwise raise
+    # AttributeError below and abort the whole run, hiding every other skill's
+    # problems behind one traceback.
+    if not isinstance(data, dict):
+        return [f"evals/{name}/evals.json: top level is {type(data).__name__}, expected an object"]
+
     errors = []
     if data.get("skill_name") != name:
         errors.append(f"evals/{name}/evals.json: skill_name is {data.get('skill_name')!r}, expected {name!r}")
@@ -142,6 +181,9 @@ def check_evals(name: str, eval_dir: Path) -> list[str]:
 
     seen_ids = set()
     for index, case in enumerate(cases):
+        if not isinstance(case, dict):
+            errors.append(f"evals/{name}/evals.json: case #{index} is {type(case).__name__}, expected an object")
+            continue
         label = case.get("id") or f"#{index}"
         if not case.get("id"):
             errors.append(f"evals/{name}/evals.json: case {label} has no id")
