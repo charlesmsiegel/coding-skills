@@ -92,14 +92,18 @@ behavior exactly as editing code does — and no type checker will tell you.</p>
 
     gap_html = ""
     if scan.gaps:
-        rows = "\n".join(
-            f"<tr><td><span class='badge {GAP_LABELS.get(k, ('warn', k))[0]}'>"
-            f"{esc(GAP_LABELS.get(k, ('warn', k))[1])}</span></td>"
-            f"<td class='num'>{len(gaps)}</td>"
-            f"<td>{' '.join(f'<code>{esc(g['cite'])}</code>' for g in gaps[:8])}"
-            + (f" <span class='dim'>… {len(gaps)-8} more</span>" if len(gaps) > 8 else "")
-            + f"</td><td class='dim'>{esc(gaps[0]['detail'])}</td></tr>"
-            for k, gaps in sorted(by_kind.items(), key=lambda kv: -len(kv[1])))
+        gap_rows = []
+        for k, gaps in sorted(by_kind.items(), key=lambda kv: -len(kv[1])):
+            badge_cls, badge_text = GAP_LABELS.get(k, ("warn", k))
+            cites = " ".join(f"<code>{esc(g['cite'])}</code>" for g in gaps[:8])
+            if len(gaps) > 8:
+                cites += f" <span class='dim'>… {len(gaps) - 8} more</span>"
+            gap_rows.append(
+                f"<tr><td><span class='badge {badge_cls}'>{esc(badge_text)}</span></td>"
+                f"<td class='num'>{len(gaps)}</td>"
+                f"<td>{cites}</td>"
+                f"<td class='dim'>{esc(gaps[0]['detail'])}</td></tr>")
+        rows = "\n".join(gap_rows)
         gap_html = f"""
 <h2>Mechanical gaps</h2>
 <p class="dim">Absences a machine can see, not judgments about the prompts. Each is a question for the
