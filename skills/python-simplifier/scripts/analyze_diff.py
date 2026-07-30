@@ -298,7 +298,8 @@ def collect(base, all_lines, scripts=None):
                 findings.append({
                     "file": filepath, "line": 1, "smell_type": "detector_error",
                     "description": f"{script} did not complete ({error}) — its findings for this file are missing",
-                    "suggestion": f"Run `python scripts/{script} {filepath}` directly to see the failure.",
+                    "suggestion": f"Run `python {Path(__file__).parent / script} {filepath}` "
+                                  f"directly to see the failure.",
                     "severity": "medium",
                 })
                 continue

@@ -9,14 +9,20 @@ Turn a pile of review comments into a set of committed fixes plus a set of hones
 replies. The deliverable is both — a PR where every thread got an answer, not one
 where every thread got a code change.
 
+Let `SKILL=/path/to/this/skill` — the directory holding this SKILL.md. Commands run
+from the repository being worked on, not from the skill directory. Needs **Python
+3.11+**, `git`, and an authenticated **`gh`** with network access; `fetch_pr_feedback.py`
+queries the GraphQL API through `gh` and can do nothing without it. If `gh auth status`
+fails, say so — never reconstruct review threads from memory or from the diff.
+
 ## Collect everything first
 
 ```bash
-python scripts/fetch_pr_feedback.py            # the current branch's PR
-python scripts/fetch_pr_feedback.py 42         # a specific PR
-python scripts/fetch_pr_feedback.py 42 --repo owner/name
-python scripts/fetch_pr_feedback.py --format json   # for programmatic triage
-python scripts/fetch_pr_feedback.py --all      # include already-resolved threads
+python "$SKILL/scripts/fetch_pr_feedback.py"            # the current branch's PR
+python "$SKILL/scripts/fetch_pr_feedback.py" 42         # a specific PR
+python "$SKILL/scripts/fetch_pr_feedback.py" 42 --repo owner/name
+python "$SKILL/scripts/fetch_pr_feedback.py" --format json   # for programmatic triage
+python "$SKILL/scripts/fetch_pr_feedback.py" --all      # include already-resolved threads
 ```
 
 `gh pr view --comments` shows review bodies but **not the inline comments**, and the

@@ -9,11 +9,17 @@ From issue number to a PR someone can review. The two failure modes this guards
 against are **fixing what was reported instead of what is wrong**, and **fixing
 something that was never reproduced**.
 
+Let `SKILL=/path/to/this/skill` — the directory holding this SKILL.md. Commands run
+from the repository being worked on, not from the skill directory. Needs **Python
+3.11+**, `git`, and an authenticated **`gh`** with network access; `fetch_issue.py`
+is a `gh` wrapper and can do nothing without it. If `gh auth status` fails, say so
+rather than guessing at the issue's contents from its number.
+
 ## 1. Read the issue and what surrounds it
 
 ```bash
-python scripts/fetch_issue.py 42
-python scripts/fetch_issue.py 42 --repo owner/name --format json
+python "$SKILL/scripts/fetch_issue.py" 42
+python "$SKILL/scripts/fetch_issue.py" 42 --repo owner/name --format json
 ```
 
 Beyond the body and comments, this gives you two things `gh issue view` doesn't:
