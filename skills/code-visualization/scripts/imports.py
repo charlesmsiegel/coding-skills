@@ -21,7 +21,7 @@ from collections import defaultdict
 from pathlib import Path
 
 from common import detect_lang, read_text
-from manifests import (RustWorkspace, go_modules, nearest_dir,
+from manifests import (join_inside, RustWorkspace, go_modules, nearest_dir,
                        npm_packages)
 
 JS_EXTS = [".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".vue", ".svelte"]
@@ -292,6 +292,23 @@ def scala_packages(text):
     return ".".join(chain), blocks
 
 
+def _mask_cs(text):
+    """C# text with comments and string/char literals blanked (newlines kept).
+
+    A `// class Util ...` comment or a string containing braces would
+    otherwise register phantom declarations and corrupt the namespace
+    stack's brace tracking.
+    """
+    def blank(m):
+        return re.sub(r"[^\n]", " ", m.group(0))
+    text = re.sub(r"/\*.*?\*/", blank, text, flags=re.S)
+    text = re.sub(r'@"(?:[^"]|"")*"', blank, text)
+    text = re.sub(r'"(?:\\.|[^"\\\n])*"', blank, text)
+    text = re.sub(r"'(?:\\.|[^'\\\n])*'", blank, text)
+    text = re.sub(r"//[^\n]*", " ", text)
+    return text
+
+
 def cs_namespaces(text):
     """{namespace: type names declared inside it} for one C# file.
 
@@ -306,7 +323,7 @@ def cs_namespaces(text):
 
     def key():
         return ".".join(file_scoped + [e["name"] for e in stack])
-    for line in text.splitlines():
+    for line in _mask_cs(text).splitlines():
         m = re.match(r"\s*namespace\s+([\w.]+)\s*(;)?", line)
         if m and m.group(2):
             file_scoped.append(m.group(1))
@@ -322,6 +339,34 @@ def cs_namespaces(text):
             # Allman style puts the brace on the next line; the namespace is
             # only live once its block has actually opened, and only then can
             # a closing brace pop it.
+            e["entered"] = e["entered"] or depth > e["open"]
+        while stack and stack[-1]["entered"] and depth <= stack[-1]["open"]:
+            stack.pop()
+    return out
+
+
+def cs_usings(text):
+    """[(using spec, enclosing-namespace prefixes, outermost first)].
+
+    A using inside `namespace App { ... }` may name a sibling namespace
+    relative to App — C# tries each enclosing scope before the global one,
+    so resolution needs the prefixes, not just the bare spec.
+    """
+    out, stack, file_scoped, depth = [], [], [], 0
+    for line in _mask_cs(text).splitlines():
+        nm = re.match(r"\s*namespace\s+([\w.]+)\s*(;)?", line)
+        if nm and nm.group(2):
+            file_scoped.append(nm.group(1))
+        elif nm:
+            stack.append({"open": depth, "name": nm.group(1), "entered": False})
+        else:
+            um = CS_USING_RE.match(line)
+            if um:
+                chain = file_scoped + [e["name"] for e in stack]
+                prefixes = [".".join(chain[:n]) for n in range(len(chain), 0, -1)]
+                out.append((um.group(1), prefixes))
+        depth += line.count("{") - line.count("}")
+        for e in stack:
             e["entered"] = e["entered"] or depth > e["open"]
         while stack and stack[-1]["entered"] and depth <= stack[-1]["open"]:
             stack.pop()
@@ -480,7 +525,7 @@ def resolve_jvm(imp, index, importer_rel=None, module_dirs=()):
         # not a declaration named `given` (a reserved word).
         star, imp = True, imp[:-len(".given")]
     if star or imp in index.pkg_files:
-        files = index.pkg_files.get(imp, set())
+        files = narrow(index.pkg_files.get(imp, set()))
         if files or not star:
             first_party = bool(files) or tuple(imp.split(".")[:2]) in index.pkg_roots
             return (set(sorted(files)[:MAX_STAR_TARGETS]), first_party)
@@ -615,8 +660,8 @@ def extract(paths, all_paths, file_set):
             for imp in jvm_import_specs(text):
                 _jvm_edge(rel, imp, jvm_idx, jvm_modules, lang, edges, stats)
         elif ext == ".cs":
-            for imp in CS_USING_RE.findall(text):
-                _jvm_edge(rel, imp, cs_idx, cs_modules, lang, edges, stats)
+            for imp, prefixes in cs_usings(text):
+                _cs_edge(rel, imp, prefixes, cs_idx, cs_modules, lang, edges, stats)
         elif ext == ".rb":
             for spec in RUBY_REQ_RE.findall(text):
                 t = resolve_relative_js(rel, spec if spec.endswith(".rb") else spec + ".rb", file_set)
@@ -662,10 +707,12 @@ def _js_edges(rel, text, file_set, by_base, npm_by_dir, npm_names, lang, edges, 
             # a scoped package's name spans two segments (@scope/utils)
             pkg_name = ("/".join(spec.split("/")[:2])
                         if spec.startswith("@") else root)
-            if pkg_name in npm_names:
-                # a sibling workspace package (declared workspace:/file: or
-                # simply present in the repo) — a local edge by name; a
-                # subpath import reaches into the package's own tree
+            if pkg_name in npm_names and pkg_name not in npm_deps:
+                # a sibling workspace package (declared workspace:/file:, or
+                # undeclared but present in the repo) — a local edge by name; a
+                # subpath import reaches into the package's own tree. A name
+                # the importer declares as a REGISTRY dependency stays
+                # external even when a same-named local package exists.
                 if spec == pkg_name:
                     t = workspace_entry(pkg_name)
                 else:
@@ -766,9 +813,11 @@ def rust_use_targets(stmt):
         for item in items:
             out.extend(rust_use_targets(item))
         return out
-    m = re.match(r"([\w:]+?)\s*(?:::)?\s*\{(.*)\}\s*$", stmt, re.S)
+    m = re.match(r"([\w:#]+?)\s*(?:::)?\s*\{(.*)\}\s*$", stmt, re.S)
     if not m:
-        m = re.match(r"[\w:]+", stmt)  # plain path; drops any trailing ` as x`
+        # plain path; drops any trailing ` as x`. '#' rides along so raw
+        # identifiers (r#type) survive; segments strip the r# when resolving.
+        m = re.match(r"[\w:#]+", stmt)
         return [m.group(0)] if m else []
     prefix, inner = m.group(1).rstrip(":"), m.group(2)
     items, cur, depth = [], "", 0
@@ -805,14 +854,16 @@ def _rust_edges(rel, text, file_set, ws, lang, edges, stats):
         am = re.match(r'\s*#\[path\s*=\s*"([^"]+)"\]', line)
         if am:
             pending_path = am.group(1)
-        dm = re.match(r"\s*(?:pub(?:\([^)]*\))?\s+)?mod\s+(\w+)\s*(;|\{)", line)
+        dm = re.match(r"\s*(?:pub(?:\([^)]*\))?\s+)?mod\s+(?:r#)?(\w+)\s*(;|\{)", line)
         if dm and dm.group(2) == ";":
             name = dm.group(1)
             scope = "/".join(e["name"] for e in mod_stack)
             if pending_path:
-                # attribute paths are relative to the declaring file's dir
-                cand = "/".join(s for s in f"{own_dir}/{pending_path}".split("/") if s)
-                t = cand if cand in file_set and cand != rel else None
+                # attribute paths are relative to the declaring file's dir;
+                # `..` segments normalize (an escape past the repo root is
+                # None, hence external)
+                cand = join_inside(own_dir, pending_path)
+                t = cand if cand and cand in file_set and cand != rel else None
             else:
                 bases = ((f"{child_dir}/{scope}",) if scope
                          else (child_dir, own_dir))
@@ -833,7 +884,7 @@ def _rust_edges(rel, text, file_set, ws, lang, edges, stats):
             mod_stack.pop()
     for stmt in RUST_USE_RE.findall(text):
         for use in rust_use_targets(stmt):
-            segs = [s for s in use.strip(":").split("::") if s]
+            segs = [s.removeprefix("r#") for s in use.strip(":").split("::") if s]
             if not segs:
                 continue
             head = segs[0]
@@ -863,3 +914,21 @@ def _jvm_edge(rel, imp, index, jvm_modules, lang, edges, stats):
     if not first_party:
         first_party = tuple(imp.split(".")[:2]) in index.pkg_roots
     stats.count(lang, imp, rel, first_party, bool(targets))
+
+
+def _cs_edge(rel, imp, prefixes, index, module_dirs, lang, edges, stats):
+    """One using, tried against each enclosing namespace scope, innermost
+    first, then the bare (global-scope) spec — the first that yields files
+    wins, mirroring C#'s outward name lookup."""
+    first_party = False
+    for cand in [f"{pref}.{imp}" for pref in prefixes] + [imp]:
+        targets, fp = resolve_jvm(cand, index, rel, module_dirs)
+        targets.discard(rel)
+        first_party = first_party or fp
+        if targets:
+            edges[rel] |= targets
+            stats.count(lang, imp, rel, True, True)
+            return
+    if not first_party:
+        first_party = tuple(imp.split(".")[:2]) in index.pkg_roots
+    stats.count(lang, imp, rel, first_party, False)

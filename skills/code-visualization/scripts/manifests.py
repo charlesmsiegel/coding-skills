@@ -41,7 +41,6 @@ class RustWorkspace:
         self._name_by_dir = {}     # crate dir -> its own package name
         self._src_by_dir = {}      # crate dir -> its default src/ root
         self._lib_src_by_dir = {}  # crate dir -> custom [lib] root, if any
-        self._ws_deps = set()      # [workspace.dependencies] names, any manifest
         self._pkg_of_lib = {}      # [lib] name -> its package name
         self._target_roots = {}    # crate dir -> [(explicit target dir, entry)]
         manifests = []
@@ -89,7 +88,6 @@ class RustWorkspace:
             self._src_by_dir[d] = f"{d}/src" if d else "src"
         for d, text in manifests:
             deps = _cargo_dep_names(text)
-            self._ws_deps |= _cargo_workspace_dep_names(text)
             self._deps[d] = deps
             renames = re.findall(
                 r'^\s*([\w-]+)\s*=\s*(\{[^}]*package\s*=\s*"[^"]+"[^}]*\})', text, re.M)
@@ -171,7 +169,10 @@ class RustWorkspace:
             probe = probe.rsplit("/", 1)[0] if "/" in probe else ""
         if name is None:
             canonical = self._pkg_of_lib.get(head, head)
-            declared = (canonical in self._deps.get(d, ()) or canonical in self._ws_deps
+            # A [workspace.dependencies] entry is only visible to members that
+            # opt in with `name.workspace = true` — and those entries land in
+            # the member's own _deps, so no global union is consulted.
+            declared = (canonical in self._deps.get(d, ())
                         or canonical == self._name_by_dir.get(d))
             if not declared:
                 return None
@@ -221,14 +222,7 @@ def _cargo_dep_names(text):
     return names
 
 
-def _cargo_workspace_dep_names(text):
-    body = _toml_section(text, r"workspace\.dependencies") or ""
-    return {m.group(1).replace("-", "_")
-            for m in re.finditer(r"^\s*([\w-]+)\s*=\s*(.+)", body, re.M)
-            if re.search(r"\bpath\s*=", m.group(2))}
-
-
-def _join_inside(base, target):
+def join_inside(base, target):
     """target resolved relative to base, or None if it escapes the repo root.
 
     A committed `replace ... => ../../dep` may point outside the analyzed
@@ -264,8 +258,9 @@ def go_modules(all_paths):
             repls = []
             for old, target in re.findall(
                     r"^\s*(?:replace\s+)?(\S+)(?:\s+\S+)?\s*=>\s*(\S+)", text, re.M):
-                if target.startswith(("./", "../", "/")) or target in (".", ".."):
-                    local = _join_inside(d, target)
+                # absolute targets point outside the scanned tree
+                if target.startswith(("./", "../")) or target in (".", ".."):
+                    local = join_inside(d, target)
                     if local is not None:
                         repls.append((old, local))
             if repls:
