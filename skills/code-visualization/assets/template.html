@@ -79,7 +79,9 @@ pre{background:var(--surface);border:1px solid var(--border);border-radius:8px;p
 .card{background:var(--surface);border:1px solid var(--border);border-radius:10px;padding:18px 20px;margin:12px 0}
 .card.hero{border-color:var(--border-strong);background:linear-gradient(180deg,var(--accent-dim),var(--surface) 60%)}
 .grid{display:grid;gap:14px;margin:12px 0}
-.grid.cols-2{grid-template-columns:repeat(auto-fit,minmax(340px,1fr))}
+/* 480px: enough for a 4-5 column table (path + two numbers + a 120px bar) at its
+   minimum widths — below that the pair stacks instead of silently clipping columns */
+.grid.cols-2{grid-template-columns:repeat(auto-fit,minmax(480px,1fr))}
 .grid.cols-3{grid-template-columns:repeat(auto-fit,minmax(240px,1fr))}
 .grid>*{min-width:0}
 .kpis{display:flex;flex-wrap:wrap;gap:12px;margin:12px 0}
@@ -110,11 +112,14 @@ thead th{
   font-size:11px;letter-spacing:.06em;text-transform:uppercase;color:var(--text-dim);
   padding:9px 14px;border-bottom:1px solid var(--border-strong);white-space:nowrap;
 }
-tbody td{padding:8px 14px;border-bottom:1px solid var(--border);vertical-align:top;overflow-wrap:break-word}
+/* anywhere (not break-word): lets a long file path shrink the column under
+   pressure, so numeric columns keep their width instead of being pushed out of
+   the clip box — the paths give way, the numbers never do */
+tbody td{padding:8px 14px;border-bottom:1px solid var(--border);vertical-align:top;overflow-wrap:anywhere}
 tbody tr:last-child td{border-bottom:none}
 tbody tr:nth-child(even){background:color-mix(in srgb,var(--surface-2) 45%,transparent)}
 tbody tr:hover{background:var(--accent-dim)}
-td.num,th.num{text-align:right;font-variant-numeric:tabular-nums;font-family:var(--mono);font-size:12.5px}
+td.num,th.num{text-align:right;font-variant-numeric:tabular-nums;font-family:var(--mono);font-size:12.5px;white-space:nowrap}
 table.sortable thead th{cursor:pointer;user-select:none}
 table.sortable thead th::after{content:"↕";opacity:.35;margin-left:6px;font-size:10px}
 table.sortable thead th.asc::after{content:"↑";opacity:1;color:var(--accent)}
