@@ -34,6 +34,8 @@ class RustWorkspace:
     """
 
     def __init__(self, all_paths):
+        self._main_dirs = {rel[: -len("/main.rs")] for rel in all_paths
+                           if rel.endswith("/main.rs")}
         self.src_of = {}       # crate name (underscored) -> [(crate dir, src root)]
         self.entry_of = {}     # src root dir -> declared entry file, if custom
         self._aliases = {}         # crate dir -> {alias: crate name}
@@ -51,12 +53,12 @@ class RustWorkspace:
             # [package] specifically: a [[bin]] table with its own name may
             # legally precede it, and its name is not the crate's.
             pkg = _toml_section(text, "package")
-            m = pkg and re.search(r'^\s*name\s*=\s*"([^"]+)"', pkg, re.M)
+            m = pkg and re.search(r"^\s*name\s*=\s*[\"']([^\"']+)[\"']", pkg, re.M)
             if not m:
                 continue
             src = f"{d}/src" if d else "src"
             lib = _toml_section(text, "lib")
-            pm = lib and re.search(r'^\s*path\s*=\s*"([^"]+)"', lib, re.M)
+            pm = lib and re.search(r"^\s*path\s*=\s*[\"']([^\"']+)[\"']", lib, re.M)
             if pm:
                 entry = f"{d}/{pm.group(1)}".lstrip("/")
                 src = entry.rsplit("/", 1)[0] if "/" in entry else ""
@@ -69,7 +71,7 @@ class RustWorkspace:
             self.src_of.setdefault(name, []).append((d, src))
             # `[lib] name = "actual_lib"` is what `use` statements spell; the
             # dependency key stays the package name, so both are recorded.
-            ln = lib and re.search(r'^\s*name\s*=\s*"([^"]+)"', lib, re.M)
+            ln = lib and re.search(r"^\s*name\s*=\s*[\"']([^\"']+)[\"']", lib, re.M)
             if ln:
                 lib_name = ln.group(1).replace("-", "_")
                 self.src_of.setdefault(lib_name, []).append((d, src))
@@ -79,7 +81,7 @@ class RustWorkspace:
             for header, body in re.findall(
                     r"^\[\[(bin|test|example|bench)\]\]\s*\n((?:(?!^\[)[^\n]*\n?)*)",
                     text, re.M):
-                tp = re.search(r'^\s*path\s*=\s*"([^"]+)"', body, re.M)
+                tp = re.search(r"^\s*path\s*=\s*[\"']([^\"']+)[\"']", body, re.M)
                 if tp:
                     tentry = f"{d}/{tp.group(1)}".lstrip("/")
                     troot = tentry.rsplit("/", 1)[0] if "/" in tentry else ""
@@ -90,13 +92,13 @@ class RustWorkspace:
             deps = _cargo_dep_names(text)
             self._deps[d] = deps
             renames = re.findall(
-                r'^\s*([\w-]+)\s*=\s*(\{[^}]*package\s*=\s*"[^"]+"[^}]*\})', text, re.M)
+                r"^\s*([\w-]+)\s*=\s*(\{[^}]*package\s*=\s*[\"'][^\"']+[\"'][^}]*\})", text, re.M)
             # the long form: [dependencies.foo] with package/path on own lines
             for header, body in re.findall(
                     r"^\[+([^\]]+)\]+\s*\n((?:(?!^\[)[^\n]*\n?)*)", text, re.M):
                 parts_h = header.split(".")
                 if len(parts_h) >= 2 and parts_h[-2].endswith("dependencies"):
-                    pk = re.search(r'^\s*package\s*=\s*"([^"]+)"', body, re.M)
+                    pk = re.search(r"^\s*package\s*=\s*[\"']([^\"']+)[\"']", body, re.M)
                     if pk:
                         renames.append((parts_h[-1], body))
             self._aliases[d] = {}
@@ -105,7 +107,7 @@ class RustWorkspace:
                 # not use a same-named in-repo package, so neither do we.
                 if not re.search(r"\bpath\s*=|\bworkspace\s*=\s*true", entry):
                     continue
-                target = re.search(r'package\s*=\s*"([^"]+)"', entry).group(1)
+                target = re.search(r"package\s*=\s*[\"']([^\"']+)[\"']", entry).group(1)
                 if target.replace("-", "_") in self.src_of:
                     self._aliases[d][alias.replace("-", "_")] = target.replace("-", "_")
         self._dirs = sorted(self._src_by_dir, key=len, reverse=True)
@@ -147,9 +149,14 @@ class RustWorkspace:
             tdir = f"{d}/{tail}" if d else tail
             if rel.startswith(tdir + "/"):
                 sub = rel[len(tdir) + 1:]
-                # src/bin/cli/main.rs roots at src/bin/cli; src/bin/cli.rs
-                # (and its `mod` siblings) roots at src/bin itself.
-                return f"{tdir}/{sub.split('/')[0]}" if "/" in sub else tdir
+                # src/bin/cli/main.rs roots at src/bin/cli, but only when the
+                # subdirectory is a real dir-target (holds a main.rs) —
+                # tests/common/mod.rs belongs to the tests/ crate that
+                # includes it, not to a phantom crate at tests/common.
+                cand = f"{tdir}/{sub.split('/')[0]}"
+                if "/" in sub and cand in self._main_dirs:
+                    return cand
+                return tdir
         default = self._src_by_dir.get(d, f"{d}/src" if d else "src")
         custom = self._lib_src_by_dir.get(d)
         if custom is not None and (rel.startswith(custom + "/") or
@@ -295,15 +302,38 @@ def npm_packages(all_paths):
                 continue
             d = rel[: -len("package.json")].rstrip("/")
             if isinstance(data.get("name"), str):
-                name_map[data["name"]] = (d, _npm_entry(data))
+                # candidates, not a single winner: independent trees may ship
+                # same-named packages, and the caller picks the nearest
+                name_map.setdefault(data["name"], []).append(
+                    (d, _npm_entry(data), _npm_subpath_exports(data)))
             deps = set()
             for key in ("dependencies", "devDependencies",
                         "peerDependencies", "optionalDependencies"):
-                for dep_name, val in (data.get(key) or {}).items():
+                section = data.get(key)
+                if not isinstance(section, dict):
+                    continue  # a fixture may hold anything; skip, don't crash
+                for dep_name, val in section.items():
                     if not str(val).startswith(("workspace:", "file:", "link:", "portal:")):
                         deps.add(dep_name)
             by_dir[d] = deps
     return by_dir, name_map
+
+
+def _npm_subpath_exports(data):
+    """{subpath: target} for explicit non-root exports entries
+    ('./feature': './src/actual.ts', string or conditional form)."""
+    exp = data.get("exports")
+    out = {}
+    if isinstance(exp, dict):
+        for key, val in exp.items():
+            if key in (".",) or not isinstance(key, str) or not key.startswith("./"):
+                continue
+            if isinstance(val, dict):
+                val = next((val[k] for k in ("import", "require", "default")
+                            if isinstance(val.get(k), str)), None)
+            if isinstance(val, str):
+                out[key[2:]] = val.lstrip("./")
+    return out
 
 
 def _npm_entry(data):

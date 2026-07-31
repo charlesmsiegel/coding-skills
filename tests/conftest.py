@@ -97,7 +97,7 @@ def load_module():
     skill's tests would silently exercise the first skill's code.
     """
     SHARED_NAMES = ("common", "diffutil", "assemble", "extract_tabs", "resources",
-                    "llmops", "imports")
+                    "llmops", "imports", "manifests", "jvmdecl")
 
     def _load(scripts_dir: Path, name: str):
         for cached in SHARED_NAMES:
