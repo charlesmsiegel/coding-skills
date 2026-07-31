@@ -30,7 +30,7 @@ GO_IMPORT_RE = re.compile(r'^\s*(?:[\w.]+\s+)?"([^"]+)"', re.M)
 # No trailing ';' required: Kotlin and Scala imports carry none, and the old
 # semicolon-anchored pattern silently matched zero Kotlin imports. '*' rides
 # along so star imports arrive intact ('.' and '_' are handled by the caller).
-JVM_IMPORT_RE = re.compile(r"^\s*import\s+(?:static\s+)?([\w.*]+)", re.M)
+JVM_IMPORT_RE = re.compile(r"\s*import\s+(?:static\s+)?([\w.*]+)")
 JVM_PKG_RE = re.compile(r"^\s*package\s+([\w.]+)", re.M)
 # Matches namespace-usings and aliases; 'using var x = ...' and
 # 'using (var x = ...)' fail the required trailing ';' after the dotted name.
@@ -226,15 +226,49 @@ def build_go_modules(all_paths):
 # not files, so `import pkg.helper` must find whichever file declares
 # `fun helper` — the file's name says nothing. Column 0 is what makes this
 # textual scan safe: nested declarations are indented by universal convention.
+# The optional dotted chain before the captured name skips an extension
+# receiver: `fun String.helper()` declares helper, not String.
 KT_DECL_RE = re.compile(
     r"^(?:(?:public|private|internal|protected|open|final|abstract|sealed|data|"
     r"inline|expect|actual|external|const|lateinit|tailrec|operator|infix|"
     r"suspend|enum|annotation|value)\s+)*"
-    r"(?:fun|val|var|class|interface|object|typealias)\s+(?:<[^>\n]*>\s*)?(\w+)", re.M)
+    r"(?:fun|val|var|class|interface|object|typealias)\s+(?:<[^>\n]*>\s*)?"
+    r"(?:[\w?]+(?:<[^>\n]*>)?\.)*(\w+)", re.M)
 SCALA_DECL_RE = re.compile(
     r"^(?:(?:private|protected|implicit|final|sealed|abstract|lazy|case|open|"
     r"transparent|inline)\s+)*"
     r"(?:def|val|var|class|trait|object|type|given|enum)\s+(\w+)", re.M)
+# `package object bar` puts the file's members in <enclosing pkg>.bar; the
+# plain package regex must not swallow the `object` keyword as a package name.
+SCALA_PKG_OBJ_RE = re.compile(r"^\s*package\s+object\s+(\w+)", re.M)
+# C# type names owe nothing to file stems, and C# nests inside namespace
+# blocks, so column-0 anchoring would find nothing: match declarations
+# anywhere. An inner type over-indexes harmlessly — it still names this file.
+CS_TYPE_RE = re.compile(
+    r"\b(?:class|struct|interface|enum|record)\s+(\w+)")
+
+
+def cs_namespaces(text):
+    """Every namespace this C# file declares, with block nesting composed.
+
+    `namespace A { namespace B { ... } }` declares A.B; a sibling block at the
+    same depth must not compose with it, so each block is tracked against the
+    brace depth it opened at and popped when that depth closes. A file-scoped
+    declaration (`namespace X;`) covers the rest of the file and never pops.
+    """
+    out, stack, file_scoped, depth = set(), [], [], 0
+    for line in text.splitlines():
+        m = re.match(r"\s*namespace\s+([\w.]+)\s*(;)?", line)
+        if m and m.group(2):
+            file_scoped.append(m.group(1))
+            out.add(".".join(file_scoped))
+        elif m:
+            stack.append((depth, m.group(1)))
+            out.add(".".join(file_scoped + [name for _, name in stack]))
+        depth += line.count("{") - line.count("}")
+        while stack and depth <= stack[-1][0]:
+            stack.pop()
+    return out
 
 
 class DeclIndex:
@@ -275,14 +309,20 @@ def build_decl_indexes(paths):
         stem = rel.rsplit("/", 1)[-1].rsplit(".", 1)[0]
         names = {stem}
         if ext == ".cs":
-            for pkg in CS_NS_RE.findall(text) or [""]:
+            names |= set(CS_TYPE_RE.findall(text))
+            for pkg in cs_namespaces(text) or {""}:
                 cs.add(pkg, rel, names)
             continue
         if ext == ".scala":
             # Chained package clauses compose: `package a.b` + `package c` = a.b.c
-            found = JVM_PKG_RE.findall(text)
+            found = [f for f in JVM_PKG_RE.findall(text) if f != "object"]
             pkg = ".".join(found) if found else ""
             names |= set(SCALA_DECL_RE.findall(text))
+            pobj = SCALA_PKG_OBJ_RE.search(text)
+            if pobj:
+                # The object's members live one level deeper; index the file
+                # there too, so `import foo.bar.helper` finds it.
+                jvm.add(f"{pkg}.{pobj.group(1)}".lstrip("."), rel, names)
         else:
             m = JVM_PKG_RE.search(text)
             pkg = m.group(1) if m else ""
@@ -290,6 +330,38 @@ def build_decl_indexes(paths):
                 names |= set(KT_DECL_RE.findall(text))
         jvm.add(pkg, rel, names)
     return jvm, cs
+
+
+# Scala's grouped form: `import p.{A, B => C, _}` — the brace half never
+# appears in Java or Kotlin, so matching it first is safe for all three.
+JVM_GROUP_IMPORT_RE = re.compile(r"\s*import\s+([\w.]+)\.\{([^}]*)\}")
+
+
+def jvm_import_specs(text):
+    """Expand every import statement into plain dotted specs.
+
+    A grouped line expands member by member — the naive pattern would truncate
+    `import p.{A, B}` to a package-wide `p.` and link unrelated files. Grouped
+    members may be renamed (`A => B` in Scala 2, `A as B` in Scala 3); the
+    original name is what the declaration index knows. A wildcard member
+    (`_`, `*`, `given`) falls back to the package-star form.
+    """
+    out = []
+    for line in text.splitlines():
+        g = JVM_GROUP_IMPORT_RE.match(line)
+        if g:
+            prefix, inner = g.groups()
+            for item in inner.split(","):
+                name = item.split("=>")[0].split(" as ")[0].strip()
+                if name in ("_", "*", "given") or not name:
+                    out.append(f"{prefix}.*")
+                elif re.fullmatch(r"\w+", name):
+                    out.append(f"{prefix}.{name}")
+            continue
+        m = JVM_IMPORT_RE.match(line)
+        if m:
+            out.append(m.group(1))
+    return out
 
 
 def resolve_jvm(imp, index):
@@ -328,14 +400,23 @@ def resolve_jvm(imp, index):
 def build_rust_crates(all_paths):
     """Cargo workspace map: crate name (underscored, as `use` spells it) ->
     src root, plus dir -> nearest enclosing crate src root for crate:: paths."""
-    crates, crate_dirs = {}, []
+    crates, crate_dirs, renames = {}, [], []
     for rel, p in all_paths.items():
         if rel == "Cargo.toml" or rel.endswith("/Cargo.toml"):
-            m = re.search(r'^\s*name\s*=\s*"([^"]+)"', read_text(p), re.M)
+            text = read_text(p)
+            m = re.search(r'^\s*name\s*=\s*"([^"]+)"', text, re.M)
             if m:
                 d = rel[: -len("Cargo.toml")].rstrip("/")
                 crates[m.group(1).replace("-", "_")] = f"{d}/src" if d else "src"
                 crate_dirs.append(d)
+            # A renamed dependency (`foo = { package = "bar", ... }`) makes code
+            # say `use foo::` for the crate named bar; record the alias.
+            renames += re.findall(
+                r'^\s*([\w-]+)\s*=\s*\{[^}]*package\s*=\s*"([^"]+)"', text, re.M)
+    for alias, target in renames:
+        target_src = crates.get(target.replace("-", "_"))
+        if target_src:  # only aliases of workspace crates; registry renames stay external
+            crates.setdefault(alias.replace("-", "_"), target_src)
     crate_dirs.sort(key=len, reverse=True)
 
     def own_src(rel):
@@ -429,7 +510,7 @@ def extract(paths, all_paths, file_set):
         elif ext == ".rs":
             _rust_edges(rel, text, file_set, rust_crates, rust_own_src, lang, edges, stats)
         elif ext in JVM_EXTS:
-            for imp in JVM_IMPORT_RE.findall(text):
+            for imp in jvm_import_specs(text):
                 _jvm_edge(rel, imp, jvm_idx, lang, edges, stats)
         elif ext == ".cs":
             for imp in CS_USING_RE.findall(text):
