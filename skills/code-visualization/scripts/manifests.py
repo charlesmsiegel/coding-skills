@@ -42,6 +42,8 @@ class RustWorkspace:
         self._src_by_dir = {}      # crate dir -> its default src/ root
         self._lib_src_by_dir = {}  # crate dir -> custom [lib] root, if any
         self._ws_deps = set()      # [workspace.dependencies] names, any manifest
+        self._pkg_of_lib = {}      # [lib] name -> its package name
+        self._target_roots = {}    # crate dir -> [(explicit target dir, entry)]
         manifests = []
         for rel, p in all_paths.items():
             if rel == "Cargo.toml" or rel.endswith("/Cargo.toml"):
@@ -61,19 +63,42 @@ class RustWorkspace:
                 src = entry.rsplit("/", 1)[0] if "/" in entry else ""
                 self.entry_of[src] = entry
                 self._lib_src_by_dir[d] = src
-            self.src_of[m.group(1).replace("-", "_")] = src
-            self._name_by_dir[d] = m.group(1).replace("-", "_")
+            name = m.group(1).replace("-", "_")
+            self.src_of[name] = src
+            # `[lib] name = "actual_lib"` is what `use` statements spell; the
+            # dependency key stays the package name, so both are recorded.
+            ln = lib and re.search(r'^\s*name\s*=\s*"([^"]+)"', lib, re.M)
+            if ln:
+                lib_name = ln.group(1).replace("-", "_")
+                self.src_of[lib_name] = src
+                self._pkg_of_lib[lib_name] = name
+            # Explicit target paths ([[bin]] path = "cmd/main.rs" and custom
+            # tests/examples/benches) root their own crates off src/.
+            for header, body in re.findall(
+                    r"^\[\[(bin|test|example|bench)\]\]\s*\n((?:(?!^\[)[^\n]*\n?)*)",
+                    text, re.M):
+                tp = re.search(r'^\s*path\s*=\s*"([^"]+)"', body, re.M)
+                if tp:
+                    tentry = f"{d}/{tp.group(1)}".lstrip("/")
+                    troot = tentry.rsplit("/", 1)[0] if "/" in tentry else ""
+                    self._target_roots.setdefault(d, []).append((troot, tentry))
+            self._name_by_dir[d] = name
             self._src_by_dir[d] = f"{d}/src" if d else "src"
         for d, text in manifests:
             deps = _cargo_dep_names(text)
             self._ws_deps |= _cargo_workspace_dep_names(text)
             self._deps[d] = deps
             renames = re.findall(
-                r'^\s*([\w-]+)\s*=\s*\{[^}]*package\s*=\s*"([^"]+)"', text, re.M)
-            self._aliases[d] = {
-                alias.replace("-", "_"): target.replace("-", "_")
-                for alias, target in renames
-                if target.replace("-", "_") in self.src_of}
+                r'^\s*([\w-]+)\s*=\s*(\{[^}]*package\s*=\s*"[^"]+"[^}]*\})', text, re.M)
+            self._aliases[d] = {}
+            for alias, entry in renames:
+                # A rename without a local path is a registry crate: Cargo will
+                # not use a same-named in-repo package, so neither do we.
+                if not re.search(r"\bpath\s*=|\bworkspace\s*=\s*true", entry):
+                    continue
+                target = re.search(r'package\s*=\s*"([^"]+)"', entry).group(1)
+                if target.replace("-", "_") in self.src_of:
+                    self._aliases[d][alias.replace("-", "_")] = target.replace("-", "_")
         self._dirs = sorted(self._src_by_dir, key=len, reverse=True)
 
     def _crate_dir(self, rel):
@@ -85,6 +110,8 @@ class RustWorkspace:
         children are its siblings), or the [lib]-declared entry file."""
         d = self._crate_dir(rel)
         if rel == self.entry_of.get(self._lib_src_by_dir.get(d, ""), ""):
+            return True
+        if any(rel == entry for _, entry in self._target_roots.get(d, ())):
             return True
         for tail in CARGO_TARGET_DIRS:
             tdir = f"{d}/{tail}" if d else tail
@@ -101,6 +128,9 @@ class RustWorkspace:
         own tree.
         """
         d = self._crate_dir(rel)
+        for troot, _ in self._target_roots.get(d, ()):
+            if rel == troot or rel.startswith(troot + "/") or troot == "":
+                return troot
         for tail in CARGO_TARGET_DIRS:
             tdir = f"{d}/{tail}" if d else tail
             if rel.startswith(tdir + "/"):
@@ -137,8 +167,9 @@ class RustWorkspace:
                 break
             probe = probe.rsplit("/", 1)[0] if "/" in probe else ""
         if name is None:
-            declared = (head in self._deps.get(d, ()) or head in self._ws_deps
-                        or head == self._name_by_dir.get(d))
+            canonical = self._pkg_of_lib.get(head, head)
+            declared = (canonical in self._deps.get(d, ()) or canonical in self._ws_deps
+                        or canonical == self._name_by_dir.get(d))
             if not declared:
                 return None
             name = head
@@ -219,24 +250,30 @@ def go_modules(all_paths):
 
 
 def npm_packages(all_paths):
-    """Each package.json's declared dependency names, keyed by its directory.
+    """(registry deps by package dir, workspace package name -> (dir, main)).
 
-    A bare import specifier matching a name here is external *for files in
-    that package* — one monorepo package's dependency list says nothing about
-    its neighbours."""
-    by_dir = {}
+    A bare import matching a *registry* dependency is external for files in
+    that package; a `workspace:`/`file:`/`link:` value names a sibling
+    workspace package — a local edge, resolved via the name map. One monorepo
+    package's dependency list says nothing about its neighbours."""
+    by_dir, name_map = {}, {}
     for rel, p in all_paths.items():
         if rel == "package.json" or rel.endswith("/package.json"):
             try:
                 data = json.loads(read_text(p))
             except ValueError:
                 continue
+            d = rel[: -len("package.json")].rstrip("/")
+            if isinstance(data.get("name"), str):
+                name_map[data["name"]] = (d, data.get("main") or "")
             deps = set()
             for key in ("dependencies", "devDependencies",
                         "peerDependencies", "optionalDependencies"):
-                deps.update(data.get(key) or {})
-            by_dir[rel[: -len("package.json")].rstrip("/")] = deps
-    return by_dir
+                for dep_name, val in (data.get(key) or {}).items():
+                    if not str(val).startswith(("workspace:", "file:", "link:", "portal:")):
+                        deps.add(dep_name)
+            by_dir[d] = deps
+    return by_dir, name_map
 
 
 def nearest_dir(rel, dirs):

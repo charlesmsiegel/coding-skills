@@ -986,6 +986,101 @@ def test_deps_jvm_duplicate_declarations_prefer_the_importers_module(repo, tabs,
     assert "app2/src/main/java/p/Util.java" not in fan_in
 
 
+def test_deps_rust_registry_rename_does_not_alias_to_repo_crates(repo, tabs, run_script):
+    """`foo = { package = "bar", version = "1" }` names the registry crate —
+    an unrelated in-repo package called bar must not capture it."""
+    repo.write("app/Cargo.toml",
+               '[package]\nname = "app"\n\n[dependencies]\n'
+               'foo = { package = "bar", version = "1" }\n')
+    repo.write("app/src/main.rs", "use foo::info;\n\nfn main() {}\n")
+    repo.write("unrelated/bar/Cargo.toml", '[package]\nname = "bar"\n')
+    repo.write("unrelated/bar/src/lib.rs", "pub fn info() {}\n")
+
+    summary = _deps_summary(repo, tabs, run_script)
+
+    fan_in = {row["path"]: row["fan_in"] for row in summary["top_fan_in_files"]}
+    assert "unrelated/bar/src/lib.rs" not in fan_in
+
+
+def test_deps_rust_lib_target_name_differs_from_package_name(repo, tabs, run_script):
+    """`[package] name = "bar-pkg"` with `[lib] name = "actual_lib"` is
+    imported as actual_lib:: by crates that depend on bar-pkg."""
+    repo.write("bar/Cargo.toml",
+               '[package]\nname = "bar-pkg"\n\n[lib]\nname = "actual_lib"\n')
+    repo.write("bar/src/lib.rs", "pub mod tools;\n")
+    repo.write("bar/src/tools.rs", "pub fn run() {}\n")
+    repo.write("app/Cargo.toml",
+               '[package]\nname = "app"\n\n[dependencies]\n'
+               'bar-pkg = { path = "../bar" }\n')
+    repo.write("app/src/main.rs", "use actual_lib::tools::run;\n\nfn main() {}\n")
+
+    summary = _deps_summary(repo, tabs, run_script)
+
+    fan_in = {row["path"]: row["fan_in"] for row in summary["top_fan_in_files"]}
+    assert fan_in.get("bar/src/tools.rs") == 2  # lib.rs mod + app's use
+
+
+def test_deps_rust_explicit_bin_target_path_roots_its_tree(repo, tabs, run_script):
+    """`[[bin]] path = "cmd/main.rs"` roots that binary's crate:: at cmd/,
+    not at the package's src/."""
+    repo.write("Cargo.toml",
+               '[package]\nname = "app"\n\n[[bin]]\nname = "app"\npath = "cmd/main.rs"\n')
+    repo.write("cmd/main.rs", "mod other;\nuse crate::other::x;\n\nfn main() {}\n")
+    repo.write("cmd/other.rs", "pub fn x() {}\n")
+    repo.write("src/other.rs", "pub fn decoy() {}\n")
+
+    summary = _deps_summary(repo, tabs, run_script)
+
+    fan_in = {row["path"]: row["fan_in"] for row in summary["top_fan_in_files"]}
+    assert fan_in.get("cmd/other.rs") == 1
+    assert "src/other.rs" not in fan_in
+
+
+def test_deps_kotlin_stem_is_not_a_declaration(repo, tabs, run_script):
+    """File names declare nothing in Kotlin: `import p.Utility` must reach the
+    file declaring class Utility, not tie with a file merely named Utility.kt."""
+    repo.write("core/src/main/kotlin/p/Utility.kt", "package p\n\nfun helper() = 1\n")
+    repo.write("core/src/main/kotlin/p/Models.kt", "package p\n\nclass Utility\n")
+    repo.write("app/src/main/kotlin/app/Main.kt",
+               "package app\n\nimport p.Utility\n")
+
+    summary = _deps_summary(repo, tabs, run_script)
+
+    fan_in = {row["path"]: row["fan_in"] for row in summary["top_fan_in_files"]}
+    assert fan_in.get("core/src/main/kotlin/p/Models.kt") == 1
+    assert "core/src/main/kotlin/p/Utility.kt" not in fan_in
+
+
+def test_deps_csharp_duplicate_types_prefer_the_importers_project(repo, tabs, run_script):
+    """Independent .csproj projects may declare the same qualified type; a
+    using inside one project resolves to its own declaration."""
+    for proj in ("app1", "app2"):
+        repo.write(f"{proj}/{proj}.csproj", "<Project Sdk=\"Microsoft.NET.Sdk\"/>\n")
+        repo.write(f"{proj}/Util.cs", "namespace P;\n\npublic class Util {}\n")
+    repo.write("app1/Main.cs", "using static P.Util;\n\nnamespace Q;\nclass Main {}\n")
+
+    summary = _deps_summary(repo, tabs, run_script)
+
+    fan_in = {row["path"]: row["fan_in"] for row in summary["top_fan_in_files"]}
+    assert fan_in.get("app1/Util.cs") == 1
+    assert "app2/Util.cs" not in fan_in
+
+
+def test_deps_js_workspace_dependency_links_the_local_package(repo, tabs, run_script):
+    """`"utils": "workspace:*"` names a sibling workspace package — a local
+    edge, not an external dependency."""
+    repo.write("packages/utils/package.json", '{"name": "utils", "main": "src/index.ts"}\n')
+    repo.write("packages/utils/src/index.ts", "export const x = 1;\n")
+    repo.write("packages/app/package.json",
+               '{"name": "app", "dependencies": {"utils": "workspace:*"}}\n')
+    repo.write("packages/app/src/main.ts", "import { x } from 'utils';\n")
+
+    summary = _deps_summary(repo, tabs, run_script)
+
+    fan_in = {row["path"]: row["fan_in"] for row in summary["top_fan_in_files"]}
+    assert fan_in.get("packages/utils/src/index.ts") == 1
+
+
 def test_deps_python_resolution_is_counted_too(repo, tabs, run_script):
     """Python goes through the same accounting as every other language: its own
     modules count as first-party (resolved or not), stdlib/pip as external."""

@@ -369,6 +369,7 @@ def build_decl_indexes(paths):
                 cs.add(pkg, rel, decls | {stem})
             continue
         if ext == ".scala":
+            names.discard(stem)  # Scala file names declare nothing
             pkg, scala_blocks = scala_packages(text)
             names |= set(SCALA_DECL_RE.findall(text))
             # Scala 3 extension blocks: `extension (s: String)` followed by
@@ -385,11 +386,12 @@ def build_decl_indexes(paths):
                 if bpkg == pkg:
                     names |= decls  # colon-syntax body: same package, indented
                 else:
-                    jvm.add(bpkg, rel, decls | {stem})
+                    jvm.add(bpkg, rel, decls)
         else:
             m = JVM_PKG_RE.search(text)
             pkg = m.group(1) if m else ""
             if ext == ".kt":
+                names.discard(stem)  # Kotlin file names declare nothing
                 names |= set(KT_DECL_RE.findall(text))
         jvm.add(pkg, rel, names)
     return jvm, cs
@@ -574,14 +576,17 @@ def extract(paths, all_paths, file_set):
     go_mods, go_replaces = go_modules(all_paths)
     jvm_idx, cs_idx = build_decl_indexes(paths)
     rust_ws = RustWorkspace(all_paths)
-    npm_by_dir = npm_packages(all_paths)
-    # Build-module boundaries: independent Gradle/Maven modules may declare
-    # the same fully qualified symbol without sharing a classpath.
+    npm_by_dir, npm_names = npm_packages(all_paths)
+    # Build-module boundaries: independent modules may declare the same fully
+    # qualified symbol without sharing a classpath. C# projects are bounded by
+    # .csproj files; JVM modules by Gradle/Maven manifests.
     jvm_modules = {rel[: -len(name)].rstrip("/")
                    for rel in all_paths
                    for name in ("build.gradle", "build.gradle.kts", "pom.xml",
                                 "settings.gradle", "settings.gradle.kts")
                    if rel == name or rel.endswith("/" + name)}
+    cs_modules = {rel.rsplit("/", 1)[0] if "/" in rel else ""
+                  for rel in all_paths if rel.endswith(".csproj")}
     by_base = build_basename_index(file_set)
     # dir -> .go files, so Go import resolution is a lookup instead of a scan
     # over every file for every import (quadratic on large Go monorepos).
@@ -600,7 +605,7 @@ def extract(paths, all_paths, file_set):
         if ext in (".py", ".pyi"):
             edges[rel] |= python_edges(rel, text, py_idx, file_set, py_roots, stats)
         elif ext in JS_EXTS:
-            _js_edges(rel, text, file_set, by_base, npm_by_dir, lang, edges, stats)
+            _js_edges(rel, text, file_set, by_base, npm_by_dir, npm_names, lang, edges, stats)
         elif ext == ".go":
             _go_edges(rel, text, go_mods, go_replaces, go_files_by_dir, lang, edges, stats)
         elif ext == ".rs":
@@ -610,7 +615,7 @@ def extract(paths, all_paths, file_set):
                 _jvm_edge(rel, imp, jvm_idx, jvm_modules, lang, edges, stats)
         elif ext == ".cs":
             for imp in CS_USING_RE.findall(text):
-                _jvm_edge(rel, imp, cs_idx, jvm_modules, lang, edges, stats)
+                _jvm_edge(rel, imp, cs_idx, cs_modules, lang, edges, stats)
         elif ext == ".rb":
             for spec in RUBY_REQ_RE.findall(text):
                 t = resolve_relative_js(rel, spec if spec.endswith(".rb") else spec + ".rb", file_set)
@@ -620,9 +625,20 @@ def extract(paths, all_paths, file_set):
     return edges, stats
 
 
-def _js_edges(rel, text, file_set, by_base, npm_by_dir, lang, edges, stats):
+def _js_edges(rel, text, file_set, by_base, npm_by_dir, npm_names, lang, edges, stats):
     pkg_dir = nearest_dir(rel, npm_by_dir)
     npm_deps = npm_by_dir.get(pkg_dir, set()) if pkg_dir is not None else set()
+
+    def workspace_entry(name):
+        """The file a workspace package's name resolves to: its declared main,
+        else a conventional index module."""
+        if name not in npm_names:
+            return None
+        d, main = npm_names[name]
+        cands = [f"{d}/{main}".strip("/")] if main else []
+        for stem_c in ("src/index", "index", "src/main", "lib/index"):
+            cands += [f"{d}/{stem_c}{e}" for e in JS_EXTS]
+        return next((c for c in cands if c in file_set), None)
     for spec in JS_IMPORT_RE.findall(text):
         if spec.startswith("."):
             t = resolve_relative_js(rel, spec, file_set)
@@ -642,7 +658,11 @@ def _js_edges(rel, text, file_set, by_base, npm_by_dir, lang, edges, stats):
             # baseUrl-style first-party import.
             t = None
             root = spec.split("/")[0]
-            if (not spec.startswith("@") and root not in npm_deps
+            if root in npm_names and "/" not in spec:
+                # a sibling workspace package (declared workspace:/file: or
+                # simply present in the repo) — a local edge by name
+                t = workspace_entry(spec)
+            elif (not spec.startswith("@") and root not in npm_deps
                     and root not in NODE_BUILTINS):
                 t = resolve_unique_suffix(spec, by_base, JS_EXTS, scope=pkg_dir)
             if t and t != rel:
