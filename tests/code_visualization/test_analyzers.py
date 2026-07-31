@@ -369,6 +369,22 @@ def test_deps_summary_reports_per_language_resolution(repo, tabs, run_script):
     assert any("dev.rpg.gone.Missing" in s for s in res["samples"])
 
 
+def test_deps_python_resolution_is_counted_too(repo, tabs, run_script):
+    """Python goes through the same accounting as every other language: its own
+    modules count as first-party (resolved or not), stdlib/pip as external."""
+    repo.write("app/main.py", "import util\nimport missing_local\nimport os\n")
+    repo.write("app/util.py", "X = 1\n")
+    repo.write("missing_local/data.txt", "not python\n")  # dir exists, module doesn't
+
+    summary = _deps_summary(repo, tabs, run_script)
+
+    res = summary["resolution"]["Python"]
+    assert res["first_party"] >= 1
+    assert res["resolved"] >= 1          # app/util.py via the sibling rule
+    assert res["external"] == 2          # os is stdlib; missing_local holds no python
+    assert summary["import_edges"] == 1
+
+
 def test_deps_refuses_a_nonexistent_repo_dir(tmp_path, tabs, run_script):
     """A mistyped or failed-clone path must error, not emit a confident
     empty graph (edges: 0, modules: 0) for a repo that isn't there."""
