@@ -34,7 +34,7 @@ class RustWorkspace:
     """
 
     def __init__(self, all_paths):
-        self.src_of = {}       # crate name (underscored) -> src root dir
+        self.src_of = {}       # crate name (underscored) -> [(crate dir, src root)]
         self.entry_of = {}     # src root dir -> declared entry file, if custom
         self._aliases = {}         # crate dir -> {alias: crate name}
         self._deps = {}            # crate dir -> declared dependency names
@@ -64,13 +64,16 @@ class RustWorkspace:
                 self.entry_of[src] = entry
                 self._lib_src_by_dir[d] = src
             name = m.group(1).replace("-", "_")
-            self.src_of[name] = src
+            # Candidates, not a single winner: separate workspaces (or fixture
+            # trees) may each ship a crate with this name, and crate_root()
+            # picks the one nearest the importer.
+            self.src_of.setdefault(name, []).append((d, src))
             # `[lib] name = "actual_lib"` is what `use` statements spell; the
             # dependency key stays the package name, so both are recorded.
             ln = lib and re.search(r'^\s*name\s*=\s*"([^"]+)"', lib, re.M)
             if ln:
                 lib_name = ln.group(1).replace("-", "_")
-                self.src_of[lib_name] = src
+                self.src_of.setdefault(lib_name, []).append((d, src))
                 self._pkg_of_lib[lib_name] = name
             # Explicit target paths ([[bin]] path = "cmd/main.rs" and custom
             # tests/examples/benches) root their own crates off src/.
@@ -173,7 +176,20 @@ class RustWorkspace:
             if not declared:
                 return None
             name = head
-        return self.src_of.get(name)
+        cands = self.src_of.get(name)
+        if not cands:
+            return None
+
+        def shared_depth(cand_dir):
+            a = cand_dir.split("/") if cand_dir else []
+            b = d.split("/") if d else []
+            n = 0
+            while n < len(a) and n < len(b) and a[n] == b[n]:
+                n += 1
+            return n
+        # The candidate sharing the longest directory prefix with the importer
+        # is the one its path dependency actually reaches.
+        return max(cands, key=lambda c: shared_depth(c[0]))[1]
 
 
 def _toml_section(text, name):
@@ -212,12 +228,18 @@ def _cargo_workspace_dep_names(text):
             if re.search(r"\bpath\s*=", m.group(2))}
 
 
-def _norm(path):
-    parts = []
-    for seg in path.split("/"):
+def _join_inside(base, target):
+    """target resolved relative to base, or None if it escapes the repo root.
+
+    A committed `replace ... => ../../dep` may point outside the analyzed
+    tree; silently clamping it to an in-repo path would link unrelated files.
+    """
+    parts = base.split("/") if base else []
+    for seg in target.split("/"):
         if seg == "..":
-            if parts:
-                parts.pop()
+            if not parts:
+                return None
+            parts.pop()
         elif seg not in ("", "."):
             parts.append(seg)
     return "/".join(parts)
@@ -243,7 +265,9 @@ def go_modules(all_paths):
             for old, target in re.findall(
                     r"^\s*(?:replace\s+)?(\S+)(?:\s+\S+)?\s*=>\s*(\S+)", text, re.M):
                 if target.startswith(("./", "../", "/")) or target in (".", ".."):
-                    repls.append((old, _norm(f"{d}/{target}" if d else target)))
+                    local = _join_inside(d, target)
+                    if local is not None:
+                        repls.append((old, local))
             if repls:
                 replaces[d] = repls
     return sorted(mods, key=lambda t: -len(t[0])), replaces
