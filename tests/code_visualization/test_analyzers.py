@@ -882,6 +882,110 @@ def test_deps_go_local_replace_translates_the_import_path(repo, tabs, run_script
     assert fan_in.get("lib/util/util.go") == 1
 
 
+def test_deps_rust_plain_module_file_keeps_nested_children(repo, tabs, run_script):
+    """src/foo.rs is an ordinary module, not a crate root: its `mod child;`
+    lives at src/foo/child.rs in the standard nested layout."""
+    repo.write("Cargo.toml", '[package]\nname = "app"\n')
+    repo.write("src/lib.rs", "mod foo;\n")
+    repo.write("src/foo.rs", "mod child;\n")
+    repo.write("src/foo/child.rs", "pub fn f() {}\n")
+
+    summary = _deps_summary(repo, tabs, run_script)
+
+    fan_in = {row["path"]: row["fan_in"] for row in summary["top_fan_in_files"]}
+    assert fan_in.get("src/foo/child.rs") == 1
+
+
+def test_deps_rust_super_reaches_a_file_layout_parent(repo, tabs, run_script):
+    """From src/foo/child.rs, `use super::Parent` lands on src/foo.rs when the
+    parent uses the file (not mod.rs) layout."""
+    repo.write("Cargo.toml", '[package]\nname = "app"\n')
+    repo.write("src/lib.rs", "mod foo;\n")
+    repo.write("src/foo.rs", "mod child;\n\npub struct Parent;\n")
+    repo.write("src/foo/child.rs", "use super::Parent;\n")
+
+    summary = _deps_summary(repo, tabs, run_script)
+
+    fan_in = {row["path"]: row["fan_in"] for row in summary["top_fan_in_files"]}
+    assert fan_in.get("src/foo.rs") == 2  # lib.rs's mod + child.rs's super
+
+
+def test_deps_rust_workspace_inherited_rename_resolves(repo, tabs, run_script):
+    """A member declaring `foo.workspace = true` inherits the workspace's
+    `foo = { package = "bar", path = "bar" }` rename."""
+    repo.write("Cargo.toml",
+               '[workspace]\nmembers = ["a", "bar"]\n\n'
+               '[workspace.dependencies]\nfoo = { package = "bar", path = "bar" }\n')
+    repo.write("a/Cargo.toml",
+               '[package]\nname = "a"\n\n[dependencies]\nfoo.workspace = true\n')
+    repo.write("a/src/lib.rs", "use foo::tools::run;\n")
+    repo.write("bar/Cargo.toml", '[package]\nname = "bar"\n')
+    repo.write("bar/src/lib.rs", "pub mod tools;\n")
+    repo.write("bar/src/tools.rs", "pub fn run() {}\n")
+
+    summary = _deps_summary(repo, tabs, run_script)
+
+    fan_in = {row["path"]: row["fan_in"] for row in summary["top_fan_in_files"]}
+    assert fan_in.get("bar/src/tools.rs") == 2  # bar's mod + a's aliased use
+
+
+def test_deps_scala3_colon_package_indexes_indented_declarations(repo, tabs, run_script):
+    """Scala 3 `package p:` scopes the indented body — its defs are importable
+    members of p even though they are not at column zero."""
+    repo.write("core/src/main/scala/p/Ext.scala",
+               "package p:\n  def helper: Int = 1\n")
+    repo.write("core/src/main/scala/p/Other.scala", "package p\n\nclass Other\n")
+    repo.write("app/src/main/scala/app/Main.scala",
+               "package app\n\nimport p.helper\n\nclass Main\n")
+
+    summary = _deps_summary(repo, tabs, run_script)
+
+    fan_in = {row["path"]: row["fan_in"] for row in summary["top_fan_in_files"]}
+    assert fan_in.get("core/src/main/scala/p/Ext.scala") == 1
+
+
+def test_deps_scala_root_qualifier_is_stripped(repo, tabs, run_script):
+    repo.write("core/src/main/scala/p/A.scala", "package p\n\nclass A\n")
+    repo.write("app/src/main/scala/app/Main.scala",
+               "package app\n\nimport _root_.p.A\n\nclass Main\n")
+
+    summary = _deps_summary(repo, tabs, run_script)
+
+    fan_in = {row["path"]: row["fan_in"] for row in summary["top_fan_in_files"]}
+    assert fan_in.get("core/src/main/scala/p/A.scala") == 1
+
+
+def test_deps_js_node_builtins_never_link_to_repo_files(repo, tabs, run_script):
+    """`import path from "path"` is the Node built-in even when a repo file
+    named path.ts exists and no package.json declares it."""
+    repo.write("src/path.ts", "export const decoy = 1;\n")
+    repo.write("src/helpers.ts", "export const x = 1;\n")
+    repo.write("src/app.ts", "import path from 'path';\nimport { x } from 'helpers';\n")
+
+    summary = _deps_summary(repo, tabs, run_script)
+
+    fan_in = {row["path"]: row["fan_in"] for row in summary["top_fan_in_files"]}
+    assert fan_in.get("src/helpers.ts") == 1
+    assert "src/path.ts" not in fan_in
+
+
+def test_deps_jvm_duplicate_declarations_prefer_the_importers_module(repo, tabs, run_script):
+    """Two Gradle modules may declare the same fully qualified class; an
+    import inside one module resolves to its own declaration, not ambiguity."""
+    for mod in ("app1", "app2"):
+        repo.write(f"{mod}/build.gradle", "plugins { id 'java' }\n")
+        repo.write(f"{mod}/src/main/java/p/Util.java",
+                   "package p;\n\npublic class Util {}\n")
+    repo.write("app1/src/main/java/q/Main.java",
+               "package q;\n\nimport p.Util;\n\nclass Main {}\n")
+
+    summary = _deps_summary(repo, tabs, run_script)
+
+    fan_in = {row["path"]: row["fan_in"] for row in summary["top_fan_in_files"]}
+    assert fan_in.get("app1/src/main/java/p/Util.java") == 1
+    assert "app2/src/main/java/p/Util.java" not in fan_in
+
+
 def test_deps_python_resolution_is_counted_too(repo, tabs, run_script):
     """Python goes through the same accounting as every other language: its own
     modules count as first-party (resolved or not), stdlib/pip as external."""

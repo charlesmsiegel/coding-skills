@@ -79,6 +79,19 @@ class RustWorkspace:
     def _crate_dir(self, rel):
         return next((d for d in self._dirs if not d or rel.startswith(d + "/")), "")
 
+    def is_target_root(self, rel):
+        """True when rel is itself a crate root by target position: a file
+        directly inside src/bin, tests/, examples/, or benches/ (its `mod`
+        children are its siblings), or the [lib]-declared entry file."""
+        d = self._crate_dir(rel)
+        if rel == self.entry_of.get(self._lib_src_by_dir.get(d, ""), ""):
+            return True
+        for tail in CARGO_TARGET_DIRS:
+            tdir = f"{d}/{tail}" if d else tail
+            if rel.startswith(tdir + "/") and "/" not in rel[len(tdir) + 1:]:
+                return True
+        return False
+
     def own_src(self, rel):
         """The crate root governing this file's crate:: — chosen per target.
 
@@ -113,7 +126,16 @@ class RustWorkspace:
         name without a dependency entry).
         """
         d = self._crate_dir(importer_rel)
-        name = self._aliases.get(d, {}).get(head)
+        # Renames bind the declaring manifest, and a member inheriting a
+        # dependency (`foo.workspace = true`) inherits the workspace root's
+        # rename with it — so enclosing manifests are consulted outward.
+        name = None
+        probe = d
+        while name is None:
+            name = self._aliases.get(probe, {}).get(head)
+            if not probe:
+                break
+            probe = probe.rsplit("/", 1)[0] if "/" in probe else ""
         if name is None:
             declared = (head in self._deps.get(d, ()) or head in self._ws_deps
                         or head == self._name_by_dir.get(d))
