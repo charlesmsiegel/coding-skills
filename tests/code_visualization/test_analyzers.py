@@ -1149,6 +1149,126 @@ def test_deps_go_replace_escaping_the_repo_is_external(repo, tabs, run_script):
     assert summary["import_edges"] == 0
 
 
+def test_deps_js_registry_dep_beats_a_same_named_local_package(repo, tabs, run_script):
+    """An importer declaring `utils: ^1.0.0` uses the registry package; an
+    unrelated in-repo package named utils must not capture the import."""
+    repo.write("libs/utils/package.json", '{"name": "utils", "main": "index.js"}\n')
+    repo.write("libs/utils/index.js", "module.exports = 1;\n")
+    repo.write("app/package.json", '{"name": "app", "dependencies": {"utils": "^1.0.0"}}\n')
+    repo.write("app/src/main.js", "const u = require('utils');\n")
+
+    summary = _deps_summary(repo, tabs, run_script)
+
+    assert summary["import_edges"] == 0
+
+
+def test_deps_rust_raw_identifier_paths_resolve(repo, tabs, run_script):
+    """`use crate::r#type::x;` names the module in type.rs — truncating at the
+    # would fall back to the crate entry and invent an edge."""
+    repo.write("Cargo.toml", '[package]\nname = "app"\n')
+    repo.write("src/lib.rs", "mod r#type;\nuse crate::r#type::Thing;\n")
+    repo.write("src/type.rs", "pub struct Thing;\n")
+
+    summary = _deps_summary(repo, tabs, run_script)
+
+    fan_in = {row["path"]: row["fan_in"] for row in summary["top_fan_in_files"]}
+    assert fan_in.get("src/type.rs") == 1
+
+
+def test_deps_go_absolute_replace_target_is_external(repo, tabs, run_script):
+    """`replace example.com/dep => /dep` points outside the scanned tree; a
+    same-named in-repo directory must not capture the import."""
+    repo.write("app/go.mod",
+               "module example.com/app\n\nreplace example.com/dep => /dep\n")
+    repo.write("app/main.go",
+               'package main\n\nimport "example.com/dep/util"\n\nfunc main() { util.Do() }\n')
+    repo.write("app/dep/util/util.go", "package util\n\nfunc Do() {}\n")
+
+    summary = _deps_summary(repo, tabs, run_script)
+
+    assert summary["import_edges"] == 0
+
+
+def test_deps_csharp_using_inside_a_namespace_sees_sibling_namespaces(
+        repo, tabs, run_script):
+    """`namespace App { using Models; }` can name App.Models — the enclosing
+    scope is part of resolution, not just the bare spec."""
+    repo.write("lib/Order.cs", "namespace App.Models;\n\npublic class Order {}\n")
+    repo.write("lib/Other.cs", "namespace App;\n\npublic class Other {}\n")
+    repo.write("app/Program.cs",
+               "namespace App {\n  using Models;\n  class P {}\n}\n")
+
+    summary = _deps_summary(repo, tabs, run_script)
+
+    fan_in = {row["path"]: row["fan_in"] for row in summary["top_fan_in_files"]}
+    assert fan_in.get("lib/Order.cs") == 1
+
+
+def test_deps_jvm_wildcard_import_narrows_to_the_importers_module(
+        repo, tabs, run_script):
+    """Two Gradle modules may declare the same package; `import p.*` links
+    only the importer's own module's files."""
+    for mod, cls in (("modA", "One"), ("modB", "Two")):
+        repo.write(f"{mod}/build.gradle", "")
+        repo.write(f"{mod}/src/main/java/p/{cls}.java",
+                   f"package p;\n\npublic class {cls} {{}}\n")
+    repo.write("modA/src/main/java/app/Main.java",
+               "package app;\n\nimport p.*;\n\nclass Main {}\n")
+
+    summary = _deps_summary(repo, tabs, run_script)
+
+    fan_in = {row["path"]: row["fan_in"] for row in summary["top_fan_in_files"]}
+    assert fan_in.get("modA/src/main/java/p/One.java") == 1
+    assert "modB/src/main/java/p/Two.java" not in fan_in
+
+
+def test_deps_rust_workspace_dep_requires_member_opt_in(repo, tabs, run_script):
+    """A [workspace.dependencies] entry is only available to members that
+    declare `name.workspace = true` — others must not see the crate."""
+    repo.write("Cargo.toml",
+               '[workspace]\nmembers = ["util", "member"]\n\n'
+               '[workspace.dependencies]\nutil = { path = "util" }\n')
+    repo.write("util/Cargo.toml", '[package]\nname = "util"\n')
+    repo.write("util/src/lib.rs", "pub mod tools;\n")
+    repo.write("util/src/tools.rs", "pub fn run() {}\n")
+    repo.write("member/Cargo.toml", '[package]\nname = "member"\n')
+    repo.write("member/src/main.rs", "use util::tools::run;\n\nfn main() {}\n")
+
+    summary = _deps_summary(repo, tabs, run_script)
+
+    fan_in = {row["path"]: row["fan_in"] for row in summary["top_fan_in_files"]}
+    assert fan_in.get("util/src/tools.rs") == 1  # only lib.rs's own mod edge
+
+
+def test_deps_csharp_comments_and_strings_do_not_declare_types(repo, tabs, run_script):
+    """`// class Util ...` and string literals are not declarations; they must
+    not make the real declaration ambiguous."""
+    repo.write("lib/Real.cs", "namespace P;\n\npublic class Util {}\n")
+    repo.write("lib/Notes.cs",
+               'namespace P;\n\n// class Util is defined elsewhere\n'
+               'public class Notes {\n  string s = "class Util {";\n}\n')
+    repo.write("app/Program.cs", "using static P.Util;\n\nnamespace App;\nclass A {}\n")
+
+    summary = _deps_summary(repo, tabs, run_script)
+
+    fan_in = {row["path"]: row["fan_in"] for row in summary["top_fan_in_files"]}
+    assert fan_in.get("lib/Real.cs") == 1
+
+
+def test_deps_rust_path_attribute_with_parent_segments_resolves(repo, tabs, run_script):
+    """`#[path = "../shared.rs"]` is relative to the declaring file; the ..
+    must normalize before lookup against the repo's normalized paths."""
+    repo.write("Cargo.toml", '[package]\nname = "app"\n')
+    repo.write("src/lib.rs", "mod sub;\n")
+    repo.write("src/sub/mod.rs", '#[path = "../shared.rs"]\nmod shared;\n')
+    repo.write("src/shared.rs", "pub fn s() {}\n")
+
+    summary = _deps_summary(repo, tabs, run_script)
+
+    fan_in = {row["path"]: row["fan_in"] for row in summary["top_fan_in_files"]}
+    assert fan_in.get("src/shared.rs") == 1
+
+
 def test_deps_python_resolution_is_counted_too(repo, tabs, run_script):
     """Python goes through the same accounting as every other language: its own
     modules count as first-party (resolved or not), stdlib/pip as external."""
