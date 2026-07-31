@@ -521,6 +521,136 @@ def test_deps_rust_renamed_path_dependency_resolves(repo, tabs, run_script):
     assert fan_in.get("bar/src/engine.rs") == 2  # lib.rs `mod` + main.rs `use`
 
 
+def test_deps_csharp_allman_namespaces_compose(repo, tabs, run_script):
+    """The brace on its own line — the dominant C# style — must not pop the
+    namespace before its block even opens."""
+    repo.write("lib/Nested.cs",
+               "namespace Acme\n{\n  namespace Billing\n  {\n    class Invoice {}\n  }\n}\n")
+    repo.write("lib/Other.cs", "namespace Acme;\n\nclass Other {}\n")
+    repo.write("app/Program.cs", "using Acme.Billing;\n\nnamespace App;\nclass P {}\n")
+
+    summary = _deps_summary(repo, tabs, run_script)
+
+    fan_in = {row["path"]: row["fan_in"] for row in summary["top_fan_in_files"]}
+    assert fan_in.get("lib/Nested.cs") == 1
+
+
+def test_deps_csharp_global_qualifier_is_accepted(repo, tabs, run_script):
+    """`using static global::Acme.Utility;` is the ambiguity-proof spelling
+    generated code favors — the global:: prefix must not hide the edge."""
+    repo.write("lib/Helpers.cs", "namespace Acme;\n\npublic class Utility {}\n")
+    repo.write("lib/Extra.cs", "namespace Acme;\n\npublic class Extra {}\n")
+    repo.write("app/Program.cs",
+               "using static global::Acme.Utility;\n\nnamespace App;\nclass P {}\n")
+
+    summary = _deps_summary(repo, tabs, run_script)
+
+    fan_in = {row["path"]: row["fan_in"] for row in summary["top_fan_in_files"]}
+    assert fan_in.get("lib/Helpers.cs") == 1
+
+
+def test_deps_jvm_type_qualified_wildcard_resolves_the_type(repo, tabs, run_script):
+    """`import static com.acme.Utility.*` hangs the wildcard off a declared
+    type, not a package — it must link the file declaring the type."""
+    repo.write("lib/src/main/java/com/acme/Utility.java",
+               "package com.acme;\n\npublic class Utility {}\n")
+    repo.write("lib/src/main/java/com/acme/Extra.java",
+               "package com.acme;\n\npublic class Extra {}\n")
+    repo.write("app/src/main/java/app/Main.java",
+               "package app;\n\nimport static com.acme.Utility.*;\n\nclass Main {}\n")
+
+    summary = _deps_summary(repo, tabs, run_script)
+
+    fan_in = {row["path"]: row["fan_in"] for row in summary["top_fan_in_files"]}
+    assert fan_in.get("lib/src/main/java/com/acme/Utility.java") == 1
+    assert "lib/src/main/java/com/acme/Extra.java" not in fan_in
+
+
+def test_deps_scala_comma_separated_imports_all_count(repo, tabs, run_script):
+    """`import p.A, q.B` is one statement naming two dependencies."""
+    repo.write("core/src/main/scala/p/A.scala", "package p\n\nclass A\n")
+    repo.write("core/src/main/scala/q/B.scala", "package q\n\nclass B\n")
+    repo.write("app/src/main/scala/app/Main.scala",
+               "package app\n\nimport p.A, q.B\n\nclass Main\n")
+
+    summary = _deps_summary(repo, tabs, run_script)
+
+    fan_in = {row["path"]: row["fan_in"] for row in summary["top_fan_in_files"]}
+    assert fan_in.get("core/src/main/scala/p/A.scala") == 1
+    assert fan_in.get("core/src/main/scala/q/B.scala") == 1
+
+
+def test_deps_scala3_extension_method_is_indexed(repo, tabs, run_script):
+    """A Scala 3 `extension (s: String)` block declares its indented defs as
+    importable members of the package."""
+    repo.write("core/src/main/scala/p/Ext.scala",
+               "package p\n\nextension (s: String)\n  def helper: Int = 1\n")
+    repo.write("core/src/main/scala/p/Other.scala", "package p\n\nclass Other\n")
+    repo.write("app/src/main/scala/app/Main.scala",
+               "package app\n\nimport p.helper\n\nclass Main\n")
+
+    summary = _deps_summary(repo, tabs, run_script)
+
+    fan_in = {row["path"]: row["fan_in"] for row in summary["top_fan_in_files"]}
+    assert fan_in.get("core/src/main/scala/p/Ext.scala") == 1
+
+
+def test_deps_rust_path_attribute_on_mod_is_honored(repo, tabs, run_script):
+    """`#[path = \"platform/unix.rs\"] mod sys;` loads the attributed file,
+    not a sys.rs that may not exist."""
+    repo.write("Cargo.toml", '[package]\nname = "app"\n')
+    repo.write("src/lib.rs", '#[path = "platform/unix.rs"]\nmod sys;\n')
+    repo.write("src/platform/unix.rs", "pub fn open() {}\n")
+
+    summary = _deps_summary(repo, tabs, run_script)
+
+    fan_in = {row["path"]: row["fan_in"] for row in summary["top_fan_in_files"]}
+    assert fan_in.get("src/platform/unix.rs") == 1
+
+
+def test_deps_rust_alias_scoping_is_per_manifest(repo, tabs, run_script):
+    """Cargo dependency aliases are local to the manifest declaring them: two
+    crates may both alias `util` to different targets."""
+    repo.write("a/Cargo.toml",
+               '[package]\nname = "a"\n\n[dependencies]\n'
+               'util = { package = "helpers-one", path = "../one" }\n')
+    repo.write("a/src/lib.rs", "use util::tools::run;\n")
+    repo.write("b/Cargo.toml",
+               '[package]\nname = "b"\n\n[dependencies]\n'
+               'util = { package = "helpers-two", path = "../two" }\n')
+    repo.write("b/src/lib.rs", "use util::tools::run;\n")
+    repo.write("one/Cargo.toml", '[package]\nname = "helpers-one"\n')
+    repo.write("one/src/lib.rs", "pub mod tools;\n")
+    repo.write("one/src/tools.rs", "pub fn run() {}\n")
+    repo.write("two/Cargo.toml", '[package]\nname = "helpers-two"\n')
+    repo.write("two/src/lib.rs", "pub mod tools;\n")
+    repo.write("two/src/tools.rs", "pub fn run() {}\n")
+
+    summary = _deps_summary(repo, tabs, run_script)
+
+    fan_in = {row["path"]: row["fan_in"] for row in summary["top_fan_in_files"]}
+    # each aliased use resolves within its own manifest: lib.rs mod + one use
+    assert fan_in.get("one/src/tools.rs") == 2
+    assert fan_in.get("two/src/tools.rs") == 2
+
+
+def test_deps_rust_custom_lib_target_path_resolves(repo, tabs, run_script):
+    """`[lib] path = "source/root.rs"` moves the crate root; crate:: and
+    cross-crate uses must search the declared tree, not a nonexistent src/."""
+    repo.write("bar/Cargo.toml",
+               '[package]\nname = "bar"\n\n[lib]\npath = "source/root.rs"\n')
+    repo.write("bar/source/root.rs", "pub mod engine;\n")
+    repo.write("bar/source/engine.rs", "pub fn start() {}\n")
+    repo.write("app/Cargo.toml",
+               '[package]\nname = "app"\n\n[dependencies]\nbar = { path = "../bar" }\n')
+    repo.write("app/src/main.rs", "use bar::engine::start;\n\nfn main() {}\n")
+
+    summary = _deps_summary(repo, tabs, run_script)
+
+    fan_in = {row["path"]: row["fan_in"] for row in summary["top_fan_in_files"]}
+    assert fan_in.get("bar/source/engine.rs") == 2  # root.rs mod + main.rs use
+
+
 def test_deps_python_resolution_is_counted_too(repo, tabs, run_script):
     """Python goes through the same accounting as every other language: its own
     modules count as first-party (resolved or not), stdlib/pip as external."""

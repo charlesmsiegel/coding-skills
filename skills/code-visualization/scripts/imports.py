@@ -27,20 +27,19 @@ JS_IMPORT_RE = re.compile(
     r"""(?:import\s+(?:[\w*{}\s,$]+\s+from\s+)?|export\s+(?:[\w*{}\s,$]+\s+from\s+)|require\s*\(\s*|import\s*\(\s*)['"]([^'"]+)['"]"""
 )
 GO_IMPORT_RE = re.compile(r'^\s*(?:[\w.]+\s+)?"([^"]+)"', re.M)
-# No trailing ';' required: Kotlin and Scala imports carry none, and the old
-# semicolon-anchored pattern silently matched zero Kotlin imports. '*' rides
-# along so star imports arrive intact ('.' and '_' are handled by the caller).
-JVM_IMPORT_RE = re.compile(r"\s*import\s+(?:static\s+)?([\w.*]+)")
 JVM_PKG_RE = re.compile(r"^\s*package\s+([\w.]+)", re.M)
 # Matches namespace-usings and aliases; 'using var x = ...' and
 # 'using (var x = ...)' fail the required trailing ';' after the dotted name.
 CS_USING_RE = re.compile(
-    r"^\s*(?:global\s+)?using\s+(?:static\s+)?(?:\w+\s*=\s*)?([\w.]+)\s*;", re.M)
+    r"^\s*(?:global\s+)?using\s+(?:static\s+)?(?:\w+\s*=\s*)?"
+    r"(?:global::)?([\w.]+)\s*;", re.M)
 CS_NS_RE = re.compile(r"^\s*namespace\s+([\w.]+)", re.M)
 # Captures the full statement (a negated class crosses newlines, so a
 # rustfmt-wrapped group still arrives whole); rust_use_targets() parses it.
 RUST_USE_RE = re.compile(r"^\s*(?:pub(?:\([^)]*\))?\s+)?use\s+([^;]+);", re.M)
-RUST_MOD_RE = re.compile(r"^\s*(?:pub(?:\([^)]*\))?\s+)?mod\s+(\w+)\s*;", re.M)
+RUST_MOD_RE = re.compile(
+    r"^\s*(?:#\[path\s*=\s*\"([^\"]+)\"\]\s*)?"
+    r"(?:pub(?:\([^)]*\))?\s+)?mod\s+(\w+)\s*;", re.M)
 RUBY_REQ_RE = re.compile(r"""require_relative\s+['"]([^'"]+)['"]""")
 
 JVM_EXTS = (".java", ".kt", ".scala")
@@ -263,10 +262,15 @@ def cs_namespaces(text):
             file_scoped.append(m.group(1))
             out.add(".".join(file_scoped))
         elif m:
-            stack.append((depth, m.group(1)))
-            out.add(".".join(file_scoped + [name for _, name in stack]))
+            stack.append({"open": depth, "name": m.group(1), "entered": False})
+            out.add(".".join(file_scoped + [e["name"] for e in stack]))
         depth += line.count("{") - line.count("}")
-        while stack and depth <= stack[-1][0]:
+        for e in stack:
+            # Allman style puts the brace on the next line; the namespace is
+            # only live once its block has actually opened, and only then can
+            # a closing brace pop it.
+            e["entered"] = e["entered"] or depth > e["open"]
+        while stack and stack[-1]["entered"] and depth <= stack[-1]["open"]:
             stack.pop()
     return out
 
@@ -318,6 +322,11 @@ def build_decl_indexes(paths):
             found = [f for f in JVM_PKG_RE.findall(text) if f != "object"]
             pkg = ".".join(found) if found else ""
             names |= set(SCALA_DECL_RE.findall(text))
+            # Scala 3 extension blocks: `extension (s: String)` followed by
+            # indented defs declares those defs as importable package members.
+            for block in re.findall(
+                    r"^extension\b[^\n]*\n((?:[ \t]+[^\n]*(?:\n|$))*)", text, re.M):
+                names |= set(re.findall(r"\bdef\s+(\w+)", block))
             pobj = SCALA_PKG_OBJ_RE.search(text)
             if pobj:
                 # The object's members live one level deeper; index the file
@@ -332,11 +341,6 @@ def build_decl_indexes(paths):
     return jvm, cs
 
 
-# Scala's grouped form: `import p.{A, B => C, _}` — the brace half never
-# appears in Java or Kotlin, so matching it first is safe for all three.
-JVM_GROUP_IMPORT_RE = re.compile(r"\s*import\s+([\w.]+)\.\{([^}]*)\}")
-
-
 def jvm_import_specs(text):
     """Expand every import statement into plain dotted specs.
 
@@ -348,19 +352,35 @@ def jvm_import_specs(text):
     """
     out = []
     for line in text.splitlines():
-        g = JVM_GROUP_IMPORT_RE.match(line)
-        if g:
-            prefix, inner = g.groups()
-            for item in inner.split(","):
-                name = item.split("=>")[0].split(" as ")[0].strip()
-                if name in ("_", "*", "given") or not name:
-                    out.append(f"{prefix}.*")
-                elif re.fullmatch(r"\w+", name):
-                    out.append(f"{prefix}.{name}")
+        m = re.match(r"\s*import\s+(?:static\s+)?(.+)", line)
+        if not m:
             continue
-        m = JVM_IMPORT_RE.match(line)
-        if m:
-            out.append(m.group(1))
+        # Scala allows several expressions per statement (`import p.A, q.B`);
+        # split on commas outside braces so grouped members stay together.
+        exprs, cur, depth = [], "", 0
+        for ch in m.group(1).rstrip().rstrip(";"):
+            if ch == "," and depth == 0:
+                exprs.append(cur)
+                cur = ""
+                continue
+            depth += (ch == "{") - (ch == "}")
+            cur += ch
+        exprs.append(cur)
+        for expr in exprs:
+            expr = expr.strip()
+            g = re.fullmatch(r"([\w.]+)\.\{([^}]*)\}", expr)
+            if g:
+                prefix, inner = g.groups()
+                for item in inner.split(","):
+                    name = item.split("=>")[0].split(" as ")[0].strip()
+                    if name in ("_", "*", "given") or not name:
+                        out.append(f"{prefix}.*")
+                    elif re.fullmatch(r"\w+", name):
+                        out.append(f"{prefix}.{name}")
+            else:
+                pm = re.match(r"[\w.*]+", expr)
+                if pm:
+                    out.append(pm.group(0))
     return out
 
 
@@ -380,8 +400,11 @@ def resolve_jvm(imp, index):
         imp = imp[:-2]
     if star or imp in index.pkg_files:
         files = index.pkg_files.get(imp, set())
-        first_party = bool(files) or tuple(imp.split(".")[:2]) in index.pkg_roots
-        return (set(sorted(files)[:MAX_STAR_TARGETS]), first_party)
+        if files or not star:
+            first_party = bool(files) or tuple(imp.split(".")[:2]) in index.pkg_roots
+            return (set(sorted(files)[:MAX_STAR_TARGETS]), first_party)
+        # `import static com.acme.Utility.*`: the wildcard hangs off a declared
+        # type, not a package — fall through and resolve the type itself.
     segs = imp.split(".")
     for i in range(len(segs) - 1, 0, -1):
         hits = index.decl_files.get((".".join(segs[:i]), segs[i]), set())
@@ -397,41 +420,65 @@ def resolve_jvm(imp, index):
     return (set(), bool(files))
 
 
-def build_rust_crates(all_paths):
-    """Cargo workspace map: crate name (underscored, as `use` spells it) ->
-    src root, plus dir -> nearest enclosing crate src root for crate:: paths."""
-    crates, crate_dirs, renames = {}, [], []
-    for rel, p in all_paths.items():
-        if rel == "Cargo.toml" or rel.endswith("/Cargo.toml"):
-            text = read_text(p)
+class RustWorkspace:
+    """Cargo workspace map: which crate a `use` head names, seen from a file.
+
+    Crate names are global to a workspace, but dependency renames
+    (`foo = { package = "bar", ... }`) are local to the manifest declaring
+    them — so alias lookup is keyed by the importing file's enclosing crate. A
+    custom lib target (`[lib] path = "source/root.rs"`) moves the crate root
+    off src/; the declared entry file doubles as the bare-reference target.
+    """
+
+    def __init__(self, all_paths):
+        self.src_of = {}       # crate name (underscored) -> src root dir
+        self.entry_of = {}     # src root dir -> declared entry file, if custom
+        self._aliases = {}     # crate dir -> {alias: crate name}
+        self._src_by_dir = {}  # crate dir -> its src root
+        manifests = []
+        for rel, p in all_paths.items():
+            if rel == "Cargo.toml" or rel.endswith("/Cargo.toml"):
+                manifests.append((rel[: -len("Cargo.toml")].rstrip("/"), read_text(p)))
+        for d, text in manifests:
             m = re.search(r'^\s*name\s*=\s*"([^"]+)"', text, re.M)
-            if m:
-                d = rel[: -len("Cargo.toml")].rstrip("/")
-                crates[m.group(1).replace("-", "_")] = f"{d}/src" if d else "src"
-                crate_dirs.append(d)
-            # A renamed dependency (`foo = { package = "bar", ... }`) makes code
-            # say `use foo::` for the crate named bar; record the alias.
-            renames += re.findall(
+            if not m:
+                continue
+            src = f"{d}/src" if d else "src"
+            lib = re.search(r"^\[lib\]\s*\n((?:(?!^\[)[^\n]*\n?)*)", text, re.M)
+            pm = lib and re.search(r'^\s*path\s*=\s*"([^"]+)"', lib.group(1), re.M)
+            if pm:
+                entry = f"{d}/{pm.group(1)}".lstrip("/")
+                src = entry.rsplit("/", 1)[0] if "/" in entry else ""
+                self.entry_of[src] = entry
+            self.src_of[m.group(1).replace("-", "_")] = src
+            self._src_by_dir[d] = src
+        for d, text in manifests:
+            renames = re.findall(
                 r'^\s*([\w-]+)\s*=\s*\{[^}]*package\s*=\s*"([^"]+)"', text, re.M)
-    for alias, target in renames:
-        target_src = crates.get(target.replace("-", "_"))
-        if target_src:  # only aliases of workspace crates; registry renames stay external
-            crates.setdefault(alias.replace("-", "_"), target_src)
-    crate_dirs.sort(key=len, reverse=True)
+            self._aliases[d] = {
+                alias.replace("-", "_"): target.replace("-", "_")
+                for alias, target in renames
+                if target.replace("-", "_") in self.src_of}
+        self._dirs = sorted(self._src_by_dir, key=len, reverse=True)
 
-    def own_src(rel):
-        for d in crate_dirs:
-            if not d or rel.startswith(d + "/"):
-                return f"{d}/src" if d else "src"
-        return "src"
+    def _crate_dir(self, rel):
+        return next((d for d in self._dirs if not d or rel.startswith(d + "/")), "")
 
-    return crates, own_src
+    def own_src(self, rel):
+        d = self._crate_dir(rel)
+        return self._src_by_dir.get(d, f"{d}/src" if d else "src")
+
+    def crate_root(self, head, importer_rel):
+        """src root the head names from this file, honoring local renames."""
+        name = self._aliases.get(self._crate_dir(importer_rel), {}).get(head, head)
+        return self.src_of.get(name)
 
 
-def resolve_rust_path(src_root, segs, file_set):
+def resolve_rust_path(src_root, segs, file_set, entry_of=None):
     """a::b::c against a crate src tree: the tail segments are items, not
     modules, so back off until a module file exists; a bare crate reference
-    lands on its lib.rs/main.rs (where the pub use re-exports live)."""
+    lands on its lib.rs/main.rs (where the pub use re-exports live), or on
+    the [lib]-declared entry file when the crate names a custom target."""
     for n in range(len(segs), 0, -1):
         base = f"{src_root}/{'/'.join(segs[:n])}"
         for cand in (f"{base}.rs", f"{base}/mod.rs"):
@@ -442,6 +489,8 @@ def resolve_rust_path(src_root, segs, file_set):
     for entry in ("lib.rs", "main.rs", "mod.rs"):
         if f"{src_root}/{entry}" in file_set:
             return f"{src_root}/{entry}"
+    if entry_of:
+        return entry_of.get(src_root)
     return None
 
 
@@ -485,7 +534,7 @@ def extract(paths, all_paths, file_set):
                 for seg in rel.rsplit(".", 1)[0].split("/")}
     go_mods = build_go_modules(all_paths)
     jvm_idx, cs_idx = build_decl_indexes(paths)
-    rust_crates, rust_own_src = build_rust_crates(all_paths)
+    rust_ws = RustWorkspace(all_paths)
     by_base = build_basename_index(file_set)
     # dir -> .go files, so Go import resolution is a lookup instead of a scan
     # over every file for every import (quadratic on large Go monorepos).
@@ -508,7 +557,7 @@ def extract(paths, all_paths, file_set):
         elif ext == ".go":
             _go_edges(rel, text, go_mods, go_files_by_dir, lang, edges, stats)
         elif ext == ".rs":
-            _rust_edges(rel, text, file_set, rust_crates, rust_own_src, lang, edges, stats)
+            _rust_edges(rel, text, file_set, rust_ws, lang, edges, stats)
         elif ext in JVM_EXTS:
             for imp in jvm_import_specs(text):
                 _jvm_edge(rel, imp, jvm_idx, lang, edges, stats)
@@ -614,21 +663,26 @@ def rust_use_targets(stmt):
     return out
 
 
-def _rust_edges(rel, text, file_set, rust_crates, rust_own_src, lang, edges, stats):
-    own = rust_own_src(rel)
+def _rust_edges(rel, text, file_set, ws, lang, edges, stats):
+    own = ws.own_src(rel)
     own_dir = str(Path(rel).parent).replace("\\", "/")
     stem = rel.rsplit("/", 1)[-1]
-    # The directory holding this module's CHILD modules: lib/main/mod.rs own
+    is_root = stem in ("lib.rs", "main.rs", "mod.rs") or rel == ws.entry_of.get(own, "")
+    # The directory holding this module's CHILD modules: crate/module roots own
     # their directory; foo.rs owns foo/. self:: resolves here, and each super::
     # pops one level from here — so one super from a/child.rs lands in a/, the
     # importer's own directory, not a level above it.
-    child_dir = own_dir if stem in ("lib.rs", "main.rs", "mod.rs") \
-        else f"{own_dir}/{stem[:-3]}"
-    for name in RUST_MOD_RE.findall(text):
-        # `mod x;` declares a child module (with the pre-2018 sibling fallback).
-        t = next((c for b in (child_dir, own_dir)
-                  for c in (f"{b}/{name}.rs", f"{b}/{name}/mod.rs")
-                  if c in file_set and c != rel), None)
+    child_dir = own_dir if is_root else f"{own_dir}/{stem[:-3]}"
+    for pm, name in RUST_MOD_RE.findall(text):
+        # `mod x;` declares a child module (with the pre-2018 sibling fallback);
+        # a #[path = "..."] attribute overrides the search entirely.
+        if pm:
+            cand = f"{own_dir}/{pm}".replace("//", "/")
+            t = cand if cand in file_set and cand != rel else None
+        else:
+            t = next((c for b in (child_dir, own_dir)
+                      for c in (f"{b}/{name}.rs", f"{b}/{name}/mod.rs")
+                      if c in file_set and c != rel), None)
         if t:
             edges[rel].add(t)
         stats.count(lang, f"mod {name}", rel, True, bool(t))
@@ -646,12 +700,12 @@ def _rust_edges(rel, text, file_set, rust_crates, rust_own_src, lang, edges, sta
                     root, segs = root.rsplit("/", 1)[0], segs[1:]
                 if segs and segs[0] == "self":
                     segs = segs[1:]
-            elif head in rust_crates:
-                root, segs = rust_crates[head], segs[1:]
+            elif ws.crate_root(head, rel) is not None:
+                root, segs = ws.crate_root(head, rel), segs[1:]
             else:
                 stats.count(lang, use, rel, False, False)
                 continue
-            t = resolve_rust_path(root, segs, file_set)
+            t = resolve_rust_path(root, segs, file_set, ws.entry_of)
             if t and t != rel:
                 edges[rel].add(t)
             stats.count(lang, use, rel, True, bool(t))
