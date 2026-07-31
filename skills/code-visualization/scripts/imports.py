@@ -16,12 +16,13 @@ surface the ratio so a sparse graph reads as under-resolution, never as
 Stdlib only; the caller supplies the file index so this module never walks a tree.
 """
 import ast
-import json
 import re
 from collections import defaultdict
 from pathlib import Path
 
 from common import detect_lang, read_text
+from manifests import (RustWorkspace, go_modules, nearest_dir,
+                       npm_packages)
 
 JS_EXTS = [".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".vue", ".svelte"]
 JS_IMPORT_RE = re.compile(
@@ -38,9 +39,6 @@ CS_NS_RE = re.compile(r"^\s*namespace\s+([\w.]+)", re.M)
 # Captures the full statement (a negated class crosses newlines, so a
 # rustfmt-wrapped group still arrives whole); rust_use_targets() parses it.
 RUST_USE_RE = re.compile(r"^\s*(?:pub(?:\([^)]*\))?\s+)?use\s+([^;]+);", re.M)
-RUST_MOD_RE = re.compile(
-    r"^\s*(?:#\[path\s*=\s*\"([^\"]+)\"\]\s*)?"
-    r"(?:pub(?:\([^)]*\))?\s+)?mod\s+(\w+)\s*;", re.M)
 RUBY_REQ_RE = re.compile(r"""require_relative\s+['"]([^'"]+)['"]""")
 
 JVM_EXTS = (".java", ".kt", ".scala")
@@ -207,21 +205,6 @@ def resolve_relative_js(rel, spec, file_set):
     return None
 
 
-def build_go_modules(all_paths):
-    """Every go.mod in the repo: [(module_path, dir)], longest module first.
-
-    Multi-module repos (and repos whose go.mod is not at the root) resolve per
-    module; the longest-prefix match sends nested modules to the right one.
-    """
-    mods = []
-    for rel, p in all_paths.items():
-        if rel == "go.mod" or rel.endswith("/go.mod"):
-            m = re.search(r"^module\s+(\S+)", read_text(p), re.M)
-            if m:
-                mods.append((m.group(1), rel[: -len("go.mod")].rstrip("/")))
-    return sorted(mods, key=lambda t: -len(t[0]))
-
-
 # Top-level (column-0) declarations: Kotlin and Scala imports name declarations,
 # not files, so `import pkg.helper` must find whichever file declares
 # `fun helper` — the file's name says nothing. Column 0 is what makes this
@@ -287,22 +270,30 @@ def scala_packages(text):
 
 
 def cs_namespaces(text):
-    """Every namespace this C# file declares, with block nesting composed.
+    """{namespace: type names declared inside it} for one C# file.
 
     `namespace A { namespace B { ... } }` declares A.B; a sibling block at the
     same depth must not compose with it, so each block is tracked against the
     brace depth it opened at and popped when that depth closes. A file-scoped
     declaration (`namespace X;`) covers the rest of the file and never pops.
+    Each type declaration is attributed to the scope containing it — a file
+    declaring A.X and B.Y does not declare A.Y.
     """
-    out, stack, file_scoped, depth = set(), [], [], 0
+    out, stack, file_scoped, depth = {}, [], [], 0
+
+    def key():
+        return ".".join(file_scoped + [e["name"] for e in stack])
     for line in text.splitlines():
         m = re.match(r"\s*namespace\s+([\w.]+)\s*(;)?", line)
         if m and m.group(2):
             file_scoped.append(m.group(1))
-            out.add(".".join(file_scoped))
+            out.setdefault(key(), set())
         elif m:
             stack.append({"open": depth, "name": m.group(1), "entered": False})
-            out.add(".".join(file_scoped + [e["name"] for e in stack]))
+            out.setdefault(key(), set())
+        else:
+            for name in CS_TYPE_RE.findall(line):
+                out.setdefault(key(), set()).add(name)
         depth += line.count("{") - line.count("}")
         for e in stack:
             # Allman style puts the brace on the next line; the namespace is
@@ -352,9 +343,8 @@ def build_decl_indexes(paths):
         stem = rel.rsplit("/", 1)[-1].rsplit(".", 1)[0]
         names = {stem}
         if ext == ".cs":
-            names |= set(CS_TYPE_RE.findall(text))
-            for pkg in cs_namespaces(text) or {""}:
-                cs.add(pkg, rel, names)
+            for pkg, decls in (cs_namespaces(text) or {"": set()}).items():
+                cs.add(pkg, rel, decls | {stem})
             continue
         if ext == ".scala":
             pkg, scala_blocks = scala_packages(text)
@@ -448,6 +438,10 @@ def resolve_jvm(imp, index):
     star = imp.endswith((".*", "._"))
     if star:
         imp = imp[:-2]
+    elif imp.endswith(".given"):
+        # Scala 3: `import p.given` pulls all givens from p — a wildcard,
+        # not a declaration named `given` (a reserved word).
+        star, imp = True, imp[:-len(".given")]
     if star or imp in index.pkg_files:
         files = index.pkg_files.get(imp, set())
         if files or not star:
@@ -468,77 +462,6 @@ def resolve_jvm(imp, index):
         # `import a.b.unrecognizedName` in a single-file package: the file is certain.
         return (set(files), True)
     return (set(), bool(files))
-
-
-class RustWorkspace:
-    """Cargo workspace map: which crate a `use` head names, seen from a file.
-
-    Crate names are global to a workspace, but dependency renames
-    (`foo = { package = "bar", ... }`) are local to the manifest declaring
-    them — so alias lookup is keyed by the importing file's enclosing crate. A
-    custom lib target (`[lib] path = "source/root.rs"`) moves the crate root
-    off src/; the declared entry file doubles as the bare-reference target.
-    """
-
-    def __init__(self, all_paths):
-        self.src_of = {}       # crate name (underscored) -> src root dir
-        self.entry_of = {}     # src root dir -> declared entry file, if custom
-        self._aliases = {}         # crate dir -> {alias: crate name}
-        self._src_by_dir = {}      # crate dir -> its default src/ root
-        self._lib_src_by_dir = {}  # crate dir -> custom [lib] root, if any
-        manifests = []
-        for rel, p in all_paths.items():
-            if rel == "Cargo.toml" or rel.endswith("/Cargo.toml"):
-                manifests.append((rel[: -len("Cargo.toml")].rstrip("/"), read_text(p)))
-        for d, text in manifests:
-            # [package] specifically: a [[bin]] table with its own name may
-            # legally precede it, and its name is not the crate's.
-            pkg = re.search(r"^\[package\]\s*\n((?:(?!^\[)[^\n]*\n?)*)", text, re.M)
-            m = pkg and re.search(r'^\s*name\s*=\s*"([^"]+)"', pkg.group(1), re.M)
-            if not m:
-                continue
-            src = f"{d}/src" if d else "src"
-            lib = re.search(r"^\[lib\]\s*\n((?:(?!^\[)[^\n]*\n?)*)", text, re.M)
-            pm = lib and re.search(r'^\s*path\s*=\s*"([^"]+)"', lib.group(1), re.M)
-            if pm:
-                entry = f"{d}/{pm.group(1)}".lstrip("/")
-                src = entry.rsplit("/", 1)[0] if "/" in entry else ""
-                self.entry_of[src] = entry
-                self._lib_src_by_dir[d] = src
-            self.src_of[m.group(1).replace("-", "_")] = src
-            self._src_by_dir[d] = f"{d}/src" if d else "src"
-        for d, text in manifests:
-            renames = re.findall(
-                r'^\s*([\w-]+)\s*=\s*\{[^}]*package\s*=\s*"([^"]+)"', text, re.M)
-            self._aliases[d] = {
-                alias.replace("-", "_"): target.replace("-", "_")
-                for alias, target in renames
-                if target.replace("-", "_") in self.src_of}
-        self._dirs = sorted(self._src_by_dir, key=len, reverse=True)
-
-    def _crate_dir(self, rel):
-        return next((d for d in self._dirs if not d or rel.startswith(d + "/")), "")
-
-    def own_src(self, rel):
-        """The crate root governing this file's crate:: — chosen per target.
-
-        A package may carry a custom [lib] root AND the default binary at
-        src/main.rs; each target's files resolve against their own tree.
-        """
-        d = self._crate_dir(rel)
-        default = self._src_by_dir.get(d, f"{d}/src" if d else "src")
-        custom = self._lib_src_by_dir.get(d)
-        if custom is not None and (rel.startswith(custom + "/") or
-                                   (custom == "" and "/" not in rel)):
-            return custom
-        if rel.startswith(default + "/"):
-            return default
-        return custom if custom is not None else default
-
-    def crate_root(self, head, importer_rel):
-        """src root the head names from this file, honoring local renames."""
-        name = self._aliases.get(self._crate_dir(importer_rel), {}).get(head, head)
-        return self.src_of.get(name)
 
 
 def resolve_rust_path(src_root, segs, file_set, entry_of=None):
@@ -568,9 +491,8 @@ def build_basename_index(file_set):
     return idx
 
 
-def resolve_unique_suffix(spec, by_base, exts=("",)):
-    """The path-suffix fallback for root-relative specs ('@/lib/util',
-    'lib/foo'): an edge only when exactly one file ends with the spec."""
+def suffix_hits(spec, by_base, exts=("",)):
+    """Every file whose path ends with the spec (plus resolvable extensions)."""
     cands = [spec] if re.search(r"\.[A-Za-z0-9]+$", spec) else []
     for e in exts:
         if e:
@@ -578,11 +500,23 @@ def resolve_unique_suffix(spec, by_base, exts=("",)):
     for c in cands:
         hits = [f for f in by_base.get(c.rsplit("/", 1)[-1], ())
                 if f == c or f.endswith("/" + c)]
-        if len(hits) == 1:
-            return hits[0]
         if hits:
-            return None
-    return None
+            return hits
+    return []
+
+
+def resolve_unique_suffix(spec, by_base, exts=("",), scope=None):
+    """The path-suffix fallback for root-relative specs ('@/lib/util',
+    'lib/foo'): an edge only when exactly one file ends with the spec.
+    With a scope directory, a unique match inside it wins first — monorepo
+    packages resolve their own files before the repo-wide tiebreak."""
+    hits = suffix_hits(spec, by_base, exts)
+    if scope is not None:
+        scoped = [h for h in hits if h.startswith(scope + "/")] if scope \
+            else hits
+        if len(scoped) == 1:
+            return scoped[0]
+    return hits[0] if len(hits) == 1 else None
 
 
 def extract(paths, all_paths, file_set):
@@ -599,21 +533,10 @@ def extract(paths, all_paths, file_set):
     # still first-party, and should be counted as unresolved rather than external.
     py_roots = {seg for rel in file_set if rel.endswith((".py", ".pyi"))
                 for seg in rel.rsplit(".", 1)[0].split("/")}
-    go_mods = build_go_modules(all_paths)
+    go_mods, go_replaces = go_modules(all_paths)
     jvm_idx, cs_idx = build_decl_indexes(paths)
     rust_ws = RustWorkspace(all_paths)
-    # Declared npm package names: a bare JS specifier matching one of these is
-    # external by definition, even when a same-named repo file exists.
-    npm_deps = set()
-    for mrel in all_paths:
-        if mrel == "package.json" or mrel.endswith("/package.json"):
-            try:
-                data = json.loads(read_text(all_paths[mrel]))
-            except ValueError:
-                continue
-            for key in ("dependencies", "devDependencies",
-                        "peerDependencies", "optionalDependencies"):
-                npm_deps.update(data.get(key) or {})
+    npm_by_dir = npm_packages(all_paths)
     by_base = build_basename_index(file_set)
     # dir -> .go files, so Go import resolution is a lookup instead of a scan
     # over every file for every import (quadratic on large Go monorepos).
@@ -632,9 +555,9 @@ def extract(paths, all_paths, file_set):
         if ext in (".py", ".pyi"):
             edges[rel] |= python_edges(rel, text, py_idx, file_set, py_roots, stats)
         elif ext in JS_EXTS:
-            _js_edges(rel, text, file_set, by_base, npm_deps, lang, edges, stats)
+            _js_edges(rel, text, file_set, by_base, npm_by_dir, lang, edges, stats)
         elif ext == ".go":
-            _go_edges(rel, text, go_mods, go_files_by_dir, lang, edges, stats)
+            _go_edges(rel, text, go_mods, go_replaces, go_files_by_dir, lang, edges, stats)
         elif ext == ".rs":
             _rust_edges(rel, text, file_set, rust_ws, lang, edges, stats)
         elif ext in JVM_EXTS:
@@ -652,7 +575,9 @@ def extract(paths, all_paths, file_set):
     return edges, stats
 
 
-def _js_edges(rel, text, file_set, by_base, npm_deps, lang, edges, stats):
+def _js_edges(rel, text, file_set, by_base, npm_by_dir, lang, edges, stats):
+    pkg_dir = nearest_dir(rel, npm_by_dir)
+    npm_deps = npm_by_dir.get(pkg_dir, set()) if pkg_dir is not None else set()
     for spec in JS_IMPORT_RE.findall(text):
         if spec.startswith("."):
             t = resolve_relative_js(rel, spec, file_set)
@@ -662,7 +587,7 @@ def _js_edges(rel, text, file_set, by_base, npm_deps, lang, edges, stats):
         elif spec.startswith(("@/", "~/")):
             # The src-root alias (tsconfig paths / Vite / Next): resolve
             # by unique path suffix, no tsconfig parsing required.
-            t = resolve_unique_suffix(spec[2:], by_base, JS_EXTS)
+            t = resolve_unique_suffix(spec[2:], by_base, JS_EXTS, scope=pkg_dir)
             if t and t != rel:
                 edges[rel].add(t)
             stats.count(lang, spec, rel, True, bool(t))
@@ -672,13 +597,14 @@ def _js_edges(rel, text, file_set, by_base, npm_deps, lang, edges, stats):
             # baseUrl-style first-party import.
             t = None
             if not spec.startswith("@") and spec.split("/")[0] not in npm_deps:
-                t = resolve_unique_suffix(spec, by_base, JS_EXTS)
+                t = resolve_unique_suffix(spec, by_base, JS_EXTS, scope=pkg_dir)
             if t and t != rel:
                 edges[rel].add(t)
             stats.count(lang, spec, rel, bool(t), bool(t))
 
 
-def _go_edges(rel, text, go_mods, go_files_by_dir, lang, edges, stats):
+def _go_edges(rel, text, go_mods, go_replaces, go_files_by_dir, lang, edges, stats):
+    my_dir = nearest_dir(rel, {d for _, d in go_mods})
     src_dir = str(Path(rel).parent).replace("\\", "/")
     in_block = False
     for line in text.splitlines():
@@ -696,6 +622,23 @@ def _go_edges(rel, text, go_mods, go_files_by_dir, lang, edges, stats):
         if not m:
             continue
         imp = m.group(1)
+        # The importer's own go.mod may rewrite this prefix to a local dir —
+        # and its replace binds only this module.
+        repl = next(((old, nd) for old, nd in go_replaces.get(my_dir, ())
+                     if imp == old or imp.startswith(old + "/")), None) \
+            if my_dir is not None else None
+        if repl is not None:
+            old, nd = repl
+            sub = imp[len(old):].strip("/")
+            cand_dir = f"{nd}/{sub}".strip("/") if sub else nd
+            hit = False
+            if cand_dir != src_dir:
+                for f in go_files_by_dir.get(cand_dir, ()):
+                    if f != rel:
+                        edges[rel].add(f)
+                        hit = True
+            stats.count(lang, imp, rel, True, hit or cand_dir == src_dir)
+            continue
         cands = [(mp, d) for mp, d in go_mods if imp == mp or imp.startswith(mp + "/")]
         # Duplicate module paths (example dirs sharing a placeholder) resolve
         # to the importer's own module, never to whichever came first.
@@ -723,9 +666,25 @@ def rust_use_targets(stmt):
     `use a::b::{c, d as e, self, f::{g}}` names a::b::c, a::b::d, a::b (self),
     and a::b::f::g — truncating at the brace would both lose the real targets
     and mis-resolve the bare prefix to lib.rs. Commas split at brace depth 0
-    only, so nested groups stay attached to their own prefix.
+    only, so nested groups stay attached to their own prefix. A prefixless
+    group (`use {a::b, c::d};`, rustfmt's merged-imports style) expands each
+    member as its own full path.
     """
     stmt = stmt.strip()
+    if stmt.startswith("{") and stmt.endswith("}"):
+        out = []
+        items, cur, depth = [], "", 0
+        for ch in stmt[1:-1]:
+            if ch == "," and depth == 0:
+                items.append(cur)
+                cur = ""
+                continue
+            depth += (ch == "{") - (ch == "}")
+            cur += ch
+        items.append(cur)
+        for item in items:
+            out.extend(rust_use_targets(item))
+        return out
     m = re.match(r"([\w:]+?)\s*(?:::)?\s*\{(.*)\}\s*$", stmt, re.S)
     if not m:
         m = re.match(r"[\w:]+", stmt)  # plain path; drops any trailing ` as x`
@@ -751,25 +710,47 @@ def _rust_edges(rel, text, file_set, ws, lang, edges, stats):
     own = ws.own_src(rel)
     own_dir = str(Path(rel).parent).replace("\\", "/")
     stem = rel.rsplit("/", 1)[-1]
-    is_root = stem in ("lib.rs", "main.rs", "mod.rs") or rel == ws.entry_of.get(own, "")
+    is_root = (stem in ("lib.rs", "main.rs", "mod.rs")
+               or rel == ws.entry_of.get(own, "") or own_dir == own)
     # The directory holding this module's CHILD modules: crate/module roots own
     # their directory; foo.rs owns foo/. self:: resolves here, and each super::
     # pops one level from here — so one super from a/child.rs lands in a/, the
     # importer's own directory, not a level above it.
     child_dir = own_dir if is_root else f"{own_dir}/{stem[:-3]}"
-    for pm, name in RUST_MOD_RE.findall(text):
-        # `mod x;` declares a child module (with the pre-2018 sibling fallback);
-        # a #[path = "..."] attribute overrides the search entirely.
-        if pm:
-            cand = f"{own_dir}/{pm}".replace("//", "/")
-            t = cand if cand in file_set and cand != rel else None
-        else:
-            t = next((c for b in (child_dir, own_dir)
-                      for c in (f"{b}/{name}.rs", f"{b}/{name}/mod.rs")
-                      if c in file_set and c != rel), None)
-        if t:
-            edges[rel].add(t)
-        stats.count(lang, f"mod {name}", rel, True, bool(t))
+    # `mod x;` declares a child module — of the enclosing INLINE module when
+    # one is open (`mod platform { mod imp; }` names platform/imp.rs), so the
+    # scan tracks `mod x {` blocks by brace depth like any other scope.
+    mod_stack, depth, pending_path = [], 0, None
+    for line in text.splitlines():
+        am = re.match(r'\s*#\[path\s*=\s*"([^"]+)"\]', line)
+        if am:
+            pending_path = am.group(1)
+        dm = re.match(r"\s*(?:pub(?:\([^)]*\))?\s+)?mod\s+(\w+)\s*(;|\{)", line)
+        if dm and dm.group(2) == ";":
+            name = dm.group(1)
+            scope = "/".join(e["name"] for e in mod_stack)
+            if pending_path:
+                # attribute paths are relative to the declaring file's dir
+                cand = "/".join(s for s in f"{own_dir}/{pending_path}".split("/") if s)
+                t = cand if cand in file_set and cand != rel else None
+            else:
+                bases = ((f"{child_dir}/{scope}",) if scope
+                         else (child_dir, own_dir))
+                t = next((c for b in bases
+                          for c in (f"{b}/{name}.rs", f"{b}/{name}/mod.rs")
+                          if c in file_set and c != rel), None)
+            if t:
+                edges[rel].add(t)
+            stats.count(lang, f"mod {name}", rel, True, bool(t))
+            pending_path = None
+        elif dm:
+            mod_stack.append({"open": depth, "name": dm.group(1), "entered": False})
+            pending_path = None
+        depth += line.count("{") - line.count("}")
+        for e in mod_stack:
+            e["entered"] = e["entered"] or depth > e["open"]
+        while mod_stack and mod_stack[-1]["entered"] and depth <= mod_stack[-1]["open"]:
+            mod_stack.pop()
     for stmt in RUST_USE_RE.findall(text):
         for use in rust_use_targets(stmt):
             segs = [s for s in use.strip(":").split("::") if s]
