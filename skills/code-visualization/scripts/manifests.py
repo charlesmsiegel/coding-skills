@@ -91,6 +91,14 @@ class RustWorkspace:
             self._deps[d] = deps
             renames = re.findall(
                 r'^\s*([\w-]+)\s*=\s*(\{[^}]*package\s*=\s*"[^"]+"[^}]*\})', text, re.M)
+            # the long form: [dependencies.foo] with package/path on own lines
+            for header, body in re.findall(
+                    r"^\[+([^\]]+)\]+\s*\n((?:(?!^\[)[^\n]*\n?)*)", text, re.M):
+                parts_h = header.split(".")
+                if len(parts_h) >= 2 and parts_h[-2].endswith("dependencies"):
+                    pk = re.search(r'^\s*package\s*=\s*"([^"]+)"', body, re.M)
+                    if pk:
+                        renames.append((parts_h[-1], body))
             self._aliases[d] = {}
             for alias, entry in renames:
                 # A rename without a local path is a registry crate: Cargo will
@@ -129,8 +137,11 @@ class RustWorkspace:
         own tree.
         """
         d = self._crate_dir(rel)
-        for troot, _ in self._target_roots.get(d, ()):
-            if rel == troot or rel.startswith(troot + "/") or troot == "":
+        for troot, tentry in self._target_roots.get(d, ()):
+            # A root-level entry ([[bin]] path = "main.rs") roots only that
+            # file — matching the whole package would capture src/ modules.
+            if rel == tentry or (troot != d and
+                                 (rel == troot or rel.startswith(troot + "/"))):
                 return troot
         for tail in CARGO_TARGET_DIRS:
             tdir = f"{d}/{tail}" if d else tail
@@ -284,7 +295,7 @@ def npm_packages(all_paths):
                 continue
             d = rel[: -len("package.json")].rstrip("/")
             if isinstance(data.get("name"), str):
-                name_map[data["name"]] = (d, data.get("main") or "")
+                name_map[data["name"]] = (d, _npm_entry(data))
             deps = set()
             for key in ("dependencies", "devDependencies",
                         "peerDependencies", "optionalDependencies"):
@@ -293,6 +304,27 @@ def npm_packages(all_paths):
                         deps.add(dep_name)
             by_dir[d] = deps
     return by_dir, name_map
+
+
+def _npm_entry(data):
+    """The package's entry file: `main`, else the root `exports` target
+    (string form, or the '.'/conditional import/require/default variants)."""
+    main = data.get("main")
+    if isinstance(main, str) and main:
+        return main.lstrip("./")
+    exp = data.get("exports")
+    if isinstance(exp, str):
+        return exp.lstrip("./")
+    if isinstance(exp, dict):
+        root = exp.get(".", exp)
+        if isinstance(root, str):
+            return root.lstrip("./")
+        if isinstance(root, dict):
+            for key in ("import", "require", "default"):
+                v = root.get(key)
+                if isinstance(v, str):
+                    return v.lstrip("./")
+    return ""
 
 
 def nearest_dir(rel, dirs):

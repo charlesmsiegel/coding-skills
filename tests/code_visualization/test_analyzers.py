@@ -1269,6 +1269,129 @@ def test_deps_rust_path_attribute_with_parent_segments_resolves(repo, tabs, run_
     assert fan_in.get("src/shared.rs") == 1
 
 
+def test_deps_rust_long_form_dependency_rename_resolves(repo, tabs, run_script):
+    """[dependencies.foo] with package = \"bar\" is the long form of an inline
+    rename — `use foo::` must reach bar's sources the same way."""
+    repo.write("app/Cargo.toml",
+               '[package]\nname = "app"\n\n[dependencies.foo]\n'
+               'package = "bar"\npath = "../bar"\n')
+    repo.write("app/src/main.rs", "use foo::engine::start;\n\nfn main() {}\n")
+    repo.write("bar/Cargo.toml", '[package]\nname = "bar"\n')
+    repo.write("bar/src/lib.rs", "pub mod engine;\n")
+    repo.write("bar/src/engine.rs", "pub fn start() {}\n")
+
+    summary = _deps_summary(repo, tabs, run_script)
+
+    fan_in = {row["path"]: row["fan_in"] for row in summary["top_fan_in_files"]}
+    assert fan_in.get("bar/src/engine.rs") == 2
+
+
+def test_deps_rust_root_level_bin_target_does_not_capture_src(repo, tabs, run_script):
+    """[[bin]] path = \"main.rs\" roots only that entry file — ordinary src/
+    library modules keep resolving crate:: against src/."""
+    repo.write("Cargo.toml",
+               '[package]\nname = "app"\n\n[[bin]]\nname = "app"\npath = "main.rs"\n')
+    repo.write("main.rs", "fn main() {}\n")
+    repo.write("src/lib.rs", "mod helper;\nuse crate::helper::go;\n")
+    repo.write("src/helper.rs", "pub fn go() {}\n")
+
+    summary = _deps_summary(repo, tabs, run_script)
+
+    fan_in = {row["path"]: row["fan_in"] for row in summary["top_fan_in_files"]}
+    assert fan_in.get("src/helper.rs") == 1
+    # both `mod helper;` and `use crate::helper::go` resolve — under the
+    # root-target bug the use searches the package dir and fails
+    assert summary["resolution"]["Rust"]["resolved"] == 2
+
+
+def test_deps_go_longest_module_prefix_beats_importer_containment(repo, tabs, run_script):
+    """A nested module with a longer module path owns its imports even when
+    the importer sits in the enclosing (shorter-path) module."""
+    repo.write("go.mod", "module example.com/root\n")
+    repo.write("main.go",
+               'package main\n\nimport "example.com/root/foo/pkg"\n\nfunc main() { pkg.Do() }\n')
+    repo.write("tools/foo/go.mod", "module example.com/root/foo\n")
+    repo.write("tools/foo/pkg/pkg.go", "package pkg\n\nfunc Do() {}\n")
+    repo.write("foo/pkg/decoy.go", "package pkg\n\nfunc Decoy() {}\n")
+
+    summary = _deps_summary(repo, tabs, run_script)
+
+    fan_in = {row["path"]: row["fan_in"] for row in summary["top_fan_in_files"]}
+    assert fan_in.get("tools/foo/pkg/pkg.go") == 1
+    assert "foo/pkg/decoy.go" not in fan_in
+
+
+def test_deps_js_relative_import_escaping_the_repo_is_external(repo, tabs, run_script):
+    """`../../util` from src/main.ts climbs above the repo root; a same-named
+    in-repo file must not capture it."""
+    repo.write("src/main.ts", "import { u } from '../../util';\n")
+    repo.write("util.ts", "export const u = 1;\n")
+
+    summary = _deps_summary(repo, tabs, run_script)
+
+    assert summary["import_edges"] == 0
+
+
+def test_deps_go_root_package_files_resolve(repo, tabs, run_script):
+    """Root-level .go files are the module's root package; an exact import of
+    the module path must find them despite the '.' vs '' dir-key mismatch."""
+    repo.write("go.mod", "module example.com/lib\n")
+    repo.write("lib.go", "package lib\n\nfunc Do() {}\n")
+    repo.write("cmd/cli/main.go",
+               'package main\n\nimport "example.com/lib"\n\nfunc main() { lib.Do() }\n')
+
+    summary = _deps_summary(repo, tabs, run_script)
+
+    fan_in = {row["path"]: row["fan_in"] for row in summary["top_fan_in_files"]}
+    assert fan_in.get("lib.go") == 1
+
+
+def test_deps_python_stub_does_not_shadow_its_implementation(repo, tabs, run_script):
+    """util.py + its colocated util.pyi stub are one module — the pair must
+    not read as ambiguous, and the import links the implementation."""
+    repo.write("pkg/__init__.py", "")
+    repo.write("pkg/util.py", "def helper():\n    return 1\n")
+    repo.write("pkg/util.pyi", "def helper() -> int: ...\n")
+    repo.write("app/main.py", "from pkg import util\n")
+
+    summary = _deps_summary(repo, tabs, run_script)
+
+    fan_in = {row["path"]: row["fan_in"] for row in summary["top_fan_in_files"]}
+    assert fan_in.get("pkg/util.py") == 1
+
+
+def test_deps_scala_package_object_members_are_indexed(repo, tabs, run_script):
+    """Members inside `package object bar { ... }` are importable as
+    foo.bar.helper even when another file also declares foo.bar."""
+    repo.write("src/main/scala/foo/package.scala",
+               "package foo\n\npackage object bar {\n  def helper = 1\n}\n")
+    repo.write("src/main/scala/foo/bar/Other.scala",
+               "package foo.bar\n\nclass Other\n")
+    repo.write("src/main/scala/app/Main.scala",
+               "package app\n\nimport foo.bar.helper\n\nclass Main\n")
+
+    summary = _deps_summary(repo, tabs, run_script)
+
+    fan_in = {row["path"]: row["fan_in"] for row in summary["top_fan_in_files"]}
+    assert fan_in.get("src/main/scala/foo/package.scala") == 1
+
+
+def test_deps_js_workspace_entry_from_exports_field(repo, tabs, run_script):
+    """A workspace package declaring only `exports` (no main, no index file)
+    still resolves by name to its exported entry."""
+    repo.write("packages/lib/package.json",
+               '{"name": "lib", "exports": {".": {"import": "./src/entry.ts"}}}\n')
+    repo.write("packages/lib/src/entry.ts", "export const x = 1;\n")
+    repo.write("packages/app/package.json",
+               '{"name": "app", "dependencies": {"lib": "workspace:*"}}\n')
+    repo.write("packages/app/src/main.ts", "import { x } from 'lib';\n")
+
+    summary = _deps_summary(repo, tabs, run_script)
+
+    fan_in = {row["path"]: row["fan_in"] for row in summary["top_fan_in_files"]}
+    assert fan_in.get("packages/lib/src/entry.ts") == 1
+
+
 def test_deps_python_resolution_is_counted_too(repo, tabs, run_script):
     """Python goes through the same accounting as every other language: its own
     modules count as first-party (resolved or not), stdlib/pip as external."""

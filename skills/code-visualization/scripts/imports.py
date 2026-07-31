@@ -110,6 +110,9 @@ def build_python_index(files):
     for rel in files:
         if not rel.endswith((".py", ".pyi")):
             continue
+        # a stub beside its implementation is the same module, not a rival
+        if rel.endswith(".pyi") and rel[:-1] in files:
+            continue
         parts = rel.rsplit(".", 1)[0].split("/")
         if parts[-1] == "__init__":
             parts = parts[:-1]
@@ -201,8 +204,9 @@ def resolve_relative_js(rel, spec, file_set):
     parts = []
     for part in norm.split("/"):
         if part == "..":
-            if parts:
-                parts.pop()
+            if not parts:
+                return None  # climbs above the repo root: external
+            parts.pop()
         elif part not in ("", "."):
             parts.append(part)
     norm = "/".join(parts)
@@ -264,7 +268,10 @@ def scala_packages(text):
     chain, stack, depth, blocks = [], [], 0, {}
     colon_pkg = None  # `package p:` (Scala 3): the indented rest of file is p
     for line in text.splitlines():
-        m = re.match(r"\s*package\s+(?!object\b)([\w.]+)\s*(\{|:\s*$)?", line)
+        m = re.match(r"\s*package\s+(?:object\s+)?([\w.]+)\s*(\{|:\s*$)?", line)
+        if m and re.match(r"\s*package\s+object\b", line) and not (
+                m.group(2) == "{" or "{" in line):
+            m = None  # a braceless package object line adds no scope here
         if m and m.group(2) == ":":
             chain.append(m.group(1))
             colon_pkg = ".".join(chain)
@@ -639,7 +646,8 @@ def extract(paths, all_paths, file_set):
     go_files_by_dir = defaultdict(list)
     for f in file_set:
         if f.endswith(".go"):
-            go_files_by_dir[str(Path(f).parent).replace("\\", "/")].append(f)
+            gd = str(Path(f).parent).replace("\\", "/")
+            go_files_by_dir["" if gd == "." else gd].append(f)
 
     stats = ResolutionStats()
     edges = defaultdict(set)  # src file -> {dst files}
@@ -768,11 +776,13 @@ def _go_edges(rel, text, go_mods, go_replaces, go_files_by_dir, lang, edges, sta
             stats.count(lang, imp, rel, True, hit or cand_dir == src_dir)
             continue
         cands = [(mp, d) for mp, d in go_mods if imp == mp or imp.startswith(mp + "/")]
-        # Duplicate module paths (example dirs sharing a placeholder) resolve
-        # to the importer's own module, never to whichever came first.
-        owner = next(((mp, d) for mp, d in cands
+        # The longest module path owns the import; importer containment only
+        # breaks ties between modules declaring the SAME path (example dirs
+        # sharing a placeholder) — it must not override a nested module.
+        equal = [c for c in cands if c[0] == cands[0][0]] if cands else []
+        owner = next(((mp, d) for mp, d in equal
                       if not d or rel == d or rel.startswith(d + "/")),
-                     cands[0] if cands else None)
+                     equal[0] if equal else None)
         if owner is None:
             stats.count(lang, imp, rel, False, False)
             continue
