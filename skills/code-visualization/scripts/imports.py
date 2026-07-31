@@ -41,6 +41,18 @@ CS_NS_RE = re.compile(r"^\s*namespace\s+([\w.]+)", re.M)
 RUST_USE_RE = re.compile(r"^\s*(?:pub(?:\([^)]*\))?\s+)?use\s+([^;]+);", re.M)
 RUBY_REQ_RE = re.compile(r"""require_relative\s+['"]([^'"]+)['"]""")
 
+# Bare specifiers naming Node built-ins are external even without a
+# package.json entry — a repo file named path.ts is never what `from "path"`
+# means.
+NODE_BUILTINS = {
+    "assert", "async_hooks", "buffer", "child_process", "cluster", "console",
+    "constants", "crypto", "dgram", "dns", "domain", "events", "fs", "http",
+    "http2", "https", "inspector", "module", "net", "os", "path", "perf_hooks",
+    "process", "punycode", "querystring", "readline", "repl", "stream",
+    "string_decoder", "sys", "timers", "tls", "tty", "url", "util", "v8", "vm",
+    "worker_threads", "zlib",
+}
+
 JVM_EXTS = (".java", ".kt", ".scala")
 # A star import (or a C# namespace-using) is a real dependency on every file of
 # the package, but a package that large is a namespace, not a unit — linking
@@ -249,9 +261,19 @@ def scala_packages(text):
     it still names this file.
     """
     chain, stack, depth, blocks = [], [], 0, {}
+    colon_pkg = None  # `package p:` (Scala 3): the indented rest of file is p
     for line in text.splitlines():
-        m = re.match(r"\s*package\s+(?!object\b)([\w.]+)\s*(\{)?", line)
-        if m and (m.group(2) or "{" in line):
+        m = re.match(r"\s*package\s+(?!object\b)([\w.]+)\s*(\{|:\s*$)?", line)
+        if m and m.group(2) == ":":
+            chain.append(m.group(1))
+            colon_pkg = ".".join(chain)
+            blocks.setdefault(colon_pkg, set())
+            continue
+        if colon_pkg and not m:
+            d = SCALA_INNER_DECL_RE.match(line)
+            if d and line[:1] in (" ", "\t"):
+                blocks[colon_pkg].add(d.group(1))
+        if m and (m.group(2) == "{" or "{" in line):
             stack.append({"open": depth, "name": m.group(1), "entered": False})
             blocks.setdefault(".".join(chain + [e["name"] for e in stack]), set())
         elif m:
@@ -360,7 +382,9 @@ def build_decl_indexes(paths):
                 # there too, so `import foo.bar.helper` finds it.
                 jvm.add(f"{pkg}.{pobj.group(1)}".lstrip("."), rel, names)
             for bpkg, decls in scala_blocks.items():
-                if bpkg != pkg:
+                if bpkg == pkg:
+                    names |= decls  # colon-syntax body: same package, indented
+                else:
                     jvm.add(bpkg, rel, decls | {stem})
         else:
             m = JVM_PKG_RE.search(text)
@@ -424,17 +448,27 @@ def jvm_import_specs(text):
     return out
 
 
-def resolve_jvm(imp, index):
+def resolve_jvm(imp, index, importer_rel=None, module_dirs=()):
     """Resolve a dotted import against a DeclIndex. Returns (files, first_party).
 
     A `.*`/`._` suffix (or a bare package name — the C# using case) links every
     file of the package. Otherwise the boundary between package and symbol is
     unknown (a.b.C, a.b.C.Inner, a.b.topLevelFn all exist), so the split is
     searched right-to-left against declared (package, name) pairs. Ambiguity —
-    two files declaring the same package+name, e.g. Kotlin expect/actual pairs —
+    two files declaring the same package+name — first narrows to the
+    importer's own build module (independent Gradle/Maven modules may declare
+    the same symbol without sharing a classpath); what remains ambiguous
     resolves to nothing: a wrong edge is worse than a missing one.
     """
-    imp = imp.rstrip(".")
+    def narrow(hits):
+        if len(hits) > 1 and importer_rel is not None and module_dirs:
+            mine = nearest_dir(importer_rel, module_dirs)
+            if mine is not None:
+                local = {h for h in hits if nearest_dir(h, module_dirs) == mine}
+                if local:
+                    return local
+        return hits
+    imp = imp.rstrip(".").removeprefix("_root_.")
     star = imp.endswith((".*", "._"))
     if star:
         imp = imp[:-2]
@@ -451,13 +485,13 @@ def resolve_jvm(imp, index):
         # type, not a package — fall through and resolve the type itself.
     segs = imp.split(".")
     for i in range(len(segs) - 1, 0, -1):
-        hits = index.decl_files.get((".".join(segs[:i]), segs[i]), set())
+        hits = narrow(index.decl_files.get((".".join(segs[:i]), segs[i]), set()))
         if len(hits) == 1:
             return (set(hits), True)
         if hits:
             return (set(), True)  # ambiguous: first-party, deliberately unresolved
     pkg = ".".join(segs[:-1])
-    files = index.pkg_files.get(pkg, set())
+    files = narrow(index.pkg_files.get(pkg, set()))
     if len(files) == 1:
         # `import a.b.unrecognizedName` in a single-file package: the file is certain.
         return (set(files), True)
@@ -479,6 +513,10 @@ def resolve_rust_path(src_root, segs, file_set, entry_of=None):
     for entry in ("lib.rs", "main.rs", "mod.rs"):
         if f"{src_root}/{entry}" in file_set:
             return f"{src_root}/{entry}"
+    # ... and a module using the file layout (src/foo.rs owning src/foo/) is
+    # the sibling FILE of the directory the root path names.
+    if f"{src_root}.rs" in file_set:
+        return f"{src_root}.rs"
     if entry_of:
         return entry_of.get(src_root)
     return None
@@ -537,6 +575,13 @@ def extract(paths, all_paths, file_set):
     jvm_idx, cs_idx = build_decl_indexes(paths)
     rust_ws = RustWorkspace(all_paths)
     npm_by_dir = npm_packages(all_paths)
+    # Build-module boundaries: independent Gradle/Maven modules may declare
+    # the same fully qualified symbol without sharing a classpath.
+    jvm_modules = {rel[: -len(name)].rstrip("/")
+                   for rel in all_paths
+                   for name in ("build.gradle", "build.gradle.kts", "pom.xml",
+                                "settings.gradle", "settings.gradle.kts")
+                   if rel == name or rel.endswith("/" + name)}
     by_base = build_basename_index(file_set)
     # dir -> .go files, so Go import resolution is a lookup instead of a scan
     # over every file for every import (quadratic on large Go monorepos).
@@ -562,10 +607,10 @@ def extract(paths, all_paths, file_set):
             _rust_edges(rel, text, file_set, rust_ws, lang, edges, stats)
         elif ext in JVM_EXTS:
             for imp in jvm_import_specs(text):
-                _jvm_edge(rel, imp, jvm_idx, lang, edges, stats)
+                _jvm_edge(rel, imp, jvm_idx, jvm_modules, lang, edges, stats)
         elif ext == ".cs":
             for imp in CS_USING_RE.findall(text):
-                _jvm_edge(rel, imp, cs_idx, lang, edges, stats)
+                _jvm_edge(rel, imp, cs_idx, jvm_modules, lang, edges, stats)
         elif ext == ".rb":
             for spec in RUBY_REQ_RE.findall(text):
                 t = resolve_relative_js(rel, spec if spec.endswith(".rb") else spec + ".rb", file_set)
@@ -596,7 +641,9 @@ def _js_edges(rel, text, file_set, by_base, npm_by_dir, lang, edges, stats):
             # declared dependency and uniquely names a repo file is a
             # baseUrl-style first-party import.
             t = None
-            if not spec.startswith("@") and spec.split("/")[0] not in npm_deps:
+            root = spec.split("/")[0]
+            if (not spec.startswith("@") and root not in npm_deps
+                    and root not in NODE_BUILTINS):
                 t = resolve_unique_suffix(spec, by_base, JS_EXTS, scope=pkg_dir)
             if t and t != rel:
                 edges[rel].add(t)
@@ -710,8 +757,7 @@ def _rust_edges(rel, text, file_set, ws, lang, edges, stats):
     own = ws.own_src(rel)
     own_dir = str(Path(rel).parent).replace("\\", "/")
     stem = rel.rsplit("/", 1)[-1]
-    is_root = (stem in ("lib.rs", "main.rs", "mod.rs")
-               or rel == ws.entry_of.get(own, "") or own_dir == own)
+    is_root = stem in ("lib.rs", "main.rs", "mod.rs") or ws.is_target_root(rel)
     # The directory holding this module's CHILD modules: crate/module roots own
     # their directory; foo.rs owns foo/. self:: resolves here, and each super::
     # pops one level from here — so one super from a/child.rs lands in a/, the
@@ -776,8 +822,8 @@ def _rust_edges(rel, text, file_set, ws, lang, edges, stats):
             stats.count(lang, use, rel, True, bool(t))
 
 
-def _jvm_edge(rel, imp, index, lang, edges, stats):
-    targets, first_party = resolve_jvm(imp, index)
+def _jvm_edge(rel, imp, index, jvm_modules, lang, edges, stats):
+    targets, first_party = resolve_jvm(imp, index, rel, jvm_modules)
     targets.discard(rel)
     edges[rel] |= targets
     if not first_party:
