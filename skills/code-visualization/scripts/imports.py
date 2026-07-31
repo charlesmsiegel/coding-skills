@@ -240,7 +240,8 @@ SCALA_PKG_OBJ_RE = re.compile(r"^\s*package\s+object\s+(\w+)", re.M)
 # blocks, so column-0 anchoring would find nothing: match declarations
 # anywhere. An inner type over-indexes harmlessly — it still names this file.
 CS_TYPE_RE = re.compile(
-    r"\b(?:class|struct|interface|enum|record)\s+(\w+)")
+    r"\b(?:record(?:\s+(?:class|struct))?|class|struct|interface|enum|delegate)"
+    r"\s+(\w+)")
 
 
 SCALA_INNER_DECL_RE = re.compile(
@@ -658,10 +659,23 @@ def _js_edges(rel, text, file_set, by_base, npm_by_dir, npm_names, lang, edges, 
             # baseUrl-style first-party import.
             t = None
             root = spec.split("/")[0]
-            if root in npm_names and "/" not in spec:
+            # a scoped package's name spans two segments (@scope/utils)
+            pkg_name = ("/".join(spec.split("/")[:2])
+                        if spec.startswith("@") else root)
+            if pkg_name in npm_names:
                 # a sibling workspace package (declared workspace:/file: or
-                # simply present in the repo) — a local edge by name
-                t = workspace_entry(spec)
+                # simply present in the repo) — a local edge by name; a
+                # subpath import reaches into the package's own tree
+                if spec == pkg_name:
+                    t = workspace_entry(pkg_name)
+                else:
+                    wdir = npm_names[pkg_name][0]
+                    sub = spec[len(pkg_name) + 1:]
+                    cands = [f"{wdir}/{sub}"] if re.search(r"\.[a-z]+$", sub) else []
+                    for e in JS_EXTS:
+                        cands += [f"{wdir}/{sub}{e}", f"{wdir}/{sub}/index{e}",
+                                  f"{wdir}/src/{sub}{e}"]
+                    t = next((c for c in cands if c in file_set), None)
             elif (not spec.startswith("@") and root not in npm_deps
                     and root not in NODE_BUILTINS):
                 t = resolve_unique_suffix(spec, by_base, JS_EXTS, scope=pkg_dir)

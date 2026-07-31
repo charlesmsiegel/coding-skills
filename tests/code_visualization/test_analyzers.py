@@ -1081,6 +1081,74 @@ def test_deps_js_workspace_dependency_links_the_local_package(repo, tabs, run_sc
     assert fan_in.get("packages/utils/src/index.ts") == 1
 
 
+def test_deps_rust_duplicate_package_names_resolve_within_their_workspace(
+        repo, tabs, run_script):
+    """Two workspaces may each ship a crate named util; an importer's path
+    dependency reaches its own workspace's util, never the other one."""
+    for ws in ("ws1", "ws2"):
+        repo.write(f"{ws}/util/Cargo.toml", '[package]\nname = "util"\n')
+        repo.write(f"{ws}/util/src/lib.rs", "pub mod tools;\n")
+        repo.write(f"{ws}/util/src/tools.rs", "pub fn run() {}\n")
+        repo.write(f"{ws}/app/Cargo.toml",
+                   '[package]\nname = "app-' + ws + '"\n\n[dependencies]\n'
+                   'util = { path = "../util" }\n')
+        repo.write(f"{ws}/app/src/main.rs", "use util::tools::run;\n\nfn main() {}\n")
+
+    summary = _deps_summary(repo, tabs, run_script)
+
+    fan_in = {row["path"]: row["fan_in"] for row in summary["top_fan_in_files"]}
+    # each tools.rs: its own lib.rs `mod` + its own workspace's app use
+    assert fan_in.get("ws1/util/src/tools.rs") == 2
+    assert fan_in.get("ws2/util/src/tools.rs") == 2
+
+
+def test_deps_csharp_record_struct_declares_its_name(repo, tabs, run_script):
+    """`record struct Point` declares Point — not a type named `struct`."""
+    repo.write("lib/Geometry.cs",
+               "namespace Acme;\n\npublic record struct Point(int X, int Y);\n")
+    repo.write("lib/Extra.cs", "namespace Acme;\n\npublic class Extra {}\n")
+    repo.write("app/Program.cs",
+               "using static Acme.Point;\n\nnamespace App;\nclass P {}\n")
+
+    summary = _deps_summary(repo, tabs, run_script)
+
+    fan_in = {row["path"]: row["fan_in"] for row in summary["top_fan_in_files"]}
+    assert fan_in.get("lib/Geometry.cs") == 1
+
+
+def test_deps_js_scoped_workspace_package_resolves(repo, tabs, run_script):
+    """`@scope/utils` always contains a slash — the workspace-name lookup must
+    match the two-segment name, and subpath imports reach into its tree."""
+    repo.write("packages/utils/package.json",
+               '{"name": "@scope/utils", "main": "src/index.ts"}\n')
+    repo.write("packages/utils/src/index.ts", "export const x = 1;\n")
+    repo.write("packages/utils/src/helpers.ts", "export const h = 1;\n")
+    repo.write("packages/app/package.json",
+               '{"name": "@scope/app", "dependencies": {"@scope/utils": "workspace:*"}}\n')
+    repo.write("packages/app/src/main.ts",
+               "import { x } from '@scope/utils';\nimport { h } from '@scope/utils/helpers';\n")
+
+    summary = _deps_summary(repo, tabs, run_script)
+
+    fan_in = {row["path"]: row["fan_in"] for row in summary["top_fan_in_files"]}
+    assert fan_in.get("packages/utils/src/index.ts") == 1
+    assert fan_in.get("packages/utils/src/helpers.ts") == 1
+
+
+def test_deps_go_replace_escaping_the_repo_is_external(repo, tabs, run_script):
+    """`replace example.com/dep => ../../dep` from app/ climbs above the repo
+    root; a same-named in-repo directory must not capture the import."""
+    repo.write("app/go.mod",
+               "module example.com/app\n\nreplace example.com/dep => ../../dep\n")
+    repo.write("app/main.go",
+               'package main\n\nimport "example.com/dep/util"\n\nfunc main() { util.Do() }\n')
+    repo.write("dep/util/util.go", "package util\n\nfunc Do() {}\n")
+
+    summary = _deps_summary(repo, tabs, run_script)
+
+    assert summary["import_edges"] == 0
+
+
 def test_deps_python_resolution_is_counted_too(repo, tabs, run_script):
     """Python goes through the same accounting as every other language: its own
     modules count as first-party (resolved or not), stdlib/pip as external."""
