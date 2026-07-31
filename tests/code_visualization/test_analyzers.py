@@ -1392,6 +1392,127 @@ def test_deps_js_workspace_entry_from_exports_field(repo, tabs, run_script):
     assert fan_in.get("packages/lib/src/entry.ts") == 1
 
 
+def test_deps_rust_integration_test_helper_shares_the_test_crate_root(
+        repo, tabs, run_script):
+    """tests/common/mod.rs is included by test targets; its crate:: is the
+    tests/ crate, not a phantom crate rooted at tests/common."""
+    repo.write("Cargo.toml", '[package]\nname = "app"\n')
+    repo.write("src/lib.rs", "pub fn lib() {}\n")
+    repo.write("tests/run.rs", "mod common;\n\n#[test]\nfn t() {}\n")
+    repo.write("tests/common/mod.rs", "use crate::helper::go;\n")
+    repo.write("tests/helper.rs", "pub fn go() {}\n")
+
+    summary = _deps_summary(repo, tabs, run_script)
+
+    fan_in = {row["path"]: row["fan_in"] for row in summary["top_fan_in_files"]}
+    assert fan_in.get("tests/helper.rs") == 1
+
+
+def test_deps_python_parse_failures_are_counted(repo, tabs, run_script):
+    """A file the analyzer's interpreter cannot parse contributes an
+    unresolved entry instead of silently vanishing from the accounting."""
+    repo.write("pkg/broken.py", "def broken(:\n")
+    repo.write("pkg/fine.py", "import os\n")
+
+    summary = _deps_summary(repo, tabs, run_script)
+
+    res = summary["resolution"]["Python"]
+    assert res["first_party"] >= 1 and res["resolved"] == 0
+    assert any("parse" in s for s in res["samples"])
+
+
+def test_deps_npm_duplicate_package_names_resolve_within_their_tree(
+        repo, tabs, run_script):
+    """Two workspace trees may each ship a package named lib; an importer
+    reaches the one in its own tree."""
+    for ws in ("ws1", "ws2"):
+        repo.write(f"{ws}/packages/lib/package.json",
+                   '{"name": "lib", "main": "index.ts"}\n')
+        repo.write(f"{ws}/packages/lib/index.ts", "export const x = 1;\n")
+        repo.write(f"{ws}/packages/app/package.json",
+                   '{"name": "app-' + ws + '", "dependencies": {"lib": "workspace:*"}}\n')
+        repo.write(f"{ws}/packages/app/main.ts", "import { x } from 'lib';\n")
+
+    summary = _deps_summary(repo, tabs, run_script)
+
+    fan_in = {row["path"]: row["fan_in"] for row in summary["top_fan_in_files"]}
+    assert fan_in.get("ws1/packages/lib/index.ts") == 1
+    assert fan_in.get("ws2/packages/lib/index.ts") == 1
+
+
+def test_deps_npm_subpath_export_resolves(repo, tabs, run_script):
+    """`lib/feature` resolves through the package's exports map, not by
+    guessing physical paths."""
+    repo.write("packages/lib/package.json",
+               '{"name": "lib", "main": "index.ts", '
+               '"exports": {".": "./index.ts", "./feature": "./src/actual.ts"}}\n')
+    repo.write("packages/lib/index.ts", "export const x = 1;\n")
+    repo.write("packages/lib/src/actual.ts", "export const f = 1;\n")
+    repo.write("packages/app/package.json",
+               '{"name": "app", "dependencies": {"lib": "workspace:*"}}\n')
+    repo.write("packages/app/main.ts", "import { f } from 'lib/feature';\n")
+
+    summary = _deps_summary(repo, tabs, run_script)
+
+    fan_in = {row["path"]: row["fan_in"] for row in summary["top_fan_in_files"]}
+    assert fan_in.get("packages/lib/src/actual.ts") == 1
+
+
+def test_deps_cargo_literal_string_names_parse(repo, tabs, run_script):
+    """TOML literal strings (name = 'app') are valid Cargo; the manifest must
+    not read as having no package."""
+    repo.write("app/Cargo.toml", "[package]\nname = 'app'\n")
+    repo.write("app/src/lib.rs", "pub mod engine;\n")
+    repo.write("app/src/engine.rs", "pub fn start() {}\n")
+    repo.write("tool/Cargo.toml",
+               "[package]\nname = 'tool'\n\n[dependencies]\napp = { path = '../app' }\n")
+    repo.write("tool/src/main.rs", "use app::engine::start;\n\nfn main() {}\n")
+
+    summary = _deps_summary(repo, tabs, run_script)
+
+    fan_in = {row["path"]: row["fan_in"] for row in summary["top_fan_in_files"]}
+    assert fan_in.get("app/src/engine.rs") == 2
+
+
+def test_deps_csharp_global_qualified_using_skips_enclosing_scopes(
+        repo, tabs, run_script):
+    """`using global::Models;` inside namespace App names the GLOBAL Models,
+    not App.Models."""
+    repo.write("lib/GlobalModels.cs", "namespace Models;\n\npublic class M {}\n")
+    repo.write("lib/AppModels.cs", "namespace App.Models;\n\npublic class N {}\n")
+    repo.write("app/Program.cs",
+               "namespace App {\n  using global::Models;\n  class P {}\n}\n")
+
+    summary = _deps_summary(repo, tabs, run_script)
+
+    fan_in = {row["path"]: row["fan_in"] for row in summary["top_fan_in_files"]}
+    assert fan_in.get("lib/GlobalModels.cs") == 1
+    assert "lib/AppModels.cs" not in fan_in
+
+
+def test_deps_malformed_package_json_dependencies_do_not_crash(repo, tabs, run_script):
+    repo.write("fixture/package.json", '{"name": "fx", "dependencies": ["a"]}\n')
+    repo.write("src/a.ts", "import { b } from './b';\n")
+    repo.write("src/b.ts", "export const b = 1;\n")
+
+    summary = _deps_summary(repo, tabs, run_script)
+
+    assert summary["import_edges"] == 1
+
+
+def test_deps_csharp_global_namespace_type_resolves(repo, tabs, run_script):
+    """`using static Util;` names a type declared outside any namespace; the
+    single-segment split must still consult the declaration index."""
+    repo.write("lib/Helpers.cs", "public class Util {}\n")
+    repo.write("lib/Extra.cs", "public class Extra {}\n")
+    repo.write("app/Program.cs", "using static Util;\n\nnamespace App;\nclass P {}\n")
+
+    summary = _deps_summary(repo, tabs, run_script)
+
+    fan_in = {row["path"]: row["fan_in"] for row in summary["top_fan_in_files"]}
+    assert fan_in.get("lib/Helpers.cs") == 1
+
+
 def test_deps_python_resolution_is_counted_too(repo, tabs, run_script):
     """Python goes through the same accounting as every other language: its own
     modules count as first-party (resolved or not), stdlib/pip as external."""
