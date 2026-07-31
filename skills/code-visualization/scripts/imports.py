@@ -16,6 +16,7 @@ surface the ratio so a sparse graph reads as under-resolution, never as
 Stdlib only; the caller supplies the file index so this module never walks a tree.
 """
 import ast
+import json
 import re
 from collections import defaultdict
 from pathlib import Path
@@ -235,7 +236,7 @@ KT_DECL_RE = re.compile(
     r"(?:[\w?]+(?:<[^>\n]*>)?\.)*(\w+)", re.M)
 SCALA_DECL_RE = re.compile(
     r"^(?:(?:private|protected|implicit|final|sealed|abstract|lazy|case|open|"
-    r"transparent|inline)\s+)*"
+    r"transparent|inline|opaque)\s+)*"
     r"(?:def|val|var|class|trait|object|type|given|enum)\s+(\w+)", re.M)
 # `package object bar` puts the file's members in <enclosing pkg>.bar; the
 # plain package regex must not swallow the `object` keyword as a package name.
@@ -245,6 +246,44 @@ SCALA_PKG_OBJ_RE = re.compile(r"^\s*package\s+object\s+(\w+)", re.M)
 # anywhere. An inner type over-indexes harmlessly — it still names this file.
 CS_TYPE_RE = re.compile(
     r"\b(?:class|struct|interface|enum|record)\s+(\w+)")
+
+
+SCALA_INNER_DECL_RE = re.compile(
+    r"\s*(?:(?:private|protected|implicit|final|sealed|abstract|lazy|case|open|"
+    r"transparent|inline|opaque)\s+)*"
+    r"(?:def|val|var|class|trait|object|type|given|enum)\s+(\w+)")
+
+
+def scala_packages(text):
+    """The file's package structure: (composed unbraced chain, braced blocks).
+
+    Unbraced leading clauses compose (`package a.b` + `package c` = a.b.c);
+    a braced block (`package foo { ... }`) scopes only its own braces, so
+    sibling blocks stay separate instead of composing into a phantom a.b.
+    Returns the chain package plus {block package: declaration names inside} —
+    block members are indented, so the column-0 scan cannot see them. A
+    nested member over-indexes into its block's package, which is harmless:
+    it still names this file.
+    """
+    chain, stack, depth, blocks = [], [], 0, {}
+    for line in text.splitlines():
+        m = re.match(r"\s*package\s+(?!object\b)([\w.]+)\s*(\{)?", line)
+        if m and (m.group(2) or "{" in line):
+            stack.append({"open": depth, "name": m.group(1), "entered": False})
+            blocks.setdefault(".".join(chain + [e["name"] for e in stack]), set())
+        elif m:
+            chain.append(m.group(1))
+        elif stack:
+            d = SCALA_INNER_DECL_RE.match(line)
+            if d:
+                key = ".".join(chain + [e["name"] for e in stack])
+                blocks.setdefault(key, set()).add(d.group(1))
+        depth += line.count("{") - line.count("}")
+        for e in stack:
+            e["entered"] = e["entered"] or depth > e["open"]
+        while stack and stack[-1]["entered"] and depth <= stack[-1]["open"]:
+            stack.pop()
+    return ".".join(chain), blocks
 
 
 def cs_namespaces(text):
@@ -318,9 +357,7 @@ def build_decl_indexes(paths):
                 cs.add(pkg, rel, names)
             continue
         if ext == ".scala":
-            # Chained package clauses compose: `package a.b` + `package c` = a.b.c
-            found = [f for f in JVM_PKG_RE.findall(text) if f != "object"]
-            pkg = ".".join(found) if found else ""
+            pkg, scala_blocks = scala_packages(text)
             names |= set(SCALA_DECL_RE.findall(text))
             # Scala 3 extension blocks: `extension (s: String)` followed by
             # indented defs declares those defs as importable package members.
@@ -332,6 +369,9 @@ def build_decl_indexes(paths):
                 # The object's members live one level deeper; index the file
                 # there too, so `import foo.bar.helper` finds it.
                 jvm.add(f"{pkg}.{pobj.group(1)}".lstrip("."), rel, names)
+            for bpkg, decls in scala_blocks.items():
+                if bpkg != pkg:
+                    jvm.add(bpkg, rel, decls | {stem})
         else:
             m = JVM_PKG_RE.search(text)
             pkg = m.group(1) if m else ""
@@ -351,10 +391,20 @@ def jvm_import_specs(text):
     (`_`, `*`, `given`) falls back to the package-star form.
     """
     out = []
-    for line in text.splitlines():
+    lines = text.splitlines()
+    i = -1
+    while i + 1 < len(lines):
+        i += 1
+        line = lines[i]
         m = re.match(r"\s*import\s+(?:static\s+)?(.+)", line)
         if not m:
             continue
+        # A formatter may wrap a grouped import; accumulate to the brace close.
+        joined = m.group(1)
+        while joined.count("{") > joined.count("}") and i + 1 < len(lines):
+            i += 1
+            joined += " " + lines[i].strip()
+        m = re.match(r"(.+)", joined)
         # Scala allows several expressions per statement (`import p.A, q.B`);
         # split on commas outside braces so grouped members stay together.
         exprs, cur, depth = [], "", 0
@@ -433,14 +483,18 @@ class RustWorkspace:
     def __init__(self, all_paths):
         self.src_of = {}       # crate name (underscored) -> src root dir
         self.entry_of = {}     # src root dir -> declared entry file, if custom
-        self._aliases = {}     # crate dir -> {alias: crate name}
-        self._src_by_dir = {}  # crate dir -> its src root
+        self._aliases = {}         # crate dir -> {alias: crate name}
+        self._src_by_dir = {}      # crate dir -> its default src/ root
+        self._lib_src_by_dir = {}  # crate dir -> custom [lib] root, if any
         manifests = []
         for rel, p in all_paths.items():
             if rel == "Cargo.toml" or rel.endswith("/Cargo.toml"):
                 manifests.append((rel[: -len("Cargo.toml")].rstrip("/"), read_text(p)))
         for d, text in manifests:
-            m = re.search(r'^\s*name\s*=\s*"([^"]+)"', text, re.M)
+            # [package] specifically: a [[bin]] table with its own name may
+            # legally precede it, and its name is not the crate's.
+            pkg = re.search(r"^\[package\]\s*\n((?:(?!^\[)[^\n]*\n?)*)", text, re.M)
+            m = pkg and re.search(r'^\s*name\s*=\s*"([^"]+)"', pkg.group(1), re.M)
             if not m:
                 continue
             src = f"{d}/src" if d else "src"
@@ -450,8 +504,9 @@ class RustWorkspace:
                 entry = f"{d}/{pm.group(1)}".lstrip("/")
                 src = entry.rsplit("/", 1)[0] if "/" in entry else ""
                 self.entry_of[src] = entry
+                self._lib_src_by_dir[d] = src
             self.src_of[m.group(1).replace("-", "_")] = src
-            self._src_by_dir[d] = src
+            self._src_by_dir[d] = f"{d}/src" if d else "src"
         for d, text in manifests:
             renames = re.findall(
                 r'^\s*([\w-]+)\s*=\s*\{[^}]*package\s*=\s*"([^"]+)"', text, re.M)
@@ -465,8 +520,20 @@ class RustWorkspace:
         return next((d for d in self._dirs if not d or rel.startswith(d + "/")), "")
 
     def own_src(self, rel):
+        """The crate root governing this file's crate:: — chosen per target.
+
+        A package may carry a custom [lib] root AND the default binary at
+        src/main.rs; each target's files resolve against their own tree.
+        """
         d = self._crate_dir(rel)
-        return self._src_by_dir.get(d, f"{d}/src" if d else "src")
+        default = self._src_by_dir.get(d, f"{d}/src" if d else "src")
+        custom = self._lib_src_by_dir.get(d)
+        if custom is not None and (rel.startswith(custom + "/") or
+                                   (custom == "" and "/" not in rel)):
+            return custom
+        if rel.startswith(default + "/"):
+            return default
+        return custom if custom is not None else default
 
     def crate_root(self, head, importer_rel):
         """src root the head names from this file, honoring local renames."""
@@ -535,6 +602,18 @@ def extract(paths, all_paths, file_set):
     go_mods = build_go_modules(all_paths)
     jvm_idx, cs_idx = build_decl_indexes(paths)
     rust_ws = RustWorkspace(all_paths)
+    # Declared npm package names: a bare JS specifier matching one of these is
+    # external by definition, even when a same-named repo file exists.
+    npm_deps = set()
+    for mrel in all_paths:
+        if mrel == "package.json" or mrel.endswith("/package.json"):
+            try:
+                data = json.loads(read_text(all_paths[mrel]))
+            except ValueError:
+                continue
+            for key in ("dependencies", "devDependencies",
+                        "peerDependencies", "optionalDependencies"):
+                npm_deps.update(data.get(key) or {})
     by_base = build_basename_index(file_set)
     # dir -> .go files, so Go import resolution is a lookup instead of a scan
     # over every file for every import (quadratic on large Go monorepos).
@@ -553,7 +632,7 @@ def extract(paths, all_paths, file_set):
         if ext in (".py", ".pyi"):
             edges[rel] |= python_edges(rel, text, py_idx, file_set, py_roots, stats)
         elif ext in JS_EXTS:
-            _js_edges(rel, text, file_set, by_base, lang, edges, stats)
+            _js_edges(rel, text, file_set, by_base, npm_deps, lang, edges, stats)
         elif ext == ".go":
             _go_edges(rel, text, go_mods, go_files_by_dir, lang, edges, stats)
         elif ext == ".rs":
@@ -573,7 +652,7 @@ def extract(paths, all_paths, file_set):
     return edges, stats
 
 
-def _js_edges(rel, text, file_set, by_base, lang, edges, stats):
+def _js_edges(rel, text, file_set, by_base, npm_deps, lang, edges, stats):
     for spec in JS_IMPORT_RE.findall(text):
         if spec.startswith("."):
             t = resolve_relative_js(rel, spec, file_set)
@@ -588,10 +667,11 @@ def _js_edges(rel, text, file_set, by_base, lang, edges, stats):
                 edges[rel].add(t)
             stats.count(lang, spec, rel, True, bool(t))
         else:
-            # Bare specifiers are packages; only a spec that uniquely
-            # names a repo file (baseUrl-style import) is first-party.
+            # A bare specifier is usually a package — but a name that is not a
+            # declared dependency and uniquely names a repo file is a
+            # baseUrl-style first-party import.
             t = None
-            if "/" in spec and not spec.startswith("@"):
+            if not spec.startswith("@") and spec.split("/")[0] not in npm_deps:
                 t = resolve_unique_suffix(spec, by_base, JS_EXTS)
             if t and t != rel:
                 edges[rel].add(t)
@@ -616,8 +696,12 @@ def _go_edges(rel, text, go_mods, go_files_by_dir, lang, edges, stats):
         if not m:
             continue
         imp = m.group(1)
-        owner = next(((mp, d) for mp, d in go_mods
-                      if imp == mp or imp.startswith(mp + "/")), None)
+        cands = [(mp, d) for mp, d in go_mods if imp == mp or imp.startswith(mp + "/")]
+        # Duplicate module paths (example dirs sharing a placeholder) resolve
+        # to the importer's own module, never to whichever came first.
+        owner = next(((mp, d) for mp, d in cands
+                      if not d or rel == d or rel.startswith(d + "/")),
+                     cands[0] if cands else None)
         if owner is None:
             stats.count(lang, imp, rel, False, False)
             continue

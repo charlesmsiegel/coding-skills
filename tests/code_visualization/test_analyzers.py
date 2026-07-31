@@ -651,6 +651,120 @@ def test_deps_rust_custom_lib_target_path_resolves(repo, tabs, run_script):
     assert fan_in.get("bar/source/engine.rs") == 2  # root.rs mod + main.rs use
 
 
+def test_deps_rust_package_name_comes_from_the_package_table(repo, tabs, run_script):
+    """A [[bin]] table with its own name may precede [package]; the crate is
+    named by the package table, not the first `name =` in the file."""
+    repo.write("app/Cargo.toml",
+               '[[bin]]\nname = "cli"\npath = "src/main.rs"\n\n'
+               '[package]\nname = "app"\n')
+    repo.write("app/src/lib.rs", "pub mod engine;\n")
+    repo.write("app/src/engine.rs", "pub fn start() {}\n")
+    repo.write("tool/Cargo.toml", '[package]\nname = "tool"\n\n[dependencies]\napp = { path = "../app" }\n')
+    repo.write("tool/src/main.rs", "use app::engine::start;\n\nfn main() {}\n")
+
+    summary = _deps_summary(repo, tabs, run_script)
+
+    fan_in = {row["path"]: row["fan_in"] for row in summary["top_fan_in_files"]}
+    assert fan_in.get("app/src/engine.rs") == 2  # lib.rs mod + tool's use
+
+
+def test_deps_rust_binary_beside_custom_lib_uses_its_own_root(repo, tabs, run_script):
+    """A crate with a custom [lib] path may still have the default binary at
+    src/main.rs — that binary's crate:: refers to the src tree, not the lib."""
+    repo.write("bar/Cargo.toml",
+               '[package]\nname = "bar"\n\n[lib]\npath = "source/root.rs"\n')
+    repo.write("bar/source/root.rs", "pub fn lib_only() {}\n")
+    repo.write("bar/src/main.rs", "mod binthing;\nuse crate::binthing::run;\n\nfn main() {}\n")
+    repo.write("bar/src/binthing.rs", "pub fn run() {}\n")
+
+    summary = _deps_summary(repo, tabs, run_script)
+
+    fan_in = {row["path"]: row["fan_in"] for row in summary["top_fan_in_files"]}
+    assert fan_in.get("bar/src/binthing.rs") == 1
+    # root.rs's only fan-in is the manifest's runtime-load reference — the
+    # binary's crate:: must not add an import edge to the library tree.
+    assert fan_in.get("bar/source/root.rs", 0) == 1
+
+
+def test_deps_scala_sibling_braced_packages_stay_separate(repo, tabs, run_script):
+    """`package foo { .. }` followed by `package bar { .. }` declares two
+    packages — composing them into foo.bar loses both."""
+    repo.write("src/main/scala/Both.scala",
+               "package foo {\n  class A\n}\n\npackage bar {\n  class B\n}\n")
+    repo.write("src/main/scala/foo/Other.scala", "package foo\n\nclass Other\n")
+    repo.write("src/main/scala/app/Main.scala",
+               "package app\n\nimport foo.A\nimport bar.B\n\nclass Main\n")
+
+    summary = _deps_summary(repo, tabs, run_script)
+
+    fan_in = {row["path"]: row["fan_in"] for row in summary["top_fan_in_files"]}
+    assert fan_in.get("src/main/scala/Both.scala") == 1  # fan-in is per importer
+    # both imports resolve — under foo.bar composition, foo.A would fail
+    assert summary["resolution"]["Scala"]["resolved"] == 2
+
+
+def test_deps_scala_multiline_grouped_import_expands(repo, tabs, run_script):
+    """A formatter may wrap a grouped import across lines; the group must be
+    accumulated to its closing brace, not truncated to a package star."""
+    repo.write("core/src/main/scala/p/A.scala", "package p\n\nclass A\n")
+    repo.write("core/src/main/scala/p/B.scala", "package p\n\nclass B\n")
+    repo.write("core/src/main/scala/p/C.scala", "package p\n\nclass C\n")
+    repo.write("app/src/main/scala/app/Main.scala",
+               "package app\n\nimport p.{\n  A,\n  B\n}\n\nclass Main\n")
+
+    summary = _deps_summary(repo, tabs, run_script)
+
+    fan_in = {row["path"]: row["fan_in"] for row in summary["top_fan_in_files"]}
+    assert fan_in.get("core/src/main/scala/p/A.scala") == 1
+    assert fan_in.get("core/src/main/scala/p/B.scala") == 1
+    assert "core/src/main/scala/p/C.scala" not in fan_in
+
+
+def test_deps_scala_opaque_type_is_indexed(repo, tabs, run_script):
+    repo.write("core/src/main/scala/p/Ids.scala",
+               "package p\n\nopaque type UserId = String\n")
+    repo.write("core/src/main/scala/p/Other.scala", "package p\n\nclass Other\n")
+    repo.write("app/src/main/scala/app/Main.scala",
+               "package app\n\nimport p.UserId\n\nclass Main\n")
+
+    summary = _deps_summary(repo, tabs, run_script)
+
+    fan_in = {row["path"]: row["fan_in"] for row in summary["top_fan_in_files"]}
+    assert fan_in.get("core/src/main/scala/p/Ids.scala") == 1
+
+
+def test_deps_go_duplicate_module_paths_prefer_the_importers_module(repo, tabs, run_script):
+    """Example dirs often share a placeholder module path; an import must
+    resolve within the importer's own module, not the first one found."""
+    for ex in ("examples/one", "examples/two"):
+        repo.write(f"{ex}/go.mod", "module example.com/demo\n")
+        repo.write(f"{ex}/util/util.go", "package util\n\nfunc Do() {}\n")
+        repo.write(f"{ex}/main.go",
+                   'package main\n\nimport "example.com/demo/util"\n\nfunc main() { util.Do() }\n')
+
+    summary = _deps_summary(repo, tabs, run_script)
+
+    fan_in = {row["path"]: row["fan_in"] for row in summary["top_fan_in_files"]}
+    assert fan_in.get("examples/one/util/util.go") == 1
+    assert fan_in.get("examples/two/util/util.go") == 1
+
+
+def test_deps_js_single_segment_baseurl_resolves_unless_a_package(repo, tabs, run_script):
+    """`from "utils"` may be a baseUrl import of a unique repo file — but a
+    name declared in package.json dependencies is an npm package, never a
+    repo file, even when a same-named file exists."""
+    repo.write("package.json", '{"dependencies": {"react": "^18.0.0"}}\n')
+    repo.write("src/utils.ts", "export const x = 1;\n")
+    repo.write("src/react.ts", "export const decoy = 1;\n")
+    repo.write("src/app.ts", "import { x } from 'utils';\nimport React from 'react';\n")
+
+    summary = _deps_summary(repo, tabs, run_script)
+
+    fan_in = {row["path"]: row["fan_in"] for row in summary["top_fan_in_files"]}
+    assert fan_in.get("src/utils.ts") == 1
+    assert "src/react.ts" not in fan_in
+
+
 def test_deps_python_resolution_is_counted_too(repo, tabs, run_script):
     """Python goes through the same accounting as every other language: its own
     modules count as first-party (resolved or not), stdlib/pip as external."""
