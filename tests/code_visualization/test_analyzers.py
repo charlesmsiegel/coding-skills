@@ -428,6 +428,99 @@ def test_deps_csharp_and_jvm_declarations_do_not_cross_link(repo, tabs, run_scri
     assert summary["import_edges"] == 0
 
 
+def test_deps_scala_grouped_import_links_only_named_declarations(repo, tabs, run_script):
+    """`import p.{A, B}` names two declarations — truncating at the brace used
+    to star-link every file of the package, C included."""
+    repo.write("core/src/main/scala/p/A.scala", "package p\n\nclass A\n")
+    repo.write("core/src/main/scala/p/B.scala", "package p\n\nclass B\n")
+    repo.write("core/src/main/scala/p/C.scala", "package p\n\nclass C\n")
+    repo.write("app/src/main/scala/app/Main.scala",
+               "package app\n\nimport p.{A, B}\n\nclass Main\n")
+
+    summary = _deps_summary(repo, tabs, run_script)
+
+    fan_in = {row["path"]: row["fan_in"] for row in summary["top_fan_in_files"]}
+    assert fan_in.get("core/src/main/scala/p/A.scala") == 1
+    assert fan_in.get("core/src/main/scala/p/B.scala") == 1
+    assert "core/src/main/scala/p/C.scala" not in fan_in
+
+
+def test_deps_scala_package_object_declares_its_own_package(repo, tabs, run_script):
+    """`package foo` + `package object bar` puts the file's members in foo.bar,
+    not in a package literally named foo.object."""
+    repo.write("src/main/scala/foo/package.scala",
+               "package foo\n\npackage object bar {\n  def helper = 1\n}\n")
+    repo.write("src/main/scala/foo/Other.scala", "package foo\n\nclass Other\n")
+    repo.write("src/main/scala/app/Main.scala",
+               "package app\n\nimport foo.bar.helper\n\nclass Main\n")
+
+    summary = _deps_summary(repo, tabs, run_script)
+
+    fan_in = {row["path"]: row["fan_in"] for row in summary["top_fan_in_files"]}
+    assert fan_in.get("src/main/scala/foo/package.scala") == 1
+
+
+def test_deps_kotlin_extension_function_resolves_by_function_name(repo, tabs, run_script):
+    """`fun String.helper()` is imported as `import p.helper` — the receiver
+    type is not the declaration's name."""
+    repo.write("core/src/main/kotlin/p/Ext.kt",
+               "package p\n\nfun String.helper() = 1\n")
+    repo.write("core/src/main/kotlin/p/Other.kt", "package p\n\nclass Other\n")
+    repo.write("app/src/main/kotlin/app/Main.kt",
+               "package app\n\nimport p.helper\n")
+
+    summary = _deps_summary(repo, tabs, run_script)
+
+    fan_in = {row["path"]: row["fan_in"] for row in summary["top_fan_in_files"]}
+    assert fan_in.get("core/src/main/kotlin/p/Ext.kt") == 1
+
+
+def test_deps_csharp_type_resolves_even_when_file_stem_differs(repo, tabs, run_script):
+    """C# type names owe nothing to file names: `using static Acme.Utility;`
+    must find the file declaring class Utility, whatever it is called."""
+    repo.write("lib/Helpers.cs",
+               "namespace Acme;\n\npublic class Utility {\n    public static int X = 1;\n}\n")
+    repo.write("lib/Extra.cs", "namespace Acme;\n\npublic class Extra {}\n")
+    repo.write("app/Program.cs", "using static Acme.Utility;\n\nnamespace App;\nclass P {}\n")
+
+    summary = _deps_summary(repo, tabs, run_script)
+
+    fan_in = {row["path"]: row["fan_in"] for row in summary["top_fan_in_files"]}
+    assert fan_in.get("lib/Helpers.cs") == 1
+
+
+def test_deps_csharp_nested_namespace_blocks_compose(repo, tabs, run_script):
+    """`namespace Acme { namespace Billing { ... } }` declares Acme.Billing;
+    sibling blocks at the same depth must not compose with each other."""
+    repo.write("lib/Nested.cs",
+               "namespace Acme {\n  namespace Billing {\n    class Invoice {}\n  }\n"
+               "  namespace Shipping {\n    class Label {}\n  }\n}\n")
+    repo.write("lib/Other.cs", "namespace Acme;\n\nclass Other {}\n")
+    repo.write("app/Program.cs", "using Acme.Billing;\n\nnamespace App;\nclass P {}\n")
+
+    summary = _deps_summary(repo, tabs, run_script)
+
+    fan_in = {row["path"]: row["fan_in"] for row in summary["top_fan_in_files"]}
+    assert fan_in.get("lib/Nested.cs") == 1
+
+
+def test_deps_rust_renamed_path_dependency_resolves(repo, tabs, run_script):
+    """`foo = { package = "bar", ... }` makes code say `use foo::` for the
+    workspace crate named bar — the alias must reach bar's sources."""
+    repo.write("app/Cargo.toml",
+               '[package]\nname = "app"\n\n[dependencies]\n'
+               'foo = { package = "bar", path = "../bar" }\n')
+    repo.write("app/src/main.rs", "use foo::engine::start;\n\nfn main() {}\n")
+    repo.write("bar/Cargo.toml", '[package]\nname = "bar"\n')
+    repo.write("bar/src/lib.rs", "pub mod engine;\n")
+    repo.write("bar/src/engine.rs", "pub fn start() {}\n")
+
+    summary = _deps_summary(repo, tabs, run_script)
+
+    fan_in = {row["path"]: row["fan_in"] for row in summary["top_fan_in_files"]}
+    assert fan_in.get("bar/src/engine.rs") == 2  # lib.rs `mod` + main.rs `use`
+
+
 def test_deps_python_resolution_is_counted_too(repo, tabs, run_script):
     """Python goes through the same accounting as every other language: its own
     modules count as first-party (resolved or not), stdlib/pip as external."""
