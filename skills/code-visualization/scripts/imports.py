@@ -37,7 +37,9 @@ JVM_PKG_RE = re.compile(r"^\s*package\s+([\w.]+)", re.M)
 CS_USING_RE = re.compile(
     r"^\s*(?:global\s+)?using\s+(?:static\s+)?(?:\w+\s*=\s*)?([\w.]+)\s*;", re.M)
 CS_NS_RE = re.compile(r"^\s*namespace\s+([\w.]+)", re.M)
-RUST_USE_RE = re.compile(r"^\s*(?:pub(?:\([^)]*\))?\s+)?use\s+([\w:]+)", re.M)
+# Captures the full statement (a negated class crosses newlines, so a
+# rustfmt-wrapped group still arrives whole); rust_use_targets() parses it.
+RUST_USE_RE = re.compile(r"^\s*(?:pub(?:\([^)]*\))?\s+)?use\s+([^;]+);", re.M)
 RUST_MOD_RE = re.compile(r"^\s*(?:pub(?:\([^)]*\))?\s+)?mod\s+(\w+)\s*;", re.M)
 RUBY_REQ_RE = re.compile(r"""require_relative\s+['"]([^'"]+)['"]""")
 
@@ -220,70 +222,105 @@ def build_go_modules(all_paths):
     return sorted(mods, key=lambda t: -len(t[0]))
 
 
-def build_jvm_index(paths):
-    """What each Java/Kotlin/Scala/C# file declares, keyed for import lookup.
+# Top-level (column-0) declarations: Kotlin and Scala imports name declarations,
+# not files, so `import pkg.helper` must find whichever file declares
+# `fun helper` — the file's name says nothing. Column 0 is what makes this
+# textual scan safe: nested declarations are indented by universal convention.
+KT_DECL_RE = re.compile(
+    r"^(?:(?:public|private|internal|protected|open|final|abstract|sealed|data|"
+    r"inline|expect|actual|external|const|lateinit|tailrec|operator|infix|"
+    r"suspend|enum|annotation|value)\s+)*"
+    r"(?:fun|val|var|class|interface|object|typealias)\s+(?:<[^>\n]*>\s*)?(\w+)", re.M)
+SCALA_DECL_RE = re.compile(
+    r"^(?:(?:private|protected|implicit|final|sealed|abstract|lazy|case|open|"
+    r"transparent|inline)\s+)*"
+    r"(?:def|val|var|class|trait|object|type|given|enum)\s+(\w+)", re.M)
+
+
+class DeclIndex:
+    """One ecosystem's declarations, keyed for import lookup.
 
     pkg_files: package/namespace -> files declaring it (a star import or a C#
-    using is a dependency on all of them). stem_files: (package, FileStem) ->
-    files, the layout-independent answer to `import a.b.C` — wherever a build
-    tool put the file, its declaration says what it is. pkg_roots holds the
-    first two segments of every declared package, the "does this repo plausibly
-    own dev.rpg.*?" test for classifying unresolved imports.
+    using is a dependency on all of them). decl_files: (package, Name) -> files,
+    the layout-independent answer to `import a.b.C` — keyed by file stem and by
+    top-level declaration names, since wherever a build tool put the file, its
+    declarations say what it is. pkg_roots holds the first two segments of every
+    declared package, the "does this repo plausibly own dev.rpg.*?" test for
+    classifying unresolved imports.
     """
-    pkg_files, stem_files, pkg_roots = defaultdict(set), defaultdict(set), set()
+
+    def __init__(self):
+        self.pkg_files = defaultdict(set)
+        self.decl_files = defaultdict(set)
+        self.pkg_roots = set()
+
+    def add(self, pkg, rel, names):
+        self.pkg_files[pkg].add(rel)
+        for name in names:
+            self.decl_files[(pkg, name)].add(rel)
+        if pkg:
+            self.pkg_roots.add(tuple(pkg.split(".")[:2]))
+
+
+def build_decl_indexes(paths):
+    """Separate declaration indexes for the JVM family and for C#: the two
+    ecosystems never link (a Java package and a C# namespace sharing a dotted
+    name are unrelated), so mixing them would invent impossible edges."""
+    jvm, cs = DeclIndex(), DeclIndex()
     for rel, p in paths.items():
         ext = "." + rel.rsplit(".", 1)[-1] if "." in rel else ""
         if ext not in JVM_EXTS and ext != ".cs":
             continue
         text = read_text(p)
+        stem = rel.rsplit("/", 1)[-1].rsplit(".", 1)[0]
+        names = {stem}
         if ext == ".cs":
-            pkgs = CS_NS_RE.findall(text) or [""]
-        elif ext == ".scala":
+            for pkg in CS_NS_RE.findall(text) or [""]:
+                cs.add(pkg, rel, names)
+            continue
+        if ext == ".scala":
             # Chained package clauses compose: `package a.b` + `package c` = a.b.c
             found = JVM_PKG_RE.findall(text)
-            pkgs = [".".join(found)] if found else [""]
+            pkg = ".".join(found) if found else ""
+            names |= set(SCALA_DECL_RE.findall(text))
         else:
             m = JVM_PKG_RE.search(text)
-            pkgs = [m.group(1)] if m else [""]
-        stem = rel.rsplit("/", 1)[-1].rsplit(".", 1)[0]
-        for pkg in pkgs:
-            pkg_files[pkg].add(rel)
-            stem_files[(pkg, stem)].add(rel)
-            if pkg:
-                pkg_roots.add(tuple(pkg.split(".")[:2]))
-    return pkg_files, stem_files, pkg_roots
+            pkg = m.group(1) if m else ""
+            if ext == ".kt":
+                names |= set(KT_DECL_RE.findall(text))
+        jvm.add(pkg, rel, names)
+    return jvm, cs
 
 
-def resolve_jvm(imp, pkg_files, stem_files):
-    """Resolve a dotted import against declarations. Returns (files, first_party).
+def resolve_jvm(imp, index):
+    """Resolve a dotted import against a DeclIndex. Returns (files, first_party).
 
     A `.*`/`._` suffix (or a bare package name — the C# using case) links every
     file of the package. Otherwise the boundary between package and symbol is
     unknown (a.b.C, a.b.C.Inner, a.b.topLevelFn all exist), so the split is
-    searched right-to-left against declared (package, stem) pairs. Ambiguity —
-    two files declaring the same package+stem, e.g. Kotlin expect/actual pairs —
+    searched right-to-left against declared (package, name) pairs. Ambiguity —
+    two files declaring the same package+name, e.g. Kotlin expect/actual pairs —
     resolves to nothing: a wrong edge is worse than a missing one.
     """
     imp = imp.rstrip(".")
     star = imp.endswith((".*", "._"))
     if star:
         imp = imp[:-2]
-    if star or imp in pkg_files:
-        files = pkg_files.get(imp, set())
-        first_party = bool(files) or tuple(imp.split(".")[:2]) in {
-            tuple(p.split(".")[:2]) for p in pkg_files if p}
+    if star or imp in index.pkg_files:
+        files = index.pkg_files.get(imp, set())
+        first_party = bool(files) or tuple(imp.split(".")[:2]) in index.pkg_roots
         return (set(sorted(files)[:MAX_STAR_TARGETS]), first_party)
     segs = imp.split(".")
     for i in range(len(segs) - 1, 0, -1):
-        hits = stem_files.get((".".join(segs[:i]), segs[i]), set())
+        hits = index.decl_files.get((".".join(segs[:i]), segs[i]), set())
         if len(hits) == 1:
             return (set(hits), True)
         if hits:
             return (set(), True)  # ambiguous: first-party, deliberately unresolved
     pkg = ".".join(segs[:-1])
-    files = pkg_files.get(pkg, set())
+    files = index.pkg_files.get(pkg, set())
     if len(files) == 1:
-        # `import a.b.topLevelFn` in a single-file package: the file is certain.
+        # `import a.b.unrecognizedName` in a single-file package: the file is certain.
         return (set(files), True)
     return (set(), bool(files))
 
@@ -319,7 +356,9 @@ def resolve_rust_path(src_root, segs, file_set):
         for cand in (f"{base}.rs", f"{base}/mod.rs"):
             if cand in file_set:
                 return cand
-    for entry in ("lib.rs", "main.rs"):
+    # mod.rs covers the self::/super:: case, where the root is a module
+    # directory rather than a crate src root.
+    for entry in ("lib.rs", "main.rs", "mod.rs"):
         if f"{src_root}/{entry}" in file_set:
             return f"{src_root}/{entry}"
     return None
@@ -364,7 +403,7 @@ def extract(paths, all_paths, file_set):
     py_roots = {seg for rel in file_set if rel.endswith((".py", ".pyi"))
                 for seg in rel.rsplit(".", 1)[0].split("/")}
     go_mods = build_go_modules(all_paths)
-    jvm_pkg_files, jvm_stem_files, jvm_pkg_roots = build_jvm_index(paths)
+    jvm_idx, cs_idx = build_decl_indexes(paths)
     rust_crates, rust_own_src = build_rust_crates(all_paths)
     by_base = build_basename_index(file_set)
     # dir -> .go files, so Go import resolution is a lookup instead of a scan
@@ -391,12 +430,10 @@ def extract(paths, all_paths, file_set):
             _rust_edges(rel, text, file_set, rust_crates, rust_own_src, lang, edges, stats)
         elif ext in JVM_EXTS:
             for imp in JVM_IMPORT_RE.findall(text):
-                _jvm_edge(rel, imp, jvm_pkg_files, jvm_stem_files, jvm_pkg_roots,
-                          lang, edges, stats)
+                _jvm_edge(rel, imp, jvm_idx, lang, edges, stats)
         elif ext == ".cs":
             for imp in CS_USING_RE.findall(text):
-                _jvm_edge(rel, imp, jvm_pkg_files, jvm_stem_files, jvm_pkg_roots,
-                          lang, edges, stats)
+                _jvm_edge(rel, imp, cs_idx, lang, edges, stats)
         elif ext == ".rb":
             for spec in RUBY_REQ_RE.findall(text):
                 t = resolve_relative_js(rel, spec if spec.endswith(".rb") else spec + ".rb", file_set)
@@ -466,49 +503,83 @@ def _go_edges(rel, text, go_mods, go_files_by_dir, lang, edges, stats):
         stats.count(lang, imp, rel, True, hit or cand_dir == src_dir)
 
 
+def rust_use_targets(stmt):
+    """Expand one use statement into the paths it names.
+
+    `use a::b::{c, d as e, self, f::{g}}` names a::b::c, a::b::d, a::b (self),
+    and a::b::f::g — truncating at the brace would both lose the real targets
+    and mis-resolve the bare prefix to lib.rs. Commas split at brace depth 0
+    only, so nested groups stay attached to their own prefix.
+    """
+    stmt = stmt.strip()
+    m = re.match(r"([\w:]+?)\s*(?:::)?\s*\{(.*)\}\s*$", stmt, re.S)
+    if not m:
+        m = re.match(r"[\w:]+", stmt)  # plain path; drops any trailing ` as x`
+        return [m.group(0)] if m else []
+    prefix, inner = m.group(1).rstrip(":"), m.group(2)
+    items, cur, depth = [], "", 0
+    for ch in inner:
+        if ch == "," and depth == 0:
+            items.append(cur)
+            cur = ""
+            continue
+        depth += (ch == "{") - (ch == "}")
+        cur += ch
+    items.append(cur)
+    out = []
+    for item in items:
+        for sub in rust_use_targets(item):
+            out.append(prefix if sub == "self" else f"{prefix}::{sub}")
+    return out
+
+
 def _rust_edges(rel, text, file_set, rust_crates, rust_own_src, lang, edges, stats):
     own = rust_own_src(rel)
     own_dir = str(Path(rel).parent).replace("\\", "/")
+    stem = rel.rsplit("/", 1)[-1]
+    # The directory holding this module's CHILD modules: lib/main/mod.rs own
+    # their directory; foo.rs owns foo/. self:: resolves here, and each super::
+    # pops one level from here — so one super from a/child.rs lands in a/, the
+    # importer's own directory, not a level above it.
+    child_dir = own_dir if stem in ("lib.rs", "main.rs", "mod.rs") \
+        else f"{own_dir}/{stem[:-3]}"
     for name in RUST_MOD_RE.findall(text):
-        # `mod x;` in lib/main/mod.rs looks beside itself; in foo.rs it
-        # looks inside foo/ (with the pre-2018 sibling as fallback).
-        stem = rel.rsplit("/", 1)[-1]
-        bases = ([own_dir] if stem in ("lib.rs", "main.rs", "mod.rs")
-                 else [f"{own_dir}/{stem[:-3]}", own_dir])
-        t = next((c for b in bases
+        # `mod x;` declares a child module (with the pre-2018 sibling fallback).
+        t = next((c for b in (child_dir, own_dir)
                   for c in (f"{b}/{name}.rs", f"{b}/{name}/mod.rs")
                   if c in file_set and c != rel), None)
         if t:
             edges[rel].add(t)
         stats.count(lang, f"mod {name}", rel, True, bool(t))
-    for use in RUST_USE_RE.findall(text):
-        segs = [s for s in use.strip(":").split("::") if s]
-        if not segs:
-            continue
-        head = segs[0]
-        if head == "crate":
-            root, segs = own, segs[1:]
-        elif head == "self":
-            root, segs = own_dir, segs[1:]
-        elif head == "super":
-            root, segs = own_dir, segs
-            while segs and segs[0] == "super":
-                root, segs = root.rsplit("/", 1)[0], segs[1:]
-        elif head in rust_crates:
-            root, segs = rust_crates[head], segs[1:]
-        else:
-            stats.count(lang, use, rel, False, False)
-            continue
-        t = resolve_rust_path(root, segs, file_set)
-        if t and t != rel:
-            edges[rel].add(t)
-        stats.count(lang, use, rel, True, bool(t))
+    for stmt in RUST_USE_RE.findall(text):
+        for use in rust_use_targets(stmt):
+            segs = [s for s in use.strip(":").split("::") if s]
+            if not segs:
+                continue
+            head = segs[0]
+            if head == "crate":
+                root, segs = own, segs[1:]
+            elif head in ("self", "super"):
+                root = child_dir
+                while segs and segs[0] == "super":
+                    root, segs = root.rsplit("/", 1)[0], segs[1:]
+                if segs and segs[0] == "self":
+                    segs = segs[1:]
+            elif head in rust_crates:
+                root, segs = rust_crates[head], segs[1:]
+            else:
+                stats.count(lang, use, rel, False, False)
+                continue
+            t = resolve_rust_path(root, segs, file_set)
+            if t and t != rel:
+                edges[rel].add(t)
+            stats.count(lang, use, rel, True, bool(t))
 
 
-def _jvm_edge(rel, imp, pkg_files, stem_files, pkg_roots, lang, edges, stats):
-    targets, first_party = resolve_jvm(imp, pkg_files, stem_files)
+def _jvm_edge(rel, imp, index, lang, edges, stats):
+    targets, first_party = resolve_jvm(imp, index)
     targets.discard(rel)
     edges[rel] |= targets
     if not first_party:
-        first_party = tuple(imp.split(".")[:2]) in pkg_roots
+        first_party = tuple(imp.split(".")[:2]) in index.pkg_roots
     stats.count(lang, imp, rel, first_party, bool(targets))

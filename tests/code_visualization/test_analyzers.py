@@ -369,6 +369,65 @@ def test_deps_summary_reports_per_language_resolution(repo, tabs, run_script):
     assert any("dev.rpg.gone.Missing" in s for s in res["samples"])
 
 
+def test_deps_rust_grouped_use_links_each_item(repo, tabs, run_script):
+    """`use crate::{a, b};` names two modules; capturing only the prefix used
+    to emit a bogus lib.rs self-reference and drop both real edges."""
+    repo.write("Cargo.toml", '[package]\nname = "app"\n')
+    repo.write("src/lib.rs", "use crate::{physics, audio};\n")
+    repo.write("src/physics.rs", "pub fn step() {}\n")
+    repo.write("src/audio.rs", "pub fn play() {}\n")
+
+    summary = _deps_summary(repo, tabs, run_script)
+
+    fan_in = {row["path"]: row["fan_in"] for row in summary["top_fan_in_files"]}
+    assert fan_in.get("src/physics.rs") == 1
+    assert fan_in.get("src/audio.rs") == 1
+
+
+def test_deps_rust_super_stays_in_the_parent_module_dir(repo, tabs, run_script):
+    """From src/a/child.rs, `super::` is module `a` — whose files live in
+    src/a/, the importer's own directory, not one level further up."""
+    repo.write("Cargo.toml", '[package]\nname = "app"\n')
+    repo.write("src/lib.rs", "mod a;\n")
+    repo.write("src/a/mod.rs", "mod child;\nmod sibling;\n")
+    repo.write("src/a/child.rs", "use super::sibling::helper;\n")
+    repo.write("src/a/sibling.rs", "pub fn helper() {}\n")
+
+    summary = _deps_summary(repo, tabs, run_script)
+
+    fan_in = {row["path"]: row["fan_in"] for row in summary["top_fan_in_files"]}
+    # one edge from mod.rs's `mod sibling;`, one from child.rs's super:: use
+    assert fan_in.get("src/a/sibling.rs") == 2
+
+
+def test_deps_kotlin_top_level_function_import_resolves_by_declaration(
+        repo, tabs, run_script):
+    """Kotlin imports name declarations, not files: `import pkg.helper` must
+    find whichever file declares `fun helper`, even in a multi-file package."""
+    repo.write("core/src/main/kotlin/dev/rpg/core/Utils.kt",
+               "package dev.rpg.core\n\nfun helper() = 1\n")
+    repo.write("core/src/main/kotlin/dev/rpg/core/Other.kt",
+               "package dev.rpg.core\n\nclass Other\n")
+    repo.write("app/src/main/kotlin/dev/rpg/app/Main.kt",
+               "package dev.rpg.app\n\nimport dev.rpg.core.helper\n")
+
+    summary = _deps_summary(repo, tabs, run_script)
+
+    fan_in = {row["path"]: row["fan_in"] for row in summary["top_fan_in_files"]}
+    assert fan_in.get("core/src/main/kotlin/dev/rpg/core/Utils.kt") == 1
+
+
+def test_deps_csharp_and_jvm_declarations_do_not_cross_link(repo, tabs, run_script):
+    """A C# using and a Java package that happen to share a dotted name are
+    different ecosystems — linking across them invents impossible edges."""
+    repo.write("jvm/Shared.java", "package com.acme.shared;\n\nclass Shared {}\n")
+    repo.write("cs/Program.cs", "using com.acme.shared;\n\nnamespace App;\nclass P {}\n")
+
+    summary = _deps_summary(repo, tabs, run_script)
+
+    assert summary["import_edges"] == 0
+
+
 def test_deps_python_resolution_is_counted_too(repo, tabs, run_script):
     """Python goes through the same accounting as every other language: its own
     modules count as first-party (resolved or not), stdlib/pip as external."""
