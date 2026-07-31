@@ -6,9 +6,19 @@ Emits: TABS_DIR/03-dependencies.html and a JSON summary on stdout.
 
 Two kinds of dependency, both drawn:
 
-  imports   Python (ast), JS/TS (import/require/export-from), Go (module-path
-            imports), Rust (use crate::), Java/Kotlin (import pkg.Class), Ruby
+  imports   Python (ast), JS/TS (import/require/export-from, plus @/-style root
+            aliases), Go (module-path imports against every go.mod in the repo),
+            Rust (use crate::/workspace-crate paths and mod declarations),
+            Java/Kotlin/Scala (import resolved against declared packages),
+            C# (using resolved against declared namespaces), Ruby
             (require_relative). Other languages appear as nodes without edges.
+
+            Resolution keys on what files DECLARE (package, namespace, crate,
+            module path), never on where a build layout happens to put them —
+            a Gradle module/src/main/kotlin tree resolves exactly like a flat
+            one. Every language reports imports seen vs resolved in the
+            summary's "resolution" block; a graph that could not be resolved
+            says so instead of rendering as "no coupling".
   loads     runtime resource references (resources.py) — a rendered template, a
             prompt read off disk, an embedded schema. A referenced asset becomes
             a node; an unreferenced one does not, so a docs directory does not
@@ -36,9 +46,60 @@ JS_IMPORT_RE = re.compile(
     r"""(?:import\s+(?:[\w*{}\s,$]+\s+from\s+)?|export\s+(?:[\w*{}\s,$]+\s+from\s+)|require\s*\(\s*|import\s*\(\s*)['"]([^'"]+)['"]"""
 )
 GO_IMPORT_RE = re.compile(r'^\s*(?:[\w.]+\s+)?"([^"]+)"', re.M)
-RUST_USE_RE = re.compile(r"^\s*(?:pub\s+)?use\s+crate::([\w:]+)", re.M)
-JAVA_IMPORT_RE = re.compile(r"^\s*import\s+(?:static\s+)?([\w.]+)\s*;", re.M)
+# No trailing ';' required: Kotlin and Scala imports carry none, and the old
+# semicolon-anchored pattern silently matched zero Kotlin imports. '*' rides
+# along so star imports arrive intact ('.' and '_' are handled by the caller).
+JVM_IMPORT_RE = re.compile(r"^\s*import\s+(?:static\s+)?([\w.*]+)", re.M)
+JVM_PKG_RE = re.compile(r"^\s*package\s+([\w.]+)", re.M)
+# Matches namespace-usings and aliases; 'using var x = ...' and
+# 'using (var x = ...)' fail the required trailing ';' after the dotted name.
+CS_USING_RE = re.compile(
+    r"^\s*(?:global\s+)?using\s+(?:static\s+)?(?:\w+\s*=\s*)?([\w.]+)\s*;", re.M)
+CS_NS_RE = re.compile(r"^\s*namespace\s+([\w.]+)", re.M)
+RUST_USE_RE = re.compile(r"^\s*(?:pub(?:\([^)]*\))?\s+)?use\s+([\w:]+)", re.M)
+RUST_MOD_RE = re.compile(r"^\s*(?:pub(?:\([^)]*\))?\s+)?mod\s+(\w+)\s*;", re.M)
 RUBY_REQ_RE = re.compile(r"""require_relative\s+['"]([^'"]+)['"]""")
+
+JVM_EXTS = (".java", ".kt", ".scala")
+# A star import (or a C# namespace-using) is a real dependency on every file of
+# the package, but a package that large is a namespace, not a unit — linking
+# hundreds of files off one line would drown the graph in noise.
+MAX_STAR_TARGETS = 25
+
+
+class ResolutionStats:
+    """Per-language accounting of import statements, so a resolver gap surfaces
+    as a number instead of a silently sparse graph.
+
+    first_party: statements that name something this repo plausibly owns (a
+    declared package root, a workspace crate, a module path, a relative spec).
+    resolved is a subset of first_party; everything else is external. Samples
+    keep the first few unresolved first-party specs for the summary.
+    """
+
+    def __init__(self):
+        self.by_lang = defaultdict(
+            lambda: {"first_party": 0, "resolved": 0, "external": 0, "samples": []})
+
+    def count(self, lang, spec, rel, first_party, resolved):
+        s = self.by_lang[lang]
+        if not first_party:
+            s["external"] += 1
+            return
+        s["first_party"] += 1
+        if resolved:
+            s["resolved"] += 1
+        elif len(s["samples"]) < 8:
+            s["samples"].append(f"{spec}  ({rel})")
+
+    def summary(self):
+        return {lang: dict(s) for lang, s in sorted(self.by_lang.items())}
+
+    def under_resolved(self):
+        """Languages where imports the repo appears to own mostly failed to
+        resolve — the signal that the graph under-states coupling."""
+        return [(lang, s) for lang, s in sorted(self.by_lang.items())
+                if s["first_party"] >= 10 and s["resolved"] < 0.5 * s["first_party"]]
 
 
 def build_python_index(files):
@@ -66,7 +127,7 @@ def build_python_index(files):
     return {key: next(iter(hits)) for key, hits in claims.items() if len(hits) == 1}
 
 
-def python_edges(rel, text, py_idx, file_set=frozenset()):
+def python_edges(rel, text, py_idx, file_set=frozenset(), py_roots=frozenset(), stats=None):
     edges = set()
     try:
         tree = ast.parse(text)
@@ -74,6 +135,10 @@ def python_edges(rel, text, py_idx, file_set=frozenset()):
     # pathologically nested literals. Either must cost one file, not the run.
     except (SyntaxError, ValueError, RecursionError):
         return edges
+
+    def count(spec, first_party, resolved):
+        if stats is not None:
+            stats.count("Python", spec, rel, first_party, resolved)
     pkg_parts = rel.rsplit(".", 1)[0].split("/")
     if pkg_parts[-1] == "__init__":
         pkg_parts = pkg_parts[:-1]
@@ -108,6 +173,7 @@ def python_edges(rel, text, py_idx, file_set=frozenset()):
                 t = resolve(a.name)
                 if t:
                     edges.add(t)
+                count(a.name, bool(t) or a.name.split(".")[0] in py_roots, bool(t))
         elif isinstance(node, ast.ImportFrom):
             if node.level:
                 base = pkg_parts[: len(pkg_parts) - (node.level - 1)]
@@ -116,13 +182,19 @@ def python_edges(rel, text, py_idx, file_set=frozenset()):
                 mod = node.module or ""
             if not mod:
                 continue
+            hit = False
             t = resolve(mod)
             if t:
                 edges.add(t)
+                hit = True
             for a in node.names:
                 t2 = resolve(f"{mod}.{a.name}")
                 if t2:
                     edges.add(t2)
+                    hit = True
+            spec = ("." * node.level) + (node.module or "")
+            # A relative import is first-party by construction.
+            count(spec, node.level > 0 or hit or mod.split(".")[0] in py_roots, hit)
     edges.discard(rel)
     return edges
 
@@ -152,12 +224,147 @@ def resolve_relative_js(rel, spec, file_set):
     return None
 
 
-def go_module_path(repo: Path):
-    gomod = repo / "go.mod"
-    if gomod.exists():
-        m = re.search(r"^module\s+(\S+)", read_text(gomod), re.M)
-        if m:
-            return m.group(1)
+def build_go_modules(all_paths):
+    """Every go.mod in the repo: [(module_path, dir)], longest module first.
+
+    Multi-module repos (and repos whose go.mod is not at the root) resolve per
+    module; the longest-prefix match sends nested modules to the right one.
+    """
+    mods = []
+    for rel, p in all_paths.items():
+        if rel == "go.mod" or rel.endswith("/go.mod"):
+            m = re.search(r"^module\s+(\S+)", read_text(p), re.M)
+            if m:
+                mods.append((m.group(1), rel[: -len("go.mod")].rstrip("/")))
+    return sorted(mods, key=lambda t: -len(t[0]))
+
+
+def build_jvm_index(paths):
+    """What each Java/Kotlin/Scala/C# file declares, keyed for import lookup.
+
+    pkg_files: package/namespace -> files declaring it (a star import or a C#
+    using is a dependency on all of them). stem_files: (package, FileStem) ->
+    files, the layout-independent answer to `import a.b.C` — wherever a build
+    tool put the file, its declaration says what it is. pkg_roots holds the
+    first two segments of every declared package, the "does this repo plausibly
+    own dev.rpg.*?" test for classifying unresolved imports.
+    """
+    pkg_files, stem_files, pkg_roots = defaultdict(set), defaultdict(set), set()
+    for rel, p in paths.items():
+        ext = "." + rel.rsplit(".", 1)[-1] if "." in rel else ""
+        if ext not in JVM_EXTS and ext != ".cs":
+            continue
+        text = read_text(p)
+        if ext == ".cs":
+            pkgs = CS_NS_RE.findall(text) or [""]
+        elif ext == ".scala":
+            # Chained package clauses compose: `package a.b` + `package c` = a.b.c
+            found = JVM_PKG_RE.findall(text)
+            pkgs = [".".join(found)] if found else [""]
+        else:
+            m = JVM_PKG_RE.search(text)
+            pkgs = [m.group(1)] if m else [""]
+        stem = rel.rsplit("/", 1)[-1].rsplit(".", 1)[0]
+        for pkg in pkgs:
+            pkg_files[pkg].add(rel)
+            stem_files[(pkg, stem)].add(rel)
+            if pkg:
+                pkg_roots.add(tuple(pkg.split(".")[:2]))
+    return pkg_files, stem_files, pkg_roots
+
+
+def resolve_jvm(imp, pkg_files, stem_files):
+    """Resolve a dotted import against declarations. Returns (files, first_party).
+
+    A `.*`/`._` suffix (or a bare package name — the C# using case) links every
+    file of the package. Otherwise the boundary between package and symbol is
+    unknown (a.b.C, a.b.C.Inner, a.b.topLevelFn all exist), so the split is
+    searched right-to-left against declared (package, stem) pairs. Ambiguity —
+    two files declaring the same package+stem, e.g. Kotlin expect/actual pairs —
+    resolves to nothing: a wrong edge is worse than a missing one.
+    """
+    imp = imp.rstrip(".")
+    star = imp.endswith((".*", "._"))
+    if star:
+        imp = imp[:-2]
+    if star or imp in pkg_files:
+        files = pkg_files.get(imp, set())
+        first_party = bool(files) or tuple(imp.split(".")[:2]) in {
+            tuple(p.split(".")[:2]) for p in pkg_files if p}
+        return (set(sorted(files)[:MAX_STAR_TARGETS]), first_party)
+    segs = imp.split(".")
+    for i in range(len(segs) - 1, 0, -1):
+        hits = stem_files.get((".".join(segs[:i]), segs[i]), set())
+        if len(hits) == 1:
+            return (set(hits), True)
+        if hits:
+            return (set(), True)  # ambiguous: first-party, deliberately unresolved
+    pkg = ".".join(segs[:-1])
+    files = pkg_files.get(pkg, set())
+    if len(files) == 1:
+        # `import a.b.topLevelFn` in a single-file package: the file is certain.
+        return (set(files), True)
+    return (set(), bool(files))
+
+
+def build_rust_crates(all_paths):
+    """Cargo workspace map: crate name (underscored, as `use` spells it) ->
+    src root, plus dir -> nearest enclosing crate src root for crate:: paths."""
+    crates, crate_dirs = {}, []
+    for rel, p in all_paths.items():
+        if rel == "Cargo.toml" or rel.endswith("/Cargo.toml"):
+            m = re.search(r'^\s*name\s*=\s*"([^"]+)"', read_text(p), re.M)
+            if m:
+                d = rel[: -len("Cargo.toml")].rstrip("/")
+                crates[m.group(1).replace("-", "_")] = f"{d}/src" if d else "src"
+                crate_dirs.append(d)
+    crate_dirs.sort(key=len, reverse=True)
+
+    def own_src(rel):
+        for d in crate_dirs:
+            if not d or rel.startswith(d + "/"):
+                return f"{d}/src" if d else "src"
+        return "src"
+
+    return crates, own_src
+
+
+def resolve_rust_path(src_root, segs, file_set):
+    """a::b::c against a crate src tree: the tail segments are items, not
+    modules, so back off until a module file exists; a bare crate reference
+    lands on its lib.rs/main.rs (where the pub use re-exports live)."""
+    for n in range(len(segs), 0, -1):
+        base = f"{src_root}/{'/'.join(segs[:n])}"
+        for cand in (f"{base}.rs", f"{base}/mod.rs"):
+            if cand in file_set:
+                return cand
+    for entry in ("lib.rs", "main.rs"):
+        if f"{src_root}/{entry}" in file_set:
+            return f"{src_root}/{entry}"
+    return None
+
+
+def build_basename_index(file_set):
+    idx = defaultdict(list)
+    for f in file_set:
+        idx[f.rsplit("/", 1)[-1]].append(f)
+    return idx
+
+
+def resolve_unique_suffix(spec, by_base, exts=("",)):
+    """The path-suffix fallback for root-relative specs ('@/lib/util',
+    'lib/foo'): an edge only when exactly one file ends with the spec."""
+    cands = [spec] if re.search(r"\.[A-Za-z0-9]+$", spec) else []
+    for e in exts:
+        if e:
+            cands += [spec + e, f"{spec}/index{e}"]
+    for c in cands:
+        hits = [f for f in by_base.get(c.rsplit("/", 1)[-1], ())
+                if f == c or f.endswith("/" + c)]
+        if len(hits) == 1:
+            return hits[0]
+        if hits:
+            return None
     return None
 
 
@@ -315,6 +522,11 @@ def main() -> int:
     args = ap.parse_args()
     extra_exclude = {d.strip() for d in args.exclude.split(",") if d.strip()}
     repo = Path(args.repo).resolve()
+    if not repo.is_dir():
+        # A failed clone or mistyped path must not become a confident
+        # "0 modules, 0 edges" graph.
+        print(f"error: repo directory does not exist: {repo}", file=sys.stderr)
+        return 2
 
     paths, locs, all_paths = {}, {}, {}
     for rel, p in walk_source(repo, extra_exclude=extra_exclude):
@@ -325,7 +537,15 @@ def main() -> int:
         locs[rel] = loc_and_complexity(read_text(p))[0]
     file_set = set(paths)
     py_idx = build_python_index(file_set)
-    go_mod = go_module_path(repo)
+    # Path segments that hold Python — the "does the repo plausibly own this
+    # import?" test. Broad on purpose: an ambiguous module the index dropped is
+    # still first-party, and should be counted as unresolved rather than external.
+    py_roots = {seg for rel in file_set if rel.endswith((".py", ".pyi"))
+                for seg in rel.rsplit(".", 1)[0].split("/")}
+    go_mods = build_go_modules(all_paths)
+    jvm_pkg_files, jvm_stem_files, jvm_pkg_roots = build_jvm_index(paths)
+    rust_crates, rust_own_src = build_rust_crates(all_paths)
+    by_base = build_basename_index(file_set)
     # dir -> .go files, so Go import resolution is a lookup instead of a scan
     # over every file for every import (quadratic on large Go monorepos).
     go_files_by_dir = defaultdict(list)
@@ -333,20 +553,40 @@ def main() -> int:
         if f.endswith(".go"):
             go_files_by_dir[str(Path(f).parent).replace("\\", "/")].append(f)
 
+    stats = ResolutionStats()
     edges = defaultdict(set)  # src file -> {dst files}
     # Files are re-read here rather than kept from the first pass: holding
     # every source text at once is multi-GB on big repos.
     for rel, text in ((rel, read_text(p)) for rel, p in paths.items()):
         ext = "." + rel.rsplit(".", 1)[-1] if "." in rel else ""
+        lang = detect_lang(rel)
         if ext in (".py", ".pyi"):
-            edges[rel] |= python_edges(rel, text, py_idx, file_set)
+            edges[rel] |= python_edges(rel, text, py_idx, file_set, py_roots, stats)
         elif ext in JS_EXTS:
             for spec in JS_IMPORT_RE.findall(text):
                 if spec.startswith("."):
                     t = resolve_relative_js(rel, spec, file_set)
                     if t and t != rel:
                         edges[rel].add(t)
-        elif ext == ".go" and go_mod:
+                    stats.count(lang, spec, rel, True, bool(t))
+                elif spec.startswith(("@/", "~/")):
+                    # The src-root alias (tsconfig paths / Vite / Next): resolve
+                    # by unique path suffix, no tsconfig parsing required.
+                    t = resolve_unique_suffix(spec[2:], by_base, JS_EXTS)
+                    if t and t != rel:
+                        edges[rel].add(t)
+                    stats.count(lang, spec, rel, True, bool(t))
+                else:
+                    # Bare specifiers are packages; only a spec that uniquely
+                    # names a repo file (baseUrl-style import) is first-party.
+                    t = None
+                    if "/" in spec and not spec.startswith("@"):
+                        t = resolve_unique_suffix(spec, by_base, JS_EXTS)
+                    if t and t != rel:
+                        edges[rel].add(t)
+                    stats.count(lang, spec, rel, bool(t), bool(t))
+        elif ext == ".go":
+            src_dir = str(Path(rel).parent).replace("\\", "/")
             in_block = False
             for line in text.splitlines():
                 if re.match(r"^\s*import\s*\(", line):
@@ -360,41 +600,83 @@ def main() -> int:
                     m = GO_IMPORT_RE.match(line)
                 elif re.match(r"^\s*import\s", line):
                     m = re.search(r'"([^"]+)"', line)
-                if m and m.group(1).startswith(go_mod):
-                    sub = m.group(1)[len(go_mod):].strip("/")
-                    src_dir = str(Path(rel).parent).replace("\\", "/")
-                    for cand_dir in (sub, f"src/{sub}"):
-                        if cand_dir == src_dir:
-                            continue
-                        for f in go_files_by_dir.get(cand_dir, ()):
-                            if f != rel:
-                                edges[rel].add(f)
+                if not m:
+                    continue
+                imp = m.group(1)
+                owner = next(((mp, d) for mp, d in go_mods
+                              if imp == mp or imp.startswith(mp + "/")), None)
+                if owner is None:
+                    stats.count(lang, imp, rel, False, False)
+                    continue
+                mod_path, mod_dir = owner
+                sub = imp[len(mod_path):].strip("/")
+                cand_dir = f"{mod_dir}/{sub}".strip("/") if sub else mod_dir
+                hit = False
+                if cand_dir != src_dir:
+                    for f in go_files_by_dir.get(cand_dir, ()):
+                        if f != rel:
+                            edges[rel].add(f)
+                            hit = True
+                stats.count(lang, imp, rel, True, hit or cand_dir == src_dir)
         elif ext == ".rs":
+            own = rust_own_src(rel)
+            own_dir = str(Path(rel).parent).replace("\\", "/")
+            for name in RUST_MOD_RE.findall(text):
+                # `mod x;` in lib/main/mod.rs looks beside itself; in foo.rs it
+                # looks inside foo/ (with the pre-2018 sibling as fallback).
+                stem = rel.rsplit("/", 1)[-1]
+                bases = ([own_dir] if stem in ("lib.rs", "main.rs", "mod.rs")
+                         else [f"{own_dir}/{stem[:-3]}", own_dir])
+                t = next((c for b in bases
+                          for c in (f"{b}/{name}.rs", f"{b}/{name}/mod.rs")
+                          if c in file_set and c != rel), None)
+                if t:
+                    edges[rel].add(t)
+                stats.count(lang, f"mod {name}", rel, True, bool(t))
             for use in RUST_USE_RE.findall(text):
-                segs = use.split("::")
-                for n in range(len(segs), 0, -1):
-                    path = "/".join(segs[:n])
-                    for cand in (f"src/{path}.rs", f"src/{path}/mod.rs", f"{path}.rs"):
-                        if cand in file_set and cand != rel:
-                            edges[rel].add(cand)
-                            break
-                    else:
-                        continue
-                    break
-        elif ext in (".java", ".kt"):
-            for imp in JAVA_IMPORT_RE.findall(text):
-                path = imp.replace(".", "/")
-                for cand in (f"{path}.java", f"{path}.kt",
-                             f"src/main/java/{path}.java", f"src/main/kotlin/{path}.kt",
-                             f"src/{path}.java"):
-                    if cand in file_set and cand != rel:
-                        edges[rel].add(cand)
-                        break
+                segs = [s for s in use.strip(":").split("::") if s]
+                if not segs:
+                    continue
+                head = segs[0]
+                if head == "crate":
+                    root, segs = own, segs[1:]
+                elif head == "self":
+                    root, segs = own_dir, segs[1:]
+                elif head == "super":
+                    root, segs = own_dir, segs
+                    while segs and segs[0] == "super":
+                        root, segs = root.rsplit("/", 1)[0], segs[1:]
+                elif head in rust_crates:
+                    root, segs = rust_crates[head], segs[1:]
+                else:
+                    stats.count(lang, use, rel, False, False)
+                    continue
+                t = resolve_rust_path(root, segs, file_set)
+                if t and t != rel:
+                    edges[rel].add(t)
+                stats.count(lang, use, rel, True, bool(t))
+        elif ext in JVM_EXTS:
+            for imp in JVM_IMPORT_RE.findall(text):
+                targets, first_party = resolve_jvm(imp, jvm_pkg_files, jvm_stem_files)
+                targets.discard(rel)
+                edges[rel] |= targets
+                if not first_party:
+                    first_party = tuple(imp.split(".")[:2]) in jvm_pkg_roots
+                stats.count(lang, imp, rel, first_party, bool(targets))
+        elif ext == ".cs":
+            for imp in CS_USING_RE.findall(text):
+                targets, first_party = resolve_jvm(imp, jvm_pkg_files, jvm_stem_files)
+                targets.discard(rel)
+                edges[rel] |= targets
+                if not first_party:
+                    first_party = tuple(imp.split(".")[:2]) in jvm_pkg_roots
+                stats.count(lang, imp, rel, first_party, bool(targets))
         elif ext == ".rb":
             for spec in RUBY_REQ_RE.findall(text):
                 t = resolve_relative_js(rel, spec if spec.endswith(".rb") else spec + ".rb", file_set)
                 if t and t != rel:
                     edges[rel].add(t)
+                stats.count(lang, spec, rel, True, bool(t))
 
     # ---- runtime resource references ----
     # A referenced asset joins the graph as a node (with its own LOC, so a large
@@ -624,6 +906,21 @@ def main() -> int:
     edge_count = sum(1 for _ in ((s, t) for s, d in edges.items() for t in d))
     res_count = sum(len(d) for d in res_edges.values())
 
+    # An empty or thin graph must never read as "no coupling" when the cause is
+    # the resolver: name the languages whose own-repo imports failed to resolve.
+    under = stats.under_resolved()
+    if not under and edge_count == 0 and len(file_set) >= 20:
+        under = [(lang, s) for lang, s in stats.summary().items() if s["first_party"]]
+    resolution_html = ""
+    if under:
+        rows = "".join(
+            f"<li><b>{esc(lang)}</b>: {s['resolved']} of {s['first_party']} "
+            f"first-party imports resolved"
+            + (" — e.g. " + ", ".join(f"<code>{esc(x)}</code>" for x in s["samples"][:3])
+               if s["samples"] else "") + "</li>"
+            for lang, s in under)
+        resolution_html = f"""<div class="callout warn"><b>Import graph likely under-resolved</b> — imports that appear to name this repo's own code could not be matched to files, so the graph understates coupling. Treat sparse areas as a resolution gap, not as decoupling; the <code>resolution</code> block in the analyzer summary has per-language numbers.<ul style="margin-top:8px">{rows}</ul></div>"""
+
     top_assets = sorted(loaders_of.items(), key=lambda kv: (-len(kv[1]), kv[0]))[:25]
     resource_html = ""
     if scan.refs:
@@ -666,6 +963,7 @@ code that names them. {esc(resources.CAVEAT)}{esc(truncation)}</p>
   <div class="kpi {'bad' if sccs else 'good'}"><div class="n">{len(sccs)}</div><div class="l">cycles</div></div>
   <div class="kpi"><div class="n">{len(arms)}</div><div class="l">top-level {'arm' if len(arms)==1 else 'arms'}</div></div>
 </div>
+{resolution_html}
 {cyc_html}
 <h2>Module dependency graph</h2>
 <p class="dim">Node area = lines of code · solid arrows = imports, dashed = runtime loads (a rendered template, a prompt read off disk) · drag nodes, Ctrl/⌘-scroll to zoom, hover to isolate a neighborhood.</p>
@@ -704,6 +1002,11 @@ code that names them. {esc(resources.CAVEAT)}{esc(truncation)}</p>
              for m in frontier),
             key=lambda d: -d["loc"]),
         "import_edges": edge_count,
+        # Per-language: import statements the repo appears to own vs actually
+        # resolved. A language with a low ratio means the graph understates its
+        # coupling — say so in the Overview instead of presenting sparseness as
+        # architecture (and consider hand-building that part of the graph).
+        "resolution": stats.summary(),
         "module_cycles": sccs,
         "file_cycles": sorted(file_sccs, key=len, reverse=True)[:6],
         "top_fan_in_files": [{"path": f, "fan_in": n, "fan_out": fan_out.get(f, 0)} for f, n in hub_in[:10]],
