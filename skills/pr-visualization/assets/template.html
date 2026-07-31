@@ -78,14 +78,16 @@ main{max-width:1280px;margin:0 auto;padding:26px 28px 80px}
 .panel li{margin:4px 0}
 .dim{color:var(--text-dim)} .faint{color:var(--text-faint)}
 code,.mono{font-family:var(--mono);font-size:.92em}
-p code,li code,td code{background:var(--surface-2);border:1px solid var(--border);border-radius:4px;padding:1px 5px}
+p code,li code,td code{background:var(--surface-2);border:1px solid var(--border);border-radius:4px;padding:1px 5px;overflow-wrap:anywhere}
 pre{background:var(--surface);border:1px solid var(--border);border-radius:8px;padding:14px 16px;overflow-x:auto;font-family:var(--mono);font-size:13px;line-height:1.5;margin:10px 0}
 .card{background:var(--surface);border:1px solid var(--border);border-radius:10px;padding:18px 20px;margin:12px 0}
 .card.hero{border-color:var(--border-strong);background:linear-gradient(180deg,var(--accent-dim),var(--surface) 60%)}
 .grid{display:grid;gap:14px;margin:12px 0}
 /* 480px: enough for a 4-5 column table (path + two numbers + a 120px bar) at its
-   minimum widths — below that the pair stacks instead of silently clipping columns */
-.grid.cols-2{grid-template-columns:repeat(auto-fit,minmax(480px,1fr))}
+   minimum widths — below that the pair stacks instead of silently clipping columns.
+   min(100%,...) lets the single remaining track shrink with a phone viewport
+   instead of forcing page-level horizontal overflow */
+.grid.cols-2{grid-template-columns:repeat(auto-fit,minmax(min(100%,480px),1fr))}
 .grid.cols-3{grid-template-columns:repeat(auto-fit,minmax(240px,1fr))}
 .grid>*{min-width:0}
 .kpis{display:flex;flex-wrap:wrap;gap:12px;margin:12px 0}
