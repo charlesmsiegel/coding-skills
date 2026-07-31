@@ -317,7 +317,9 @@ def test_deps_resolves_rust_workspace_crates_and_mod_decls(repo, tabs, run_scrip
     repo.write("crates/engine/Cargo.toml", '[package]\nname = "engine"\n')
     repo.write("crates/engine/src/lib.rs", "mod physics;\n\npub fn run() {}\n")
     repo.write("crates/engine/src/physics.rs", "pub fn step() {}\n")
-    repo.write("crates/game/Cargo.toml", '[package]\nname = "game"\n')
+    repo.write("crates/game/Cargo.toml",
+               '[package]\nname = "game"\n\n[dependencies]\n'
+               'engine = { path = "../engine" }\n')
     repo.write("crates/game/src/main.rs", "use engine::run;\n\nfn main() { run(); }\n")
 
     summary = _deps_summary(repo, tabs, run_script)
@@ -763,6 +765,121 @@ def test_deps_js_single_segment_baseurl_resolves_unless_a_package(repo, tabs, ru
     fan_in = {row["path"]: row["fan_in"] for row in summary["top_fan_in_files"]}
     assert fan_in.get("src/utils.ts") == 1
     assert "src/react.ts" not in fan_in
+
+
+def test_deps_rust_undeclared_same_name_crate_does_not_link(repo, tabs, run_script):
+    """An in-repo crate named like an external dependency (log) must not
+    capture `use log::` from a crate that never declared it."""
+    repo.write("app/Cargo.toml", '[package]\nname = "app"\n\n[dependencies]\nlog = "0.4"\n')
+    repo.write("app/src/main.rs", "use log::info;\n\nfn main() {}\n")
+    repo.write("unrelated/log/Cargo.toml", '[package]\nname = "log"\n')
+    repo.write("unrelated/log/src/lib.rs", "pub fn info() {}\n")
+    repo.write("declared/Cargo.toml",
+               '[package]\nname = "declared"\n\n[dependencies]\n'
+               'log = { path = "../unrelated/log" }\n')
+    repo.write("declared/src/main.rs", "use log::info;\n\nfn main() {}\n")
+
+    summary = _deps_summary(repo, tabs, run_script)
+
+    fan_in = {row["path"]: row["fan_in"] for row in summary["top_fan_in_files"]}
+    # only the crate that declares the path dependency links to it
+    assert fan_in.get("unrelated/log/src/lib.rs") == 1
+
+
+def test_deps_rust_auto_discovered_binary_roots_at_itself(repo, tabs, run_script):
+    """src/bin/cli.rs is its own crate: its crate:: and mod declarations live
+    beside it, never in the library tree."""
+    repo.write("Cargo.toml", '[package]\nname = "app"\n')
+    repo.write("src/lib.rs", "pub fn lib_only() {}\n")
+    repo.write("src/bin/cli.rs", "mod helper;\nuse crate::helper::run;\n\nfn main() {}\n")
+    repo.write("src/bin/helper.rs", "pub fn run() {}\n")
+
+    summary = _deps_summary(repo, tabs, run_script)
+
+    fan_in = {row["path"]: row["fan_in"] for row in summary["top_fan_in_files"]}
+    assert fan_in.get("src/bin/helper.rs") == 1
+    assert "src/lib.rs" not in fan_in
+
+
+def test_deps_rust_inline_module_scopes_child_declarations(repo, tabs, run_script):
+    """`mod platform { pub mod imp; }` in lib.rs declares src/platform/imp.rs —
+    not a same-named file at the crate root, even when one exists."""
+    repo.write("Cargo.toml", '[package]\nname = "app"\n')
+    repo.write("src/lib.rs", "mod platform {\n    pub mod imp;\n}\n")
+    repo.write("src/platform/imp.rs", "pub fn real() {}\n")
+    repo.write("src/imp.rs", "pub fn decoy() {}\n")
+
+    summary = _deps_summary(repo, tabs, run_script)
+
+    fan_in = {row["path"]: row["fan_in"] for row in summary["top_fan_in_files"]}
+    assert fan_in.get("src/platform/imp.rs") == 1
+    assert "src/imp.rs" not in fan_in
+
+
+def test_deps_csharp_declarations_stay_in_their_namespace(repo, tabs, run_script):
+    """A file with two namespace blocks declares each type only in its own
+    block — A.Y must not exist just because the file also declares B.Y."""
+    repo.write("lib/Mixed.cs",
+               "namespace A {\n  class X {}\n}\nnamespace B {\n  class Y {}\n}\n")
+    repo.write("lib/Other.cs", "namespace A;\n\nclass Z {}\n")
+    repo.write("app/P1.cs", "using static A.X;\n\nnamespace App;\nclass P1 {}\n")
+    repo.write("app/P2.cs", "using static A.Y;\n\nnamespace App;\nclass P2 {}\n")
+
+    summary = _deps_summary(repo, tabs, run_script)
+
+    fan_in = {row["path"]: row["fan_in"] for row in summary["top_fan_in_files"]}
+    assert fan_in.get("lib/Mixed.cs") == 1        # P1 via A.X only
+    assert summary["resolution"]["C#"]["resolved"] == 1
+
+
+def test_deps_js_npm_deps_scope_to_the_importing_package(repo, tabs, run_script):
+    """One monorepo package declaring an npm dep named utils must not disable
+    another package's baseUrl import of its own utils.ts."""
+    repo.write("packages/a/package.json", '{"dependencies": {"utils": "^1.0.0"}}\n')
+    repo.write("packages/a/src/app.ts", "import { x } from 'utils';\n")
+    repo.write("packages/a/src/utils.ts", "export const decoy = 1;\n")
+    repo.write("packages/b/package.json", '{"dependencies": {}}\n')
+    repo.write("packages/b/src/app.ts", "import { x } from 'utils';\n")
+    repo.write("packages/b/src/utils.ts", "export const x = 1;\n")
+
+    summary = _deps_summary(repo, tabs, run_script)
+
+    fan_in = {row["path"]: row["fan_in"] for row in summary["top_fan_in_files"]}
+    assert fan_in.get("packages/b/src/utils.ts") == 1
+    assert "packages/a/src/utils.ts" not in fan_in
+
+
+def test_deps_scala3_direct_given_import_links_the_package(repo, tabs, run_script):
+    """`import p.given` imports all givens from p — it is a wildcard, not a
+    declaration named `given`."""
+    repo.write("core/src/main/scala/p/Givens.scala",
+               "package p\n\ngiven intOrd: Ordering[Int] = Ordering.Int\n")
+    repo.write("core/src/main/scala/p/Other.scala", "package p\n\nclass Other\n")
+    repo.write("app/src/main/scala/app/Main.scala",
+               "package app\n\nimport p.given\n\nclass Main\n")
+
+    summary = _deps_summary(repo, tabs, run_script)
+
+    fan_in = {row["path"]: row["fan_in"] for row in summary["top_fan_in_files"]}
+    assert fan_in.get("core/src/main/scala/p/Givens.scala") == 1
+    assert fan_in.get("core/src/main/scala/p/Other.scala") == 1
+
+
+def test_deps_go_local_replace_translates_the_import_path(repo, tabs, run_script):
+    """`replace example.com/old => ../lib` makes example.com/old/util resolve
+    into the local lib module, whatever module path lib declares."""
+    repo.write("mod-a/go.mod",
+               "module example.com/a\n\nrequire example.com/old v0.0.0\n\n"
+               "replace example.com/old => ../lib\n")
+    repo.write("mod-a/main.go",
+               'package main\n\nimport "example.com/old/util"\n\nfunc main() { util.Do() }\n')
+    repo.write("lib/go.mod", "module example.com/lib\n")
+    repo.write("lib/util/util.go", "package util\n\nfunc Do() {}\n")
+
+    summary = _deps_summary(repo, tabs, run_script)
+
+    fan_in = {row["path"]: row["fan_in"] for row in summary["top_fan_in_files"]}
+    assert fan_in.get("lib/util/util.go") == 1
 
 
 def test_deps_python_resolution_is_counted_too(repo, tabs, run_script):
