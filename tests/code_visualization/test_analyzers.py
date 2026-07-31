@@ -244,6 +244,154 @@ def test_deps_summary_carries_the_resource_caveat(repo, tabs, run_script):
 
 
 # --------------------------------------------------------------------------- #
+# Layout-independent resolution
+#
+# The failure these pin down: resolution used to guess a fixed list of source
+# roots (src/main/kotlin/... at the repo root), so a Gradle multi-module repo —
+# 433 Kotlin files across ten modules — produced 0 import edges and read as
+# "no coupling". Resolution must key on what files DECLARE (package, namespace,
+# crate) rather than where a build tool happens to put them.
+# --------------------------------------------------------------------------- #
+
+
+def _deps_summary(repo, tabs, run_script):
+    return json.loads(run_script(SCRIPTS / "analyze_deps.py", repo.path, "--tabs-dir", tabs).stdout)
+
+
+def test_deps_resolves_kotlin_imports_across_gradle_modules(repo, tabs, run_script):
+    """Gradle layout: each module carries its own src/main/kotlin tree. The
+    import must resolve via the declared package, not a path rooted at the repo."""
+    repo.write("core/src/main/kotlin/dev/rpg/core/Util.kt",
+               "package dev.rpg.core\n\nfun helper() = 1\n")
+    repo.write("app/src/main/kotlin/dev/rpg/app/Main.kt",
+               "package dev.rpg.app\n\nimport dev.rpg.core.Util\n\nfun main() {}\n")
+
+    summary = _deps_summary(repo, tabs, run_script)
+
+    fan_in = {row["path"]: row["fan_in"] for row in summary["top_fan_in_files"]}
+    assert fan_in.get("core/src/main/kotlin/dev/rpg/core/Util.kt") == 1
+
+
+def test_deps_kotlin_star_import_links_every_file_of_the_package(repo, tabs, run_script):
+    repo.write("core/src/main/kotlin/dev/rpg/core/A.kt", "package dev.rpg.core\n")
+    repo.write("core/src/main/kotlin/dev/rpg/core/B.kt", "package dev.rpg.core\n")
+    repo.write("app/src/main/kotlin/dev/rpg/app/Main.kt",
+               "package dev.rpg.app\n\nimport dev.rpg.core.*\n")
+
+    summary = _deps_summary(repo, tabs, run_script)
+
+    fan_in = {row["path"]: row["fan_in"] for row in summary["top_fan_in_files"]}
+    assert fan_in.get("core/src/main/kotlin/dev/rpg/core/A.kt") == 1
+    assert fan_in.get("core/src/main/kotlin/dev/rpg/core/B.kt") == 1
+
+
+def test_deps_ambiguous_jvm_class_is_dropped_not_guessed(repo, tabs, run_script):
+    """Kotlin multiplatform: commonMain and jvmMain both declare the same
+    package+class (expect/actual). Guessing one would be a wrong edge."""
+    for src_set in ("commonMain", "jvmMain"):
+        repo.write(f"lib/src/{src_set}/kotlin/dev/rpg/core/Clock.kt",
+                   "package dev.rpg.core\n\nclass Clock\n")
+    repo.write("app/src/main/kotlin/dev/rpg/app/Main.kt",
+               "package dev.rpg.app\n\nimport dev.rpg.core.Clock\n")
+
+    summary = _deps_summary(repo, tabs, run_script)
+
+    assert summary["import_edges"] == 0
+
+
+def test_deps_resolves_csharp_using_to_namespace_files(repo, tabs, run_script):
+    repo.write("Core/Billing/Invoice.cs",
+               "namespace Acme.Billing;\n\npublic class Invoice {}\n")
+    repo.write("App/Program.cs",
+               "using Acme.Billing;\n\nnamespace Acme.App;\n\nclass Program {}\n")
+
+    summary = _deps_summary(repo, tabs, run_script)
+
+    fan_in = {row["path"]: row["fan_in"] for row in summary["top_fan_in_files"]}
+    assert fan_in.get("Core/Billing/Invoice.cs") == 1
+
+
+def test_deps_resolves_rust_workspace_crates_and_mod_decls(repo, tabs, run_script):
+    """Cargo workspace: crates live under crates/<name>, not src/ at the root.
+    `use other_crate::` must reach the other crate; `mod x;` must reach x.rs."""
+    repo.write("crates/engine/Cargo.toml", '[package]\nname = "engine"\n')
+    repo.write("crates/engine/src/lib.rs", "mod physics;\n\npub fn run() {}\n")
+    repo.write("crates/engine/src/physics.rs", "pub fn step() {}\n")
+    repo.write("crates/game/Cargo.toml", '[package]\nname = "game"\n')
+    repo.write("crates/game/src/main.rs", "use engine::run;\n\nfn main() { run(); }\n")
+
+    summary = _deps_summary(repo, tabs, run_script)
+
+    fan_in = {row["path"]: row["fan_in"] for row in summary["top_fan_in_files"]}
+    assert fan_in.get("crates/engine/src/lib.rs") == 1      # from game/src/main.rs
+    assert fan_in.get("crates/engine/src/physics.rs") == 1  # from lib.rs's mod decl
+
+
+def test_deps_resolves_go_imports_in_a_nested_module(repo, tabs, run_script):
+    """go.mod sits in backend/, not at the repo root — the old resolver only
+    ever read the root go.mod."""
+    repo.write("backend/go.mod", "module example.com/be\n\ngo 1.22\n")
+    repo.write("backend/pkg/db/db.go", "package db\n\nfunc Open() {}\n")
+    repo.write("backend/cmd/api/main.go",
+               'package main\n\nimport "example.com/be/pkg/db"\n\nfunc main() { db.Open() }\n')
+
+    summary = _deps_summary(repo, tabs, run_script)
+
+    fan_in = {row["path"]: row["fan_in"] for row in summary["top_fan_in_files"]}
+    assert fan_in.get("backend/pkg/db/db.go") == 1
+
+
+def test_deps_resolves_js_root_alias_imports(repo, tabs, run_script):
+    """'@/x' is the near-universal src-root alias (Vite/Next/tsconfig paths)."""
+    repo.write("src/lib/util.ts", "export const x = 1;\n")
+    repo.write("src/pages/home.ts", "import { x } from '@/lib/util';\n")
+
+    summary = _deps_summary(repo, tabs, run_script)
+
+    fan_in = {row["path"]: row["fan_in"] for row in summary["top_fan_in_files"]}
+    assert fan_in.get("src/lib/util.ts") == 1
+
+
+def test_deps_summary_reports_per_language_resolution(repo, tabs, run_script):
+    """Every language reports imports seen vs resolved, so a resolver gap shows
+    up as a number instead of a silently sparse graph."""
+    repo.write("app/src/main/kotlin/dev/rpg/app/Main.kt",
+               "package dev.rpg.app\n\nimport dev.rpg.gone.Missing\n"
+               "import kotlinx.coroutines.launch\n")
+    repo.write("core/src/main/kotlin/dev/rpg/core/Real.kt", "package dev.rpg.core\n")
+
+    summary = _deps_summary(repo, tabs, run_script)
+
+    res = summary["resolution"]["Kotlin"]
+    assert res["first_party"] == 1      # dev.rpg.gone.* — our dev.rpg root...
+    assert res["resolved"] == 0         # ...but no file declares that package
+    assert res["external"] == 1         # kotlinx.coroutines is not this repo
+    assert any("dev.rpg.gone.Missing" in s for s in res["samples"])
+
+
+def test_deps_refuses_a_nonexistent_repo_dir(tmp_path, tabs, run_script):
+    """A mistyped or failed-clone path must error, not emit a confident
+    empty graph (edges: 0, modules: 0) for a repo that isn't there."""
+    result = run_script(SCRIPTS / "analyze_deps.py", tmp_path / "no-such-repo",
+                        "--tabs-dir", tabs, expect_rc=2)
+    assert "no-such-repo" in result.stderr
+
+
+def test_deps_zero_edges_on_a_real_codebase_warns_in_the_fragment(
+        repo, tabs, run_script, fragment):
+    """The Gradle failure mode: many code files, no resolvable imports. The tab
+    must say the graph is under-resolved, never present it as 'no coupling'."""
+    for i in range(25):
+        repo.write(f"m{i}/src/main/kotlin/com/x/m{i}/F.kt",
+                   f"package com.x.m{i}\n\nimport com.x.other{i}.Gone\n\nclass F\n")
+
+    run_script(SCRIPTS / "analyze_deps.py", repo.path, "--tabs-dir", tabs)
+
+    body = fragment.body(tabs / "03-dependencies.html")
+    assert "under-resolved" in body
+
+
+# --------------------------------------------------------------------------- #
 # Module grouping
 #
 # The failure these pin down: a repo whose code lives under two arms used to
