@@ -45,6 +45,8 @@ class RustWorkspace:
         self._lib_src_by_dir = {}  # crate dir -> custom [lib] root, if any
         self._pkg_of_lib = {}      # [lib] name -> its package name
         self._dep_paths = {}       # crate dir -> {dep name: declared target dir}
+        self._registry_deps = {}   # crate dir -> registry-declared dep names
+        self._patches = {}         # manifest dir -> {patched name: target dir}
         self._target_roots = {}    # crate dir -> [(explicit target dir, entry)]
         manifests = []
         for rel, p in all_paths.items():
@@ -80,7 +82,7 @@ class RustWorkspace:
             # Explicit target paths ([[bin]] path = "cmd/main.rs" and custom
             # tests/examples/benches) root their own crates off src/.
             for header, body in re.findall(
-                    r"^\[\[(bin|test|example|bench)\]\]\s*\n((?:(?!^\[)[^\n]*\n?)*)",
+                    r"^\[\[(bin|test|example|bench)\]\]\s*(?:#[^\n]*)?\n((?:(?!^\[)[^\n]*\n?)*)",
                     text, re.M):
                 tp = re.search(r"^\s*path\s*=\s*[\"']([^\"']+)[\"']", body, re.M)
                 if tp:
@@ -93,11 +95,30 @@ class RustWorkspace:
             deps = _cargo_dep_names(text)
             self._deps[d] = deps
             self._dep_paths[d] = _cargo_dep_paths(text, d)
+            self._registry_deps[d] = _cargo_registry_dep_names(text)
+            # [patch.crates-io] foo = { path = "foo" } redirects the registry
+            # crate to the in-repo one, workspace-wide from this manifest
+            patches = {}
+            for header, body in re.findall(
+                    r"^\[+([^\]]+)\]+\s*(?:#[^\n]*)?\n((?:(?!^\[)[^\n]*\n?)*)",
+                    text, re.M):
+                if not header.startswith("patch"):
+                    continue
+                for line in body.splitlines():
+                    lm = re.match(r"\s*([\w-]+)\s*=\s*(.+)", line)
+                    pm = lm and re.search(
+                        r"\bpath\s*=\s*[\"']([^\"']+)[\"']", lm.group(2))
+                    if pm:
+                        tgt = join_inside(d, pm.group(1))
+                        if tgt is not None:
+                            patches[lm.group(1).replace("-", "_")] = tgt
+            if patches:
+                self._patches[d] = patches
             renames = re.findall(
                 r"^\s*([\w-]+)\s*=\s*(\{[^}]*package\s*=\s*[\"'][^\"']+[\"'][^}]*\})", text, re.M)
             # the long form: [dependencies.foo] with package/path on own lines
             for header, body in re.findall(
-                    r"^\[+([^\]]+)\]+\s*\n((?:(?!^\[)[^\n]*\n?)*)", text, re.M):
+                    r"^\[+([^\]]+)\]+\s*(?:#[^\n]*)?\n((?:(?!^\[)[^\n]*\n?)*)", text, re.M):
                 parts_h = header.split(".")
                 if (len(parts_h) >= 2 and parts_h[-2].endswith("dependencies")
                         and "metadata" not in parts_h):
@@ -114,6 +135,18 @@ class RustWorkspace:
                 if target.replace("-", "_") in self.src_of:
                     self._aliases[d][alias.replace("-", "_")] = target.replace("-", "_")
         self._dirs = sorted(self._src_by_dir, key=len, reverse=True)
+
+    def _patch_target(self, name, d):
+        """The local dir a [patch.*] entry redirects `name` to, from d's
+        manifest or any enclosing one."""
+        probe = d
+        while True:
+            tgt = self._patches.get(probe, {}).get(name)
+            if tgt is not None:
+                return tgt
+            if not probe:
+                return None
+            probe = probe.rsplit("/", 1)[0] if "/" in probe else ""
 
     def _crate_dir(self, rel):
         return next((d for d in self._dirs if not d or rel.startswith(d + "/")), "")
@@ -194,6 +227,13 @@ class RustWorkspace:
             # the member's own _deps, so no global union is consulted.
             declared = (canonical in self._deps.get(d, ())
                         or canonical == self._name_by_dir.get(d))
+            if not declared and canonical in self._registry_deps.get(d, ()):
+                # a registry dep patched to a local path compiles locally
+                patch_tgt = self._patch_target(canonical, d)
+                if patch_tgt is not None:
+                    for cand_dir, cand_src in self.src_of.get(canonical, ()):
+                        if cand_dir == patch_tgt:
+                            return cand_src
             if not declared:
                 return None
             name = head
@@ -222,7 +262,8 @@ class RustWorkspace:
 
 
 def _toml_section(text, name):
-    m = re.search(rf"^\[{name}\]\s*\n((?:(?!^\[)[^\n]*\n?)*)", text, re.M)
+    m = re.search(rf"^\[{name}\]\s*(?:#[^\n]*)?\n((?:(?!^\[)[^\n]*\n?)*)",
+                  text, re.M)
     return m.group(1) if m else None
 
 
@@ -234,7 +275,7 @@ def _cargo_dep_names(text):
     """
     names = set()
     for header, body in re.findall(
-            r"^\[+([^\]]+)\]+\s*\n((?:(?!^\[)[^\n]*\n?)*)", text, re.M):
+            r"^\[+([^\]]+)\]+\s*(?:#[^\n]*)?\n((?:(?!^\[)[^\n]*\n?)*)", text, re.M):
         segs = header.split(".")
         # [package.metadata.*] is arbitrary tool config Cargo ignores — a
         # dependencies-shaped table inside it must not declare anything
@@ -260,7 +301,7 @@ def _cargo_dep_paths(text, d):
     explicit `path = "..."` that disambiguates same-named crates."""
     out = {}
     for header, body in re.findall(
-            r"^\[+([^\]]+)\]+\s*\n((?:(?!^\[)[^\n]*\n?)*)", text, re.M):
+            r"^\[+([^\]]+)\]+\s*(?:#[^\n]*)?\n((?:(?!^\[)[^\n]*\n?)*)", text, re.M):
         segs = header.split(".")
         if ("metadata" in segs or "dependencies" not in header
                 or header.startswith("workspace")):
@@ -288,6 +329,23 @@ def _cargo_dep_paths(text, d):
             if tgt is not None:
                 out[name_l.replace("-", "_")] = tgt
     return out
+
+
+def _cargo_registry_dep_names(text):
+    """Dep names declared with plain registry ranges (foo = "1") — the ones a
+    [patch.*] path entry may redirect to an in-repo crate."""
+    names = set()
+    for header, body in re.findall(
+            r"^\[+([^\]]+)\]+\s*(?:#[^\n]*)?\n((?:(?!^\[)[^\n]*\n?)*)", text, re.M):
+        segs = header.split(".")
+        if ("metadata" in segs or "dependencies" not in header
+                or header.startswith("workspace")):
+            continue
+        for line in body.splitlines():
+            lm = re.match(r"\s*([\w-]+)\s*=\s*[\"'][^\"']*[\"']\s*(?:#.*)?$", line)
+            if lm:
+                names.add(lm.group(1).replace("-", "_"))
+    return names
 
 
 def join_inside(base, target):
@@ -351,7 +409,7 @@ def npm_packages(all_paths):
     that package; a `workspace:`/`file:`/`link:` value names a sibling
     workspace package — a local edge, resolved via the name map. One monorepo
     package's dependency list says nothing about its neighbours."""
-    by_dir, name_map, local_by_dir = {}, {}, {}
+    by_dir, name_map, local_by_dir, ws_roots = {}, {}, {}, set()
     for rel, p in all_paths.items():
         if rel == "package.json" or rel.endswith("/package.json"):
             try:
@@ -359,6 +417,8 @@ def npm_packages(all_paths):
             except ValueError:
                 continue
             d = rel[: -len("package.json")].rstrip("/")
+            if data.get("workspaces"):
+                ws_roots.add(d)
             if isinstance(data.get("name"), str):
                 # candidates, not a single winner: independent trees may ship
                 # same-named packages, and the caller picks the nearest
@@ -393,7 +453,7 @@ def npm_packages(all_paths):
                         imports_map[key] = val.lstrip("./")
             by_dir[d] = deps
             local_by_dir[d] = {"aliases": aliases, "imports": imports_map}
-    return by_dir, name_map, local_by_dir
+    return by_dir, name_map, local_by_dir, ws_roots
 
 
 def _npm_subpath_exports(data):

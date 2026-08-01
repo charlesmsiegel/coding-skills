@@ -107,10 +107,15 @@ def scala_packages(text):
             if d and line[:1] in (" ", "\t"):
                 blocks[colon_pkg].add(d.group(1))
         if m and (m.group(2) == "{" or "{" in line):
-            stack.append({"open": depth, "name": m.group(1),
-                          "entered": line.count("{") == line.count("}") + 1
-                          and line.rstrip().endswith("}")})
-            blocks.setdefault(".".join(chain + [e["name"] for e in stack]), set())
+            # the block opened on this line — the standard pop below closes a
+            # compact `package p { class A }` immediately
+            stack.append({"open": depth, "name": m.group(1), "entered": True})
+            key = ".".join(chain + [e["name"] for e in stack])
+            blocks.setdefault(key, set())
+            for dm in re.finditer(
+                    r"(?:def|val|var|class|trait|object|type|given|enum)\s+(\w+)",
+                    line[m.end():]):
+                blocks[key].add(dm.group(1))
         elif m:
             chain.append(m.group(1))
         elif stack:
@@ -215,7 +220,11 @@ def cs_usings(text):
                     # `using global::X;` names the global namespace explicitly
                     prefixes = []
                 else:
-                    chain = file_scoped + [e["name"] for e in stack]
+                    # outward lookup walks per COMPONENT: from A.B, `using C;`
+                    # tries A.B.C, then A.C, then C
+                    chain = [seg for part in
+                             file_scoped + [e["name"] for e in stack]
+                             for seg in part.split(".")]
                     prefixes = [".".join(chain[:n]) for n in range(len(chain), 0, -1)]
                 out.append((um.group(1), prefixes))
         depth += line.count("{") - line.count("}")
