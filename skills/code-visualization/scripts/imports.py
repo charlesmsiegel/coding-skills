@@ -21,7 +21,7 @@ from collections import defaultdict
 from pathlib import Path
 
 from common import detect_lang, read_text
-from jvmdecl import (JVM_EXTS, build_decl_indexes, cs_usings,
+from jvmdecl import (JVM_EXTS, JVM_PKG_RE, build_decl_indexes, cs_usings,
                      jvm_import_specs, resolve_jvm)
 from manifests import (join_inside, RustWorkspace, go_modules, nearest_dir,
                        npm_packages)
@@ -30,11 +30,11 @@ JS_EXTS = [".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".vue", ".svelte"]
 JS_IMPORT_RE = re.compile(
     r"""(?:import\s+(?:[\w*{}\s,$]+\s+from\s+)?|export\s+(?:[\w*{}\s,$]+\s+from\s+)|require\s*\(\s*|import\s*\(\s*)['"]([^'"]+)['"]"""
 )
-GO_IMPORT_RE = re.compile(r'^\s*(?:[\w.]+\s+)?"([^"]+)"', re.M)
+GO_IMPORT_RE = re.compile(r'^\s*(?:[\w.]+\s+)?["`]([^"`]+)["`]', re.M)
 # Captures the full statement (a negated class crosses newlines, so a
 # rustfmt-wrapped group still arrives whole); rust_use_targets() parses it.
 RUST_USE_RE = re.compile(r"^\s*(?:pub(?:\([^)]*\))?\s+)?use\s+([^;]+);", re.M)
-RUBY_REQ_RE = re.compile(r"""require_relative\s+['"]([^'"]+)['"]""")
+RUBY_REQ_RE = re.compile(r"""(require_relative|require)\s+['"]([^'"]+)['"]""")
 
 # Bare specifiers naming Node built-ins are external even without a
 # package.json entry — a repo file named path.ts is never what `from "path"`
@@ -292,7 +292,7 @@ def extract(paths, all_paths, file_set):
     go_mods, go_replaces = go_modules(all_paths)
     jvm_idx, cs_idx = build_decl_indexes(paths)
     rust_ws = RustWorkspace(all_paths)
-    npm_by_dir, npm_names = npm_packages(all_paths)
+    npm_by_dir, npm_names, npm_local = npm_packages(all_paths)
     # Build-module boundaries: independent modules may declare the same fully
     # qualified symbol without sharing a classpath. C# projects are bounded by
     # .csproj files; JVM modules by Gradle/Maven manifests.
@@ -308,7 +308,9 @@ def extract(paths, all_paths, file_set):
     # over every file for every import (quadratic on large Go monorepos).
     go_files_by_dir = defaultdict(list)
     for f in file_set:
-        if f.endswith(".go"):
+        # _test.go files import things but are never compiled into an
+        # importer — linking them inflates fan-in and invents cycles.
+        if f.endswith(".go") and not f.endswith("_test.go"):
             gd = str(Path(f).parent).replace("\\", "/")
             go_files_by_dir["" if gd == "." else gd].append(f)
 
@@ -322,29 +324,62 @@ def extract(paths, all_paths, file_set):
         if ext in (".py", ".pyi"):
             edges[rel] |= python_edges(rel, text, py_idx, file_set, py_roots, stats)
         elif ext in JS_EXTS:
-            _js_edges(rel, text, file_set, by_base, npm_by_dir, npm_names, lang, edges, stats)
+            _js_edges(rel, text, file_set, by_base, npm_by_dir, npm_names,
+                      npm_local, lang, edges, stats)
         elif ext == ".go":
-            _go_edges(rel, text, go_mods, go_replaces, go_files_by_dir, lang, edges, stats)
+            # _test.go compiles into a separate test binary, but the graph's
+            # directory grouping would conflate its edges with the package's —
+            # inventing cycles production code does not have. Skip both
+            # directions (they are already excluded as import targets).
+            if not rel.endswith("_test.go"):
+                _go_edges(rel, text, go_mods, go_replaces, go_files_by_dir,
+                          lang, edges, stats)
         elif ext == ".rs":
             _rust_edges(rel, text, file_set, rust_ws, lang, edges, stats)
         elif ext in JVM_EXTS:
+            # Scala resolves imports through enclosing packages: inside
+            # `package com.acme`, `import util.Helper` names com.acme.util
+            # first. Java and Kotlin imports are absolute.
+            prefixes = []
+            if ext == ".scala":
+                pm = JVM_PKG_RE.search(text)
+                if pm:
+                    chain = pm.group(1).split(".")
+                    prefixes = [".".join(chain[:n])
+                                for n in range(len(chain), 0, -1)]
             for imp in jvm_import_specs(text):
-                _jvm_edge(rel, imp, jvm_idx, jvm_modules, lang, edges, stats)
+                if prefixes:
+                    _cs_edge(rel, imp, prefixes, jvm_idx, jvm_modules,
+                             lang, edges, stats)
+                else:
+                    _jvm_edge(rel, imp, jvm_idx, jvm_modules, lang, edges, stats)
         elif ext == ".cs":
             for imp, prefixes in cs_usings(text):
                 _cs_edge(rel, imp, prefixes, cs_idx, cs_modules, lang, edges, stats)
         elif ext == ".rb":
-            for spec in RUBY_REQ_RE.findall(text):
-                t = resolve_relative_js(rel, spec if spec.endswith(".rb") else spec + ".rb", file_set)
-                if t and t != rel:
-                    edges[rel].add(t)
-                stats.count(lang, spec, rel, True, bool(t))
+            for kind, spec in RUBY_REQ_RE.findall(text):
+                if kind == "require_relative":
+                    t = resolve_relative_js(
+                        rel, spec if spec.endswith(".rb") else spec + ".rb", file_set)
+                    if t and t != rel:
+                        edges[rel].add(t)
+                    stats.count(lang, spec, rel, True, bool(t))
+                else:
+                    # plain require: the gem convention roots load paths at
+                    # lib/, so a unique lib/<spec>.rb match is first-party;
+                    # anything else (stdlib, other gems) is external.
+                    t = resolve_unique_suffix(f"lib/{spec}", by_base, (".rb",))
+                    if t and t != rel:
+                        edges[rel].add(t)
+                    stats.count(lang, spec, rel, bool(t), bool(t))
     return edges, stats
 
 
-def _js_edges(rel, text, file_set, by_base, npm_by_dir, npm_names, lang, edges, stats):
+def _js_edges(rel, text, file_set, by_base, npm_by_dir, npm_names,
+              npm_local, lang, edges, stats):
     pkg_dir = nearest_dir(rel, npm_by_dir)
     npm_deps = npm_by_dir.get(pkg_dir, set()) if pkg_dir is not None else set()
+    local = npm_local.get(pkg_dir, {}) if pkg_dir is not None else {}
 
     def workspace_pkg(name):
         """The candidate package nearest the importer: independent trees may
@@ -387,6 +422,17 @@ def _js_edges(rel, text, file_set, by_base, npm_by_dir, npm_names, lang, edges, 
             if t and t != rel:
                 edges[rel].add(t)
             stats.count(lang, spec, rel, True, bool(t))
+        elif spec.startswith("#"):
+            # Node's package `imports` map: "#utils" -> ./src/utils.js,
+            # relative to the declaring package
+            target = local.get("imports", {}).get(spec)
+            t = None
+            if target is not None:
+                cand = f"{pkg_dir}/{target}".strip("/")
+                t = cand if cand in file_set else None
+            if t and t != rel:
+                edges[rel].add(t)
+            stats.count(lang, spec, rel, True, bool(t))
         else:
             # A bare specifier is usually a package — but a name that is not a
             # declared dependency and uniquely names a repo file is a
@@ -396,7 +442,19 @@ def _js_edges(rel, text, file_set, by_base, npm_by_dir, npm_names, lang, edges, 
             # a scoped package's name spans two segments (@scope/utils)
             pkg_name = ("/".join(spec.split("/")[:2])
                         if spec.startswith("@") else root)
-            if pkg_name in npm_names and pkg_name not in npm_deps:
+            alias_dir = local.get("aliases", {}).get(pkg_name)
+            if alias_dir is not None:
+                # `"alias": "file:../actual"` — the alias IS the installed
+                # name; link the target package's entry (its dir need not
+                # share the alias's name)
+                data_cands = [c for cands_list in npm_names.values()
+                              for c in cands_list if c[0] == alias_dir]
+                entry = data_cands[0][1] if data_cands else ""
+                cands = [f"{alias_dir}/{entry}".strip("/")] if entry else []
+                for stem_c in ("src/index", "index", "src/main", "lib/index"):
+                    cands += [f"{alias_dir}/{stem_c}{e}" for e in JS_EXTS]
+                t = next((c for c in cands if c in file_set), None)
+            elif pkg_name in npm_names and pkg_name not in npm_deps:
                 # a sibling workspace package (declared workspace:/file:, or
                 # undeclared but present in the repo) — a local edge by name; a
                 # subpath import reaches into the package's own tree. A name
@@ -440,7 +498,7 @@ def _go_edges(rel, text, go_mods, go_replaces, go_files_by_dir, lang, edges, sta
         if in_block:
             m = GO_IMPORT_RE.match(line)
         elif re.match(r"^\s*import\s", line):
-            m = re.search(r'"([^"]+)"', line)
+            m = re.search(r'["`]([^"`]+)["`]', line)
         if not m:
             continue
         imp = m.group(1)
@@ -482,6 +540,21 @@ def _go_edges(rel, text, go_mods, go_replaces, go_files_by_dir, lang, edges, sta
                     edges[rel].add(f)
                     hit = True
         stats.count(lang, imp, rel, True, hit or cand_dir == src_dir)
+
+
+def _mask_rust(text):
+    """Rust text with comments and string literals blanked (newlines kept).
+
+    A brace in a comment would corrupt inline-module scope tracking, and a
+    commented-out `use` line would invent an edge.
+    """
+    def blank(m):
+        return re.sub(r"[^\n]", " ", m.group(0))
+    text = re.sub(r'r#*"(?:[^"]|"(?!#))*"#*', blank, text)
+    text = re.sub(r"/\*.*?\*/", blank, text, flags=re.S)
+    text = re.sub(r'"(?:\\.|[^"\\\n])*"', blank, text)
+    text = re.sub(r"//[^\n]*", " ", text)
+    return text
 
 
 def rust_use_targets(stmt):
@@ -533,6 +606,8 @@ def rust_use_targets(stmt):
 
 
 def _rust_edges(rel, text, file_set, ws, lang, edges, stats):
+    orig_lines = text.splitlines()
+    text = _mask_rust(text)
     own = ws.own_src(rel)
     own_dir = str(Path(rel).parent).replace("\\", "/")
     stem = rel.rsplit("/", 1)[-1]
@@ -546,8 +621,10 @@ def _rust_edges(rel, text, file_set, ws, lang, edges, stats):
     # one is open (`mod platform { mod imp; }` names platform/imp.rs), so the
     # scan tracks `mod x {` blocks by brace depth like any other scope.
     mod_stack, depth, pending_path = [], 0, None
-    for line in text.splitlines():
-        am = re.match(r'\s*#\[path\s*=\s*"([^"]+)"\]', line)
+    for lineno, line in enumerate(text.splitlines()):
+        # the attribute's path is a string literal the mask blanked — read it
+        # from the original line
+        am = re.match(r'\s*#\[path\s*=\s*"([^"]+)"\]', orig_lines[lineno])
         if am:
             pending_path = am.group(1)
         dm = re.match(r"\s*(?:pub(?:\([^)]*\))?\s+)?mod\s+(?:r#)?(\w+)\s*(;|\{)", line)

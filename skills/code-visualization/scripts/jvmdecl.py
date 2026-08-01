@@ -264,6 +264,18 @@ def build_decl_indexes(paths):
     return jvm, cs
 
 
+def _mask_jvm(text):
+    """Java/Kotlin/Scala text with comments and strings blanked (newlines
+    kept) — a commented-out import must not become an edge."""
+    def blank(m):
+        return re.sub(r"[^\n]", " ", m.group(0))
+    text = re.sub(r"/\*.*?\*/", blank, text, flags=re.S)
+    text = re.sub(r'"""(?:[^"]|"(?!""))*"""', blank, text)
+    text = re.sub(r'"(?:\\.|[^"\\\n])*"', blank, text)
+    text = re.sub(r"//[^\n]*", " ", text)
+    return text
+
+
 def jvm_import_specs(text):
     """Expand every import statement into plain dotted specs.
 
@@ -274,7 +286,7 @@ def jvm_import_specs(text):
     (`_`, `*`, `given`) falls back to the package-star form.
     """
     out = []
-    lines = text.splitlines()
+    lines = _mask_jvm(text).splitlines()
     i = -1
     while i + 1 < len(lines):
         i += 1
