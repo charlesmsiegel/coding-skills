@@ -1513,6 +1513,153 @@ def test_deps_csharp_global_namespace_type_resolves(repo, tabs, run_script):
     assert fan_in.get("lib/Helpers.cs") == 1
 
 
+def test_deps_go_raw_string_import_resolves(repo, tabs, run_script):
+    repo.write("go.mod", "module example.com/app\n")
+    repo.write("lib/lib.go", "package lib\n\nfunc Do() {}\n")
+    repo.write("main.go",
+               "package main\n\nimport `example.com/app/lib`\n\nfunc main() { lib.Do() }\n")
+
+    summary = _deps_summary(repo, tabs, run_script)
+
+    fan_in = {row["path"]: row["fan_in"] for row in summary["top_fan_in_files"]}
+    assert fan_in.get("lib/lib.go") == 1
+
+
+def test_deps_rust_workspace_alias_requires_member_opt_in(repo, tabs, run_script):
+    """A renamed [workspace.dependencies] entry binds only members declaring
+    foo.workspace = true — others must not inherit the alias."""
+    repo.write("Cargo.toml",
+               '[workspace]\nmembers = ["bar", "member"]\n\n'
+               '[workspace.dependencies]\nfoo = { package = "bar", path = "bar" }\n')
+    repo.write("bar/Cargo.toml", '[package]\nname = "bar"\n')
+    repo.write("bar/src/lib.rs", "pub mod tools;\n")
+    repo.write("bar/src/tools.rs", "pub fn run() {}\n")
+    repo.write("member/Cargo.toml", '[package]\nname = "member"\n')
+    repo.write("member/src/main.rs", "use foo::tools::run;\n\nfn main() {}\n")
+
+    summary = _deps_summary(repo, tabs, run_script)
+
+    fan_in = {row["path"]: row["fan_in"] for row in summary["top_fan_in_files"]}
+    assert fan_in.get("bar/src/tools.rs") == 1  # only lib.rs's own mod edge
+
+
+def test_deps_js_package_imports_alias_resolves(repo, tabs, run_script):
+    """Node's package `imports` map (`#utils`) is a first-party alias."""
+    repo.write("package.json", '{"name": "app", "imports": {"#utils": "./src/utils.js"}}\n')
+    repo.write("src/utils.js", "export const u = 1;\n")
+    repo.write("src/main.js", "import { u } from '#utils';\n")
+
+    summary = _deps_summary(repo, tabs, run_script)
+
+    fan_in = {row["path"]: row["fan_in"] for row in summary["top_fan_in_files"]}
+    assert fan_in.get("src/utils.js") == 1
+
+
+def test_deps_cargo_metadata_tables_are_not_dependencies(repo, tabs, run_script):
+    """[package.metadata.*] is arbitrary tool config — a dependencies-shaped
+    entry there must not make a crate visible."""
+    repo.write("app/Cargo.toml",
+               '[package]\nname = "app"\n\n'
+               '[package.metadata.dependencies]\nfoo = { path = "../foo" }\n')
+    repo.write("app/src/main.rs", "use foo::tools::run;\n\nfn main() {}\n")
+    repo.write("foo/Cargo.toml", '[package]\nname = "foo"\n')
+    repo.write("foo/src/lib.rs", "pub mod tools;\n")
+    repo.write("foo/src/tools.rs", "pub fn run() {}\n")
+
+    summary = _deps_summary(repo, tabs, run_script)
+
+    fan_in = {row["path"]: row["fan_in"] for row in summary["top_fan_in_files"]}
+    assert fan_in.get("foo/src/tools.rs") == 1  # only foo's own mod edge
+
+
+def test_deps_rust_comments_do_not_corrupt_module_scopes(repo, tabs, run_script):
+    """A brace inside a comment must not pop an inline module early, and a
+    commented-out use must not create an edge."""
+    repo.write("Cargo.toml", '[package]\nname = "app"\n')
+    repo.write("src/lib.rs",
+               "mod platform {\n    // }\n    mod imp;\n}\n// use crate::decoy::x;\n")
+    repo.write("src/platform/imp.rs", "pub fn i() {}\n")
+    repo.write("src/imp.rs", "pub fn decoy() {}\n")
+    repo.write("src/decoy.rs", "pub fn x() {}\n")
+
+    summary = _deps_summary(repo, tabs, run_script)
+
+    fan_in = {row["path"]: row["fan_in"] for row in summary["top_fan_in_files"]}
+    assert fan_in.get("src/platform/imp.rs") == 1
+    assert "src/imp.rs" not in fan_in
+    assert "src/decoy.rs" not in fan_in
+
+
+def test_deps_ruby_load_path_require_resolves(repo, tabs, run_script):
+    """`require "my_gem/version"` is the conventional gem-internal import;
+    it resolves against the lib/ tree."""
+    repo.write("lib/my_gem.rb", 'require "my_gem/version"\n')
+    repo.write("lib/my_gem/version.rb", 'VERSION = "1.0"\n')
+
+    summary = _deps_summary(repo, tabs, run_script)
+
+    fan_in = {row["path"]: row["fan_in"] for row in summary["top_fan_in_files"]}
+    assert fan_in.get("lib/my_gem/version.rb") == 1
+
+
+def test_deps_go_test_files_are_not_import_targets(repo, tabs, run_script):
+    """Importing a package links its production sources, not its _test.go
+    files — dependency tests are not compiled into the importer."""
+    repo.write("go.mod", "module example.com/app\n")
+    repo.write("lib/lib.go", "package lib\n\nfunc Do() {}\n")
+    repo.write("lib/lib_test.go",
+               'package lib\n\nimport "example.com/app/cmd"\n\nfunc TestDo(t int) {}\n')
+    repo.write("cmd/main.go",
+               'package main\n\nimport "example.com/app/lib"\n\nfunc main() { lib.Do() }\n')
+
+    summary = _deps_summary(repo, tabs, run_script)
+
+    assert summary["module_cycles"] == []
+    fan_in = {row["path"]: row["fan_in"] for row in summary["top_fan_in_files"]}
+    assert fan_in.get("lib/lib.go") == 1
+    assert "lib/lib_test.go" not in fan_in
+
+
+def test_deps_commented_jvm_imports_are_ignored(repo, tabs, run_script):
+    repo.write("lib/src/main/kotlin/p/Real.kt", "package p\n\nclass Real\n")
+    repo.write("app/src/main/kotlin/app/Main.kt",
+               "package app\n\n/*\nimport p.Real\n*/\n\nclass Main\n")
+
+    summary = _deps_summary(repo, tabs, run_script)
+
+    assert summary["import_edges"] == 0
+
+
+def test_deps_npm_local_dependency_alias_resolves(repo, tabs, run_script):
+    """`"alias": "file:../actual"` installs the local package under the alias
+    name; `import "alias"` links its entry."""
+    repo.write("actual/package.json", '{"name": "actual-name", "main": "index.js"}\n')
+    repo.write("actual/index.js", "module.exports = 1;\n")
+    repo.write("app/package.json",
+               '{"name": "app", "dependencies": {"alias": "file:../actual"}}\n')
+    repo.write("app/src/main.js", "const a = require('alias');\n")
+
+    summary = _deps_summary(repo, tabs, run_script)
+
+    fan_in = {row["path"]: row["fan_in"] for row in summary["top_fan_in_files"]}
+    assert fan_in.get("actual/index.js") == 1
+
+
+def test_deps_scala_import_resolves_through_the_enclosing_package(
+        repo, tabs, run_script):
+    """`package com.acme` + `import util.Helper` names com.acme.util.Helper —
+    Scala imports resolve through enclosing packages."""
+    repo.write("core/src/main/scala/com/acme/util/Helper.scala",
+               "package com.acme.util\n\nclass Helper\n")
+    repo.write("core/src/main/scala/com/acme/Main.scala",
+               "package com.acme\n\nimport util.Helper\n\nclass Main\n")
+
+    summary = _deps_summary(repo, tabs, run_script)
+
+    fan_in = {row["path"]: row["fan_in"] for row in summary["top_fan_in_files"]}
+    assert fan_in.get("core/src/main/scala/com/acme/util/Helper.scala") == 1
+
+
 def test_deps_python_resolution_is_counted_too(repo, tabs, run_script):
     """Python goes through the same accounting as every other language: its own
     modules count as first-party (resolved or not), stdlib/pip as external."""

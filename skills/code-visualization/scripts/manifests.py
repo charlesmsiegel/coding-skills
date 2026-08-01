@@ -97,7 +97,8 @@ class RustWorkspace:
             for header, body in re.findall(
                     r"^\[+([^\]]+)\]+\s*\n((?:(?!^\[)[^\n]*\n?)*)", text, re.M):
                 parts_h = header.split(".")
-                if len(parts_h) >= 2 and parts_h[-2].endswith("dependencies"):
+                if (len(parts_h) >= 2 and parts_h[-2].endswith("dependencies")
+                        and "metadata" not in parts_h):
                     pk = re.search(r"^\s*package\s*=\s*[\"']([^\"']+)[\"']", body, re.M)
                     if pk:
                         renames.append((parts_h[-1], body))
@@ -175,16 +176,15 @@ class RustWorkspace:
         name without a dependency entry).
         """
         d = self._crate_dir(importer_rel)
-        # Renames bind the declaring manifest, and a member inheriting a
-        # dependency (`foo.workspace = true`) inherits the workspace root's
-        # rename with it — so enclosing manifests are consulted outward.
-        name = None
-        probe = d
-        while name is None:
-            name = self._aliases.get(probe, {}).get(head)
-            if not probe:
-                break
-            probe = probe.rsplit("/", 1)[0] if "/" in probe else ""
+        # Renames bind the declaring manifest; a member inherits the workspace
+        # root's rename only by opting in (`foo.workspace = true`, which lands
+        # in the member's own dependency table).
+        name = self._aliases.get(d, {}).get(head)
+        if name is None and head in self._deps.get(d, ()):
+            probe = d
+            while name is None and probe:
+                probe = probe.rsplit("/", 1)[0] if "/" in probe else ""
+                name = self._aliases.get(probe, {}).get(head)
         if name is None:
             canonical = self._pkg_of_lib.get(head, head)
             # A [workspace.dependencies] entry is only visible to members that
@@ -225,7 +225,11 @@ def _cargo_dep_names(text):
     names = set()
     for header, body in re.findall(
             r"^\[+([^\]]+)\]+\s*\n((?:(?!^\[)[^\n]*\n?)*)", text, re.M):
-        if "dependencies" not in header or header.startswith("workspace"):
+        segs = header.split(".")
+        # [package.metadata.*] is arbitrary tool config Cargo ignores — a
+        # dependencies-shaped table inside it must not declare anything
+        if ("metadata" in segs or "dependencies" not in header
+                or header.startswith("workspace")):
             continue
         tail = header.split("dependencies", 1)[1].lstrip(".")
         if tail:  # [dependencies.foo] long form
@@ -287,13 +291,15 @@ def go_modules(all_paths):
 
 
 def npm_packages(all_paths):
-    """(registry deps by package dir, workspace package name -> (dir, main)).
+    """(registry deps by dir, name -> [(dir, entry, subpath exports)],
+    per-dir local info: the package's `imports` map and its local
+    dependency aliases).
 
     A bare import matching a *registry* dependency is external for files in
     that package; a `workspace:`/`file:`/`link:` value names a sibling
     workspace package — a local edge, resolved via the name map. One monorepo
     package's dependency list says nothing about its neighbours."""
-    by_dir, name_map = {}, {}
+    by_dir, name_map, local_by_dir = {}, {}, {}
     for rel, p in all_paths.items():
         if rel == "package.json" or rel.endswith("/package.json"):
             try:
@@ -307,16 +313,35 @@ def npm_packages(all_paths):
                 name_map.setdefault(data["name"], []).append(
                     (d, _npm_entry(data), _npm_subpath_exports(data)))
             deps = set()
+            # `"alias": "file:../actual"` installs the local package under the
+            # alias; record alias -> target dir so imports of it resolve
+            aliases = {}
             for key in ("dependencies", "devDependencies",
                         "peerDependencies", "optionalDependencies"):
                 section = data.get(key)
                 if not isinstance(section, dict):
                     continue  # a fixture may hold anything; skip, don't crash
                 for dep_name, val in section.items():
-                    if not str(val).startswith(("workspace:", "file:", "link:", "portal:")):
+                    sval = str(val)
+                    if sval.startswith(("file:", "link:", "portal:")):
+                        target = join_inside(d, sval.split(":", 1)[1])
+                        if target is not None:
+                            aliases[dep_name] = target
+                    elif not sval.startswith("workspace:"):
                         deps.add(dep_name)
+            # Node's own `imports` map (`#utils` -> ./src/utils.js)
+            imports_map = {}
+            imp = data.get("imports")
+            if isinstance(imp, dict):
+                for key, val in imp.items():
+                    if isinstance(val, dict):
+                        val = next((val[k] for k in ("import", "require", "default")
+                                    if isinstance(val.get(k), str)), None)
+                    if isinstance(key, str) and key.startswith("#") and isinstance(val, str):
+                        imports_map[key] = val.lstrip("./")
             by_dir[d] = deps
-    return by_dir, name_map
+            local_by_dir[d] = {"aliases": aliases, "imports": imports_map}
+    return by_dir, name_map, local_by_dir
 
 
 def _npm_subpath_exports(data):
