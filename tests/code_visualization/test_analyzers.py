@@ -262,7 +262,7 @@ def test_deps_resolves_kotlin_imports_across_gradle_modules(repo, tabs, run_scri
     """Gradle layout: each module carries its own src/main/kotlin tree. The
     import must resolve via the declared package, not a path rooted at the repo."""
     repo.write("core/src/main/kotlin/dev/rpg/core/Util.kt",
-               "package dev.rpg.core\n\nfun helper() = 1\n")
+               "package dev.rpg.core\n\nclass Util\n\nfun helper() = 1\n")
     repo.write("app/src/main/kotlin/dev/rpg/app/Main.kt",
                "package dev.rpg.app\n\nimport dev.rpg.core.Util\n\nfun main() {}\n")
 
@@ -755,6 +755,8 @@ def test_deps_js_single_segment_baseurl_resolves_unless_a_package(repo, tabs, ru
     """`from "utils"` may be a baseUrl import of a unique repo file — but a
     name declared in package.json dependencies is an npm package, never a
     repo file, even when a same-named file exists."""
+    repo.write("tsconfig.json",
+               '{"compilerOptions": {"baseUrl": "."}}\n')
     repo.write("package.json", '{"dependencies": {"react": "^18.0.0"}}\n')
     repo.write("src/utils.ts", "export const x = 1;\n")
     repo.write("src/react.ts", "export const decoy = 1;\n")
@@ -835,6 +837,8 @@ def test_deps_csharp_declarations_stay_in_their_namespace(repo, tabs, run_script
 def test_deps_js_npm_deps_scope_to_the_importing_package(repo, tabs, run_script):
     """One monorepo package declaring an npm dep named utils must not disable
     another package's baseUrl import of its own utils.ts."""
+    repo.write("tsconfig.json",
+               '{"compilerOptions": {"baseUrl": "."}}\n')
     repo.write("packages/a/package.json", '{"dependencies": {"utils": "^1.0.0"}}\n')
     repo.write("packages/a/src/app.ts", "import { x } from 'utils';\n")
     repo.write("packages/a/src/utils.ts", "export const decoy = 1;\n")
@@ -958,6 +962,8 @@ def test_deps_scala_root_qualifier_is_stripped(repo, tabs, run_script):
 def test_deps_js_node_builtins_never_link_to_repo_files(repo, tabs, run_script):
     """`import path from "path"` is the Node built-in even when a repo file
     named path.ts exists and no package.json declares it."""
+    repo.write("tsconfig.json",
+               '{"compilerOptions": {"baseUrl": "."}}\n')
     repo.write("src/path.ts", "export const decoy = 1;\n")
     repo.write("src/helpers.ts", "export const x = 1;\n")
     repo.write("src/app.ts", "import path from 'path';\nimport { x } from 'helpers';\n")
@@ -2168,6 +2174,126 @@ def test_deps_cargo_patch_redirects_a_registry_dep_locally(repo, tabs, run_scrip
 
     fan_in = {row["path"]: row["fan_in"] for row in summary["top_fan_in_files"]}
     assert fan_in.get("foo/src/tools.rs") == 2
+
+
+def test_deps_js_import_text_inside_a_string_is_ignored(repo, tabs, run_script):
+    repo.write("src/docs.ts",
+               "const docs = 'import x from \"./dep\"';\nexport const d = docs;\n")
+    repo.write("src/dep.ts", "export const x = 1;\n")
+
+    summary = _deps_summary(repo, tabs, run_script)
+
+    assert summary["import_edges"] == 0
+
+
+def test_deps_js_bare_suffix_fallback_requires_ts_config(repo, tabs, run_script):
+    """Without a baseUrl/paths tsconfig, a bare specifier is a package — a
+    same-named repo file must not capture it."""
+    repo.write("fixtures/lodash.ts", "export const decoy = 1;\n")
+    repo.write("src/app.ts", "import lodash from 'lodash';\n")
+
+    summary = _deps_summary(repo, tabs, run_script)
+
+    assert summary["import_edges"] == 0
+
+
+def test_deps_js_bare_suffix_fallback_applies_with_ts_config(repo, tabs, run_script):
+    repo.write("tsconfig.json",
+               '{"compilerOptions": {"baseUrl": ".", "outDir": "dist"}}\n')
+    repo.write("src/utils.ts", "export const u = 1;\n")
+    repo.write("src/app.ts", "import { u } from 'src/utils';\n")
+
+    summary = _deps_summary(repo, tabs, run_script)
+
+    fan_in = {row["path"]: row["fan_in"] for row in summary["top_fan_in_files"]}
+    assert fan_in.get("src/utils.ts") == 1
+
+
+def test_deps_csharp_using_on_a_compact_namespace_line(repo, tabs, run_script):
+    repo.write("lib/Models.cs", "namespace Q;\n\npublic class M {}\n")
+    repo.write("lib/OtherQ.cs", "namespace Q;\n\npublic class N {}\n")
+    repo.write("app/Program.cs", "namespace P { using Q; class X {} }\n")
+
+    summary = _deps_summary(repo, tabs, run_script)
+
+    fan_in = {row["path"]: row["fan_in"] for row in summary["top_fan_in_files"]}
+    assert fan_in.get("lib/Models.cs") == 1
+    assert fan_in.get("lib/OtherQ.cs") == 1
+
+
+def test_deps_npm_alias_subpath_resolves_into_the_target(repo, tabs, run_script):
+    repo.write("actual/package.json",
+               '{"name": "actual-name", "main": "index.js", '
+               '"exports": {".": "./index.js", "./feature": "./src/feat.js"}}\n')
+    repo.write("actual/index.js", "module.exports = 1;\n")
+    repo.write("actual/src/feat.js", "module.exports = 2;\n")
+    repo.write("app/package.json",
+               '{"name": "app", "dependencies": {"alias": "file:../actual"}}\n')
+    repo.write("app/src/main.js", "const f = require('alias/feature');\n")
+
+    summary = _deps_summary(repo, tabs, run_script)
+
+    fan_in = {row["path"]: row["fan_in"] for row in summary["top_fan_in_files"]}
+    assert fan_in.get("actual/src/feat.js") == 1
+    assert "actual/index.js" not in fan_in
+
+
+def test_deps_jvm_unknown_symbol_does_not_fall_to_a_single_file(repo, tabs, run_script):
+    """`import p.External` where External is not declared locally (a jar or
+    generated class) must stay unresolved, not link p's only local file."""
+    repo.write("lib/src/main/kotlin/p/Local.kt", "package p\n\nclass Local\n")
+    repo.write("app/src/main/kotlin/app/Main.kt",
+               "package app\n\nimport p.External\n\nclass Main\n")
+
+    summary = _deps_summary(repo, tabs, run_script)
+
+    assert summary["import_edges"] == 0
+    assert summary["resolution"]["Kotlin"]["first_party"] == 1
+    assert summary["resolution"]["Kotlin"]["resolved"] == 0
+
+
+def test_deps_java_import_of_a_kotlin_file_facade_resolves(repo, tabs, run_script):
+    """Java sees Kotlin top-level functions through the <Stem>Kt facade (or
+    the @file:JvmName override)."""
+    repo.write("lib/src/main/kotlin/p/Util.kt", "package p\n\nfun helper() = 1\n")
+    repo.write("lib/src/main/kotlin/p/Named.kt",
+               '@file:JvmName("Facade")\n\npackage p\n\nfun other() = 2\n')
+    repo.write("app/src/main/java/app/Main.java",
+               "package app;\n\nimport static p.UtilKt.helper;\n"
+               "import static p.Facade.other;\n\nclass Main {}\n")
+
+    summary = _deps_summary(repo, tabs, run_script)
+
+    fan_in = {row["path"]: row["fan_in"] for row in summary["top_fan_in_files"]}
+    assert fan_in.get("lib/src/main/kotlin/p/Util.kt") == 1
+    assert fan_in.get("lib/src/main/kotlin/p/Named.kt") == 1
+
+
+def test_deps_scala_commented_package_does_not_shift_prefixes(repo, tabs, run_script):
+    repo.write("core/src/main/scala/com/util/Helper.scala",
+               "package com.util\n\nclass Helper\n")
+    repo.write("core/src/main/scala/com/app/Main.scala",
+               "/*\npackage fake\n*/\npackage com.app\n\nimport util.Helper\n\nclass Main\n")
+
+    summary = _deps_summary(repo, tabs, run_script)
+
+    fan_in = {row["path"]: row["fan_in"] for row in summary["top_fan_in_files"]}
+    assert fan_in.get("core/src/main/scala/com/util/Helper.scala") == 1
+
+
+def test_deps_rust_build_script_is_its_own_crate(repo, tabs, run_script):
+    """build.rs is a separate crate: its crate:: sees its own mod siblings,
+    never the library's src/ tree."""
+    repo.write("Cargo.toml", '[package]\nname = "app"\n')
+    repo.write("build.rs", "mod build_helper;\nuse crate::build_helper::gen;\n\nfn main() {}\n")
+    repo.write("build_helper.rs", "pub fn gen() {}\n")
+    repo.write("src/lib.rs", "pub fn lib() {}\n")
+
+    summary = _deps_summary(repo, tabs, run_script)
+
+    fan_in = {row["path"]: row["fan_in"] for row in summary["top_fan_in_files"]}
+    assert fan_in.get("build_helper.rs") == 1
+    assert "src/lib.rs" not in fan_in
 
 
 def test_deps_python_resolution_is_counted_too(repo, tabs, run_script):
