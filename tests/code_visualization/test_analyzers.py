@@ -1780,6 +1780,110 @@ def test_deps_csharp_type_on_the_namespace_line_is_indexed(repo, tabs, run_scrip
     assert fan_in.get("lib/Compact.cs") == 1
 
 
+def test_deps_csharp_file_stem_is_not_a_type_claim(repo, tabs, run_script):
+    """A file named Helpers.cs declaring only Other must not satisfy (or make
+    ambiguous) `using static P.Helpers` — filenames declare nothing in C#."""
+    repo.write("lib/Helpers.cs", "namespace P;\n\nclass Other {}\n")
+    repo.write("lib/Real.cs", "namespace P;\n\nclass Helpers {}\n")
+    repo.write("app/Program.cs", "using static P.Helpers;\n\nnamespace App;\nclass A {}\n")
+
+    summary = _deps_summary(repo, tabs, run_script)
+
+    fan_in = {row["path"]: row["fan_in"] for row in summary["top_fan_in_files"]}
+    assert fan_in.get("lib/Real.cs") == 1
+    assert "lib/Helpers.cs" not in fan_in
+
+
+def test_deps_rust_self_use_respects_inline_module_scope(repo, tabs, run_script):
+    """`use self::child::X` inside `mod inner { ... }` names inner/child.rs,
+    not the file-level child.rs."""
+    repo.write("Cargo.toml", '[package]\nname = "app"\n')
+    repo.write("src/lib.rs",
+               "mod inner {\n    mod child;\n    use self::child::X;\n}\n")
+    repo.write("src/inner/child.rs", "pub struct X;\n")
+    repo.write("src/child.rs", "pub struct Decoy;\n")
+
+    summary = _deps_summary(repo, tabs, run_script)
+
+    fan_in = {row["path"]: row["fan_in"] for row in summary["top_fan_in_files"]}
+    assert fan_in.get("src/inner/child.rs") == 1
+    assert "src/child.rs" not in fan_in
+
+
+def test_deps_npm_extensionless_main_resolves(repo, tabs, run_script):
+    repo.write("packages/lib/package.json", '{"name": "lib", "main": "src/entry"}\n')
+    repo.write("packages/lib/src/entry.js", "module.exports = 1;\n")
+    repo.write("packages/app/package.json",
+               '{"name": "app", "dependencies": {"lib": "workspace:*"}}\n')
+    repo.write("packages/app/main.js", "const l = require('lib');\n")
+
+    summary = _deps_summary(repo, tabs, run_script)
+
+    fan_in = {row["path"]: row["fan_in"] for row in summary["top_fan_in_files"]}
+    assert fan_in.get("packages/lib/src/entry.js") == 1
+
+
+def test_deps_rust_root_level_lib_entry_resolves_crate_paths(repo, tabs, run_script):
+    """[lib] path = "lib.rs" makes the source root the repo root; crate::
+    paths must join without a leading slash."""
+    repo.write("Cargo.toml", '[package]\nname = "app"\n\n[lib]\npath = "lib.rs"\n')
+    repo.write("lib.rs", "mod helper;\nuse crate::helper::X;\n")
+    repo.write("helper.rs", "pub struct X;\n")
+
+    summary = _deps_summary(repo, tabs, run_script)
+
+    fan_in = {row["path"]: row["fan_in"] for row in summary["top_fan_in_files"]}
+    assert fan_in.get("helper.rs") == 1
+    assert summary["resolution"]["Rust"]["resolved"] == 2
+
+
+def test_deps_commented_go_imports_are_ignored(repo, tabs, run_script):
+    repo.write("go.mod", "module example.com/app\n")
+    repo.write("lib/lib.go", "package lib\n\nfunc Do() {}\n")
+    repo.write("main.go",
+               'package main\n\n/*\nimport "example.com/app/lib"\n*/\n\nfunc main() {}\n')
+
+    summary = _deps_summary(repo, tabs, run_script)
+
+    assert summary["import_edges"] == 0
+
+
+def test_deps_commented_ruby_requires_are_ignored(repo, tabs, run_script):
+    repo.write("lib/main.rb", '# require_relative "legacy"\nputs 1\n')
+    repo.write("lib/legacy.rb", "LEGACY = 1\n")
+
+    summary = _deps_summary(repo, tabs, run_script)
+
+    assert summary["import_edges"] == 0
+
+
+def test_deps_csharp_delegate_declares_its_name_not_its_return_type(
+        repo, tabs, run_script):
+    repo.write("lib/Events.cs", "namespace P;\n\npublic delegate void Handler();\n")
+    repo.write("lib/Other.cs", "namespace P;\n\nclass Other {}\n")
+    repo.write("app/Program.cs", "using static P.Handler;\n\nnamespace App;\nclass A {}\n")
+
+    summary = _deps_summary(repo, tabs, run_script)
+
+    fan_in = {row["path"]: row["fan_in"] for row in summary["top_fan_in_files"]}
+    assert fan_in.get("lib/Events.cs") == 1
+
+
+def test_deps_rust_extern_crate_creates_an_edge(repo, tabs, run_script):
+    """Rust 2015's `#[macro_use] extern crate helper;` is a dependency even
+    with no subsequent use statement."""
+    repo.write("app/Cargo.toml",
+               '[package]\nname = "app"\n\n[dependencies]\nhelper = { path = "../helper" }\n')
+    repo.write("app/src/main.rs", "#[macro_use]\nextern crate helper;\n\nfn main() {}\n")
+    repo.write("helper/Cargo.toml", '[package]\nname = "helper"\n')
+    repo.write("helper/src/lib.rs", "#[macro_export]\nmacro_rules! m { () => {} }\n")
+
+    summary = _deps_summary(repo, tabs, run_script)
+
+    fan_in = {row["path"]: row["fan_in"] for row in summary["top_fan_in_files"]}
+    assert fan_in.get("helper/src/lib.rs") == 1
+
+
 def test_deps_python_resolution_is_counted_too(repo, tabs, run_script):
     """Python goes through the same accounting as every other language: its own
     modules count as first-party (resolved or not), stdlib/pip as external."""
