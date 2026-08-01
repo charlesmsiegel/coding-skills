@@ -315,7 +315,7 @@ def extract(paths, all_paths, file_set):
     # still first-party, and should be counted as unresolved rather than external.
     py_roots = {seg for rel in file_set if rel.endswith((".py", ".pyi"))
                 for seg in rel.rsplit(".", 1)[0].split("/")}
-    go_mods, go_replaces = go_modules(all_paths)
+    go_mods, go_replaces, go_work_replaces = go_modules(all_paths)
     jvm_idx, cs_idx = build_decl_indexes(paths)
     rust_ws = RustWorkspace(all_paths)
     npm_by_dir, npm_names, npm_local = npm_packages(all_paths)
@@ -358,8 +358,8 @@ def extract(paths, all_paths, file_set):
             # inventing cycles production code does not have. Skip both
             # directions (they are already excluded as import targets).
             if not rel.endswith("_test.go"):
-                _go_edges(rel, text, go_mods, go_replaces, go_files_by_dir,
-                          lang, edges, stats)
+                _go_edges(rel, text, go_mods, go_replaces, go_work_replaces,
+                          go_files_by_dir, lang, edges, stats)
         elif ext == ".rs":
             _rust_edges(rel, text, file_set, rust_ws, lang, edges, stats)
         elif ext in JVM_EXTS:
@@ -437,15 +437,19 @@ def _js_edges(rel, text, file_set, by_base, npm_by_dir, npm_names,
             return n
         return max(cands, key=lambda c: shared_depth(c[0]))
 
-    def workspace_entry(name):
-        """The file a workspace package's name resolves to: its declared main
-        (or exports root), else a conventional index module."""
+    def workspace_entry(name, mode="import"):
+        """The file a workspace package's name resolves to: its exports/main
+        entry for the caller's syntax (import vs require), else a
+        conventional index module."""
         pkg = workspace_pkg(name)
         if pkg is None:
             return None
-        d, main, _ = pkg
+        d, (esm, cjs), _ = pkg
+        preferred = [esm, cjs] if mode == "import" else [cjs, esm]
         cands = []
-        if main:
+        for main in preferred:
+            if not main:
+                continue
             base = f"{d}/{main}".strip("/")
             # Node resolves an extensionless or directory main
             cands += [base] + [base + e for e in JS_EXTS] \
@@ -453,7 +457,10 @@ def _js_edges(rel, text, file_set, by_base, npm_by_dir, npm_names,
         for stem_c in ("src/index", "index", "src/main", "lib/index"):
             cands += [f"{d}/{stem_c}{e}" for e in JS_EXTS]
         return next((c for c in cands if c in file_set), None)
-    for spec in JS_IMPORT_RE.findall(text):
+    for jm in JS_IMPORT_RE.finditer(text):
+        spec = jm.group(1)
+        # a require() call resolves the package's CommonJS condition
+        mode = "require" if jm.group(0).lstrip().startswith("require") else "import"
         if spec.startswith("."):
             t = resolve_relative_js(rel, spec, file_set)
             if t and t != rel:
@@ -497,8 +504,9 @@ def _js_edges(rel, text, file_set, by_base, npm_by_dir, npm_names,
                 # share the alias's name)
                 data_cands = [c for cands_list in npm_names.values()
                               for c in cands_list if c[0] == alias_dir]
-                entry = data_cands[0][1] if data_cands else ""
-                cands = [f"{alias_dir}/{entry}".strip("/")] if entry else []
+                esm_a, cjs_a = data_cands[0][1] if data_cands else ("", "")
+                order = [esm_a, cjs_a] if mode == "import" else [cjs_a, esm_a]
+                cands = [f"{alias_dir}/{e}".strip("/") for e in order if e]
                 for stem_c in ("src/index", "index", "src/main", "lib/index"):
                     cands += [f"{alias_dir}/{stem_c}{e}" for e in JS_EXTS]
                 t = next((c for c in cands if c in file_set), None)
@@ -509,7 +517,7 @@ def _js_edges(rel, text, file_set, by_base, npm_by_dir, npm_names,
                 # the importer declares as a REGISTRY dependency stays
                 # external even when a same-named local package exists.
                 if spec == pkg_name:
-                    t = workspace_entry(pkg_name)
+                    t = workspace_entry(pkg_name, mode)
                 else:
                     wdir, _, subexports = workspace_pkg(pkg_name)
                     sub = spec[len(pkg_name) + 1:]
@@ -539,7 +547,8 @@ def _mask_go_comments(text):
     return text
 
 
-def _go_edges(rel, text, go_mods, go_replaces, go_files_by_dir, lang, edges, stats):
+def _go_edges(rel, text, go_mods, go_replaces, go_work_replaces,
+              go_files_by_dir, lang, edges, stats):
     text = _mask_go_comments(text)
     my_dir = nearest_dir(rel, {d for _, d in go_mods})
     src_dir = str(Path(rel).parent).replace("\\", "/")
@@ -560,8 +569,8 @@ def _go_edges(rel, text, go_mods, go_replaces, go_files_by_dir, lang, edges, sta
             continue
         imp = m.group(1)
         # The importer's own go.mod may rewrite this prefix to a local dir —
-        # and its replace binds only this module — plus any enclosing
-        # go.work, whose replaces bind every workspace member.
+        # go.work replaces bind every member and take precedence over the
+        # module's own go.mod replaces.
         repl_dirs = [my_dir] if my_dir is not None else []
         probe = my_dir or ""
         while probe:
@@ -569,8 +578,10 @@ def _go_edges(rel, text, go_mods, go_replaces, go_files_by_dir, lang, edges, sta
             repl_dirs.append(probe)
         if "" not in repl_dirs:
             repl_dirs.append("")
-        repl = next(((old, nd) for rd in repl_dirs
-                     for old, nd in go_replaces.get(rd, ())
+        repl = next(((old, nd)
+                     for source in (go_work_replaces, go_replaces)
+                     for rd in repl_dirs
+                     for old, nd in source.get(rd, ())
                      if imp == old or imp.startswith(old + "/")), None) \
             if my_dir is not None else None
         if repl is not None:
