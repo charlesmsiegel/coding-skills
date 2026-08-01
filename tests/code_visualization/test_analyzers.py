@@ -2076,6 +2076,100 @@ def test_deps_go_work_replace_beats_module_replace(repo, tabs, run_script):
     assert "app/local-fork/pkg/pkg.go" not in fan_in
 
 
+def test_deps_cargo_table_header_comments_parse(repo, tabs, run_script):
+    repo.write("app/Cargo.toml",
+               '[package] # application crate\nname = "app"\n\n'
+               '[dependencies] # local\nfoo = { path = "../foo" }\n')
+    repo.write("app/src/main.rs", "use foo::tools::run;\n\nfn main() {}\n")
+    repo.write("foo/Cargo.toml", '[package]\nname = "foo"\n')
+    repo.write("foo/src/lib.rs", "pub mod tools;\n")
+    repo.write("foo/src/tools.rs", "pub fn run() {}\n")
+
+    summary = _deps_summary(repo, tabs, run_script)
+
+    fan_in = {row["path"]: row["fan_in"] for row in summary["top_fan_in_files"]}
+    assert fan_in.get("foo/src/tools.rs") == 2
+
+
+def test_deps_npm_semver_linked_workspace_sibling_resolves(repo, tabs, run_script):
+    """Inside one workspace, `"local-lib": "^1.0.0"` installs the sibling as
+    a link — the name is local, not a registry package."""
+    repo.write("package.json", '{"name": "root", "workspaces": ["packages/*"]}\n')
+    repo.write("packages/local-lib/package.json",
+               '{"name": "local-lib", "version": "1.2.0", "main": "index.js"}\n')
+    repo.write("packages/local-lib/index.js", "module.exports = 1;\n")
+    repo.write("packages/app/package.json",
+               '{"name": "app", "dependencies": {"local-lib": "^1.0.0"}}\n')
+    repo.write("packages/app/main.js", "const l = require('local-lib');\n")
+
+    summary = _deps_summary(repo, tabs, run_script)
+
+    fan_in = {row["path"]: row["fan_in"] for row in summary["top_fan_in_files"]}
+    assert fan_in.get("packages/local-lib/index.js") == 1
+
+
+def test_deps_csharp_outward_lookup_expands_dotted_namespaces(repo, tabs, run_script):
+    """From namespace A.B, `using C;` tries A.B.C, then A.C, then C — the
+    dotted name expands per component."""
+    repo.write("lib/AC.cs", "namespace A.C;\n\npublic class FromAC {}\n")
+    repo.write("lib/GlobalC.cs", "namespace C;\n\npublic class FromGlobal {}\n")
+    repo.write("app/Program.cs",
+               "namespace A.B {\n  using C;\n  class P {}\n}\n")
+
+    summary = _deps_summary(repo, tabs, run_script)
+
+    fan_in = {row["path"]: row["fan_in"] for row in summary["top_fan_in_files"]}
+    assert fan_in.get("lib/AC.cs") == 1
+    assert "lib/GlobalC.cs" not in fan_in
+
+
+def test_deps_ruby_parenthesized_require_resolves(repo, tabs, run_script):
+    repo.write("lib/main.rb",
+               'require_relative("helper")\nrequire("my_gem/version")\n')
+    repo.write("lib/helper.rb", "H = 1\n")
+    repo.write("lib/my_gem/version.rb", 'VERSION = "1"\n')
+
+    summary = _deps_summary(repo, tabs, run_script)
+
+    fan_in = {row["path"]: row["fan_in"] for row in summary["top_fan_in_files"]}
+    assert fan_in.get("lib/helper.rb") == 1
+    assert fan_in.get("lib/my_gem/version.rb") == 1
+
+
+def test_deps_scala_compact_package_block_pops_immediately(repo, tabs, run_script):
+    """`package p { class A }` on one line closes on that line — a following
+    package q must not compose into p.q."""
+    repo.write("src/main/scala/Both.scala",
+               "package p { class A }\npackage q { class B }\n")
+    repo.write("src/main/scala/q/Other.scala", "package q\n\nclass Other\n")
+    repo.write("src/main/scala/app/Main.scala",
+               "package app\n\nimport q.B\n\nclass Main\n")
+
+    summary = _deps_summary(repo, tabs, run_script)
+
+    fan_in = {row["path"]: row["fan_in"] for row in summary["top_fan_in_files"]}
+    assert fan_in.get("src/main/scala/Both.scala") == 1
+
+
+def test_deps_cargo_patch_redirects_a_registry_dep_locally(repo, tabs, run_script):
+    """A [patch.crates-io] path entry makes the member's registry dep compile
+    from the in-repo crate."""
+    repo.write("Cargo.toml",
+               '[workspace]\nmembers = ["app", "foo"]\n\n'
+               '[patch.crates-io]\nfoo = { path = "foo" }\n')
+    repo.write("app/Cargo.toml",
+               '[package]\nname = "app"\n\n[dependencies]\nfoo = "1"\n')
+    repo.write("app/src/main.rs", "use foo::tools::run;\n\nfn main() {}\n")
+    repo.write("foo/Cargo.toml", '[package]\nname = "foo"\n')
+    repo.write("foo/src/lib.rs", "pub mod tools;\n")
+    repo.write("foo/src/tools.rs", "pub fn run() {}\n")
+
+    summary = _deps_summary(repo, tabs, run_script)
+
+    fan_in = {row["path"]: row["fan_in"] for row in summary["top_fan_in_files"]}
+    assert fan_in.get("foo/src/tools.rs") == 2
+
+
 def test_deps_python_resolution_is_counted_too(repo, tabs, run_script):
     """Python goes through the same accounting as every other language: its own
     modules count as first-party (resolved or not), stdlib/pip as external."""

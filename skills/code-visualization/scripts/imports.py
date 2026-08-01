@@ -34,7 +34,8 @@ GO_IMPORT_RE = re.compile(r'^\s*(?:[\w.]+\s+)?["`]([^"`]+)["`]', re.M)
 # Captures the full statement (a negated class crosses newlines, so a
 # rustfmt-wrapped group still arrives whole); rust_use_targets() parses it.
 RUST_USE_RE = re.compile(r"^\s*(?:pub(?:\([^)]*\))?\s+)?use\s+([^;]+);", re.M)
-RUBY_REQ_RE = re.compile(r"""(require_relative|require)\s+['"]([^'"]+)['"]""")
+RUBY_REQ_RE = re.compile(
+    r"""(require_relative|require)\s*\(?\s*['"]([^'"]+)['"]""")
 
 # Bare specifiers naming Node built-ins are external even without a
 # package.json entry — a repo file named path.ts is never what `from "path"`
@@ -318,7 +319,7 @@ def extract(paths, all_paths, file_set):
     go_mods, go_replaces, go_work_replaces = go_modules(all_paths)
     jvm_idx, cs_idx = build_decl_indexes(paths)
     rust_ws = RustWorkspace(all_paths)
-    npm_by_dir, npm_names, npm_local = npm_packages(all_paths)
+    npm_by_dir, npm_names, npm_local, npm_ws_roots = npm_packages(all_paths)
     # Build-module boundaries: independent modules may declare the same fully
     # qualified symbol without sharing a classpath. C# projects are bounded by
     # .csproj files; JVM modules by Gradle/Maven manifests.
@@ -351,7 +352,7 @@ def extract(paths, all_paths, file_set):
             edges[rel] |= python_edges(rel, text, py_idx, file_set, py_roots, stats)
         elif ext in JS_EXTS:
             _js_edges(rel, text, file_set, by_base, npm_by_dir, npm_names,
-                      npm_local, lang, edges, stats)
+                      npm_local, npm_ws_roots, lang, edges, stats)
         elif ext == ".go":
             # _test.go compiles into a separate test binary, but the graph's
             # directory grouping would conflate its edges with the package's —
@@ -414,7 +415,7 @@ def _mask_js_comments(text):
 
 
 def _js_edges(rel, text, file_set, by_base, npm_by_dir, npm_names,
-              npm_local, lang, edges, stats):
+              npm_local, npm_ws_roots, lang, edges, stats):
     text = _mask_js_comments(text)
     pkg_dir = nearest_dir(rel, npm_by_dir)
     npm_deps = npm_by_dir.get(pkg_dir, set()) if pkg_dir is not None else set()
@@ -495,8 +496,21 @@ def _js_edges(rel, text, file_set, by_base, npm_by_dir, npm_names,
             pkg_name = ("/".join(spec.split("/")[:2])
                         if spec.startswith("@") else root)
             alias_dir = local.get("aliases", {}).get(pkg_name)
+
+            def same_workspace(name):
+                """npm links a semver range to a sibling when both packages
+                live under the same workspaces-declaring root."""
+                for cand_dir, _, _ in npm_names.get(name, ()):
+                    for root in npm_ws_roots:
+                        if ((not root or cand_dir == root
+                             or cand_dir.startswith(root + "/"))
+                                and (not root or (pkg_dir or "") == root
+                                     or (pkg_dir or "").startswith(root + "/"))):
+                            return True
+                return False
             if alias_dir is not None or (pkg_name in npm_names
-                                         and pkg_name not in npm_deps):
+                                         and (pkg_name not in npm_deps
+                                              or same_workspace(pkg_name))):
                 known_local = True
             if alias_dir is not None:
                 # `"alias": "file:../actual"` — the alias IS the installed
@@ -510,7 +524,8 @@ def _js_edges(rel, text, file_set, by_base, npm_by_dir, npm_names,
                 for stem_c in ("src/index", "index", "src/main", "lib/index"):
                     cands += [f"{alias_dir}/{stem_c}{e}" for e in JS_EXTS]
                 t = next((c for c in cands if c in file_set), None)
-            elif pkg_name in npm_names and pkg_name not in npm_deps:
+            elif pkg_name in npm_names and (pkg_name not in npm_deps
+                                            or same_workspace(pkg_name)):
                 # a sibling workspace package (declared workspace:/file:, or
                 # undeclared but present in the repo) — a local edge by name; a
                 # subpath import reaches into the package's own tree. A name
