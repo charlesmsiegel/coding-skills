@@ -53,8 +53,15 @@ SCALA_PKG_OBJ_RE = re.compile(r"^\s*package\s+object\s+(\w+)", re.M)
 # blocks, so column-0 anchoring would find nothing: match declarations
 # anywhere. An inner type over-indexes harmlessly — it still names this file.
 CS_TYPE_RE = re.compile(
-    r"\b(?:record(?:\s+(?:class|struct))?|class|struct|interface|enum|delegate)"
+    r"\b(?:record(?:\s+(?:class|struct))?|class|struct|interface|enum)"
     r"\s+(\w+)")
+# a delegate's name follows its return type: `delegate void Handler();`
+CS_DELEGATE_RE = re.compile(
+    r"\bdelegate\s+[\w<>\[\],?.\s]+?\b(\w+)\s*\(")
+
+
+def _cs_decl_names(segment):
+    return CS_TYPE_RE.findall(segment) + CS_DELEGATE_RE.findall(segment)
 
 
 SCALA_INNER_DECL_RE = re.compile(
@@ -150,10 +157,10 @@ def cs_namespaces(text):
         if m:
             # compact form: `namespace P { class Util {} }` declares on the
             # same line, inside the just-opened scope
-            for name in CS_TYPE_RE.findall(line[m.end():]):
+            for name in _cs_decl_names(line[m.end():]):
                 out.setdefault(key(), set()).add(name)
         else:
-            for name in CS_TYPE_RE.findall(line):
+            for name in _cs_decl_names(line):
                 out.setdefault(key(), set()).add(name)
         depth += line.count("{") - line.count("}")
         for e in stack:
@@ -241,8 +248,10 @@ def build_decl_indexes(paths):
             # rival claim that turns the real declaration ambiguous
             text = _mask_jvm(text)
         if ext == ".cs":
+            # C# filenames declare nothing — a stem claim would satisfy (or
+            # make ambiguous) usings the file's real types never declare
             for pkg, decls in (cs_namespaces(text) or {"": set()}).items():
-                cs.add(pkg, rel, decls | {stem})
+                cs.add(pkg, rel, decls)
             continue
         if ext == ".scala":
             names.discard(stem)  # Scala file names declare nothing

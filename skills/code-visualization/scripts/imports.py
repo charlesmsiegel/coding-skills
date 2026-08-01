@@ -246,19 +246,20 @@ def resolve_rust_path(src_root, segs, file_set, entry_of=None,
     the [lib]-declared entry file when the crate names a custom target.
     skip_entries suppresses that fallback when the owning target is
     ambiguous (both lib.rs and main.rs exist and the importer is neither)."""
+    prefix = f"{src_root}/" if src_root else ""
     for n in range(len(segs), 0, -1):
-        base = f"{src_root}/{'/'.join(segs[:n])}"
+        base = prefix + "/".join(segs[:n])
         for cand in (f"{base}.rs", f"{base}/mod.rs"):
             if cand in file_set:
                 return cand
     # mod.rs covers the self::/super:: case, where the root is a module
     # directory rather than a crate src root.
     for entry in (("mod.rs",) if skip_entries else ("lib.rs", "main.rs", "mod.rs")):
-        if f"{src_root}/{entry}" in file_set:
-            return f"{src_root}/{entry}"
+        if prefix + entry in file_set:
+            return prefix + entry
     # ... and a module using the file layout (src/foo.rs owning src/foo/) is
     # the sibling FILE of the directory the root path names.
-    if f"{src_root}.rs" in file_set:
+    if src_root and f"{src_root}.rs" in file_set:
         return f"{src_root}.rs"
     if entry_of:
         return entry_of.get(src_root)
@@ -382,7 +383,8 @@ def extract(paths, all_paths, file_set):
             for imp, prefixes in cs_usings(text):
                 _cs_edge(rel, imp, prefixes, cs_idx, cs_modules, lang, edges, stats)
         elif ext == ".rb":
-            for kind, spec in RUBY_REQ_RE.findall(text):
+            rb_text = re.sub(r"^\s*#[^\n]*", "", text, flags=re.M)
+            for kind, spec in RUBY_REQ_RE.findall(rb_text):
                 if kind == "require_relative":
                     t = resolve_relative_js(
                         rel, spec if spec.endswith(".rb") else spec + ".rb", file_set)
@@ -441,7 +443,12 @@ def _js_edges(rel, text, file_set, by_base, npm_by_dir, npm_names,
         if pkg is None:
             return None
         d, main, _ = pkg
-        cands = [f"{d}/{main}".strip("/")] if main else []
+        cands = []
+        if main:
+            base = f"{d}/{main}".strip("/")
+            # Node resolves an extensionless or directory main
+            cands += [base] + [base + e for e in JS_EXTS] \
+                + [f"{base}/index{e}" for e in JS_EXTS]
         for stem_c in ("src/index", "index", "src/main", "lib/index"):
             cands += [f"{d}/{stem_c}{e}" for e in JS_EXTS]
         return next((c for c in cands if c in file_set), None)
@@ -519,7 +526,16 @@ def _js_edges(rel, text, file_set, by_base, npm_by_dir, npm_names,
             stats.count(lang, spec, rel, bool(t), bool(t))
 
 
+def _mask_go_comments(text):
+    def blank(m):
+        return re.sub(r"[^\n]", " ", m.group(0))
+    text = re.sub(r"/\*.*?\*/", blank, text, flags=re.S)
+    text = re.sub(r"(?<!:)//[^\n]*", " ", text)
+    return text
+
+
 def _go_edges(rel, text, go_mods, go_replaces, go_files_by_dir, lang, edges, stats):
+    text = _mask_go_comments(text)
     my_dir = nearest_dir(rel, {d for _, d in go_mods})
     src_dir = str(Path(rel).parent).replace("\\", "/")
     in_block = False
@@ -646,13 +662,15 @@ def _rust_edges(rel, text, file_set, ws, lang, edges, stats):
     text = _mask_rust(text)
     own = ws.own_src(rel)
     own_dir = str(Path(rel).parent).replace("\\", "/")
+    own_dir = "" if own_dir == "." else own_dir  # root files join without "./"
     stem = rel.rsplit("/", 1)[-1]
     is_root = stem in ("lib.rs", "main.rs", "mod.rs") or ws.is_target_root(rel)
     # The directory holding this module's CHILD modules: crate/module roots own
     # their directory; foo.rs owns foo/. self:: resolves here, and each super::
     # pops one level from here — so one super from a/child.rs lands in a/, the
     # importer's own directory, not a level above it.
-    child_dir = own_dir if is_root else f"{own_dir}/{stem[:-3]}"
+    child_dir = own_dir if is_root else \
+        (f"{own_dir}/{stem[:-3]}" if own_dir else stem[:-3])
     # both entry files present and this file is neither: its owning target
     # (lib vs bin) is unknowable textually, so bare crate:: falls to nothing
     dual_entries = (stem not in ("lib.rs", "main.rs")
@@ -662,7 +680,9 @@ def _rust_edges(rel, text, file_set, ws, lang, edges, stats):
     # one is open (`mod platform { mod imp; }` names platform/imp.rs), so the
     # scan tracks `mod x {` blocks by brace depth like any other scope.
     mod_stack, depth, pending_path = [], 0, None
+    scope_at_line = []  # inline-module path enclosing each line
     for lineno, line in enumerate(text.splitlines()):
+        scope_at_line.append("/".join(e["name"] for e in mod_stack))
         # the attribute's path is a string literal the mask blanked — read it
         # from the original line
         am = re.match(r'\s*#\[path\s*=\s*"([^"]+)"\]', orig_lines[lineno])
@@ -679,10 +699,11 @@ def _rust_edges(rel, text, file_set, ws, lang, edges, stats):
                 cand = join_inside(own_dir, pending_path)
                 t = cand if cand and cand in file_set and cand != rel else None
             else:
-                bases = ((f"{child_dir}/{scope}",) if scope
+                bases = ((f"{child_dir}/{scope}".lstrip("/"),) if scope
                          else (child_dir, own_dir))
                 t = next((c for b in bases
-                          for c in (f"{b}/{name}.rs", f"{b}/{name}/mod.rs")
+                          for pb in (f"{b}/" if b else "",)
+                          for c in (f"{pb}{name}.rs", f"{pb}{name}/mod.rs")
                           if c in file_set and c != rel), None)
             if t:
                 edges[rel].add(t)
@@ -696,7 +717,22 @@ def _rust_edges(rel, text, file_set, ws, lang, edges, stats):
             e["entered"] = e["entered"] or depth > e["open"]
         while mod_stack and mod_stack[-1]["entered"] and depth <= mod_stack[-1]["open"]:
             mod_stack.pop()
-    for stmt in RUST_USE_RE.findall(text):
+    for em in re.finditer(
+            r"^\s*(?:#\[[^\]]*\]\s*)*(?:pub\s+)?extern\s+crate\s+"
+            r"(?:r#)?(\w+)(?:\s+as\s+\w+)?\s*;", text, re.M):
+        crate_name = em.group(1)
+        if crate_name in ("std", "core", "alloc", "proc_macro", "test", "self"):
+            continue
+        root = ws.crate_root(crate_name, rel)
+        t2 = (resolve_rust_path(root, [], file_set, ws.entry_of)
+              if root is not None else None)
+        if t2 and t2 != rel:
+            edges[rel].add(t2)
+        stats.count(lang, f"extern crate {crate_name}", rel,
+                    root is not None, bool(t2))
+    for sm in RUST_USE_RE.finditer(text):
+        stmt = sm.group(1)
+        use_scope = scope_at_line[text.count("\n", 0, sm.start())]
         for use in rust_use_targets(stmt):
             segs = [s.removeprefix("r#") for s in use.strip(":").split("::") if s]
             if not segs:
@@ -705,7 +741,9 @@ def _rust_edges(rel, text, file_set, ws, lang, edges, stats):
             if head == "crate":
                 root, segs = own, segs[1:]
             elif head in ("self", "super"):
-                root = child_dir
+                # self/super are relative to the LEXICAL module — including
+                # any inline `mod x { ... }` blocks enclosing this use
+                root = f"{child_dir}/{use_scope}" if use_scope else child_dir
                 while segs and segs[0] == "super":
                     root, segs = root.rsplit("/", 1)[0], segs[1:]
                 if segs and segs[0] == "self":
