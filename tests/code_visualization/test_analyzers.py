@@ -1660,6 +1660,126 @@ def test_deps_scala_import_resolves_through_the_enclosing_package(
     assert fan_in.get("core/src/main/scala/com/acme/util/Helper.scala") == 1
 
 
+def test_deps_lumped_other_node_cannot_create_cycles(repo, tabs, run_script):
+    """Cycles are computed on the real module graph — modules merged into
+    (other) by --max-nodes must not fuse into a phantom cycle."""
+    # a imports c; d imports a. With max-nodes 3, c and d lump into (other):
+    # a -> (other) and (other) -> a would read as a cycle. No real cycle exists.
+    repo.write("a/mod.py", "import helper_c\n")
+    repo.write("c/helper_c.py", "X = 1\n")
+    repo.write("d/mod2.py", "import mod\n")
+    repo.write("a/mod.py", "import helper_c\n")
+    repo.write("b/other.py", "Y = 1\n")
+
+    summary = json.loads(run_script(
+        SCRIPTS / "analyze_deps.py", repo.path, "--tabs-dir", tabs,
+        "--max-nodes", "3").stdout)
+
+    assert summary["module_cycles"] == []
+
+
+def test_deps_cargo_declared_dep_path_beats_proximity(repo, tabs, run_script):
+    """`common = { path = "../vendor/common" }` names its target explicitly;
+    a same-named crate nearer the importer must not win."""
+    repo.write("apps/tool/Cargo.toml",
+               '[package]\nname = "tool"\n\n[dependencies]\n'
+               'common = { path = "../../third_party/common" }\n')
+    repo.write("apps/tool/src/main.rs", "use common::util::go;\n\nfn main() {}\n")
+    repo.write("apps/common/Cargo.toml", '[package]\nname = "common"\n')
+    repo.write("apps/common/src/lib.rs", "pub mod util;\n")
+    repo.write("apps/common/src/util.rs", "pub fn decoy() {}\n")
+    repo.write("third_party/common/Cargo.toml", '[package]\nname = "common"\n')
+    repo.write("third_party/common/src/lib.rs", "pub mod util;\n")
+    repo.write("third_party/common/src/util.rs", "pub fn go() {}\n")
+
+    summary = _deps_summary(repo, tabs, run_script)
+
+    fan_in = {row["path"]: row["fan_in"] for row in summary["top_fan_in_files"]}
+    assert fan_in.get("third_party/common/src/util.rs") == 2  # own lib.rs + tool
+    assert fan_in.get("apps/common/src/util.rs") == 1         # own lib.rs only
+
+
+def test_deps_kotlin_commented_declarations_are_not_indexed(repo, tabs, run_script):
+    repo.write("lib/src/main/kotlin/p/Real.kt", "package p\n\nclass Real\n")
+    repo.write("lib/src/main/kotlin/p/Notes.kt",
+               "package p\n\n/*\nclass Real\n*/\nclass Notes\n")
+    repo.write("app/src/main/kotlin/app/Main.kt",
+               "package app\n\nimport p.Real\n\nclass Main\n")
+
+    summary = _deps_summary(repo, tabs, run_script)
+
+    fan_in = {row["path"]: row["fan_in"] for row in summary["top_fan_in_files"]}
+    assert fan_in.get("lib/src/main/kotlin/p/Real.kt") == 1
+
+
+def test_deps_rust_shared_src_bare_crate_fallback_is_ambiguous(
+        repo, tabs, run_script):
+    """With both src/lib.rs and src/main.rs, a loose module's bare crate::
+    fallback cannot know its owning target — no edge beats a wrong edge."""
+    repo.write("Cargo.toml", '[package]\nname = "app"\n')
+    repo.write("src/lib.rs", "pub struct LibConfig;\n")
+    repo.write("src/main.rs", "mod cli;\nstruct Config;\nfn main() {}\n")
+    repo.write("src/cli.rs", "use crate::Config;\n")
+
+    summary = _deps_summary(repo, tabs, run_script)
+
+    fan_in = {row["path"]: row["fan_in"] for row in summary["top_fan_in_files"]}
+    # main.rs's `mod cli;` edge exists; cli.rs's crate::Config must NOT
+    # resolve to lib.rs (a crate rustc never links it to)
+    assert fan_in.get("src/cli.rs") == 1
+    assert "src/lib.rs" not in fan_in
+
+
+def test_deps_js_commented_imports_are_ignored(repo, tabs, run_script):
+    repo.write("src/main.ts",
+               "// import './legacy';\n/*\nimport './old';\n*/\nexport const x = 1;\n")
+    repo.write("src/legacy.ts", "export const l = 1;\n")
+    repo.write("src/old.ts", "export const o = 1;\n")
+
+    summary = _deps_summary(repo, tabs, run_script)
+
+    assert summary["import_edges"] == 0
+
+
+def test_deps_python_absolute_import_inside_a_package_is_not_a_sibling(
+        repo, tabs, run_script):
+    """`import util` from inside package pkg/ is absolute — it names the root
+    util.py, not the sibling pkg/util.py."""
+    repo.write("util.py", "ROOT = 1\n")
+    repo.write("pkg/__init__.py", "")
+    repo.write("pkg/util.py", "SIBLING = 1\n")
+    repo.write("pkg/a.py", "import util\n")
+
+    summary = _deps_summary(repo, tabs, run_script)
+
+    fan_in = {row["path"]: row["fan_in"] for row in summary["top_fan_in_files"]}
+    assert fan_in.get("util.py") == 1
+    assert "pkg/util.py" not in fan_in
+
+
+def test_deps_js_emitted_js_specifier_resolves_to_ts_source(repo, tabs, run_script):
+    """NodeNext TypeScript imports './util.js' at runtime while the source is
+    util.ts — the emitted extension maps back to the TS file."""
+    repo.write("src/main.ts", "import { u } from './util.js';\n")
+    repo.write("src/util.ts", "export const u = 1;\n")
+
+    summary = _deps_summary(repo, tabs, run_script)
+
+    fan_in = {row["path"]: row["fan_in"] for row in summary["top_fan_in_files"]}
+    assert fan_in.get("src/util.ts") == 1
+
+
+def test_deps_csharp_type_on_the_namespace_line_is_indexed(repo, tabs, run_script):
+    repo.write("lib/Compact.cs", "namespace P { class Util {} }\n")
+    repo.write("lib/Other.cs", "namespace P;\n\nclass Other {}\n")
+    repo.write("app/Program.cs", "using static P.Util;\n\nnamespace App;\nclass A {}\n")
+
+    summary = _deps_summary(repo, tabs, run_script)
+
+    fan_in = {row["path"]: row["fan_in"] for row in summary["top_fan_in_files"]}
+    assert fan_in.get("lib/Compact.cs") == 1
+
+
 def test_deps_python_resolution_is_counted_too(repo, tabs, run_script):
     """Python goes through the same accounting as every other language: its own
     modules count as first-party (resolved or not), stdlib/pip as external."""

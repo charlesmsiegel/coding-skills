@@ -147,6 +147,11 @@ def cs_namespaces(text):
         elif m:
             stack.append({"open": depth, "name": m.group(1), "entered": False})
             out.setdefault(key(), set())
+        if m:
+            # compact form: `namespace P { class Util {} }` declares on the
+            # same line, inside the just-opened scope
+            for name in CS_TYPE_RE.findall(line[m.end():]):
+                out.setdefault(key(), set()).add(name)
         else:
             for name in CS_TYPE_RE.findall(line):
                 out.setdefault(key(), set()).add(name)
@@ -231,6 +236,10 @@ def build_decl_indexes(paths):
         text = read_text(p)
         stem = rel.rsplit("/", 1)[-1].rsplit(".", 1)[0]
         names = {stem}
+        if ext != ".cs":
+            # a declaration-looking line inside a comment must not become a
+            # rival claim that turns the real declaration ambiguous
+            text = _mask_jvm(text)
         if ext == ".cs":
             for pkg, decls in (cs_namespaces(text) or {"": set()}).items():
                 cs.add(pkg, rel, decls | {stem})

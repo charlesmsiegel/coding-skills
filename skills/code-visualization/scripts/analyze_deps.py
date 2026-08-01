@@ -344,12 +344,19 @@ def main() -> int:
         return sccs
 
     # Cycles run over both edge kinds: a pair of templates that include each
-    # other is as circular as a pair of modules that import each other.
+    # other is as circular as a pair of modules that import each other. They
+    # are computed on the UNCOLLAPSED module graph: modules lumped into
+    # (other) would otherwise fuse into phantom cycles no real path forms.
     adj = defaultdict(set)
-    for (a, b) in list(mod_edges) + list(mod_res_edges):
-        adj[a].add(b)
+    for graph in (edges, res_edges):
+        for src, dsts in graph.items():
+            ms = module_of(src)
+            for dst in dsts:
+                md = module_of(dst)
+                if ms != md:
+                    adj[ms].add(md)
     all_mods = sorted(set(mod_loc if not lump else list(keep) + ["(other)"]))
-    sccs = find_sccs(all_mods, adj)
+    sccs = find_sccs(sorted(mod_loc), adj)
 
     file_adj = defaultdict(set)
     for graph_edges in (edges, res_edges):
