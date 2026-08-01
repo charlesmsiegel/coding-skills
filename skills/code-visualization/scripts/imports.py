@@ -137,14 +137,30 @@ def python_edges(rel, text, py_idx, file_set=frozenset(), py_roots=frozenset(), 
         pkg_parts = pkg_parts[:-1]
 
     src_dir = "/".join(rel.split("/")[:-1])
+    # Inside a package (an __init__.py beside the importer), a plain
+    # `import util` is ABSOLUTE — Python 3 never resolves it to a sibling.
+    # The sibling rule models scripts, whose own directory is sys.path[0].
+    in_package = (f"{src_dir}/__init__.py" if src_dir else "__init__.py") in file_set
 
     def sibling(cand):
         """The module a script would import with sys.path[0] = its own dir."""
+        if in_package:
+            return None
         stem = cand.replace(".", "/")
         for suffix in (".py", ".pyi", "/__init__.py"):
             hit = f"{src_dir}/{stem}{suffix}" if src_dir else f"{stem}{suffix}"
             if hit in file_set:
                 return hit
+        return None
+
+    def root_anchored(cand):
+        """The module the repo root's sys.path entry provides — the exact
+        path match that stays valid even when the bare suffix is ambiguous
+        (a root util.py beside some pkg/util.py)."""
+        stem = cand.replace(".", "/")
+        for suffix in (".py", ".pyi", "/__init__.py"):
+            if f"{stem}{suffix}" in file_set:
+                return f"{stem}{suffix}"
         return None
 
     def resolve(name):
@@ -153,7 +169,7 @@ def python_edges(rel, text, py_idx, file_set=frozenset(), py_roots=frozenset(), 
                 continue
             # Neighbour first: two directories each shipping their own common.py
             # must resolve to the one beside the importer, never to its twin.
-            hit = sibling(cand) or py_idx.get(cand)
+            hit = sibling(cand) or py_idx.get(cand) or root_anchored(cand)
             if hit:
                 return hit
         return None
@@ -207,6 +223,12 @@ def resolve_relative_js(rel, spec, file_set):
     norm = "/".join(parts)
     if re.search(r"\.[a-z]+$", norm):
         cands.append(norm)
+        # NodeNext TS: source says './util.js' while the repo holds util.ts
+        emitted = {".js": (".ts", ".tsx"), ".mjs": (".mts",), ".cjs": (".cts",),
+                   ".jsx": (".tsx",)}
+        for ext_e, sources in emitted.items():
+            if norm.endswith(ext_e):
+                cands += [norm[: -len(ext_e)] + s for s in sources]
     for e in JS_EXTS:
         cands.append(norm + e)
         cands.append(norm + "/index" + e)
@@ -216,11 +238,14 @@ def resolve_relative_js(rel, spec, file_set):
     return None
 
 
-def resolve_rust_path(src_root, segs, file_set, entry_of=None):
+def resolve_rust_path(src_root, segs, file_set, entry_of=None,
+                      skip_entries=False):
     """a::b::c against a crate src tree: the tail segments are items, not
     modules, so back off until a module file exists; a bare crate reference
     lands on its lib.rs/main.rs (where the pub use re-exports live), or on
-    the [lib]-declared entry file when the crate names a custom target."""
+    the [lib]-declared entry file when the crate names a custom target.
+    skip_entries suppresses that fallback when the owning target is
+    ambiguous (both lib.rs and main.rs exist and the importer is neither)."""
     for n in range(len(segs), 0, -1):
         base = f"{src_root}/{'/'.join(segs[:n])}"
         for cand in (f"{base}.rs", f"{base}/mod.rs"):
@@ -228,7 +253,7 @@ def resolve_rust_path(src_root, segs, file_set, entry_of=None):
                 return cand
     # mod.rs covers the self::/super:: case, where the root is a module
     # directory rather than a crate src root.
-    for entry in ("lib.rs", "main.rs", "mod.rs"):
+    for entry in (("mod.rs",) if skip_entries else ("lib.rs", "main.rs", "mod.rs")):
         if f"{src_root}/{entry}" in file_set:
             return f"{src_root}/{entry}"
     # ... and a module using the file layout (src/foo.rs owning src/foo/) is
@@ -375,8 +400,19 @@ def extract(paths, all_paths, file_set):
     return edges, stats
 
 
+def _mask_js_comments(text):
+    """JS/TS text with comments blanked. Strings stay: import specs are
+    string literals. `://` (URLs) is not a comment start."""
+    def blank(m):
+        return re.sub(r"[^\n]", " ", m.group(0))
+    text = re.sub(r"/\*.*?\*/", blank, text, flags=re.S)
+    text = re.sub(r"(?<!:)//[^\n]*", " ", text)
+    return text
+
+
 def _js_edges(rel, text, file_set, by_base, npm_by_dir, npm_names,
               npm_local, lang, edges, stats):
+    text = _mask_js_comments(text)
     pkg_dir = nearest_dir(rel, npm_by_dir)
     npm_deps = npm_by_dir.get(pkg_dir, set()) if pkg_dir is not None else set()
     local = npm_local.get(pkg_dir, {}) if pkg_dir is not None else {}
@@ -617,6 +653,11 @@ def _rust_edges(rel, text, file_set, ws, lang, edges, stats):
     # pops one level from here — so one super from a/child.rs lands in a/, the
     # importer's own directory, not a level above it.
     child_dir = own_dir if is_root else f"{own_dir}/{stem[:-3]}"
+    # both entry files present and this file is neither: its owning target
+    # (lib vs bin) is unknowable textually, so bare crate:: falls to nothing
+    dual_entries = (stem not in ("lib.rs", "main.rs")
+                    and (f"{own}/lib.rs" if own else "lib.rs") in file_set
+                    and (f"{own}/main.rs" if own else "main.rs") in file_set)
     # `mod x;` declares a child module — of the enclosing INLINE module when
     # one is open (`mod platform { mod imp; }` names platform/imp.rs), so the
     # scan tracks `mod x {` blocks by brace depth like any other scope.
@@ -674,7 +715,8 @@ def _rust_edges(rel, text, file_set, ws, lang, edges, stats):
             else:
                 stats.count(lang, use, rel, False, False)
                 continue
-            t = resolve_rust_path(root, segs, file_set, ws.entry_of)
+            t = resolve_rust_path(root, segs, file_set, ws.entry_of,
+                                  skip_entries=(root == own and dual_entries))
             if t and t != rel:
                 edges[rel].add(t)
             stats.count(lang, use, rel, True, bool(t))

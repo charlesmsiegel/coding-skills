@@ -44,6 +44,7 @@ class RustWorkspace:
         self._src_by_dir = {}      # crate dir -> its default src/ root
         self._lib_src_by_dir = {}  # crate dir -> custom [lib] root, if any
         self._pkg_of_lib = {}      # [lib] name -> its package name
+        self._dep_paths = {}       # crate dir -> {dep name: declared target dir}
         self._target_roots = {}    # crate dir -> [(explicit target dir, entry)]
         manifests = []
         for rel, p in all_paths.items():
@@ -91,6 +92,7 @@ class RustWorkspace:
         for d, text in manifests:
             deps = _cargo_dep_names(text)
             self._deps[d] = deps
+            self._dep_paths[d] = _cargo_dep_paths(text, d)
             renames = re.findall(
                 r"^\s*([\w-]+)\s*=\s*(\{[^}]*package\s*=\s*[\"'][^\"']+[\"'][^}]*\})", text, re.M)
             # the long form: [dependencies.foo] with package/path on own lines
@@ -198,6 +200,14 @@ class RustWorkspace:
         cands = self.src_of.get(name)
         if not cands:
             return None
+        # An explicit `path = "..."` names the target unambiguously — a
+        # same-named crate nearer the importer must not win over it.
+        declared_path = (self._dep_paths.get(d, {}).get(head)
+                         or self._dep_paths.get(d, {}).get(name))
+        if declared_path is not None:
+            for cand_dir, cand_src in cands:
+                if cand_dir == declared_path:
+                    return cand_src
 
         def shared_depth(cand_dir):
             a = cand_dir.split("/") if cand_dir else []
@@ -242,6 +252,34 @@ def _cargo_dep_names(text):
                        re.search(r"\bpath\s*=|\bworkspace\s*=\s*true", lm.group(2))):
                 names.add(lm.group(1).replace("-", "_"))
     return names
+
+
+def _cargo_dep_paths(text, d):
+    """{dependency name: declared path target dir} for one manifest — the
+    explicit `path = "..."` that disambiguates same-named crates."""
+    out = {}
+    for header, body in re.findall(
+            r"^\[+([^\]]+)\]+\s*\n((?:(?!^\[)[^\n]*\n?)*)", text, re.M):
+        segs = header.split(".")
+        if ("metadata" in segs or "dependencies" not in header
+                or header.startswith("workspace")):
+            continue
+        tail = header.split("dependencies", 1)[1].lstrip(".")
+        if tail:
+            pm = re.search(r"^\s*path\s*=\s*[\"']([^\"']+)[\"']", body, re.M)
+            if pm:
+                tgt = join_inside(d, pm.group(1))
+                if tgt is not None:
+                    out[tail.replace("-", "_")] = tgt
+            continue
+        for line in body.splitlines():
+            lm = re.match(r"\s*([\w-]+)\s*=\s*(.+)", line)
+            pm = lm and re.search(r"path\s*=\s*[\"']([^\"']+)[\"']", lm.group(2))
+            if pm:
+                tgt = join_inside(d, pm.group(1))
+                if tgt is not None:
+                    out[lm.group(1).replace("-", "_")] = tgt
+    return out
 
 
 def join_inside(base, target):
