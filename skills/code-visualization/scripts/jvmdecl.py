@@ -55,6 +55,9 @@ SCALA_PKG_OBJ_RE = re.compile(r"^\s*package\s+object\s+(\w+)", re.M)
 CS_TYPE_RE = re.compile(
     r"\b(?:record(?:\s+(?:class|struct))?|class|struct|interface|enum)"
     r"\s+(\w+)")
+CS_PARTIAL_RE = re.compile(
+    r"\bpartial\s+(?:record(?:\s+(?:class|struct))?|class|struct|interface)"
+    r"\s+(\w+)")
 # a delegate's name follows its return type: `delegate void Handler();`
 CS_DELEGATE_RE = re.compile(
     r"\bdelegate\s+[\w<>\[\],?.\s]+?\b(\w+)\s*\(")
@@ -98,7 +101,9 @@ def scala_packages(text):
             if d and line[:1] in (" ", "\t"):
                 blocks[colon_pkg].add(d.group(1))
         if m and (m.group(2) == "{" or "{" in line):
-            stack.append({"open": depth, "name": m.group(1), "entered": False})
+            stack.append({"open": depth, "name": m.group(1),
+                          "entered": line.count("{") == line.count("}") + 1
+                          and line.rstrip().endswith("}")})
             blocks.setdefault(".".join(chain + [e["name"] for e in stack]), set())
         elif m:
             chain.append(m.group(1))
@@ -142,26 +147,34 @@ def cs_namespaces(text):
     Each type declaration is attributed to the scope containing it — a file
     declaring A.X and B.Y does not declare A.Y.
     """
-    out, stack, file_scoped, depth = {}, [], [], 0
+    out, partials, stack, file_scoped, depth = {}, {}, [], [], 0
 
     def key():
         return ".".join(file_scoped + [e["name"] for e in stack])
+
+    def add_names(segment):
+        k = key()
+        for name in _cs_decl_names(segment):
+            out.setdefault(k, set()).add(name)
+        for name in CS_PARTIAL_RE.findall(segment):
+            partials.setdefault(k, set()).add(name)
     for line in _mask_cs(text).splitlines():
         m = re.match(r"\s*namespace\s+([\w.]+)\s*(;)?", line)
         if m and m.group(2):
             file_scoped.append(m.group(1))
             out.setdefault(key(), set())
         elif m:
-            stack.append({"open": depth, "name": m.group(1), "entered": False})
+            # a brace on the namespace's own line opens (and may close) the
+            # block immediately — `namespace P { class A {} }` must pop below
+            stack.append({"open": depth, "name": m.group(1),
+                          "entered": "{" in line[m.end():]})
             out.setdefault(key(), set())
         if m:
             # compact form: `namespace P { class Util {} }` declares on the
             # same line, inside the just-opened scope
-            for name in _cs_decl_names(line[m.end():]):
-                out.setdefault(key(), set()).add(name)
+            add_names(line[m.end():])
         else:
-            for name in _cs_decl_names(line):
-                out.setdefault(key(), set()).add(name)
+            add_names(line)
         depth += line.count("{") - line.count("}")
         for e in stack:
             # Allman style puts the brace on the next line; the namespace is
@@ -170,7 +183,7 @@ def cs_namespaces(text):
             e["entered"] = e["entered"] or depth > e["open"]
         while stack and stack[-1]["entered"] and depth <= stack[-1]["open"]:
             stack.pop()
-    return out
+    return out, partials
 
 
 def cs_usings(text):
@@ -186,7 +199,8 @@ def cs_usings(text):
         if nm and nm.group(2):
             file_scoped.append(nm.group(1))
         elif nm:
-            stack.append({"open": depth, "name": nm.group(1), "entered": False})
+            stack.append({"open": depth, "name": nm.group(1),
+                          "entered": "{" in line[nm.end():]})
         else:
             um = CS_USING_RE.match(line)
             if um:
@@ -221,6 +235,7 @@ class DeclIndex:
     def __init__(self):
         self.pkg_files = defaultdict(set)
         self.decl_files = defaultdict(set)
+        self.partial_files = defaultdict(set)  # (pkg, name) -> files saying partial
         self.pkg_roots = set()
 
     def add(self, pkg, rel, names):
@@ -250,8 +265,12 @@ def build_decl_indexes(paths):
         if ext == ".cs":
             # C# filenames declare nothing — a stem claim would satisfy (or
             # make ambiguous) usings the file's real types never declare
-            for pkg, decls in (cs_namespaces(text) or {"": set()}).items():
+            ns_decls, ns_partials = cs_namespaces(text)
+            for pkg, decls in (ns_decls or {"": set()}).items():
                 cs.add(pkg, rel, decls)
+            for pkg, names in ns_partials.items():
+                for name in names:
+                    cs.partial_files[(pkg, name)].add(rel)
             continue
         if ext == ".scala":
             names.discard(stem)  # Scala file names declare nothing
@@ -386,10 +405,15 @@ def resolve_jvm(imp, index, importer_rel=None, module_dirs=()):
     for i in range(len(segs) - 1, -1, -1):
         # i == 0 is the global-namespace split: `using static Util;` names a
         # type declared outside any namespace, keyed ("", "Util").
-        hits = narrow(index.decl_files.get((".".join(segs[:i]), segs[i]), set()))
+        key = (".".join(segs[:i]), segs[i])
+        hits = narrow(index.decl_files.get(key, set()))
         if len(hits) == 1:
             return (set(hits), True)
         if hits:
+            # partial C# types split one declaration across files — when every
+            # claimant says partial, the import depends on all of them
+            if hits <= index.partial_files.get(key, set()):
+                return (set(sorted(hits)[:MAX_STAR_TARGETS]), True)
             return (set(), True)  # ambiguous: first-party, deliberately unresolved
     pkg = ".".join(segs[:-1])
     files = narrow(index.pkg_files.get(pkg, set()))
