@@ -21,8 +21,8 @@ from collections import defaultdict
 from pathlib import Path
 
 from common import detect_lang, read_text
-from jvmdecl import (JVM_EXTS, JVM_PKG_RE, build_decl_indexes, cs_usings,
-                     jvm_import_specs, resolve_jvm)
+from jvmdecl import (JVM_EXTS, build_decl_indexes, cs_usings,
+                     jvm_import_specs, resolve_jvm, scala_packages)
 from manifests import (join_inside, RustWorkspace, go_modules, nearest_dir,
                        npm_packages)
 
@@ -368,9 +368,10 @@ def extract(paths, all_paths, file_set):
             # first. Java and Kotlin imports are absolute.
             prefixes = []
             if ext == ".scala":
-                pm = JVM_PKG_RE.search(text)
-                if pm:
-                    chain = pm.group(1).split(".")
+                # the FULL composed chain (package a.b + package c = a.b.c)
+                full_pkg = scala_packages(text)[0]
+                if full_pkg:
+                    chain = full_pkg.split(".")
                     prefixes = [".".join(chain[:n])
                                 for n in range(len(chain), 0, -1)]
             for imp in jvm_import_specs(text):
@@ -481,11 +482,15 @@ def _js_edges(rel, text, file_set, by_base, npm_by_dir, npm_names,
             # declared dependency and uniquely names a repo file is a
             # baseUrl-style first-party import.
             t = None
+            known_local = False
             root = spec.split("/")[0]
             # a scoped package's name spans two segments (@scope/utils)
             pkg_name = ("/".join(spec.split("/")[:2])
                         if spec.startswith("@") else root)
             alias_dir = local.get("aliases", {}).get(pkg_name)
+            if alias_dir is not None or (pkg_name in npm_names
+                                         and pkg_name not in npm_deps):
+                known_local = True
             if alias_dir is not None:
                 # `"alias": "file:../actual"` — the alias IS the installed
                 # name; link the target package's entry (its dir need not
@@ -523,7 +528,7 @@ def _js_edges(rel, text, file_set, by_base, npm_by_dir, npm_names,
                 t = resolve_unique_suffix(spec, by_base, JS_EXTS, scope=pkg_dir)
             if t and t != rel:
                 edges[rel].add(t)
-            stats.count(lang, spec, rel, bool(t), bool(t))
+            stats.count(lang, spec, rel, known_local or bool(t), bool(t))
 
 
 def _mask_go_comments(text):
@@ -555,8 +560,17 @@ def _go_edges(rel, text, go_mods, go_replaces, go_files_by_dir, lang, edges, sta
             continue
         imp = m.group(1)
         # The importer's own go.mod may rewrite this prefix to a local dir —
-        # and its replace binds only this module.
-        repl = next(((old, nd) for old, nd in go_replaces.get(my_dir, ())
+        # and its replace binds only this module — plus any enclosing
+        # go.work, whose replaces bind every workspace member.
+        repl_dirs = [my_dir] if my_dir is not None else []
+        probe = my_dir or ""
+        while probe:
+            probe = probe.rsplit("/", 1)[0] if "/" in probe else ""
+            repl_dirs.append(probe)
+        if "" not in repl_dirs:
+            repl_dirs.append("")
+        repl = next(((old, nd) for rd in repl_dirs
+                     for old, nd in go_replaces.get(rd, ())
                      if imp == old or imp.startswith(old + "/")), None) \
             if my_dir is not None else None
         if repl is not None:
@@ -576,9 +590,13 @@ def _go_edges(rel, text, go_mods, go_replaces, go_files_by_dir, lang, edges, sta
         # breaks ties between modules declaring the SAME path (example dirs
         # sharing a placeholder) — it must not override a nested module.
         equal = [c for c in cands if c[0] == cands[0][0]] if cands else []
-        owner = next(((mp, d) for mp, d in equal
-                      if not d or rel == d or rel.startswith(d + "/")),
-                     equal[0] if equal else None)
+        # deepest containing candidate first: a repo-root module contains
+        # every importer, and must not shadow a nested same-path module
+        containing = sorted((c for c in equal
+                             if not c[1] or rel == c[1]
+                             or rel.startswith(c[1] + "/")),
+                            key=lambda c: -len(c[1]))
+        owner = containing[0] if containing else (equal[0] if equal else None)
         if owner is None:
             stats.count(lang, imp, rel, False, False)
             continue

@@ -247,7 +247,8 @@ def _cargo_dep_names(text):
                 names.add(tail.replace("-", "_"))
             continue
         for line in body.splitlines():
-            lm = re.match(r"\s*([\w-]+)(?:\.workspace\s*=\s*true|\s*=\s*(.+))", line)
+            lm = re.match(r"\s*([\w-]+)(?:\.workspace\s*=\s*true"
+                          r"|\.path\s*=\s*.+|\s*=\s*(.+))", line)
             if lm and (lm.group(2) is None or
                        re.search(r"\bpath\s*=|\bworkspace\s*=\s*true", lm.group(2))):
                 names.add(lm.group(1).replace("-", "_"))
@@ -273,12 +274,19 @@ def _cargo_dep_paths(text, d):
                     out[tail.replace("-", "_")] = tgt
             continue
         for line in body.splitlines():
-            lm = re.match(r"\s*([\w-]+)\s*=\s*(.+)", line)
-            pm = lm and re.search(r"path\s*=\s*[\"']([^\"']+)[\"']", lm.group(2))
-            if pm:
-                tgt = join_inside(d, pm.group(1))
-                if tgt is not None:
-                    out[lm.group(1).replace("-", "_")] = tgt
+            dm = re.match(r"\s*([\w-]+)\.path\s*=\s*[\"']([^\"']+)[\"']", line)
+            if dm:  # dotted form: foo.path = "../foo"
+                name_l, path_l = dm.group(1), dm.group(2)
+            else:   # inline table: foo = { ..., path = "../foo" }
+                lm = re.match(r"\s*([\w-]+)\s*=\s*(.+)", line)
+                pm = lm and re.search(
+                    r"\bpath\s*=\s*[\"']([^\"']+)[\"']", lm.group(2))
+                if not pm:
+                    continue
+                name_l, path_l = lm.group(1), pm.group(1)
+            tgt = join_inside(d, path_l)
+            if tgt is not None:
+                out[name_l.replace("-", "_")] = tgt
     return out
 
 
@@ -309,22 +317,28 @@ def go_modules(all_paths):
     """
     mods, replaces = [], {}
     for rel, p in all_paths.items():
-        if rel == "go.mod" or rel.endswith("/go.mod"):
-            text = read_text(p)
-            d = rel[: -len("go.mod")].rstrip("/")
+        is_mod = rel == "go.mod" or rel.endswith("/go.mod")
+        # go.work replacements use the same syntax and bind every workspace
+        # member, taking precedence over go.mod replaces
+        is_work = rel == "go.work" or rel.endswith("/go.work")
+        if not (is_mod or is_work):
+            continue
+        text = read_text(p)
+        d = rel.rsplit("/", 1)[0] if "/" in rel else ""
+        if is_mod:
             m = re.search(r"^module\s+(\S+)", text, re.M)
             if m:
                 mods.append((m.group(1), d))
-            repls = []
-            for old, target in re.findall(
-                    r"^\s*(?:replace\s+)?(\S+)(?:\s+\S+)?\s*=>\s*(\S+)", text, re.M):
-                # absolute targets point outside the scanned tree
-                if target.startswith(("./", "../")) or target in (".", ".."):
-                    local = join_inside(d, target)
-                    if local is not None:
-                        repls.append((old, local))
-            if repls:
-                replaces[d] = repls
+        repls = []
+        for old, target in re.findall(
+                r"^\s*(?:replace\s+)?(\S+)(?:\s+\S+)?\s*=>\s*(\S+)", text, re.M):
+            # absolute targets point outside the scanned tree
+            if target.startswith(("./", "../")) or target in (".", ".."):
+                local = join_inside(d, target)
+                if local is not None:
+                    repls.append((old, local))
+        if repls:
+            replaces.setdefault(d, []).extend(repls)
     return sorted(mods, key=lambda t: -len(t[0])), replaces
 
 

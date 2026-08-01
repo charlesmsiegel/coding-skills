@@ -1884,6 +1884,113 @@ def test_deps_rust_extern_crate_creates_an_edge(repo, tabs, run_script):
     assert fan_in.get("helper/src/lib.rs") == 1
 
 
+def test_deps_csharp_compact_namespaces_pop_on_their_own_line(repo, tabs, run_script):
+    """`namespace P { class A {} }` closes on its own line — a following
+    namespace Q must not compose into P.Q."""
+    repo.write("lib/Both.cs",
+               "namespace P { class A {} }\nnamespace Q { class B {} }\n")
+    repo.write("lib/OtherQ.cs", "namespace Q;\n\nclass C {}\n")
+    repo.write("app/Program.cs", "using static Q.B;\n\nnamespace App;\nclass X {}\n")
+
+    summary = _deps_summary(repo, tabs, run_script)
+
+    fan_in = {row["path"]: row["fan_in"] for row in summary["top_fan_in_files"]}
+    assert fan_in.get("lib/Both.cs") == 1
+
+
+def test_deps_go_duplicate_module_prefers_the_deepest_container(repo, tabs, run_script):
+    """A repo-root module and a nested fixture sharing a module path: the
+    nested importer resolves within the deepest containing module."""
+    repo.write("go.mod", "module example.com/demo\n")
+    repo.write("util/util.go", "package util\n\nfunc Do() {}\n")
+    repo.write("fixtures/copy/go.mod", "module example.com/demo\n")
+    repo.write("fixtures/copy/util/util.go", "package util\n\nfunc Do() {}\n")
+    repo.write("fixtures/copy/main.go",
+               'package main\n\nimport "example.com/demo/util"\n\nfunc main() { util.Do() }\n')
+
+    summary = _deps_summary(repo, tabs, run_script)
+
+    fan_in = {row["path"]: row["fan_in"] for row in summary["top_fan_in_files"]}
+    assert fan_in.get("fixtures/copy/util/util.go") == 1
+    assert "util/util.go" not in fan_in
+
+
+def test_deps_go_work_replacements_apply(repo, tabs, run_script):
+    """A go.work `replace example.com/old => ./fork` binds the whole
+    workspace, even when the fork declares a different module path."""
+    repo.write("go.work", "use ./app\n\nreplace example.com/old => ./fork\n")
+    repo.write("app/go.mod", "module example.com/app\n")
+    repo.write("app/main.go",
+               'package main\n\nimport "example.com/old/pkg"\n\nfunc main() { pkg.Do() }\n')
+    repo.write("fork/go.mod", "module example.com/fork\n")
+    repo.write("fork/pkg/pkg.go", "package pkg\n\nfunc Do() {}\n")
+
+    summary = _deps_summary(repo, tabs, run_script)
+
+    fan_in = {row["path"]: row["fan_in"] for row in summary["top_fan_in_files"]}
+    assert fan_in.get("fork/pkg/pkg.go") == 1
+
+
+def test_deps_scala_relative_import_uses_the_full_package_chain(repo, tabs, run_script):
+    """Composed clauses (`package com.acme` + `package service`) put the file
+    in com.acme.service — relative imports must try that full chain."""
+    repo.write("core/src/main/scala/com/acme/service/util/Helper.scala",
+               "package com.acme.service.util\n\nclass Helper\n")
+    repo.write("core/src/main/scala/com/acme/service/Main.scala",
+               "package com.acme\npackage service\n\nimport util.Helper\n\nclass Main\n")
+
+    summary = _deps_summary(repo, tabs, run_script)
+
+    fan_in = {row["path"]: row["fan_in"] for row in summary["top_fan_in_files"]}
+    assert fan_in.get(
+        "core/src/main/scala/com/acme/service/util/Helper.scala") == 1
+
+
+def test_deps_unresolved_workspace_import_counts_first_party(repo, tabs, run_script):
+    """A bare import naming a known workspace package is first-party even when
+    its entry cannot be resolved — the gap must feed the warning, not hide."""
+    repo.write("packages/lib/package.json",
+               '{"name": "lib", "exports": {".": {"weird": ["./a.wasm"]}}}\n')
+    repo.write("packages/lib/src/other.ts", "export const x = 1;\n")
+    repo.write("packages/app/package.json",
+               '{"name": "app", "dependencies": {"lib": "workspace:*"}}\n')
+    repo.write("packages/app/main.ts", "import { x } from 'lib';\n")
+
+    summary = _deps_summary(repo, tabs, run_script)
+
+    res = summary["resolution"]["TypeScript"]
+    assert res["first_party"] == 1 and res["resolved"] == 0
+
+
+def test_deps_cargo_dotted_key_path_dependency_parses(repo, tabs, run_script):
+    """`[dependencies]` + `foo.path = "../foo"` is valid TOML Cargo accepts."""
+    repo.write("app/Cargo.toml",
+               '[package]\nname = "app"\n\n[dependencies]\nfoo.path = "../foo"\n')
+    repo.write("app/src/main.rs", "use foo::tools::run;\n\nfn main() {}\n")
+    repo.write("foo/Cargo.toml", '[package]\nname = "foo"\n')
+    repo.write("foo/src/lib.rs", "pub mod tools;\n")
+    repo.write("foo/src/tools.rs", "pub fn run() {}\n")
+
+    summary = _deps_summary(repo, tabs, run_script)
+
+    fan_in = {row["path"]: row["fan_in"] for row in summary["top_fan_in_files"]}
+    assert fan_in.get("foo/src/tools.rs") == 2
+
+
+def test_deps_csharp_partial_type_links_all_its_files(repo, tabs, run_script):
+    """`partial class Util` split across files is one type — the import links
+    both parts instead of dropping as ambiguous."""
+    repo.write("lib/Util.Main.cs", "namespace P;\n\npublic partial class Util {}\n")
+    repo.write("lib/Util.Generated.cs", "namespace P;\n\npublic partial class Util {}\n")
+    repo.write("app/Program.cs", "using static P.Util;\n\nnamespace App;\nclass A {}\n")
+
+    summary = _deps_summary(repo, tabs, run_script)
+
+    fan_in = {row["path"]: row["fan_in"] for row in summary["top_fan_in_files"]}
+    assert fan_in.get("lib/Util.Main.cs") == 1
+    assert fan_in.get("lib/Util.Generated.cs") == 1
+
+
 def test_deps_python_resolution_is_counted_too(repo, tabs, run_script):
     """Python goes through the same accounting as every other language: its own
     modules count as first-party (resolved or not), stdlib/pip as external."""
