@@ -50,7 +50,7 @@ KT_BACKTICK_DECL_RE = re.compile(
     r"(?:fun|val|var|class|interface|object|typealias)\s+`([^`\n]+)`", re.M)
 SCALA_DECL_RE = re.compile(
     r"^(?:(?:private|protected|implicit|final|sealed|abstract|lazy|case|open|"
-    r"transparent|inline|opaque)\s+)*"
+    r"transparent|inline|opaque)(?:\[[^\]\n]*\])?\s+)*"
     r"(?:def|val|var|class|trait|object|type|given|enum)\s+(\w+)", re.M)
 # `package object bar` puts the file's members in <enclosing pkg>.bar; the
 # plain package regex must not swallow the `object` keyword as a package name.
@@ -75,7 +75,7 @@ def _cs_decl_names(segment):
 
 SCALA_INNER_DECL_RE = re.compile(
     r"\s*(?:(?:private|protected|implicit|final|sealed|abstract|lazy|case|open|"
-    r"transparent|inline|opaque)\s+)*"
+    r"transparent|inline|opaque)(?:\[[^\]\n]*\])?\s+)*"
     r"(?:def|val|var|class|trait|object|type|given|enum)\s+(\w+)")
 
 
@@ -140,6 +140,9 @@ def _mask_cs(text):
     """
     def blank(m):
         return re.sub(r"[^\n]", " ", m.group(0))
+    # C# 11 raw strings first (three or more quotes, possibly interpolated):
+    # they may span lines and contain code-like documentation
+    text = re.sub(r'\$*"{3,}[\s\S]*?"{3,}', blank, text)
     text = re.sub(r"/\*.*?\*/", blank, text, flags=re.S)
     text = re.sub(r'@"(?:[^"]|"")*"', blank, text)
     text = re.sub(r'"(?:\\.|[^"\\\n])*"', blank, text)
@@ -340,6 +343,9 @@ def mask_jvm(text):
     kept) — a commented-out import must not become an edge."""
     def blank(m):
         return re.sub(r"[^\n]", " ", m.group(0))
+    # C# 11 raw strings first (three or more quotes, possibly interpolated):
+    # they may span lines and contain code-like documentation
+    text = re.sub(r'\$*"{3,}[\s\S]*?"{3,}', blank, text)
     text = re.sub(r"/\*.*?\*/", blank, text, flags=re.S)
     text = re.sub(r'"""(?:[^"]|"(?!""))*"""', blank, text)
     text = re.sub(r'"(?:\\.|[^"\\\n])*"', blank, text)
@@ -347,7 +353,7 @@ def mask_jvm(text):
     return text
 
 
-def jvm_import_specs(text):
+def jvm_import_specs(text, with_scopes=False):
     """Expand every import statement into plain dotted specs.
 
     A grouped line expands member by member — the naive pattern would truncate
@@ -355,24 +361,55 @@ def jvm_import_specs(text):
     members may be renamed (`A => B` in Scala 2, `A as B` in Scala 3); the
     original name is what the declaration index knows. A wildcard member
     (`_`, `*`, `given`) falls back to the package-star form.
+
+    with_scopes (Scala): each import carries its enclosing package prefixes,
+    outermost-composed first — an import inside `package com { ... }` (or
+    after chained/colon package clauses) resolves relative to com before the
+    global scope. Returns [(spec, prefixes)] instead of [spec].
     """
     out = []
     lines = mask_jvm(text).splitlines()
+    chain, stack, depth = [], [], 0
+
+    def scope_step(braces_src):
+        nonlocal depth
+        depth += braces_src.count("{") - braces_src.count("}")
+        for e in stack:
+            e["entered"] = e["entered"] or depth > e["open"]
+        while stack and stack[-1]["entered"] and depth <= stack[-1]["open"]:
+            stack.pop()
     i = -1
     while i + 1 < len(lines):
         i += 1
         line = lines[i]
+        if with_scopes:
+            pm = re.match(r"\s*package\s+(?:object\s+)?([\w.]+)\s*(\{|:\s*$)?", line)
+            if pm and not re.match(r"\s*package\s+object\b", line):
+                if pm.group(2) == "{" or "{" in line:
+                    stack.append({"open": depth, "name": pm.group(1),
+                                  "entered": False})
+                else:
+                    chain.append(pm.group(1))
         # Scala 3 `export lib.Util` is a compile-time dependency like an
         # import (Java module-info's `exports p;` fails the \s+ after
         # 'export', so it cannot match).
         m = re.match(r"\s*(?:import|export)\s+(?:static\s+)?(.+)", line)
         if not m:
+            if with_scopes:
+                scope_step(line)
             continue
         # A formatter may wrap a grouped import; accumulate to the brace close.
         joined = m.group(1)
         while joined.count("{") > joined.count("}") and i + 1 < len(lines):
             i += 1
             joined += " " + lines[i].strip()
+        if with_scopes:
+            # `package com.app` opens BOTH com.app and com scopes, so
+            # prefixes compose per dotted segment, innermost first
+            segs = [s for part in chain + [e["name"] for e in stack]
+                    for s in part.split(".")]
+            prefixes = [".".join(segs[:n]) for n in range(len(segs), 0, -1)]
+            stmt_start = len(out)
         m = re.match(r"(.+)", joined)
         # Scala allows several expressions per statement (`import p.A, q.B`);
         # split on commas outside braces so grouped members stay together.
@@ -403,6 +440,11 @@ def jvm_import_specs(text):
                 pm = re.match(rf"{seg}(?:\.{seg})*", expr)
                 if pm:
                     out.append(pm.group(0).replace("`", ""))
+        if with_scopes:
+            out[stmt_start:] = [(s, prefixes) for s in out[stmt_start:]]
+            # group braces balance across the joined statement; the package
+            # scope only moves with braces outside import statements
+            scope_step(joined)
     return out
 
 

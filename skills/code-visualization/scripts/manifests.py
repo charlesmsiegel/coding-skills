@@ -63,8 +63,10 @@ class RustWorkspace:
             src = f"{d}/src" if d else "src"
             lib = _toml_section(text, "lib")
             pm = lib and re.search(r"^\s*path\s*=\s*[\"']([^\"']+)[\"']", lib, re.M)
-            if pm:
-                entry = f"{d}/{pm.group(1)}".lstrip("/")
+            # normalize ../ segments so the recorded root matches the indexed
+            # repo paths; an escape past the repo root stays unrecorded
+            entry = pm and join_inside(d, pm.group(1))
+            if entry:
                 src = entry.rsplit("/", 1)[0] if "/" in entry else ""
                 self.entry_of[src] = entry
                 self._lib_src_by_dir[d] = src
@@ -86,8 +88,8 @@ class RustWorkspace:
                     r"^\[\[(bin|test|example|bench)\]\]\s*(?:#[^\n]*)?\n((?:(?!^\[)[^\n]*\n?)*)",
                     text, re.M):
                 tp = re.search(r"^\s*path\s*=\s*[\"']([^\"']+)[\"']", body, re.M)
-                if tp:
-                    tentry = f"{d}/{tp.group(1)}".lstrip("/")
+                tentry = tp and join_inside(d, tp.group(1))
+                if tentry:
                     troot = tentry.rsplit("/", 1)[0] if "/" in tentry else ""
                     self._target_roots.setdefault(d, []).append((troot, tentry))
             self._name_by_dir[d] = name
@@ -438,6 +440,7 @@ def npm_packages(all_paths):
                 name_map.setdefault(data["name"], []).append(
                     (d, _npm_entry(data), _npm_subpath_exports(data)))
             deps = set()
+            ranges = {}  # registry-declared name -> its version range
             # `"alias": "file:../actual"` installs the local package under the
             # alias; record alias -> target dir so imports of it resolve
             aliases = {}
@@ -454,6 +457,7 @@ def npm_packages(all_paths):
                             aliases[dep_name] = target
                     elif not sval.startswith("workspace:"):
                         deps.add(dep_name)
+                        ranges[dep_name] = sval
             # Node's own `imports` map (`#utils` -> ./src/utils.js)
             imports_map = {}
             imp = data.get("imports")
@@ -465,7 +469,10 @@ def npm_packages(all_paths):
                     if isinstance(key, str) and key.startswith("#") and isinstance(val, str):
                         imports_map[key] = val.lstrip("./")
             by_dir[d] = deps
-            local_by_dir[d] = {"aliases": aliases, "imports": imports_map}
+            local_by_dir[d] = {"aliases": aliases, "imports": imports_map,
+                               "ranges": ranges,
+                               "version": data.get("version")
+                               if isinstance(data.get("version"), str) else None}
     return by_dir, name_map, local_by_dir, ws_roots
 
 
@@ -517,6 +524,38 @@ def ts_config_roots(all_paths):
         if re.search(r'"(?:baseUrl|paths)"\s*:', text):
             roots.add(rel.rsplit("/", 1)[0] if "/" in rel else "")
     return roots
+
+
+def semver_satisfies(rng, version):
+    """Whether a sibling's version can satisfy a declared range — the coarse
+    check npm applies before it would fall back to the registry.
+
+    Handles the common shapes (caret, tilde, exact, x-ranges, wildcards);
+    anything more elaborate (>=, ||, hyphen ranges) is treated as satisfiable
+    so an unparseable range never severs a real workspace link.
+    """
+    rng = (rng or "").strip()
+    if rng in ("", "*", "latest") or not version:
+        return True
+    m = re.match(r"^([~^]?)(\d+)(?:\.(\d+|[xX*]))?(?:\.(\d+|[xX*]))?$", rng)
+    vm = re.match(r"^(\d+)\.(\d+)\.(\d+)", version)
+    if not m or not vm:
+        return True  # not a simple range/version: assume compatible
+    op, rmaj, rmin, rpat = m.group(1), m.group(2), m.group(3), m.group(4)
+    vmaj, vmin, vpat = (int(x) for x in vm.groups())
+    if int(rmaj) != vmaj:
+        return False
+    wild = ("x", "X", "*", None)
+    if op == "^":
+        # ^0.y pins the minor as well
+        return int(rmaj) != 0 or rmin in wild or int(rmin) == vmin
+    if op == "~":
+        return rmin in wild or int(rmin) == vmin
+    if rmin in wild:
+        return True
+    if int(rmin) != vmin:
+        return False
+    return rpat in wild or int(rpat) == vpat
 
 
 def nearest_dir(rel, dirs):

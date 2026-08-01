@@ -22,10 +22,9 @@ from pathlib import Path
 
 from common import detect_lang, read_text
 from jvmdecl import (JVM_EXTS, build_decl_indexes, cs_usings,
-                     jvm_import_specs, mask_jvm, resolve_jvm,
-                     scala_packages)
+                     jvm_import_specs, resolve_jvm)
 from manifests import (join_inside, RustWorkspace, go_modules, nearest_dir,
-                       npm_packages, ts_config_roots)
+                       npm_packages, semver_satisfies, ts_config_roots)
 
 JS_EXTS = [".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".vue", ".svelte"]
 JS_IMPORT_RE = re.compile(
@@ -367,22 +366,15 @@ def extract(paths, all_paths, file_set):
             _rust_edges(rel, text, file_set, rust_ws, lang, edges, stats)
         elif ext in JVM_EXTS:
             # Scala resolves imports through enclosing packages: inside
-            # `package com.acme`, `import util.Helper` names com.acme.util
-            # first. Java and Kotlin imports are absolute.
-            prefixes = []
+            # `package com.acme` — or a braced `package com { ... }` block —
+            # `import util.Helper` names com.acme.util first. Each import
+            # carries its own block scope. Java and Kotlin are absolute.
             if ext == ".scala":
-                # the FULL composed chain (package a.b + package c = a.b.c),
-                # from comment-masked text like every other scala scan
-                full_pkg = scala_packages(mask_jvm(text))[0]
-                if full_pkg:
-                    chain = full_pkg.split(".")
-                    prefixes = [".".join(chain[:n])
-                                for n in range(len(chain), 0, -1)]
-            for imp in jvm_import_specs(text):
-                if prefixes:
+                for imp, prefixes in jvm_import_specs(text, with_scopes=True):
                     _cs_edge(rel, imp, prefixes, jvm_idx, jvm_modules,
                              lang, edges, stats)
-                else:
+            else:
+                for imp in jvm_import_specs(text):
                     _jvm_edge(rel, imp, jvm_idx, jvm_modules, lang, edges, stats)
         elif ext == ".cs":
             for imp, prefixes in cs_usings(text):
@@ -511,8 +503,14 @@ def _js_edges(rel, text, file_set, by_base, npm_by_dir, npm_names,
 
             def same_workspace(name):
                 """npm links a semver range to a sibling when both packages
-                live under the same workspaces-declaring root."""
+                live under the same workspaces-declaring root AND the
+                sibling's version satisfies the declared range — otherwise
+                npm fetches from the registry instead."""
+                rng = local.get("ranges", {}).get(name)
                 for cand_dir, _, _ in npm_names.get(name, ()):
+                    ver = npm_local.get(cand_dir, {}).get("version")
+                    if not semver_satisfies(rng, ver):
+                        continue
                     for root in npm_ws_roots:
                         if ((not root or cand_dir == root
                              or cand_dir.startswith(root + "/"))
@@ -592,7 +590,16 @@ def _go_edges(rel, text, go_mods, go_replaces, go_work_replaces,
     my_dir = nearest_dir(rel, {d for _, d in go_mods})
     src_dir = str(Path(rel).parent).replace("\\", "/")
     in_block = False
+    # Multiline backtick raw strings may hold import-looking documentation;
+    # a line that STARTS inside one is string content, not a declaration.
+    # (Backtick import paths are legal Go and sit on lines that start code.)
+    in_raw = False
     for line in text.splitlines():
+        starts_in_raw = in_raw
+        if line.count("`") % 2 == 1:
+            in_raw = not in_raw
+        if starts_in_raw:
+            continue
         if re.match(r"^\s*import\s*\(", line):
             in_block = True
             continue
@@ -778,7 +785,9 @@ def _rust_edges(rel, text, file_set, ws, lang, edges, stats):
             stats.count(lang, f"mod {name}", rel, True, bool(t))
             pending_path = None
         elif dm:
-            mod_stack.append({"open": depth, "name": dm.group(1), "entered": False})
+            # the block's brace is on this very line, so the module is live
+            # immediately — a compact `mod m { .. }` closes by end of line
+            mod_stack.append({"open": depth, "name": dm.group(1), "entered": True})
             pending_path = None
         depth += line.count("{") - line.count("}")
         for e in mod_stack:

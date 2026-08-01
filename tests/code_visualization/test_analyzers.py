@@ -2296,6 +2296,126 @@ def test_deps_rust_build_script_is_its_own_crate(repo, tabs, run_script):
     assert "src/lib.rs" not in fan_in
 
 
+def test_deps_scala_import_inside_braced_package_uses_its_scope(repo, tabs, run_script):
+    """An import inside `package com { ... }` resolves relative to com first,
+    like any other enclosing package scope."""
+    repo.write("src/main/scala/Main.scala",
+               "package com {\n  import util.Helper\n  class Main\n}\n")
+    repo.write("src/main/scala/ComUtil.scala",
+               "package com.util\n\nclass Helper\n")
+    repo.write("src/main/scala/ComOther.scala", "package com\n\nclass Other\n")
+
+    summary = _deps_summary(repo, tabs, run_script)
+
+    fan_in = {row["path"]: row["fan_in"] for row in summary["top_fan_in_files"]}
+    assert fan_in.get("src/main/scala/ComUtil.scala") == 1
+
+
+def test_deps_scala_qualified_visibility_modifier_is_indexed(repo, tabs, run_script):
+    """`private[p] class Helper` declares Helper; the [scope] qualifier must
+    not hide the declaration."""
+    repo.write("core/src/main/scala/p/H.scala",
+               "package p\n\nprivate[p] class Helper\n")
+    repo.write("core/src/main/scala/p/Other.scala", "package p\n\nclass Other\n")
+    repo.write("core/src/main/scala/p/User.scala",
+               "package p\n\nimport p.Helper\n\nclass User\n")
+
+    summary = _deps_summary(repo, tabs, run_script)
+
+    fan_in = {row["path"]: row["fan_in"] for row in summary["top_fan_in_files"]}
+    assert fan_in.get("core/src/main/scala/p/H.scala") == 1
+
+
+def test_deps_npm_incompatible_sibling_version_stays_external(repo, tabs, run_script):
+    """A workspace sibling at 1.2.0 does not satisfy a declared ^2.0.0; npm
+    would fetch from the registry, so no local edge."""
+    repo.write("package.json", '{"name": "root", "workspaces": ["packages/*"]}\n')
+    repo.write("packages/local-lib/package.json",
+               '{"name": "local-lib", "version": "1.2.0", "main": "index.ts"}\n')
+    repo.write("packages/local-lib/index.ts", "export const x = 1;\n")
+    repo.write("packages/app/package.json",
+               '{"name": "app", "dependencies": {"local-lib": "^2.0.0"}}\n')
+    repo.write("packages/app/main.ts", "import { x } from 'local-lib';\n")
+
+    summary = _deps_summary(repo, tabs, run_script)
+
+    assert summary["import_edges"] == 0
+
+
+def test_deps_npm_compatible_sibling_version_links(repo, tabs, run_script):
+    """The same layout with a satisfying range keeps the local edge."""
+    repo.write("package.json", '{"name": "root", "workspaces": ["packages/*"]}\n')
+    repo.write("packages/local-lib/package.json",
+               '{"name": "local-lib", "version": "2.3.0", "main": "index.ts"}\n')
+    repo.write("packages/local-lib/index.ts", "export const x = 1;\n")
+    repo.write("packages/app/package.json",
+               '{"name": "app", "dependencies": {"local-lib": "^2.0.0"}}\n')
+    repo.write("packages/app/main.ts", "import { x } from 'local-lib';\n")
+
+    summary = _deps_summary(repo, tabs, run_script)
+
+    fan_in = {row["path"]: row["fan_in"] for row in summary["top_fan_in_files"]}
+    assert fan_in.get("packages/local-lib/index.ts") == 1
+
+
+def test_deps_rust_compact_inline_module_closes(repo, tabs, run_script):
+    """`mod inline { fn x() {} }` on one line opens and closes; the next
+    `mod helper;` is a crate-level sibling, not inline/helper.rs."""
+    repo.write("Cargo.toml", '[package]\nname = "app"\n')
+    repo.write("src/lib.rs", "mod inline { fn x() {} }\nmod helper;\n")
+    repo.write("src/helper.rs", "pub fn go() {}\n")
+
+    summary = _deps_summary(repo, tabs, run_script)
+
+    fan_in = {row["path"]: row["fan_in"] for row in summary["top_fan_in_files"]}
+    assert fan_in.get("src/helper.rs") == 1
+
+
+def test_deps_rust_lib_path_with_parent_segments_normalizes(repo, tabs, run_script):
+    """`[lib] path = \"../shared/lib.rs\"` records the normalized repo path,
+    so cross-crate imports reach the real file rather than a phantom node."""
+    repo.write("app/Cargo.toml",
+               '[package]\nname = "app"\n\n[lib]\npath = "../shared/lib.rs"\n')
+    repo.write("shared/lib.rs", "pub mod engine;\n")
+    repo.write("shared/engine.rs", "pub fn start() {}\n")
+    repo.write("tool/Cargo.toml",
+               '[package]\nname = "tool"\n\n[dependencies]\napp = { path = "../app" }\n')
+    repo.write("tool/src/main.rs", "use app::engine::start;\n\nfn main() {}\n")
+
+    summary = _deps_summary(repo, tabs, run_script)
+
+    fan_in = {row["path"]: row["fan_in"] for row in summary["top_fan_in_files"]}
+    assert fan_in.get("shared/engine.rs") == 2  # lib.rs mod + tool's use
+
+
+def test_deps_go_raw_string_import_lines_are_ignored(repo, tabs, run_script):
+    """An import-looking line inside a backtick raw string is documentation,
+    not a declaration."""
+    repo.write("go.mod", "module example.com/app\n")
+    repo.write("pkg/real/real.go", "package real\n\nfunc Do() {}\n")
+    repo.write("doc.go",
+               'package app\n\nvar usage = `\nimport "example.com/app/pkg/real"\n`\n')
+
+    summary = _deps_summary(repo, tabs, run_script)
+
+    assert summary["import_edges"] == 0
+
+
+def test_deps_csharp_raw_strings_do_not_declare(repo, tabs, run_script):
+    """C# 11 raw strings (triple-quoted) are masked: code-like documentation
+    inside them must not index declarations or corrupt scopes."""
+    repo.write("lib/Real.cs", "namespace P;\n\npublic class Util {}\n")
+    repo.write("lib/Doc.cs",
+               'namespace P;\n\npublic class Doc {\n  string s = """\n'
+               '  class Util {}\n  """;\n}\n')
+    repo.write("app/Program.cs", "using static P.Util;\n\nnamespace App;\nclass A {}\n")
+
+    summary = _deps_summary(repo, tabs, run_script)
+
+    fan_in = {row["path"]: row["fan_in"] for row in summary["top_fan_in_files"]}
+    assert fan_in.get("lib/Real.cs") == 1
+
+
 def test_deps_python_resolution_is_counted_too(repo, tabs, run_script):
     """Python goes through the same accounting as every other language: its own
     modules count as first-party (resolved or not), stdlib/pip as external."""
