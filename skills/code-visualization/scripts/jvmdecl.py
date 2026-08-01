@@ -42,6 +42,12 @@ KT_DECL_RE = re.compile(
     r"suspend|enum|annotation|value)\s+)*"
     r"(?:fun|val|var|class|interface|object|typealias)\s+(?:<[^>\n]*>\s*)?"
     r"(?:[\w?]+(?:<[^>\n]*>)?\.)*(\w+)", re.M)
+# `fun \`when\`()` declares the escaped name; imports strip backticks too
+KT_BACKTICK_DECL_RE = re.compile(
+    r"^(?:(?:public|private|internal|protected|open|final|abstract|sealed|data|"
+    r"inline|expect|actual|external|const|lateinit|tailrec|operator|infix|"
+    r"suspend|enum|annotation|value)\s+)*"
+    r"(?:fun|val|var|class|interface|object|typealias)\s+`([^`\n]+)`", re.M)
 SCALA_DECL_RE = re.compile(
     r"^(?:(?:private|protected|implicit|final|sealed|abstract|lazy|case|open|"
     r"transparent|inline|opaque)\s+)*"
@@ -297,6 +303,7 @@ def build_decl_indexes(paths):
             if ext == ".kt":
                 names.discard(stem)  # Kotlin file names declare nothing
                 names |= set(KT_DECL_RE.findall(text))
+                names |= set(KT_BACKTICK_DECL_RE.findall(text))
         jvm.add(pkg, rel, names)
     return jvm, cs
 
@@ -328,7 +335,10 @@ def jvm_import_specs(text):
     while i + 1 < len(lines):
         i += 1
         line = lines[i]
-        m = re.match(r"\s*import\s+(?:static\s+)?(.+)", line)
+        # Scala 3 `export lib.Util` is a compile-time dependency like an
+        # import (Java module-info's `exports p;` fails the \s+ after
+        # 'export', so it cannot match).
+        m = re.match(r"\s*(?:import|export)\s+(?:static\s+)?(.+)", line)
         if not m:
             continue
         # A formatter may wrap a grouped import; accumulate to the brace close.
@@ -360,9 +370,12 @@ def jvm_import_specs(text):
                     elif re.fullmatch(r"\w+", name):
                         out.append(f"{prefix}.{name}")
             else:
-                pm = re.match(r"[\w.*]+", expr)
+                # Kotlin backtick-escaped segments (import p.`when`) survive
+                # and are stripped for lookup against the escaped declaration
+                seg = r"(?:`[^`\n]+`|[\w*]+)"
+                pm = re.match(rf"{seg}(?:\.{seg})*", expr)
                 if pm:
-                    out.append(pm.group(0))
+                    out.append(pm.group(0).replace("`", ""))
     return out
 
 

@@ -1991,6 +1991,91 @@ def test_deps_csharp_partial_type_links_all_its_files(repo, tabs, run_script):
     assert fan_in.get("lib/Util.Generated.cs") == 1
 
 
+def test_deps_kotlin_backtick_import_resolves_the_declaration(repo, tabs, run_script):
+    """`import p.\\`when\\`` names the escaped declaration — truncating at the
+    backtick would star-link the whole package."""
+    repo.write("lib/src/main/kotlin/p/Escaped.kt",
+               "package p\n\nfun `when`() = 1\n")
+    repo.write("lib/src/main/kotlin/p/Other.kt", "package p\n\nclass Other\n")
+    repo.write("app/src/main/kotlin/app/Main.kt",
+               "package app\n\nimport p.`when`\n\nclass Main\n")
+
+    summary = _deps_summary(repo, tabs, run_script)
+
+    fan_in = {row["path"]: row["fan_in"] for row in summary["top_fan_in_files"]}
+    assert fan_in.get("lib/src/main/kotlin/p/Escaped.kt") == 1
+    assert "lib/src/main/kotlin/p/Other.kt" not in fan_in
+
+
+def test_deps_scala_export_clause_is_a_dependency(repo, tabs, run_script):
+    """Scala 3 `export lib.Util` re-exports — a facade's only reference."""
+    repo.write("core/src/main/scala/lib/Util.scala",
+               "package lib\n\nclass Util\n")
+    repo.write("core/src/main/scala/facade/Api.scala",
+               "package facade\n\nexport lib.Util\n\nclass Api\n")
+
+    summary = _deps_summary(repo, tabs, run_script)
+
+    fan_in = {row["path"]: row["fan_in"] for row in summary["top_fan_in_files"]}
+    assert fan_in.get("core/src/main/scala/lib/Util.scala") == 1
+
+
+def test_deps_npm_conditional_entries_follow_the_call_syntax(repo, tabs, run_script):
+    """A dual-published package's import condition serves ESM imports and its
+    require condition serves CommonJS calls."""
+    repo.write("packages/lib/package.json",
+               '{"name": "lib", "exports": {".": '
+               '{"import": "./esm.mjs", "require": "./cjs.cjs"}}}\n')
+    repo.write("packages/lib/esm.mjs", "export const x = 1;\n")
+    repo.write("packages/lib/cjs.cjs", "module.exports = 1;\n")
+    repo.write("packages/esm-app/package.json",
+               '{"name": "esm-app", "dependencies": {"lib": "workspace:*"}}\n')
+    repo.write("packages/esm-app/main.mjs", "import { x } from 'lib';\n")
+    repo.write("packages/cjs-app/package.json",
+               '{"name": "cjs-app", "dependencies": {"lib": "workspace:*"}}\n')
+    repo.write("packages/cjs-app/main.cjs", "const l = require('lib');\n")
+
+    summary = _deps_summary(repo, tabs, run_script)
+
+    fan_in = {row["path"]: row["fan_in"] for row in summary["top_fan_in_files"]}
+    assert fan_in.get("packages/lib/esm.mjs") == 1
+    assert fan_in.get("packages/lib/cjs.cjs") == 1
+
+
+def test_deps_npm_exports_beats_main(repo, tabs, run_script):
+    """Node gives exports precedence over main for dual-declared packages."""
+    repo.write("packages/lib/package.json",
+               '{"name": "lib", "main": "legacy.js", "exports": "./modern.js"}\n')
+    repo.write("packages/lib/legacy.js", "module.exports = 0;\n")
+    repo.write("packages/lib/modern.js", "export const x = 1;\n")
+    repo.write("packages/app/package.json",
+               '{"name": "app", "dependencies": {"lib": "workspace:*"}}\n')
+    repo.write("packages/app/main.js", "import { x } from 'lib';\n")
+
+    summary = _deps_summary(repo, tabs, run_script)
+
+    fan_in = {row["path"]: row["fan_in"] for row in summary["top_fan_in_files"]}
+    assert fan_in.get("packages/lib/modern.js") == 1
+    assert "packages/lib/legacy.js" not in fan_in
+
+
+def test_deps_go_work_replace_beats_module_replace(repo, tabs, run_script):
+    """go.work replacements take precedence over go.mod replacements."""
+    repo.write("go.work", "use ./app\n\nreplace example.com/old => ./work-fork\n")
+    repo.write("app/go.mod",
+               "module example.com/app\n\nreplace example.com/old => ./local-fork\n")
+    repo.write("app/local-fork/pkg/pkg.go", "package pkg\n\nfunc Do() {}\n")
+    repo.write("work-fork/pkg/pkg.go", "package pkg\n\nfunc Do() {}\n")
+    repo.write("app/main.go",
+               'package main\n\nimport "example.com/old/pkg"\n\nfunc main() { pkg.Do() }\n')
+
+    summary = _deps_summary(repo, tabs, run_script)
+
+    fan_in = {row["path"]: row["fan_in"] for row in summary["top_fan_in_files"]}
+    assert fan_in.get("work-fork/pkg/pkg.go") == 1
+    assert "app/local-fork/pkg/pkg.go" not in fan_in
+
+
 def test_deps_python_resolution_is_counted_too(repo, tabs, run_script):
     """Python goes through the same accounting as every other language: its own
     modules count as first-party (resolved or not), stdlib/pip as external."""

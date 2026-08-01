@@ -309,17 +309,17 @@ def join_inside(base, target):
 
 def go_modules(all_paths):
     """Every go.mod in the repo: ([(module_path, dir)] longest module first,
-    {dir: [(old_prefix, local_dir)]} for local replace directives).
+    {dir: [...]} go.mod replaces, {dir: [...]} go.work replaces).
 
     A `replace old => ../new` maps import paths under `old` into the local
     directory regardless of what module path that directory declares — and it
     binds only the module whose go.mod carries it.
     """
-    mods, replaces = [], {}
+    mods, replaces, work_replaces = [], {}, {}
     for rel, p in all_paths.items():
         is_mod = rel == "go.mod" or rel.endswith("/go.mod")
-        # go.work replacements use the same syntax and bind every workspace
-        # member, taking precedence over go.mod replaces
+        # go.work replacements use the same syntax, bind every workspace
+        # member, and take precedence over go.mod replaces
         is_work = rel == "go.work" or rel.endswith("/go.work")
         if not (is_mod or is_work):
             continue
@@ -338,8 +338,8 @@ def go_modules(all_paths):
                 if local is not None:
                     repls.append((old, local))
         if repls:
-            replaces.setdefault(d, []).extend(repls)
-    return sorted(mods, key=lambda t: -len(t[0])), replaces
+            (work_replaces if is_work else replaces).setdefault(d, []).extend(repls)
+    return sorted(mods, key=lambda t: -len(t[0])), replaces, work_replaces
 
 
 def npm_packages(all_paths):
@@ -414,24 +414,21 @@ def _npm_subpath_exports(data):
 
 
 def _npm_entry(data):
-    """The package's entry file: `main`, else the root `exports` target
-    (string form, or the '.'/conditional import/require/default variants)."""
-    main = data.get("main")
-    if isinstance(main, str) and main:
-        return main.lstrip("./")
+    """(esm entry, cjs entry) for the package. Node gives `exports`
+    precedence over `main`; a conditional root serves its import condition
+    to ESM callers and its require condition to CommonJS callers."""
+    def clean(v):
+        return v.lstrip("./") if isinstance(v, str) and v else ""
+    esm = cjs = ""
     exp = data.get("exports")
-    if isinstance(exp, str):
-        return exp.lstrip("./")
-    if isinstance(exp, dict):
-        root = exp.get(".", exp)
-        if isinstance(root, str):
-            return root.lstrip("./")
-        if isinstance(root, dict):
-            for key in ("import", "require", "default"):
-                v = root.get(key)
-                if isinstance(v, str):
-                    return v.lstrip("./")
-    return ""
+    root = exp.get(".", exp) if isinstance(exp, dict) else exp
+    if isinstance(root, str):
+        esm = cjs = clean(root)
+    elif isinstance(root, dict):
+        esm = clean(root.get("import")) or clean(root.get("default"))
+        cjs = clean(root.get("require")) or clean(root.get("default"))
+    main = clean(data.get("main"))
+    return (esm or main, cjs or main)
 
 
 def nearest_dir(rel, dirs):
