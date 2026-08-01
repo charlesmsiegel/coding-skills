@@ -212,6 +212,17 @@ def cs_usings(text):
         elif nm:
             stack.append({"open": depth, "name": nm.group(1),
                           "entered": "{" in line[nm.end():]})
+        if nm:
+            # compact form: `namespace P { using Q; ... }` carries directives
+            # on the namespace's own line, inside the just-opened scope
+            for um2 in re.finditer(
+                    r"(?:global\s+)?using\s+(?:static\s+)?(?:\w+\s*=\s*)?"
+                    r"(?:global::)?([\w.]+)\s*;", line[nm.end():]):
+                chain = [seg for part in
+                         file_scoped + [e["name"] for e in stack]
+                         for seg in part.split(".")]
+                prefixes = [".".join(chain[:n]) for n in range(len(chain), 0, -1)]
+                out.append((um2.group(1), prefixes))
         else:
             um = CS_USING_RE.match(line)
             if um:
@@ -270,13 +281,14 @@ def build_decl_indexes(paths):
         ext = "." + rel.rsplit(".", 1)[-1] if "." in rel else ""
         if ext not in JVM_EXTS and ext != ".cs":
             continue
-        text = read_text(p)
+        raw = read_text(p)
+        text = raw
         stem = rel.rsplit("/", 1)[-1].rsplit(".", 1)[0]
         names = {stem}
         if ext != ".cs":
             # a declaration-looking line inside a comment must not become a
             # rival claim that turns the real declaration ambiguous
-            text = _mask_jvm(text)
+            text = mask_jvm(text)
         if ext == ".cs":
             # C# filenames declare nothing — a stem claim would satisfy (or
             # make ambiguous) usings the file's real types never declare
@@ -313,11 +325,17 @@ def build_decl_indexes(paths):
                 names.discard(stem)  # Kotlin file names declare nothing
                 names |= set(KT_DECL_RE.findall(text))
                 names |= set(KT_BACKTICK_DECL_RE.findall(text))
+                # Java reaches top-level Kotlin declarations through the
+                # <Stem>Kt facade class (or its @file:JvmName override)
+                if re.search(r"^(?:\w+\s+)*(?:fun|val|var)\s", text, re.M):
+                    # the JvmName argument is a string literal the mask blanks
+                    jn = re.search(r'@file\s*:\s*JvmName\s*\(\s*"(\w+)"', raw)
+                    names.add(jn.group(1) if jn else f"{stem}Kt")
         jvm.add(pkg, rel, names)
     return jvm, cs
 
 
-def _mask_jvm(text):
+def mask_jvm(text):
     """Java/Kotlin/Scala text with comments and strings blanked (newlines
     kept) — a commented-out import must not become an edge."""
     def blank(m):
@@ -339,7 +357,7 @@ def jvm_import_specs(text):
     (`_`, `*`, `given`) falls back to the package-star form.
     """
     out = []
-    lines = _mask_jvm(text).splitlines()
+    lines = mask_jvm(text).splitlines()
     i = -1
     while i + 1 < len(lines):
         i += 1
@@ -438,8 +456,7 @@ def resolve_jvm(imp, index, importer_rel=None, module_dirs=()):
                 return (set(sorted(hits)[:MAX_STAR_TARGETS]), True)
             return (set(), True)  # ambiguous: first-party, deliberately unresolved
     pkg = ".".join(segs[:-1])
-    files = narrow(index.pkg_files.get(pkg, set()))
-    if len(files) == 1:
-        # `import a.b.unrecognizedName` in a single-file package: the file is certain.
-        return (set(files), True)
-    return (set(), bool(files))
+    # The imported name is not declared by any indexed file. JVM packages can
+    # split across sources and jars, so even a single-file package must not
+    # claim an unknown symbol — the import stays first-party unresolved.
+    return (set(), bool(narrow(index.pkg_files.get(pkg, set()))))

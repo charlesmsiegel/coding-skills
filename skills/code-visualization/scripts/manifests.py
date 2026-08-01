@@ -48,6 +48,7 @@ class RustWorkspace:
         self._registry_deps = {}   # crate dir -> registry-declared dep names
         self._patches = {}         # manifest dir -> {patched name: target dir}
         self._target_roots = {}    # crate dir -> [(explicit target dir, entry)]
+        self._build_entry = {}     # crate dir -> its build-script file
         manifests = []
         for rel, p in all_paths.items():
             if rel == "Cargo.toml" or rel.endswith("/Cargo.toml"):
@@ -91,6 +92,13 @@ class RustWorkspace:
                     self._target_roots.setdefault(d, []).append((troot, tentry))
             self._name_by_dir[d] = name
             self._src_by_dir[d] = f"{d}/src" if d else "src"
+            # the build script compiles as its own crate; custom paths come
+            # from [package] build = "..."
+            bm = pkg and re.search(r"^\s*build\s*=\s*[\"']([^\"']+)[\"']", pkg, re.M)
+            bentry = (join_inside(d, bm.group(1)) if bm
+                      else (f"{d}/build.rs" if d else "build.rs"))
+            if bentry is not None and bentry in all_paths:
+                self._build_entry[d] = bentry
         for d, text in manifests:
             deps = _cargo_dep_names(text)
             self._deps[d] = deps
@@ -160,6 +168,8 @@ class RustWorkspace:
             return True
         if any(rel == entry for _, entry in self._target_roots.get(d, ())):
             return True
+        if rel == self._build_entry.get(d):
+            return True
         for tail in CARGO_TARGET_DIRS:
             tdir = f"{d}/{tail}" if d else tail
             if rel.startswith(tdir + "/") and "/" not in rel[len(tdir) + 1:]:
@@ -175,6 +185,9 @@ class RustWorkspace:
         own tree.
         """
         d = self._crate_dir(rel)
+        if rel == self._build_entry.get(d):
+            # build.rs is a separate crate rooted beside itself
+            return rel.rsplit("/", 1)[0] if "/" in rel else ""
         for troot, tentry in self._target_roots.get(d, ()):
             # A root-level entry ([[bin]] path = "main.rs") roots only that
             # file — matching the whole package would capture src/ modules.
@@ -489,6 +502,21 @@ def _npm_entry(data):
         cjs = clean(root.get("require")) or clean(root.get("default"))
     main = clean(data.get("main"))
     return (esm or main, cjs or main)
+
+
+def ts_config_roots(all_paths):
+    """Dirs whose tsconfig/jsconfig declares baseUrl or paths — the only
+    configurations that make bare specifiers resolve against the repo."""
+    roots = set()
+    for rel, p in all_paths.items():
+        base = rel.rsplit("/", 1)[-1]
+        if not (base.startswith("tsconfig") or base == "jsconfig.json") \
+                or not base.endswith(".json"):
+            continue
+        text = read_text(p)
+        if re.search(r'"(?:baseUrl|paths)"\s*:', text):
+            roots.add(rel.rsplit("/", 1)[0] if "/" in rel else "")
+    return roots
 
 
 def nearest_dir(rel, dirs):

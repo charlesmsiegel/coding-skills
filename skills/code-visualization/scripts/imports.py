@@ -22,9 +22,10 @@ from pathlib import Path
 
 from common import detect_lang, read_text
 from jvmdecl import (JVM_EXTS, build_decl_indexes, cs_usings,
-                     jvm_import_specs, resolve_jvm, scala_packages)
+                     jvm_import_specs, mask_jvm, resolve_jvm,
+                     scala_packages)
 from manifests import (join_inside, RustWorkspace, go_modules, nearest_dir,
-                       npm_packages)
+                       npm_packages, ts_config_roots)
 
 JS_EXTS = [".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".vue", ".svelte"]
 JS_IMPORT_RE = re.compile(
@@ -320,6 +321,7 @@ def extract(paths, all_paths, file_set):
     jvm_idx, cs_idx = build_decl_indexes(paths)
     rust_ws = RustWorkspace(all_paths)
     npm_by_dir, npm_names, npm_local, npm_ws_roots = npm_packages(all_paths)
+    ts_roots = ts_config_roots(all_paths)
     # Build-module boundaries: independent modules may declare the same fully
     # qualified symbol without sharing a classpath. C# projects are bounded by
     # .csproj files; JVM modules by Gradle/Maven manifests.
@@ -352,7 +354,7 @@ def extract(paths, all_paths, file_set):
             edges[rel] |= python_edges(rel, text, py_idx, file_set, py_roots, stats)
         elif ext in JS_EXTS:
             _js_edges(rel, text, file_set, by_base, npm_by_dir, npm_names,
-                      npm_local, npm_ws_roots, lang, edges, stats)
+                      npm_local, npm_ws_roots, ts_roots, lang, edges, stats)
         elif ext == ".go":
             # _test.go compiles into a separate test binary, but the graph's
             # directory grouping would conflate its edges with the package's —
@@ -369,8 +371,9 @@ def extract(paths, all_paths, file_set):
             # first. Java and Kotlin imports are absolute.
             prefixes = []
             if ext == ".scala":
-                # the FULL composed chain (package a.b + package c = a.b.c)
-                full_pkg = scala_packages(text)[0]
+                # the FULL composed chain (package a.b + package c = a.b.c),
+                # from comment-masked text like every other scala scan
+                full_pkg = scala_packages(mask_jvm(text))[0]
                 if full_pkg:
                     chain = full_pkg.split(".")
                     prefixes = [".".join(chain[:n])
@@ -415,7 +418,11 @@ def _mask_js_comments(text):
 
 
 def _js_edges(rel, text, file_set, by_base, npm_by_dir, npm_names,
-              npm_local, npm_ws_roots, lang, edges, stats):
+              npm_local, npm_ws_roots, ts_roots, lang, edges, stats):
+    # bare specifiers resolve against the repo only where a tsconfig/jsconfig
+    # declares baseUrl or paths — without one, Node treats them as packages
+    has_base_url = any(not r or rel == r or rel.startswith(r + "/")
+                       for r in ts_roots)
     text = _mask_js_comments(text)
     pkg_dir = nearest_dir(rel, npm_by_dir)
     npm_deps = npm_by_dir.get(pkg_dir, set()) if pkg_dir is not None else set()
@@ -459,6 +466,11 @@ def _js_edges(rel, text, file_set, by_base, npm_by_dir, npm_names,
             cands += [f"{d}/{stem_c}{e}" for e in JS_EXTS]
         return next((c for c in cands if c in file_set), None)
     for jm in JS_IMPORT_RE.finditer(text):
+        # an `import ...` that sits inside a string literal is documentation,
+        # not code: skip matches immediately preceded by a quote
+        prev = text[:jm.start()].rstrip()[-1:]
+        if prev in ("'", '"', "`"):
+            continue
         spec = jm.group(1)
         # a require() call resolves the package's CommonJS condition
         mode = "require" if jm.group(0).lstrip().startswith("require") else "import"
@@ -514,15 +526,27 @@ def _js_edges(rel, text, file_set, by_base, npm_by_dir, npm_names,
                 known_local = True
             if alias_dir is not None:
                 # `"alias": "file:../actual"` — the alias IS the installed
-                # name; link the target package's entry (its dir need not
-                # share the alias's name)
+                # name; link the target package's entry, or the subpath's
+                # export/physical file for `alias/feature` imports
                 data_cands = [c for cands_list in npm_names.values()
                               for c in cands_list if c[0] == alias_dir]
                 esm_a, cjs_a = data_cands[0][1] if data_cands else ("", "")
-                order = [esm_a, cjs_a] if mode == "import" else [cjs_a, esm_a]
-                cands = [f"{alias_dir}/{e}".strip("/") for e in order if e]
-                for stem_c in ("src/index", "index", "src/main", "lib/index"):
-                    cands += [f"{alias_dir}/{stem_c}{e}" for e in JS_EXTS]
+                subexports_a = data_cands[0][2] if data_cands else {}
+                if spec != pkg_name:
+                    sub = spec[len(pkg_name) + 1:]
+                    exported = subexports_a.get(sub)
+                    cands = [f"{alias_dir}/{exported}"] if exported else []
+                    if re.search(r"\.[a-z]+$", sub):
+                        cands.append(f"{alias_dir}/{sub}")
+                    for e in JS_EXTS:
+                        cands += [f"{alias_dir}/{sub}{e}",
+                                  f"{alias_dir}/{sub}/index{e}",
+                                  f"{alias_dir}/src/{sub}{e}"]
+                else:
+                    order = [esm_a, cjs_a] if mode == "import" else [cjs_a, esm_a]
+                    cands = [f"{alias_dir}/{e}".strip("/") for e in order if e]
+                    for stem_c in ("src/index", "index", "src/main", "lib/index"):
+                        cands += [f"{alias_dir}/{stem_c}{e}" for e in JS_EXTS]
                 t = next((c for c in cands if c in file_set), None)
             elif pkg_name in npm_names and (pkg_name not in npm_deps
                                             or same_workspace(pkg_name)):
@@ -546,8 +570,8 @@ def _js_edges(rel, text, file_set, by_base, npm_by_dir, npm_names,
                         cands += [f"{wdir}/{sub}{e}", f"{wdir}/{sub}/index{e}",
                                   f"{wdir}/src/{sub}{e}"]
                     t = next((c for c in cands if c in file_set), None)
-            elif (not spec.startswith("@") and root not in npm_deps
-                    and root not in NODE_BUILTINS):
+            elif (has_base_url and not spec.startswith("@")
+                    and root not in npm_deps and root not in NODE_BUILTINS):
                 t = resolve_unique_suffix(spec, by_base, JS_EXTS, scope=pkg_dir)
             if t and t != rel:
                 edges[rel].add(t)
