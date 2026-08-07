@@ -31,7 +31,10 @@ from common import (
     configure_output, emit, envelope, is_config, iter_files, read_source, rel, skipped_note,
 )
 
-_NUMERIC_RE = re.compile(r"^-?\d+(?:\.\d+)?$")
+# Leading-dot and exponent forms count as numbers here too. Without this, tracing
+# `.75` fell through to the identifier branch, where `\b` cannot match before a
+# dot — so the tool reported the value appears nowhere while the tree was full of it.
+_NUMERIC_RE = re.compile(r"^-?(?:\d+\.?\d*|\.\d+)(?:[eE][-+]?\d+)?$")
 _ASSIGN_RE = re.compile(r"(?<![=!<>+\-*/])=(?!=)")
 _COMPARE_RE = re.compile(r"(?:>=|<=|==|!=|>|<)")
 # The needle is the thing being assigned: `quality_score = ...` / `quality_score: number =`

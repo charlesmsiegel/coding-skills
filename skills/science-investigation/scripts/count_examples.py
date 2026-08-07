@@ -104,7 +104,9 @@ def read_jsonl(path: Path, max_rows: int) -> dict:
                     continue
                 tally([record], fields)
     except OSError as exc:
-        return {"error": str(exc)}
+        # Same shape as the other readers: an unreadable eval set is reported, not
+        # dropped into the "no datasets found" bucket.
+        return {"parse_error": type(exc).__name__}
     return {"rows": rows, "bad_rows": bad, "fields": fields, "truncated": truncated}
 
 
@@ -114,13 +116,18 @@ def records_from_json(payload):
     An *empty* list is a dataset with zero rows, not a non-dataset: `[]` in
     eval.json says the measurement input exists and has n=0, which is a different
     fact from "there is no eval set" and a much more actionable one.
+
+    The whole list decides, not its first element. Testing `payload[:1]` made the
+    answer depend on record order — `["bad", {...}]` vanished while
+    `[{...}, "bad"]` was accepted — and non-object entries are counted as
+    malformed rows rather than silently inflating or deleting N.
     """
     if isinstance(payload, list):
-        return payload if all(isinstance(r, dict) for r in payload[:1]) else None
+        return payload if not payload or any(isinstance(r, dict) for r in payload) else None
     if isinstance(payload, dict):
         for key in RECORD_KEYS:
             value = payload.get(key)
-            if isinstance(value, list) and all(isinstance(r, dict) for r in value[:1]):
+            if isinstance(value, list) and (not value or any(isinstance(r, dict) for r in value)):
                 return value
     return None
 
@@ -143,8 +150,10 @@ def read_json(path: Path, max_rows: int) -> dict:
         return {}
     truncated = len(records) > max_rows
     fields: dict = {}
-    tally(records[:max_rows], fields)
-    return {"rows": min(len(records), max_rows), "bad_rows": 0, "fields": fields, "truncated": truncated}
+    kept = records[:max_rows]
+    tally(kept, fields)
+    bad = sum(1 for record in kept if not isinstance(record, dict))
+    return {"rows": len(kept), "bad_rows": bad, "fields": fields, "truncated": truncated}
 
 
 def read_delimited(path: Path, max_rows: int) -> dict:
