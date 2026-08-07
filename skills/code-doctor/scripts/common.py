@@ -8,12 +8,14 @@ the finding/candidate split below is the load-bearing part of this module, not
 a formality.
 """
 
+import argparse
 import contextlib
+import json
 import os
 import subprocess
 import sys
 import time
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Iterator
 
@@ -333,3 +335,155 @@ def probe_history(repo: Path, *, min_commits: int = 20) -> HistoryDepth:
         oldest_days = None
 
     return HistoryDepth(True, shallow, count, oldest_days, min_commits=min_commits)
+
+
+# --------------------------------------------------------------------------- #
+# One CLI, one report
+# --------------------------------------------------------------------------- #
+
+def warn_unreadable(filepath: Path, exc: Exception) -> None:
+    """Name a file this skill could not read, rather than counting it clean."""
+    print(f"⚠️  {filepath}: skipped, unreadable ({exc})", file=sys.stderr)
+
+
+def warn_detector_error(filepath: Path, exc: Exception) -> None:
+    """Surface a detector crash instead of silently reporting the file clean."""
+    print(
+        f"⚠️  {filepath}: detector failed ({type(exc).__name__}: {exc}); "
+        "findings for this file are incomplete, not clean",
+        file=sys.stderr,
+    )
+
+
+def fail_on_bad_path(exc: ScanPathError) -> int:
+    """Turn a missing scan root into a loud, nonzero exit at the CLI boundary."""
+    print(f"error: {exc}", file=sys.stderr)
+    return 2
+
+
+def build_parser(description: str) -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description=description)
+    parser.add_argument("path", nargs="?", default=".", help="File or directory")
+    parser.add_argument("--format", choices=["text", "json"], default="text")
+    parser.add_argument("--ignore", type=str, default="",
+                        help="Comma-separated finding types to suppress")
+    return parser
+
+
+def sort_findings(findings: list[Finding]) -> list[Finding]:
+    """Findings before candidates, then by severity, then by location."""
+    findings.sort(key=lambda f: (f.kind != "finding",
+                                 SEVERITY_RANK.get(f.severity, 1), f.file, f.line))
+    return findings
+
+
+def _print_report(findings: list[Finding], clean_message: str,
+                  completeness: dict | None) -> None:
+    if completeness:
+        for label, note in completeness.items():
+            print(f"ℹ️  {label}: {note}")
+        print()
+
+    confirmed = [f for f in findings if f.kind == "finding"]
+    leads = [f for f in findings if f.kind == "candidate"]
+
+    if not findings:
+        print(f"✅ {clean_message}")
+        return
+
+    print(f"{len(confirmed)} finding(s), {len(leads)} candidate(s):\n")
+
+    for record in confirmed:
+        icon = SEVERITY_ICONS.get(record.severity, "")
+        print(f"{icon} [{record.severity.upper()}] {record.file}:{record.line}")
+        print(f"   {record.smell_type}: {record.description}")
+        if record.code_snippet:
+            print(f"   Code: {record.code_snippet}")
+        print(f"   → {record.suggestion}\n")
+
+    if leads:
+        print("Candidates — unverified leads, check before acting:\n")
+    for record in leads:
+        icon = SEVERITY_ICONS.get(record.severity, "")
+        print(f"{icon} [candidate] {record.file}:{record.line}")
+        print(f"   {record.smell_type}: {record.description}")
+        if record.code_snippet:
+            print(f"   Code: {record.code_snippet}")
+        print("   Also caused by:")
+        for reason in record.also_caused_by:
+            print(f"     - {reason}")
+        print()
+
+
+def emit(findings: list[Finding], output_format: str, clean_message: str,
+         completeness: dict | None = None) -> None:
+    sort_findings(findings)
+    if output_format == "json":
+        records = [asdict(f) for f in findings]
+        if completeness:
+            print(json.dumps({"completeness": completeness, "findings": records}, indent=2))
+        else:
+            print(json.dumps(records, indent=2))
+    else:
+        _print_report(findings, clean_message, completeness)
+
+
+def coverage_gaps(unreadable: list[str], failed: list[str]) -> dict:
+    """Lost-file accounting, as a completeness record.
+
+    stderr is not enough. analyze_all.py ignores a subprocess's stderr when it
+    exits zero, so a detector that lost ten files to read errors would still
+    aggregate as "No problems found" — a silent coverage hole reported as a
+    clean repository, which is the exact failure this skill exists to avoid.
+    """
+    gaps = {}
+    if unreadable:
+        gaps["files_unreadable"] = (
+            f"{len(unreadable)} file(s) could not be read and were not analysed: "
+            + ", ".join(unreadable[:5]) + ("…" if len(unreadable) > 5 else "")
+        )
+    if failed:
+        gaps["files_detector_failed"] = (
+            f"{len(failed)} file(s) crashed the detector and are incomplete, not clean: "
+            + ", ".join(failed[:5]) + ("…" if len(failed) > 5 else "")
+        )
+    return gaps
+
+
+def run_file_detector(description: str, clean_message: str, analyze,
+                      *, source_only: bool = True, argv: list[str] | None = None) -> int:
+    """Standard main() for a detector that reasons about one file at a time.
+
+    ``analyze`` is called as ``analyze(path, text, reporter)``. Returns the
+    process exit code.
+    """
+    configure_output()
+    args = build_parser(description).parse_args(argv)
+    ignore = set(args.ignore.split(",")) if args.ignore else set()
+
+    findings: list[Finding] = []
+    unreadable: list[str] = []
+    failed: list[str] = []
+    try:
+        walked = list(walk_files(Path(args.path), source_only=source_only))
+    except ScanPathError as exc:
+        return fail_on_bad_path(exc)
+    for filepath in walked:
+        try:
+            text = filepath.read_text(encoding="utf-8", errors="replace")
+        except OSError as exc:
+            warn_unreadable(filepath, exc)
+            unreadable.append(str(filepath))
+            continue
+        reporter = Reporter(filepath, ignore)
+        try:
+            analyze(filepath, text, reporter)
+        except Exception as exc:  # a detector bug must not read as a clean file
+            warn_detector_error(filepath, exc)
+            failed.append(str(filepath))
+            continue
+        findings.extend(reporter.findings)
+
+    gaps = coverage_gaps(unreadable, failed)
+    emit(findings, args.format, clean_message, completeness=gaps or None)
+    return 0

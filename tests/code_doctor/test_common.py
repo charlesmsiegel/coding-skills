@@ -1,5 +1,7 @@
 """The walk: what counts as source, what counts as text, what is skipped."""
 
+import json
+
 import pytest
 
 
@@ -222,3 +224,41 @@ def test_probe_history_accepts_sufficient_history(common, repo):
         repo.commit(f"commit {i}")
     depth = common.probe_history(repo.path, min_commits=20)
     assert depth.usable is True
+
+
+def test_emit_json_is_a_bare_list_without_completeness(common, capsys):
+    common.emit([common.Finding(file="a.go", line=1, smell_type="x",
+                                description="d", suggestion="fix")],
+                "json", "clean")
+    payload = json.loads(capsys.readouterr().out)
+    assert isinstance(payload, list)
+    assert payload[0]["kind"] == "finding"
+
+
+def test_emit_json_wraps_when_completeness_is_given(common, capsys):
+    common.emit([], "json", "clean", completeness={"history": "shallow clone"})
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["completeness"] == {"history": "shallow clone"}
+    assert payload["findings"] == []
+
+
+def test_emit_text_prints_completeness_banner(common, capsys):
+    common.emit([], "text", "no problems found",
+                completeness={"history": "shallow clone — findings skipped"})
+    out = capsys.readouterr().out
+    assert "shallow clone" in out
+    assert "no problems found" in out
+
+
+def test_emit_text_separates_candidates_from_findings(common, capsys):
+    records = [
+        common.Finding(file="a.go", line=1, smell_type="defect",
+                       description="broken", suggestion="fix it", severity="high"),
+        common.Finding(file="b.go", line=2, smell_type="lead", description="maybe",
+                       kind="candidate", also_caused_by=["it is an entry point"]),
+    ]
+    common.emit(records, "text", "clean")
+    out = capsys.readouterr().out
+    assert "1 finding(s)" in out
+    assert "1 candidate(s)" in out
+    assert "it is an entry point" in out
