@@ -287,3 +287,61 @@ def test_unpinned_models_are_caught_quoted_or_bare(tmp_path, name, body):
 def test_a_pinned_model_stays_unflagged_in_config_too(tmp_path):
     (tmp_path / "config.yaml").write_text("model: gpt-4o-2024-08-06\n", encoding="utf-8")
     assert not kinds(run(tmp_path), "unpinned_model")
+
+
+# ---- third review round ------------------------------------------------------- #
+
+def test_the_word_rethrow_inside_a_string_does_not_excuse_a_zero(tmp_path):
+    """Comments were stripped last round; string bodies reached the check too."""
+    (tmp_path / "s.py").write_text(
+        "def score(row):\n"
+        "    try:\n"
+        "        return judge(row)\n"
+        "    except Exception:\n"
+        '        log("cannot rethrow here")\n'
+        "        return 0.0\n",
+        encoding="utf-8",
+    )
+    assert kinds(run(tmp_path), "error_becomes_zero")
+
+
+def test_a_genuine_reraise_is_still_recognized_after_string_stripping(tmp_path):
+    (tmp_path / "s.py").write_text(
+        "def score(row):\n"
+        "    try:\n"
+        "        return judge(row)\n"
+        "    except Exception:\n"
+        '        log("giving up")\n'
+        "        raise\n",
+        encoding="utf-8",
+    )
+    assert run(tmp_path)["candidates"] == []
+
+
+@pytest.mark.parametrize("body,kind", [
+    ("const s = (r) => judge(r).catch(() => 0);\n", "error_becomes_zero"),
+    ('const s = (r) => judge(r).catch(() => "");\n', "error_becomes_zero"),
+    ("const s = (r) => judge(r).catch(() => null);\n", "swallowed_error"),
+])
+def test_promise_rejection_handlers_are_read_as_fail_soft(tmp_path, body, kind):
+    (tmp_path / "m.ts").write_text(body, encoding="utf-8")
+    assert kinds(run(tmp_path), kind)
+
+
+def test_a_promise_catch_that_rethrows_is_not_flagged(tmp_path):
+    (tmp_path / "m.ts").write_text(
+        "const s = (r) => judge(r).catch((e) => { throw e; });\n", encoding="utf-8"
+    )
+    assert run(tmp_path)["candidates"] == []
+
+
+@pytest.mark.parametrize("setting", ['{"temperature": 0.7}', '{"do_sample": true}'])
+def test_json_quoted_sampling_keys_are_matched(tmp_path, setting):
+    (tmp_path / "config.json").write_text(setting + "\n", encoding="utf-8")
+    assert kinds(run(tmp_path), "nondeterminism")
+
+
+@pytest.mark.parametrize("command", ["head -n 50 eval.jsonl > sub.jsonl", "head -50 eval.jsonl"])
+def test_the_shell_head_cap_the_guide_documents_is_detected(tmp_path, command):
+    (tmp_path / "run.sh").write_text(command + "\n", encoding="utf-8")
+    assert kinds(run(tmp_path), "silent_cap")

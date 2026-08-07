@@ -310,3 +310,43 @@ def test_a_zero_default_beside_a_metric_is_still_reported(tmp_path):
         encoding="utf-8",
     )
     assert kinds(run(tmp_path), "zero_default")
+
+
+# ---- third review round ------------------------------------------------------- #
+
+def test_repeated_definitions_in_one_file_each_get_a_row(tmp_path):
+    """The headline's site count has to match the rows printed under it."""
+    (tmp_path / "m.py").write_text(
+        "def quality_score(r):\n    return 1\n\n"
+        "def quality_score(r):\n    return 2\n",
+        encoding="utf-8",
+    )
+    rows = kinds(run(tmp_path), "no_consumer")
+    assert [row["line"] for row in rows] == [1, 4]
+
+
+@pytest.mark.parametrize("line,name", [
+    ("double accuracy = 0.5;", "accuracy"),
+    ("float quality_score = 0.8f;", "quality_score"),
+])
+def test_typed_variable_declarations_are_definitions(tmp_path, line, name):
+    (tmp_path / "m.cpp").write_text(line + "\n", encoding="utf-8")
+    assert any(row["detail"].startswith(name) for row in kinds(run(tmp_path), "metric_definition"))
+
+
+def test_a_statement_keyword_is_never_read_as_a_declaration_type(tmp_path):
+    """`return x = 1` must not register `x` as a metric declaration."""
+    (tmp_path / "m.py").write_text("def f():\n    return score = 1\n", encoding="utf-8")
+    assert not [row for row in kinds(run(tmp_path), "metric_definition") if row["detail"].startswith("score")]
+
+
+def test_a_semicolon_terminated_zero_return_is_flagged(tmp_path):
+    """`return 0;` is how JS, Java, C, C++ and C# write the same failure path."""
+    (tmp_path / "m.js").write_text(
+        "function accuracy(rows) {\n"
+        "  if (!rows.length) return 0;\n"
+        "  return 1;\n"
+        "}\n",
+        encoding="utf-8",
+    )
+    assert kinds(run(tmp_path), "zero_default")

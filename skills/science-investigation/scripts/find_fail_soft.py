@@ -67,8 +67,18 @@ _ZERO_BODY_RE = re.compile(r"\breturn\s+" + _ZERO
 _EMPTY_BODY_RE = re.compile(r"^\s*(?:pass|continue|break|return(?:\s+(?:None|null|nil))?|\}|;)\s*$")
 _SURFACED_RE = re.compile(r"\braise\b|\bthrow\b|\brethrow\b")
 # `# cannot rethrow here` must not count as re-raising, or the `pass` under it
-# never surfaces. Comments are stripped before the check.
+# never surfaces. Comments are stripped before the check — and so are string
+# bodies, because `log("cannot rethrow")` above a `return 0.0` was reading as a
+# re-raise and producing a clean headline over the exact shape this tool exists
+# to find. The quotes are kept so `return ""` still matches _ZERO_BODY_RE.
 _COMMENT_RE = re.compile(r"(?<![:\w])#.*$|//.*$")
+_STRING_BODY_RE = re.compile(r"(['\"])(?:\\.|(?!\1).)*\1")
+
+# `judge(row).catch(() => 0)` — a promise rejection handler, which is fail-soft in
+# exactly the same way as a catch block and never opened one.
+_PROMISE_CATCH_RE = re.compile(r"\.catch\s*\(\s*(?:\([^)]*\)|[A-Za-z_$][\w$]*)?\s*=>\s*(.+)$")
+_ARROW_ZERO_RE = re.compile(r"^\s*(?:0(?:\.0*)?(?![\d.])|\"\"|'')")
+_ARROW_EMPTY_RE = re.compile(r"^\s*(?:\{\s*\}|null|undefined|void\s+0)")
 
 # The flag word may open the name (`enable_reranker`) or sit inside it
 # (`rag.use_reranker`), so the prefix is optional. `on` alone matches half the
@@ -97,16 +107,17 @@ _CAP_RE = re.compile(
     r"\[\s*:\s*\d{1,6}\s*\]"                             # rows[:100]
     r"|\.head\(\s*\d+"                                     # df.head(50)
     r"|\bislice\(\s*[^,]+,\s*\d+"                          # islice(rows, 50)
-    r"|\blimit\s*[=:(]\s*\d+"                              # limit=100
+    r"|\blimit[\"']?\s*[=:(]\s*\d+"                        # limit=100, "limit": 100
     r"|\blimit\s+\d+"                                      # SQL LIMIT 100
     r"|\b(?:sample|choices|choice)\(\s*[^)]*(?:\b[nk]\s*=\s*\d|,\s*\d+\s*\))"  # sample(rows, 50) / (rows, k=50) / (n=50)
-    r"|\bmax_(?:examples|rows|samples|cases|items|records)\s*[=:]\s*\d+",
+    r"|\bmax_(?:examples|rows|samples|cases|items|records)[\"']?\s*[=:]\s*\d+"
+    r"|\bhead\s+-n?\s*\d+",                                # head -n 50 / head -50
     re.IGNORECASE,
 )
 _NONDET_RE = re.compile(
-    r"\btemperature\s*[=:]\s*([0-9]*\.?[0-9]+)"
-    r"|\btop_p\s*[=:]\s*([0-9]*\.?[0-9]+)"
-    r"|\bdo_sample\s*[=:]\s*true",
+    r"\btemperature[\"']?\s*[=:]\s*([0-9]*\.?[0-9]+)"
+    r"|\btop_p[\"']?\s*[=:]\s*([0-9]*\.?[0-9]+)"
+    r"|\bdo_sample[\"']?\s*[=:]\s*true",
     re.IGNORECASE,
 )
 # Quoted in code, bare in config: `model="gpt-4o"`, `MODEL=gpt-4`, `model: gpt-4`.
@@ -158,7 +169,7 @@ def scan_handlers(lines: list, display: str) -> list:
         code = [_COMMENT_RE.sub("", b).rstrip() for b in body]
         code = [b for b in code if b.strip()]
         joined = "\n".join(code)
-        if _SURFACED_RE.search(joined):
+        if _SURFACED_RE.search(_STRING_BODY_RE.sub(r"\1\1", joined)):
             continue  # re-raised: the error is not being hidden
         if _ZERO_BODY_RE.search(joined):
             out.append(candidate(
@@ -181,11 +192,36 @@ def scan_handlers(lines: list, display: str) -> list:
     return out
 
 
+def scan_promise_catches(line: str, display: str, lineno: int) -> list:
+    """`.catch(() => 0)` and friends: fail-soft with no catch block to open."""
+    match = _PROMISE_CATCH_RE.search(line)
+    if not match:
+        return []
+    body = match.group(1)
+    if _SURFACED_RE.search(_STRING_BODY_RE.sub(r"\1\1", body)):
+        return []
+    if _ARROW_ZERO_RE.match(body) or _ZERO_BODY_RE.search(body):
+        return [candidate(
+            "error_becomes_zero", display, lineno,
+            "a rejected promise resolves to 0/empty — indistinguishable from a genuine low score",
+            CONFIRM["error_becomes_zero"], line.strip(),
+        )]
+    if _ARROW_EMPTY_RE.match(body):
+        return [candidate(
+            "swallowed_error", display, lineno,
+            "a rejected promise is discarded here — the example is lost without a trace",
+            CONFIRM["swallowed_error"], line.strip(),
+        )]
+    return []
+
+
 def scan_line(line: str, display: str, lineno: int) -> list:
     out = []
     stripped = line.strip()
     if not stripped or stripped.startswith(("#", "//", "*", "<!--")):
         return out
+
+    out += scan_promise_catches(line, display, lineno)
 
     match = _DEFAULT_OFF_RE.search(line)
     if match and is_flag_name(match.group(1) or match.group(2) or ""):

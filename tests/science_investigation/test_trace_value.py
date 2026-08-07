@@ -136,3 +136,12 @@ def test_dot_env_sites_are_classified_as_config_not_as_code_definitions(tmp_path
     counts = run("0.75", tmp_path)["counts"]
     assert counts["config"] == 2
     assert "definition" not in counts
+
+
+@pytest.mark.parametrize("needle", [".75", "-.75"])
+def test_a_leading_dot_literal_is_traced_as_a_number(tmp_path, needle):
+    """`\\b` cannot match before a dot, so these used to report 'appears nowhere'."""
+    (tmp_path / "s.py").write_text("if score > " + needle + ":\n    pass\n", encoding="utf-8")
+    payload = run(needle, tmp_path)
+    assert payload["candidates"]
+    assert "appears nowhere" not in payload["headline"]

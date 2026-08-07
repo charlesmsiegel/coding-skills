@@ -185,3 +185,29 @@ def test_an_empty_record_list_under_a_named_key_is_also_a_dataset(tmp_path):
 def test_a_json_list_of_scalars_is_still_not_a_dataset(tmp_path):
     (tmp_path / "allow.json").write_text('["a", "b", "c"]', encoding="utf-8")
     assert run(tmp_path)["counts"]["datasets"] == 0
+
+
+# ---- third review round ------------------------------------------------------- #
+
+@pytest.mark.parametrize("payload", ['["bad", {"gold": "a"}]', '[{"gold": "a"}, "bad"]'])
+def test_a_mixed_json_array_is_read_the_same_way_in_either_order(tmp_path, payload):
+    """Testing only the first element made the answer depend on record order."""
+    (tmp_path / "eval.json").write_text(payload, encoding="utf-8")
+    result = run(tmp_path)
+    assert result["counts"]["datasets"] == 1
+    assert result["counts"]["records_total"] == 2
+    assert "1 of 2" in kinds(result, "unparseable_rows")[0]["detail"]
+
+
+def test_an_unreadable_jsonl_file_reports_a_parse_error_like_the_other_readers(tmp_path, load_module):
+    """An eval set that cannot be opened is not the same as one that isn't there.
+
+    Driven at the function level: a permission error cannot be staged in a
+    container running as root, and the defect was that this reader alone returned
+    a key (`error`) that `analyze()` had no branch for, so the file fell through
+    into the "no datasets found" headline.
+    """
+    counter = load_module(SCRIPT.parent, "count_examples")
+    unopenable = tmp_path / "as_a_directory.jsonl"
+    unopenable.mkdir()
+    assert "parse_error" in counter.read_jsonl(unopenable, 100)

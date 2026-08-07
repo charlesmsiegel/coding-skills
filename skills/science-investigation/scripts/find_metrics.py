@@ -72,8 +72,14 @@ _DEF_RE = re.compile(
 # `accuracy = ...`, `self.win_rate = ...`, `const qualityScore = ...`, `NDCG_AT_10 = ...`
 # The lookarounds keep `score == 0.75` out: a comparison is not a definition, and it
 # is already caught (better) by _COMPARE_RE below.
+# The optional type token carries C-family declarations (`double accuracy = 0.5;`,
+# `float quality_score = 0.8f;`), which otherwise parsed the *type* as the name and
+# then failed. Statement keywords are excluded so `return x = 1` cannot masquerade
+# as a declaration of `x`.
+_NOT_A_TYPE = r"(?!(?:return|if|else|while|for|switch|case|yield|await|throw|new|delete)\b)"
 _ASSIGN_RE = re.compile(r"^\s*(?:(?:export|default|const|let|var|final|readonly|"
                         r"public|private|protected|static)\s+)*"
+                        + _NOT_A_TYPE + r"(?:[A-Za-z_][\w:<>,\[\]]*\s+)?"
                         r"(?:self\.|this\.)?([A-Za-z_][\w]*)\s*(?::[^=\n]+?)?"
                         r"(?<![=!<>+\-*/])=(?!=)\s*(.+)$")
 # `"accuracy": 0.81` in JSON/dict, and `accuracy:` in YAML
@@ -90,7 +96,9 @@ _RENORMALIZE_RE = re.compile(
 # `0.4 * relevance + 0.2 * latency`
 _WEIGHTED_SUM_RE = re.compile(r"(?:" + _NUMBER + r"\s*\*\s*[A-Za-z_]|[A-Za-z_][\w.]*\s*\*\s*" + _NUMBER + r")")
 # `return 0.0`, `except ...: return 0`, `.get("accuracy", 0)`, `or 0.0`
-_ZERO_RETURN_RE = re.compile(r"\breturn\s+(?:0|0\.0+|0\.)\s*(?:#.*)?$")
+# The trailing `;` is not optional decoration: without it every JS/Java/C/C#
+# `return 0;` in a metric path went unreported.
+_ZERO_RETURN_RE = re.compile(r"\breturn\s+(?:0|0\.0+|0\.)\s*;?\s*(?:(?:#|//).*)?$")
 _ZERO_DEFAULT_RE = re.compile(r"\.get\(\s*[\"'][^\"']+[\"']\s*,\s*(?:0|0\.0+)\s*\)|(?:\bor\s+(?:0|0\.0+))\b")
 
 CONFIRM = {
@@ -294,13 +302,16 @@ def scope_zero_defaults(rows: list) -> list:
 
 
 def dedupe(rows: list, limit: int) -> list:
-    """One row per (kind, file, detail); kinds ordered by how often they matter."""
+    """One row per (kind, file, line, detail); kinds ordered by how often they matter."""
     order = ["no_consumer", "renormalized_composite", "zero_default", "composite_weight",
              "threshold", "metric_definition"]
     seen = set()
     unique = []
     for row in rows:
-        key = (row["kind"], row["file"], row["detail"])
+        # `line` belongs in the key: two definitions of one metric in one file are
+        # two places to read, and collapsing them made the headline's site count
+        # disagree with the rows printed underneath it.
+        key = (row["kind"], row["file"], row["line"], row["detail"])
         if key not in seen:
             seen.add(key)
             unique.append(row)
