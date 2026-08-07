@@ -274,10 +274,6 @@ def is_true(node):
     return isinstance(node, ast.Constant) and node.value is True
 
 
-def is_false(node):
-    return isinstance(node, ast.Constant) and node.value is False
-
-
 def string_value(node):
     """The value of a string constant, or None."""
     if isinstance(node, ast.Constant) and isinstance(node.value, str):
