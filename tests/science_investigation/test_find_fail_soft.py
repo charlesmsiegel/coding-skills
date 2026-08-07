@@ -411,3 +411,20 @@ def test_sampling_explicitly_switched_off_is_not_nondeterminism(tmp_path):
 def test_a_real_sampling_setting_is_still_flagged(tmp_path):
     (tmp_path / "gen.yaml").write_text("top_p: 0.9\ntemperature: 0.7\n", encoding="utf-8")
     assert kinds(run(tmp_path), "nondeterminism")
+
+
+# ---- sixth review round ------------------------------------------------------- #
+
+def test_an_ambiguous_sampling_config_is_reported_rather_than_silenced(tmp_path):
+    """One file, two generation configs: a `do_sample: false` in the first must
+    not silence the second, which samples."""
+    (tmp_path / "gen.yaml").write_text(
+        "fast:\n  do_sample: false\nslow:\n  do_sample: true\n  temperature: 0.8\n",
+        encoding="utf-8",
+    )
+    assert kinds(run(tmp_path), "nondeterminism")
+
+
+def test_kebab_case_flags_are_read_as_default_off(tmp_path):
+    (tmp_path / "config.yaml").write_text("enable-reranker: false\n", encoding="utf-8")
+    assert kinds(run(tmp_path), "default_off_flag")

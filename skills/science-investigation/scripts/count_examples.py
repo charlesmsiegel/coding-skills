@@ -21,6 +21,7 @@ Usage:
   python count_examples.py data/eval.jsonl --max-rows 5000
 """
 
+import re
 import csv
 import sys
 import json
@@ -81,8 +82,15 @@ CONFIRM = {
 
 
 def looks_like_data(display: str) -> bool:
-    """Whether an unparseable file is plausibly a dataset rather than a config."""
-    return any(hint in display.lower() for hint in DATASET_HINTS)
+    """Whether an unparseable file is plausibly a dataset rather than a config.
+
+    Tokenized rather than substring-matched: `metadata.json` contains "data" and
+    is not a dataset, and calling a broken config file corrupted measurement input
+    is the manufacturing error this gate exists to prevent. A token may extend a
+    hint (`testdata`, `results`) but may not merely contain one.
+    """
+    tokens = re.split(r"[^A-Za-z0-9]+", display.lower())
+    return any(token.startswith(hint) for token in tokens if token for hint in DATASET_HINTS)
 
 
 def is_populated(value) -> bool:
@@ -203,9 +211,11 @@ def read_json(path: Path, max_rows: int) -> dict:
 
 def read_delimited(path: Path, max_rows: int) -> dict:
     delimiter = "\t" if path.suffix == ".tsv" else ","
-    rows, read, fields = 0, 0, {}
+    rows, read, bad, fields = 0, 0, 0, {}
     try:
-        with path.open("r", encoding="utf-8", errors="replace", newline="") as handle:
+        # utf-8-sig: an exported eval CSV often carries a BOM, which otherwise
+        # survives into the first field name as `\ufeffexpected` and hides the label.
+        with path.open("r", encoding="utf-8-sig", errors="replace", newline="") as handle:
             # strict=True so an unterminated quoted field raises instead of
             # swallowing the following lines into one record and reporting a
             # confident, wrong N with bad_rows=0.
@@ -215,12 +225,14 @@ def read_delimited(path: Path, max_rows: int) -> dict:
                 if read >= max_rows:
                     continue
                 read += 1
+                if None in record:
+                    bad += 1      # more fields than the header: a malformed row
                 for key, value in record.items():
                     if key and isinstance(value, str) and value.strip():
                         fields[key] = fields.get(key, 0) + 1
     except (OSError, csv.Error, UnicodeError) as exc:
         return {"parse_error": type(exc).__name__}
-    return {"rows": rows, "read": read, "bad_rows": 0, "fields": fields, "truncated": read < rows}
+    return {"rows": rows, "read": read, "bad_rows": bad, "fields": fields, "truncated": read < rows}
 
 
 def read_dataset(path: Path, max_rows: int) -> dict:
@@ -339,6 +351,11 @@ def analyze(root: Path, max_rows: int) -> tuple:
 
 
 def headline_for(summaries: list, unparseable: list) -> str:
+    if summaries and unparseable:
+        return (str(len(unparseable)) + " file(s) that look like datasets could not be read ("
+                + ", ".join(unparseable[:3]) + ") beside " + str(len(summaries))
+                + " that could — settle what the unreadable ones were feeding before drawing "
+                "any conclusion from the rest.")
     if not summaries:
         if unparseable:
             return (str(len(unparseable)) + " file(s) look like datasets but do not parse ("
@@ -361,6 +378,9 @@ def headline_for(summaries: list, unparseable: list) -> str:
                 + " — every reference metric reading that field has it as its n.")
 
     unlabeled = [s for s in summaries if not s["label_fields"]]
+    if len(unlabeled) == len(summaries) and any(s["truncated"] for s in summaries):
+        return ("no recognized ground-truth field in the records read, but the read was capped "
+                "(--max-rows) — raise the cap before concluding the datasets are unlabeled.")
     if len(unlabeled) == len(summaries):
         total = sum(s["rows"] for s in summaries)
         return (str(len(summaries)) + " dataset(s), " + str(total) + " record(s), no recognized "

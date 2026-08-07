@@ -161,3 +161,20 @@ def test_an_r_arrow_assignment_is_a_definition_not_a_comparison(tmp_path):
     payload = run("quality_score", tmp_path)
     assert payload["counts"].get("definition") == 1
     assert "defined nowhere" not in payload["headline"]
+
+
+def test_a_kotlin_declaration_is_a_definition(tmp_path):
+    (tmp_path / "M.kt").write_text(
+        "fun quality_score(rows: List<Int>): Double = 1.0\n", encoding="utf-8"
+    )
+    assert run("quality_score", tmp_path)["counts"].get("definition") == 1
+
+
+def test_a_name_on_the_right_hand_side_is_a_consumer_not_a_definition(tmp_path):
+    """`reported = quality_score` reads the metric; counting it as a second
+    definition produced a false 'defined independently' headline."""
+    (tmp_path / "a.py").write_text("def quality_score(r):\n    return 1\n", encoding="utf-8")
+    (tmp_path / "b.py").write_text("reported = quality_score\n", encoding="utf-8")
+    payload = run("quality_score", tmp_path)
+    assert payload["counts"].get("definition") == 1
+    assert "defined independently" not in payload["headline"]
