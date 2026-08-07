@@ -1,0 +1,10 @@
+{
+  "skill_name": "code-doctor",
+  "evals": [
+    {
+      "id": "under-construction-defers",
+      "prompt": "Review this Go repo for problems.",
+      "expected_output": "Recognizes code-doctor is incomplete and not yet usable, and says so rather than pretending to review. Does not fabricate findings. Replaced in Task 9 by the real eval set."
+    }
+  ]
+}
