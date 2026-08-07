@@ -72,6 +72,8 @@ Create `tests/code_doctor/test_common.py`:
 ```python
 """The walk: what counts as source, what counts as text, what is skipped."""
 
+import os
+
 import pytest
 
 SCRIPTS = None  # set by the fixture below
@@ -173,6 +175,40 @@ def test_excluded_directories_are_not_descended_into(common, repo, monkeypatch):
     assert not any("node_modules" in d for d in seen), (
         "walked into an excluded tree instead of pruning it"
     )
+
+
+def test_symlink_scan_root_raises(common, repo, tmp_path):
+    """Refusing to follow it is right; reporting it clean is not."""
+    link = tmp_path / "link-to-repo"
+    link.symlink_to(repo.path)
+    with pytest.raises(common.ScanPathError, match="symlink"):
+        list(common.walk_files(link, source_only=True))
+
+
+def test_gitignored_files_are_not_walked(common, repo):
+    """The design promises .gitignore awareness, not just EXCLUDE_DIRS."""
+    repo.write(".gitignore", "generated/\n*.gen.go\n")
+    repo.write("generated/big.go", "package generated\n")
+    repo.write("thing.gen.go", "package thing\n")
+    repo.write("app.go", "package main\n")
+    repo.commit("ignore generated")
+    found = {p.name for p in common.walk_files(repo.path, source_only=True)}
+    assert "app.go" in found
+    assert "big.go" not in found, "walked into a gitignored directory"
+    assert "thing.gen.go" not in found, "walked a gitignored file"
+
+
+def test_unreadable_file_is_not_silently_classified_binary(common, repo):
+    """An OSError must reach the caller, not masquerade as a binary skip."""
+    target = repo.write("locked.go", "package main\n")
+    os.chmod(target, 0o000)
+    try:
+        if os.access(target, os.R_OK):
+            pytest.skip("running as a user that ignores file permissions (root)")
+        with pytest.raises(OSError):
+            common.is_probably_binary(target)
+    finally:
+        os.chmod(target, 0o644)
 
 
 def test_walk_paths_yields_binaries_for_metadata_checks(common, repo):
@@ -281,12 +317,17 @@ def configure_output() -> None:
 
 
 def is_probably_binary(path: Path) -> bool:
-    """A NUL byte in the first block means this is not text. Cheap and reliable."""
-    try:
-        with path.open("rb") as handle:
-            return b"\x00" in handle.read(_BINARY_SNIFF_BYTES)
-    except OSError:
-        return True
+    """A NUL byte in the first block means this is not text. Cheap and reliable.
+
+    Propagates OSError rather than swallowing it. "I could not open this" is
+    not "this is binary": treating them alike drops an unreadable file out of
+    the walk entirely, so the detector's own unreadable-file handling never
+    sees it and no `files_unreadable` note reaches the report. A permission
+    error would then read as a clean scan, which is the one outcome this skill
+    is built to avoid.
+    """
+    with path.open("rb") as handle:
+        return b"\x00" in handle.read(_BINARY_SNIFF_BYTES)
 
 
 def is_source(rel_parts: tuple[str, ...], path: Path) -> bool:
@@ -305,6 +346,29 @@ def is_source(rel_parts: tuple[str, ...], path: Path) -> bool:
     return not any(marker in name for marker in GENERATED_MARKERS)
 
 
+def gitignored_paths(root: Path) -> set[Path]:
+    """Everything under ``root`` that git ignores, resolved to absolute paths.
+
+    Delegates to git rather than reimplementing the ignore language —
+    negation, directory-scoped patterns, nested .gitignore files and the
+    global excludes file are all more subtlety than a hand-rolled matcher
+    survives, and a wrong answer here silently drops real source.
+
+    Empty set outside a git repo, or when git cannot answer: the walk then
+    falls back to EXCLUDE_DIRS alone, which is a narrower filter but never a
+    wrong one.
+    """
+    try:
+        listing = subprocess.run(
+            ["git", "-C", str(root), "-c", "core.quotepath=false",
+             "ls-files", "--others", "--ignored", "--exclude-standard", "--directory"],
+            capture_output=True, text=True, timeout=120, check=True,
+        ).stdout
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError):
+        return set()
+    return {(root / rel.strip()).resolve() for rel in listing.splitlines() if rel.strip()}
+
+
 def walk_paths(root: Path) -> Iterator[Path]:
     """Yield every non-excluded file path under ``root``, binaries included.
 
@@ -319,12 +383,17 @@ def walk_paths(root: Path) -> Iterator[Path]:
     there is nothing of the target's content to review in any case.
     """
     if root.is_symlink():
-        return
+        raise ScanPathError(
+            f"{root}: the scan root is a symlink, which this skill will not follow. "
+            "Pass the real path it points at."
+        )
     if root.is_file():
         yield root
         return
     if not root.is_dir():
         raise ScanPathError(f"{root}: no such file or directory")
+
+    ignored = gitignored_paths(root)
 
     # os.walk with in-place dirnames pruning, NOT rglob-then-filter: rglob
     # descends into node_modules, vendor and target in full and stats every
@@ -334,9 +403,13 @@ def walk_paths(root: Path) -> Iterator[Path]:
         dirnames[:] = sorted(d for d in dirnames
                              if d not in EXCLUDE_DIRS
                              and not Path(dirpath, d).is_symlink())
+        if ignored:
+            dirnames[:] = [d for d in dirnames if Path(dirpath, d).resolve() not in ignored]
         for name in sorted(filenames):
             path = Path(dirpath, name)
             if not path.is_symlink() and path.is_file():
+                if ignored and path.resolve() in ignored:
+                    continue
                 yield path
 
 
@@ -351,8 +424,14 @@ def walk_files(root: Path, *, source_only: bool) -> Iterator[Path]:
         if source_only and not is_source(path.relative_to(root).parts
                                          if root.is_dir() else (path.name,), path):
             continue
-        if is_probably_binary(path):
-            continue
+        try:
+            if is_probably_binary(path):
+                continue
+        except OSError:
+            # Yield it anyway. The detector's read will fail the same way and
+            # record it under files_unreadable — dropping it here instead
+            # would erase the file from the report entirely.
+            pass
         yield path
 ```
 
