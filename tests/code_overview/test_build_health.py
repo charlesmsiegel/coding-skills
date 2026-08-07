@@ -60,7 +60,7 @@ def test_a_clean_package_scores_top_marks(run_script, sized_repo):
 def test_more_findings_never_improves_the_grade(run_script, sized_repo):
     few = read_meta(build(run_script, sized_repo, [finding(category="security")]))
     many = read_meta(build(run_script, sized_repo,
-                           [finding(category="security") for _ in range(40)]))
+                           [finding(category="security", line=n) for n in range(40)]))
     assert many["score"] < few["score"]
 
 
@@ -68,7 +68,8 @@ def test_severity_matters_more_than_count(run_script, sized_repo):
     one_high = read_meta(build(run_script, sized_repo,
                                [finding(category="security", severity="high")]))
     three_low = read_meta(build(run_script, sized_repo,
-                                [finding(category="security", severity="low")] * 3))
+                                [finding(category="security", severity="low", line=n)
+                                 for n in range(3)]))
     assert one_high["score"] < three_low["score"], (
         "high is worth ten lows; three lows must not outweigh one high"
     )
@@ -76,9 +77,11 @@ def test_severity_matters_more_than_count(run_script, sized_repo):
 
 def test_weighting_puts_bugs_above_style(run_script, sized_repo):
     correctness = read_meta(build(run_script, sized_repo,
-                                  [finding(category="mutation_hazards", severity="high")] * 6))
+                                  [finding(category="mutation_hazards", severity="high", line=n)
+                                   for n in range(6)]))
     hygiene = read_meta(build(run_script, sized_repo,
-                              [finding(category="naming_issues", severity="high")] * 6))
+                              [finding(category="naming_issues", severity="high", line=n)
+                               for n in range(6)]))
     assert correctness["score"] < hygiene["score"]
 
 
@@ -96,7 +99,8 @@ def test_metadata_carries_every_documented_field(run_script, sized_repo):
 
 def test_category_rows_carry_their_own_grade_and_counts(run_script, sized_repo):
     meta = read_meta(build(run_script, sized_repo,
-                           [finding(category="security", severity="high")] * 3))
+                           [finding(category="security", severity="high", line=n)
+                            for n in range(3)]))
     security = next(row for row in meta["categories"] if row["key"] == "security")
     assert security["findings"] == {"high": 3, "medium": 0, "low": 0, "total": 3}
     assert security["grade"] != "A+"
@@ -183,8 +187,8 @@ def test_the_root_document_rolls_up_every_package(run_script, repo):
     for package, count in (("alpha", 30), ("beta", 1)):
         report = repo.path / f"{package}.json"
         report.write_text(json.dumps([
-            finding(category="security", severity="high", file=f"src/{package}/m0.py")
-            for _ in range(count)]))
+            finding(category="security", severity="high", file=f"src/{package}/m0.py", line=n)
+            for n in range(count)]))
         reports[package] = report
         run_script(BUILD_HEALTH, "--out", repo.path / f"src/{package}/docs/health.html",
                    "--findings", report, "--repo", repo.path, "--name", package,
@@ -327,7 +331,8 @@ def test_the_root_grade_is_sized_over_the_mapped_packages_only(run_script, repo)
     repo.commit("init")
     report = repo.path / "f.json"
     report.write_text(json.dumps(
-        [finding(file="src/app/m0.py", category="security", severity="high")] * 5))
+        [finding(file="src/app/m0.py", category="security", severity="high", line=n)
+         for n in range(5)]))
     out = repo.path / "docs/health.html"
     run_script(BUILD_HEALTH, "--root", "--out", out, "--map", repo.path / "docs/code-overview.json",
                "--findings", report, "--repo", repo.path, "--name", "whole-repo",
@@ -390,6 +395,153 @@ def test_duplicate_package_names_are_rejected(run_script, repo):
                         "--repo", repo.path, "--name", "whole-repo", expect_rc=1)
     assert "two packages named 'api'" in result.stderr
     assert "unique" in result.stderr
+
+
+def test_a_single_detector_report_grades_nothing(run_script, sized_repo):
+    """One detector's output says what it found, never what else was examined."""
+    report = sized_repo.path / "one.json"
+    report.write_text(json.dumps({"issues": []}))
+    out = sized_repo.path / "src/app/docs/health.html"
+    result = run_script(BUILD_HEALTH, "--out", out, "--findings", report,
+                        "--repo", sized_repo.path, "--name", "app", "--root-dir", "src/app",
+                        "--doctor", "python-code-doctor")
+    meta = read_meta(out)
+    assert meta["score"] is None, "an empty find_duplicates run is not an A+ in seven categories"
+    assert meta["grade"] == "—"
+    assert "single detector" in result.stderr
+    assert "--covers" in result.stderr
+
+
+def test_covers_names_what_was_examined(run_script, sized_repo):
+    report = sized_repo.path / "one.json"
+    report.write_text(json.dumps({"issues": [finding(smell_type="duplicate_block")]}))
+    out = sized_repo.path / "src/app/docs/health.html"
+    run_script(BUILD_HEALTH, "--out", out, "--findings", report, "--repo", sized_repo.path,
+               "--name", "app", "--root-dir", "src/app", "--covers", "duplication")
+    meta = read_meta(out)
+    assert meta["ungraded"] == [k for k in
+                                (row["key"] for row in meta["categories"]) if k != "duplication"]
+    duplication = next(r for r in meta["categories"] if r["key"] == "duplication")
+    assert duplication["graded"] is True
+
+
+def test_covers_rejects_an_unknown_category(run_script, sized_repo):
+    report = sized_repo.path / "one.json"
+    report.write_text("[]")
+    result = run_script(BUILD_HEALTH, "--out", sized_repo.path / "h.html", "--findings", report,
+                        "--repo", sized_repo.path, "--name", "app", "--covers", "not-a-category",
+                        expect_rc=1)
+    assert "unknown categories" in result.stderr
+
+
+def test_a_companion_report_cannot_undo_the_first_reports_skip(run_script, sized_repo):
+    """The Python+Django merge the skill recommends, with --skip-duplicates."""
+    python = sized_repo.path / "py.json"
+    python.write_text(json.dumps({
+        "meta": {"analyzers_run": ["security", "complexity"], "analyzers_skipped": ["duplicates"]},
+        "categories": {"security": {"issues": [finding(severity="high")]},
+                       "complexity": {"issues": []}},
+    }))
+    django = sized_repo.path / "dj.json"   # flat list: says nothing about coverage
+    django.write_text(json.dumps([finding(smell_type="n_plus_one_query", file="src/app/mod0.py")]))
+    out = sized_repo.path / "src/app/docs/health.html"
+    run_script(BUILD_HEALTH, "--out", out, "--findings", python, "--findings", django,
+               "--repo", sized_repo.path, "--name", "app", "--root-dir", "src/app",
+               "--doctor", "python-code-doctor")
+    meta = read_meta(out)
+    assert "duplication" in meta["ungraded"], (
+        "the flat companion report has no duplication detector either; it must not be "
+        "read as evidence that duplication was examined"
+    )
+    assert "security" not in meta["ungraded"]
+    assert "complexity" not in meta["ungraded"]
+
+
+def test_the_same_defect_from_two_doctors_is_charged_once(run_script, sized_repo):
+    """Both doctors flag a hardcoded SECRET_KEY at the same line, at different severities."""
+    shared = {"file": "src/app/mod0.py", "line": 2, "smell_type": "hardcoded_secret"}
+    a = sized_repo.path / "a.json"
+    a.write_text(json.dumps([{**shared, "severity": "medium", "description": "python's wording"}]))
+    b = sized_repo.path / "b.json"
+    b.write_text(json.dumps([{**shared, "severity": "high", "description": "django's wording"}]))
+    out = sized_repo.path / "src/app/docs/health.html"
+    run_script(BUILD_HEALTH, "--out", out, "--findings", a, "--findings", b,
+               "--repo", sized_repo.path, "--name", "app", "--root-dir", "src/app",
+               "--doctor", "django-code-doctor")
+    meta = read_meta(out)
+    assert meta["findings_total"] == 1
+    assert meta["duplicates_merged"] == 1
+    assert meta["findings_by_severity"]["high"] == 1, "the stronger call survives"
+    assert meta["findings_by_severity"]["medium"] == 0
+    assert "merged" in out.read_text()
+
+
+def test_the_same_finding_in_two_packages_is_not_merged(run_script, repo):
+    """Basename-keyed dedup would collapse these; monorepos produce them constantly."""
+    for package in ("a", "b"):
+        repo.write(f"src/{package}/models.py", "\n".join(f"x{i}=1" for i in range(400)))
+    repo.commit("init")
+    report = repo.path / "f.json"
+    report.write_text(json.dumps([
+        {"file": "src/a/models.py", "line": 3, "smell_type": "fat_model", "severity": "high"},
+        {"file": "src/b/models.py", "line": 3, "smell_type": "fat_model", "severity": "high"},
+    ]))
+    out = repo.path / "docs/health.html"
+    run_script(BUILD_HEALTH, "--out", out, "--findings", report, "--repo", repo.path,
+               "--name", "whole", "--doctor", "django-code-doctor")
+    meta = read_meta(out)
+    assert meta["findings_total"] == 2
+    assert meta["duplicates_merged"] == 0
+
+
+def test_the_grade_matches_the_score_that_is_published(run_script, sized_repo):
+    """A published 93.0 beside an A- would contradict the documented bands."""
+    for count in range(0, 40):
+        meta = read_meta(build(run_script, sized_repo,
+                               [finding(category="security", severity="low", line=n)
+                                for n in range(count)]))
+        for row in meta["categories"]:
+            if row["score"] is not None:
+                assert row["grade"] == grade_of(row["score"]), row
+        if meta["score"] is not None:
+            assert meta["grade"] == grade_of(meta["score"])
+
+
+BANDS = ((97, "A+"), (93, "A"), (90, "A-"), (87, "B+"), (83, "B"), (80, "B-"),
+         (77, "C+"), (73, "C"), (70, "C-"), (67, "D+"), (63, "D"), (60, "D-"))
+
+
+def grade_of(score):
+    for threshold, letter in BANDS:
+        if score >= threshold:
+            return letter
+    return "F"
+
+
+def test_the_root_keeps_repo_level_configuration_findings(run_script, repo):
+    for module in range(4):
+        repo.write(f"src/api/m{module}.py", "\n".join(f"x{i}=1" for i in range(300)))
+    repo.write("tsconfig.json", "{}\n")
+    repo.write("docs/code-overview.json", json.dumps({
+        "schema": "code-overview/1",
+        "packages": [{"name": "api", "roots": ["src/api"], "docs": "src/api/docs",
+                      "language": "python", "doctor": "python-code-doctor"}],
+    }))
+    repo.commit("init")
+    report = repo.path / "f.json"
+    report.write_text(json.dumps([
+        finding(file="src/api/m0.py", category="security", severity="high"),
+        finding(file="tsconfig.json", line=1, category="security", severity="high"),
+        finding(file="legacy/old.py", line=1, category="security", severity="high"),
+    ]))
+    out = repo.path / "docs/health.html"
+    run_script(BUILD_HEALTH, "--root", "--out", out, "--map", repo.path / "docs/code-overview.json",
+               "--findings", report, "--repo", repo.path, "--name", "whole-repo",
+               "--doctor", "python-code-doctor")
+    files = {f["file"] for f in read_meta(out)["top_findings"]}
+    assert "tsconfig.json" in files, "repo-level configuration belongs to the repo grade"
+    assert "src/api/m0.py" in files
+    assert "legacy/old.py" not in files, "an unmapped directory is still out of scope"
 
 
 def test_malformed_findings_fail_loudly(run_script, sized_repo, tmp_path):

@@ -148,8 +148,19 @@ def test_the_documented_pipeline_produces_a_navigable_set(run_script, monorepo, 
     for row in root["packages"]:
         package = next(p for p in chosen if p["name"] == row["package"])
         assert row["grade"] == read_meta(repo.path / package["docs"] / "health.html")["grade"]
-    assert root["findings_total"] == sum(
+    # The root keeps everything the packages keep, plus findings about
+    # repo-level configuration (the root pyproject.toml) that belongs to no
+    # package — so it is a superset, not an equal.
+    package_total = sum(
         read_meta(repo.path / p["docs"] / "health.html")["findings_total"] for p in chosen)
+    assert root["findings_total"] >= package_total
+    root_only = {(f["file"], f["line"], f["type"]) for f in root["top_findings"]}
+    for package in chosen:
+        root_only -= {(f["file"], f["line"], f["type"])
+                      for f in read_meta(repo.path / package["docs"] / "health.html")["top_findings"]}
+    assert all("/" not in path for path, _, _ in root_only), (
+        f"the root's extra findings must be repo-level config, not package code: {root_only}"
+    )
 
     # the fixture is deliberately awful, so the grade has to say so
     assert root["grade"] not in {"A+", "A", "A-"}

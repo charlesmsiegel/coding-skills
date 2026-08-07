@@ -33,6 +33,7 @@ import datetime as dt
 import sys
 from pathlib import Path
 
+import common
 import rubric
 from common import (HEALTH_SCHEMA, doc_path, esc, git_sha, json_block, listed_packages,
                     load_findings, load_map, measure, read_asset, read_meta, rel_href,
@@ -79,21 +80,26 @@ def score_categories(findings: list[dict], loc: int, covered) -> dict:
         density = rubric.density(weighted, loc)
 
         graded = covered is GRADE_EVERYTHING or key in covered
-        score = rubric.score_from_density(density, half_life) if graded else None
+        # Round before grading, not after. A score of 92.9535 is published as
+        # 93.0, and the bands say 93.0 is an A — so grading the unrounded value
+        # would print "93.0" beside "A-" and contradict the documented scale.
+        score = (round(rubric.score_from_density(density, half_life), 1)
+                 if graded else None)
         scores[key] = score
         rows.append({
             "key": key, "label": label, "weight": weight, "half_life": half_life,
             "graded": graded,
-            "score": None if score is None else round(score, 1),
+            "score": score,
             "grade": rubric.grade_for(score),
             "density": round(density, 2),
             "findings": counts,
         })
 
     overall = rubric.weighted_overall(scores)
+    overall = None if overall is None else round(overall, 1)
     return {
         "categories": rows,
-        "score": None if overall is None else round(overall, 1),
+        "score": overall,
         "grade": rubric.grade_for(overall),
         "ungraded": [row["key"] for row in rows if not row["graded"]],
         "unmapped_types": sorted(unmapped),
@@ -262,8 +268,12 @@ def render_package_table(packages: list[dict], links: dict[str, str]) -> str:
 
 def render_caveats(errors: dict[str, str], skipped: set[str], unmapped: list[str],
                    ungraded: list[str], notes: list[str], out_of_scope: int,
-                   roots: list[str]) -> str:
+                   roots: list[str], duplicates: int = 0) -> str:
     parts = []
+    if duplicates:
+        parts.append(f'<div class="callout">{duplicates} finding(s) were reported by more than '
+                     'one doctor at the same file, line and type, and were merged — keeping the '
+                     'higher severity — so one defect is charged once.</div>')
     if out_of_scope:
         listed = ", ".join(f"<code>{esc(r)}</code>" for r in roots)
         parts.append(f'<div class="callout">{out_of_scope} finding(s) in the report were about '
@@ -272,9 +282,15 @@ def render_caveats(errors: dict[str, str], skipped: set[str], unmapped: list[str
                      "that code should be graded, add it to the package map.</div>")
     if errors:
         listed = ", ".join(f"<code>{esc(k)}</code>" for k in sorted(errors))
+        # Not "an upper bound": the affected category is dropped and the weights
+        # renormalized, so restoring it could move the overall either way —
+        # up if it would have scored well, down if badly. Saying "upper bound"
+        # would give the reader a direction of error that is simply wrong.
         parts.append('<div class="callout bad"><strong>Detectors that did not complete:</strong> '
                      f"{listed}. A zero count in those categories means <em>unknown</em>, "
-                     "not clean — the grade is an upper bound.</div>")
+                     "not clean, so they were dropped from the grade — which makes this score "
+                     "partial rather than high or low: the missing categories could have moved "
+                     "it either way.</div>")
     if skipped:
         listed = ", ".join(f"<code>{esc(k)}</code>" for k in sorted(skipped))
         parts.append('<div class="callout warn"><strong>Detectors that were not run:</strong> '
@@ -333,10 +349,50 @@ def scoring_roots(args, repo: Path) -> list[str]:
     return ["."]
 
 
-def resolve_coverage(args, errors: dict[str, str], skipped: set[str]):
-    """Which rubric categories this analysis is entitled to grade."""
+def is_repo_root_file(path: str, repo: Path) -> bool:
+    """A file sitting directly in the repo root — repo-wide configuration."""
+    if not path:
+        return False
+    try:
+        candidate = Path(path)
+        resolved = (candidate if candidate.is_absolute() else repo / candidate).resolve()
+        return resolved.parent == repo and resolved.is_file()
+    except (OSError, ValueError):
+        return False
+
+
+def resolve_coverage(args, reports: list[dict]):
+    """Which rubric categories this analysis is entitled to grade.
+
+    Coverage is **evidence**, not the doctor's advertised capability. A report
+    from `analyze_all.py` names the analyzers that ran, so it can be believed
+    per category; the other two shapes cannot, and are handled by their own
+    rules rather than being credited with everything the doctor could have done.
+    That distinction is what stops `--skip-duplicates`, a crashed detector, or a
+    single-detector report from being read as a clean bill of health.
+    """
     if args.assume_full_coverage:
         return GRADE_EVERYTHING
+    if args.covers:
+        named = {c.strip() for part in args.covers for c in part.split(",") if c.strip()}
+        unknown = named - set(rubric.CATEGORY_KEYS)
+        if unknown:
+            raise SystemExit(f"error: --covers names unknown categories: {', '.join(sorted(unknown))}")
+        return named
+
+    evidenced = [report for report in reports if report["shape"] == common.SHAPE_FULL]
+    if evidenced:
+        # At least one report says what it ran. Believe it, and let the other
+        # reports contribute findings without inflating what was examined.
+        return {rubric.DETECTOR_CATEGORIES[name]
+                for report in evidenced for name in report["ran"]
+                if name in rubric.DETECTOR_CATEGORIES}
+
+    if any(report["shape"] == common.SHAPE_PARTIAL for report in reports):
+        warn("a findings file is a single detector's output, which says nothing about what "
+             "else was examined — every category is ungraded. Pass --covers a,b,c to name "
+             "what this analysis actually looked at, or --assume-full-coverage.")
+        return set()
 
     covered = rubric.DOCTOR_COVERAGE.get(args.doctor)
     if covered is None:
@@ -346,17 +402,14 @@ def resolve_coverage(args, errors: dict[str, str], skipped: set[str]):
         # one output this skill must never produce.
         warn(f"no coverage profile for doctor {args.doctor!r} — every category is ungraded. "
              "Pass --assume-full-coverage if the findings really do cover the whole rubric, "
-             "or add the doctor to rubric.DOCTOR_COVERAGE.")
+             "--covers a,b,c to name what was examined, or add the doctor to "
+             "rubric.DOCTOR_COVERAGE.")
         return set()
-
-    # An analyzer that crashed, was skipped, or never ran reported nothing, and
-    # nothing is not a clean bill of health.
-    absent = set(errors) | set(skipped)
-    return set(covered) - {rubric.DETECTOR_CATEGORIES[name]
-                           for name in absent if name in rubric.DETECTOR_CATEGORIES}
+    return set(covered)
 
 
-def build(args, findings: list[dict], errors: dict[str, str], skipped: set[str]) -> tuple[str, dict]:
+def build(args, findings: list[dict], errors: dict[str, str], skipped: set[str],
+          reports: list[dict], duplicates: int) -> tuple[str, dict]:
     repo = Path(args.repo).resolve()
     relative_roots = scoring_roots(args, repo)
     roots = [repo / r for r in relative_roots]
@@ -369,11 +422,21 @@ def build(args, findings: list[dict], errors: dict[str, str], skipped: set[str])
     scope = [repo / s for s in (args.scope or relative_roots)]
     out_of_scope = 0
     if scope and [Path(s).resolve() for s in scope] != [repo]:
-        kept = [f for f in findings if within(str(f.get("file", "")), scope, repo)]
+        def in_scope(finding: dict) -> bool:
+            path = str(finding.get("file", ""))
+            if within(path, scope, repo):
+                return True
+            # The repo grade has to keep findings about repo-level configuration
+            # — tsconfig.json, the root manifest, settings — which belong to no
+            # package but describe the whole tree. Only files sitting directly
+            # in the repo root qualify; an unmapped *directory* is still out.
+            return args.root and is_repo_root_file(path, repo)
+
+        kept = [f for f in findings if in_scope(f)]
         out_of_scope = len(findings) - len(kept)
         findings = kept
 
-    covered = resolve_coverage(args, errors, skipped)
+    covered = resolve_coverage(args, reports)
     scored = score_categories(findings, size["loc"], covered)
     packages = []
     links: dict[str, str] = {}
@@ -398,6 +461,7 @@ def build(args, findings: list[dict], errors: dict[str, str], skipped: set[str])
         "analyzer_errors": errors,
         "analyzers_skipped": sorted(skipped),
         "findings_out_of_scope": out_of_scope,
+        "duplicates_merged": duplicates,
         "findings_total": len(findings),
         "findings_by_severity": {sev: sum(1 for f in findings if f.get("severity") == sev)
                                  for sev in SEVERITY_ORDER},
@@ -423,7 +487,8 @@ def build(args, findings: list[dict], errors: dict[str, str], skipped: set[str])
         "TOP_FINDINGS": render_top_findings(meta["top_findings"]),
         "BY_TYPE": render_by_type(findings),
         "CAVEATS": render_caveats(errors, skipped, scored["unmapped_types"],
-                                  scored["ungraded"], args.note, out_of_scope, relative_roots),
+                                  scored["ungraded"], args.note, out_of_scope,
+                                  relative_roots, duplicates),
         "META_JSON": json_block(meta),
     })
 
@@ -502,6 +567,11 @@ def main(argv=None) -> int:
     parser.add_argument("--files", type=int, help="override the measured file count")
     parser.add_argument("--commit", default="", help="commit sha for the metadata")
     parser.add_argument("--date", default="", help="generation date (default: today)")
+    parser.add_argument("--covers", action="append", default=[],
+                        help="comma-separated rubric categories this analysis actually examined "
+                             f"({', '.join(rubric.CATEGORY_KEYS)}). Use when the findings come "
+                             "from a single detector or an unrecognized tool, where nothing in "
+                             "the file says what was looked at")
     parser.add_argument("--assume-full-coverage", action="store_true",
                         help="grade every category regardless of which doctor produced the "
                              "findings; without it, an unrecognized --doctor leaves everything "
@@ -513,8 +583,8 @@ def main(argv=None) -> int:
     if not args.name:
         args.name = Path(args.repo).resolve().name if args.root else "package"
 
-    findings, errors, skipped = load_findings(args.findings)
-    page, meta = build(args, findings, errors, skipped)
+    findings, errors, skipped, reports, duplicates = load_findings(args.findings)
+    page, meta = build(args, findings, errors, skipped, reports, duplicates)
 
     out = Path(args.out)
     out.parent.mkdir(parents=True, exist_ok=True)
