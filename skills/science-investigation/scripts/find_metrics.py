@@ -39,7 +39,7 @@ STRONG_TOKENS = frozenset({
     "ndcg", "mrr", "map", "correctness", "faithfulness", "groundedness", "grounding",
     "relevance", "helpfulness", "coherence", "fluency", "toxicity", "calibration",
     "brier", "rmse", "mse", "mae", "mape", "perplexity", "bleu", "rouge", "meteor",
-    "bertscore", "score", "quality", "metric", "judge", "grade",
+    "bertscore", "score", "quality", "metric", "judge", "grade", "composite",
     "rating", "eval", "benchmark", "kappa", "agreement", "regret", "mean",
     "average", "avg", "median", "delta", "lift", "uplift", "pvalue", "baseline",
 })
@@ -65,7 +65,7 @@ _NUMBER = r"-?(?:\d+\.?\d*|\.\d+)(?:[eE][-+]?\d+)?"
 # A bare `qualityScore(` is deliberately NOT matched: it is indistinguishable from
 # a call, and treating every call as a definition would bury the real ones.
 _DEF_RE = re.compile(
-    r"\b(?:def|function|func|fn)\s+(?:\([^)]*\)\s*)?([A-Za-z_][\w]*)\s*\("
+    r"\b(?:def|function|func|fun|fn|sub)\s+(?:\([^)]*\)\s*)?([A-Za-z_][\w]*)\s*\("
     r"|^\s*(?:(?:public|private|protected|static|final|virtual|override|async|export)\s+)*"
     r"(?:[A-Za-z_][\w:<>,\[\] ]*?[\w>\]])\s+([A-Za-z_][\w]*)\s*\([^;]*\)\s*(?:const\s*)?\{"
 )
@@ -95,6 +95,15 @@ _RENORMALIZE_RE = re.compile(
     r"for\s+\w+\s+in\s+[^\n]*\bif\s+[\w.\[\]()]+\s+is\s+not\s+None"
     r"|\.filter\([^)]*(?:!==?\s*(?:null|undefined)|\bBoolean\b)"
     r"|\bdropna\(\)"
+)
+# What makes a dropped-None list a *composite* rather than ordinary cleanup: the
+# survivors are then averaged or summed. Without an aggregate nearby,
+# `[v for v in values if v is not None]` is a utility, and calling it a
+# renormalized composite invents measurement in code that has none.
+_AGGREGATE_RE = re.compile(
+    r"\b(?:sum|mean|average|avg|nanmean|median|agg|aggregate|reduce|fmean)\s*\("
+    r"|/\s*len\s*\("
+    r"|\.(?:mean|sum|average|agg)\s*\("
 )
 # `0.4 * relevance + 0.2 * latency`
 _WEIGHTED_SUM_RE = re.compile(r"(?:" + _NUMBER + r"\s*\*\s*[A-Za-z_]|[A-Za-z_][\w.]*\s*\*\s*" + _NUMBER + r")")
@@ -157,7 +166,16 @@ def named_on(line: str, stripped: str) -> list:
         key = _KEY_RE.match(line)
         if key and "=" not in stripped.split(":")[0]:
             names.append((key.group(1), key.group(2)))
-    return names
+    # `const accuracy = function accuracy(rows) {...}` matches both patterns with
+    # the same name, which doubled the raw candidate and dead-site counts while
+    # the final dedup showed one — a headline disagreeing with its own rows.
+    deduped, seen = [], set()
+    for name, value in names:
+        if name in seen:
+            continue
+        seen.add(name)
+        deduped.append((name, value))
+    return deduped
 
 
 def name_candidates(line: str, stripped: str, path_display: str, lineno: int, defined: dict) -> list:
@@ -178,7 +196,9 @@ def name_candidates(line: str, stripped: str, path_display: str, lineno: int, de
         # a local inside a function is a step in a computation, and "this local is
         # never read in another file" is not a finding.
         if top_level and not _DISCOVERED_RE.search(name):
-            defined.setdefault(name, []).append((path_display, lineno))
+            sites = defined.setdefault(name, [])
+            if (path_display, lineno) not in sites:
+                sites.append((path_display, lineno))
         if not is_threshold:
             out.append(candidate(
                 "metric_definition", path_display, lineno,
@@ -188,7 +208,7 @@ def name_candidates(line: str, stripped: str, path_display: str, lineno: int, de
     return out
 
 
-def scan_line(line: str, path_display: str, lineno: int, defined: dict) -> list:
+def scan_line(line: str, path_display: str, lineno: int, defined: dict, window: str = "") -> list:
     """Candidates from one line. `defined` accumulates metric name -> first site."""
     stripped = line.strip()
     if not stripped or stripped.startswith(("#", "//", "*", "<!--")):
@@ -227,7 +247,7 @@ def scan_line(line: str, path_display: str, lineno: int, defined: dict) -> list:
             CONFIRM["composite_weight"], stripped,
         ))
 
-    if _RENORMALIZE_RE.search(line):
+    if _RENORMALIZE_RE.search(line) and _AGGREGATE_RE.search(window or line):
         out.append(candidate(
             "renormalized_composite", path_display, lineno,
             "missing values are dropped here — the survivors' aggregate can be reported as the whole",
@@ -259,7 +279,10 @@ def scan(root: Path) -> tuple:
             continue
         corpus[display] = lines
         for lineno, line in enumerate(lines, 1):
-            found += scan_line(line, display, lineno, defined)
+            # A few lines of context, because the aggregate that makes a dropped-None
+            # list a composite usually sits on the next line, not this one.
+            window = "\n".join(lines[max(0, lineno - 2):lineno + 3])
+            found += scan_line(line, display, lineno, defined, window)
     return found, defined, corpus, skipped
 
 
@@ -297,20 +320,20 @@ def dead_metrics(defined: dict, corpus: dict) -> list:
     return out
 
 
-MEASURE_KINDS = ("metric_definition", "threshold", "composite_weight", "renormalized_composite")
+MEASURE_KINDS = ("metric_definition", "threshold", "composite_weight")
+# Kinds that mean nothing without a measure nearby. `return 0` in a CLI's main(),
+# `settings.get("retries", 0)`, and `[v for v in values if v is not None]` in a
+# utility module are all ordinary code; reporting them as measurement sites in an
+# unrelated subtree manufactures measurement content, which is the one thing this
+# skill tells its reader never to do. A zero default inside an exception handler
+# is still caught by find_fail_soft.py, which reads the handler, not the name.
+SCOPED_KINDS = ("zero_default",)
 
 
 def scope_zero_defaults(rows: list) -> list:
-    """Drop zero-default rows from files with no measurement content at all.
-
-    `return 0` in a CLI's main() and `settings.get("retries", 0)` are not
-    measurement, and reporting them as "zero-default sites" in an unrelated
-    subtree manufactures measurement content — the one thing this skill tells its
-    reader never to do. A zero default inside an exception handler is still caught
-    by find_fail_soft.py, which reads the handler rather than the name.
-    """
+    """Drop context-free rows from files with no measurement content at all."""
     measured = {r["file"] for r in rows if r["kind"] in MEASURE_KINDS}
-    return [r for r in rows if r["kind"] != "zero_default" or r["file"] in measured]
+    return [r for r in rows if r["kind"] not in SCOPED_KINDS or r["file"] in measured]
 
 
 def dedupe(rows: list, limit: int) -> list:
@@ -356,7 +379,11 @@ def headline_for(rows: list, defined: dict, files: int) -> str:
         return (str(len(renorm)) + " site(s) drop missing values before aggregating: a run where half the "
                 "components skipped can report the survivors' average as if it were the whole.")
     if zeros:
-        return (str(len(zeros)) + " zero-default site(s) alongside " + str(len(defined))
+        # Counted from the rows, not from `defined`: that map holds only
+        # module-level names, so a metric under an indented config key produced
+        # "alongside 0 metric name(s)" with its own definition row in the output.
+        printed = {r["detail"].split(" ")[0] for r in rows if r["kind"] == "metric_definition"}
+        return (str(len(zeros)) + " zero-default site(s) alongside " + str(len(printed))
                 + " metric name(s): check that 'never measured' cannot be reported as 0.0.")
     if weights:
         return (str(len(weights)) + " composite/weight site(s): ask where each weight was derived, "

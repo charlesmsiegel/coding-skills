@@ -51,6 +51,7 @@ CONFIRM = {
 _HANDLER_RE = re.compile(
     r"^\s*(?:\}\s*)?(?:except\b[^:]*:|rescue\b)"
     r"|\bcatch\s*(?:\([^)]*\))?\s*\{"
+    r"|\.catch\s*\(\s*(?:\([^)]*\)|[A-Za-z_$][\w$]*)?\s*=>\s*\{"   # judge(row).catch(() => { ... })
 )
 # A complete zero literal, never a prefix of one: `0`, `0.`, `0.00` — but not the
 # `0` inside `0.75`, which would make every "return a real low score" path a false
@@ -180,12 +181,20 @@ def scan_handlers(lines: list, display: str) -> list:
         code = [_COMMENT_RE.sub("", b).rstrip() for b in body]
         code = [b for b in code if b.strip()]
         joined = "\n".join(code)
-        if _SURFACED_RE.search(_STRING_BODY_RE.sub(r"\1\1", joined)):
-            continue  # re-raised: the error is not being hidden
-        if _ZERO_BODY_RE.search(joined):
+        surfaced = _SURFACED_RE.search(_STRING_BODY_RE.sub(r"\1\1", joined))
+        zeroed = _ZERO_BODY_RE.search(joined)
+        # A raise clears the handler only when nothing else in it produces a score.
+        # `if isinstance(exc, Fatal): raise` followed by `return 0.0` re-raises one
+        # class and scores every other failure, and reading the raise as covering
+        # the whole handler reported that as clean.
+        if surfaced and not zeroed:
+            continue
+        if zeroed:
+            detail = "a failure here yields 0/empty — indistinguishable from a genuine low score"
+            if surfaced:
+                detail += " (another path re-raises — check which errors take which)"
             out.append(candidate(
-                "error_becomes_zero", display, index + 1,
-                "a failure here yields 0/empty — indistinguishable from a genuine low score",
+                "error_becomes_zero", display, index + 1, detail,
                 CONFIRM["error_becomes_zero"], line.strip() + " ... " + " ".join(b.strip() for b in body)[:120],
             ))
         elif code and all(_EMPTY_BODY_RE.match(b) for b in code):
@@ -226,7 +235,10 @@ def scan_promise_catches(line: str, display: str, lineno: int) -> list:
     return []
 
 
-def scan_line(line: str, display: str, lineno: int) -> list:
+_SAMPLING_OFF_RE = re.compile(r"\bdo_sample[\"']?\s*[=:]\s*false", re.IGNORECASE)
+
+
+def scan_line(line: str, display: str, lineno: int, sampling_off: bool = False) -> list:
     out = []
     stripped = line.strip()
     if not stripped or stripped.startswith(("#", "//", "*", "<!--")):
@@ -258,8 +270,11 @@ def scan_line(line: str, display: str, lineno: int) -> list:
         ))
 
     nondet = _NONDET_RE.search(line)
-    if nondet:
+    if nondet and not sampling_off:
         value = nondet.group(1) or nondet.group(2)
+        # top_p = 1.0 is the neutral setting, not a sampling knob turned up.
+        if nondet.group(2) is not None and float(nondet.group(2)) >= 1.0:
+            value = "0"
         if value is None or float(value) > 0:
             out.append(candidate(
                 "nondeterminism", display, lineno,
@@ -288,8 +303,9 @@ def scan(root: Path) -> tuple:
             continue
         read += 1
         rows += scan_handlers(lines, display)
+        sampling_off = bool(_SAMPLING_OFF_RE.search("\n".join(lines)))
         for lineno, line in enumerate(lines, 1):
-            rows += scan_line(line, display, lineno)
+            rows += scan_line(line, display, lineno, sampling_off)
     return rows, read, skipped
 
 
