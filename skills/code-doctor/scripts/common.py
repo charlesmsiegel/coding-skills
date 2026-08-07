@@ -9,6 +9,7 @@ a formality.
 """
 
 import contextlib
+import os
 import sys
 from pathlib import Path
 from typing import Iterator
@@ -53,6 +54,14 @@ DOC_DIR_NAMES = frozenset({"docs", "doc", "documentation", "examples", "example"
 GENERATED_MARKERS = (".min.js", ".min.css", ".bundle.js", "_pb2.py", ".g.dart", ".generated.")
 
 _BINARY_SNIFF_BYTES = 8192
+
+
+class ScanPathError(ValueError):
+    """The path handed to a detector does not exist.
+
+    Ending the iterator instead would let a typo in an audit path produce an
+    authoritative-looking "No problems found" over nothing at all.
+    """
 
 
 def configure_output() -> None:
@@ -103,19 +112,23 @@ def walk_paths(root: Path) -> Iterator[Path]:
     if root.is_symlink():
         return
     if root.is_file():
-        candidates = [root]
-        rel_for = {root: (root.name,)}
-    elif root.is_dir():
-        candidates = sorted(p for p in root.rglob("*")
-                            if p.is_file() and not p.is_symlink())
-        rel_for = {p: p.relative_to(root).parts for p in candidates}
-    else:
+        yield root
         return
+    if not root.is_dir():
+        raise ScanPathError(f"{root}: no such file or directory")
 
-    for path in candidates:
-        parts = rel_for[path]
-        if EXCLUDE_DIRS.isdisjoint(parts):
-            yield path
+    # os.walk with in-place dirnames pruning, NOT rglob-then-filter: rglob
+    # descends into node_modules, vendor and target in full and stats every
+    # file inside before anything is discarded. On a real project that tree
+    # dwarfs the source and dominates both wall-clock and memory.
+    for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
+        dirnames[:] = sorted(d for d in dirnames
+                             if d not in EXCLUDE_DIRS
+                             and not Path(dirpath, d).is_symlink())
+        for name in sorted(filenames):
+            path = Path(dirpath, name)
+            if not path.is_symlink() and path.is_file():
+                yield path
 
 
 def walk_files(root: Path, *, source_only: bool) -> Iterator[Path]:
