@@ -245,3 +245,32 @@ ctx.at_least(major, minor) -> bool          # False when the version is unknown
 **Type consistency:** `ctx.at_least(major, minor)` is the single version gate used by Tasks 5, 9, and 10. `detect_django_version` returns `(version, source)` in Task 1 and is consumed unchanged in Tasks 2 and 3. Every `smell_type` a task emits appears in the inventory above.
 
 **Known deviation from the spec:** the spec named `find_version_issues` as one of "nine new" detectors and also listed it separately; the count is fifteen detectors total either way.
+
+---
+
+## Deviations from this plan, as built
+
+All fifteen detectors shipped. Four planned `smell_type`s were **dropped during
+implementation**, each because it would have fired on correct Django — the
+failure mode the whole skill is arranged to avoid.
+
+| Dropped | Why |
+|---|---|
+| `unbounded_queryset_in_view` | Distinguishing "renders an unbounded queryset" from "returns a queryset that a paginator will slice" needs to follow the value into the template. Every narrow version I could write missed the real cases; every broad version fired on paginated views. |
+| `missing_csrf_trusted_origins` | Correct to omit. A single-origin site needs no trusted origins, so this would fire on most well-written projects. |
+| `missing_samesite` | Correct to omit. `SESSION_COOKIE_SAMESITE` defaults to `Lax`. |
+| `no_unauthorized_path_test` | "Does the suite test that another user gets a 404?" is the right question and I could not detect it without guessing. It is covered prescriptively instead — `django-safety-net.md` and `django-drf.md` both require the test, and the SKILL.md workflow says to verify every ownership finding by hand. |
+
+Two further changes made while building:
+
+- **`unscoped_get_queryset` no longer fires on DRF viewsets.** Both the view
+  detector and the DRF detector reported the same gap; the DRF one owns it,
+  because it knows about permission classes and project defaults and gives advice
+  specific to DRF. Found by running the finished skill against a realistic bad
+  project, not by a test.
+- **`django-modernization.md` was absorbed into `django-upgrade-runbook.md`**
+  rather than kept alongside it, as the spec anticipated.
+
+**Final state:** 15 detectors, 122 distinct `smell_type` values, 11 references,
+312 tests in `tests/django_simplifier/` (963 across the repo), ruff clean,
+`validate_skills.py` passing.
