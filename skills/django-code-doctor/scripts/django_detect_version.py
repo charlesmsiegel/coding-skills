@@ -18,6 +18,8 @@ import argparse
 import re
 import sys
 import tomllib
+from importlib.metadata import PackageNotFoundError
+from importlib.metadata import version as installed_version
 from pathlib import Path
 
 from django_versions import parse_version
@@ -114,13 +116,12 @@ def _from_pipfile(path):
 def _from_installed_environment():
     """What is importable right now — a different claim, and labelled as one.
 
-    Imported rather than shelled out to, because `pip show` costs a subprocess
-    and this is a fallback nobody should be relying on anyway.
+    Read from the metadata rather than shelled out to, because `pip show` costs
+    a subprocess and this is a fallback nobody should be relying on anyway.
     """
     try:
-        from importlib.metadata import version as _version
-        return parse_version(_version("django"))
-    except Exception:      # not installed, or a metadata backend that disagrees
+        return parse_version(installed_version("django"))
+    except PackageNotFoundError:      # not installed in this interpreter
         return None
 
 
