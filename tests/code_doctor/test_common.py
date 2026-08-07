@@ -262,3 +262,81 @@ def test_emit_text_separates_candidates_from_findings(common, capsys):
     assert "1 finding(s)" in out
     assert "1 candidate(s)" in out
     assert "it is an entry point" in out
+
+
+def test_oldest_commit_days_is_age_of_root(common, repo):
+    """oldest_commit_days is computed from the root commit, not the last."""
+    import time
+    repo.write("initial.go", "package main\n")
+    # Backdate the first commit to 30 days ago (use Unix timestamp format)
+    old_time = int(time.time()) - (30 * 86400)
+    repo.commit("initial", date=str(old_time))
+    # Add recent commits
+    for i in range(21):
+        repo.write(f"f{i}.go", f"package p{i}\n")
+        repo.commit(f"commit {i}")
+    depth = common.probe_history(repo.path, min_commits=20)
+    # oldest_commit_days should be approximately 30, not 0
+    assert depth.oldest_commit_days is not None
+    assert depth.oldest_commit_days >= 29  # Allow 1 day margin for test execution time
+
+
+def test_probe_history_window_gates_on_age(common, repo):
+    """Sufficient commits but insufficient age fails the window_days check."""
+    repo.write("initial.go", "package main\n")
+    # Create initial commit at current time (today)
+    repo.commit("initial")
+    # Add 24 commits quickly (all recent)
+    for i in range(24):
+        repo.write(f"f{i}.go", f"package p{i}\n")
+        repo.commit(f"commit {i}")
+    # 25 commits but all within a day cannot answer a question about a year
+    depth = common.probe_history(repo.path, min_commits=20, window_days=365)
+    assert depth.is_repo is True
+    assert depth.is_shallow is False
+    assert depth.commit_count >= 20
+    assert depth.usable is False
+
+
+def test_extensionless_prose_basenames_excluded_from_source(common, repo):
+    """Files like README, LICENSE, CHANGELOG are prose, not code."""
+    repo.write("README", "# README\n")
+    repo.write("LICENSE", "MIT License\n")
+    repo.write("AUTHORS", "Alice\nBob\n")
+    repo.write("main.zig", "const x = 1;\n")
+    found = {p.name for p in common.walk_files(repo.path, source_only=True)}
+    assert found == {"main.zig"}
+    assert "README" not in found
+    assert "LICENSE" not in found
+    assert "AUTHORS" not in found
+
+
+def test_shallow_clone_detected(common, repo, tmp_path):
+    """A shallow clone reports is_shallow=True and usable=False."""
+    import subprocess
+    # Ensure the repo has at least one commit
+    repo.write("initial.go", "package main\n")
+    repo.commit("initial")
+
+    # Create a local bare repo
+    bare_repo = tmp_path / "bare.git"
+    subprocess.run(["git", "init", "--bare", str(bare_repo)], check=True,
+                   capture_output=True)
+    # Push repo to the bare repo (so we can clone from it)
+    subprocess.run(["git", "-C", str(repo.path), "remote", "add", "origin",
+                    str(bare_repo)], check=True, capture_output=True)
+    # Get the current branch and push it
+    current_branch = subprocess.run(["git", "-C", str(repo.path), "rev-parse",
+                                     "--abbrev-ref", "HEAD"],
+                                    check=True, capture_output=True, text=True).stdout.strip()
+    subprocess.run(["git", "-C", str(repo.path), "push", "-u", "origin",
+                    current_branch], check=True, capture_output=True)
+    # Clone from file:// URL with --depth to create a shallow clone
+    shallow_clone = tmp_path / "shallow"
+    subprocess.run(["git", "clone", "--depth", "1",
+                    f"file://{bare_repo}", str(shallow_clone)],
+                   check=True, capture_output=True)
+    depth = common.probe_history(shallow_clone)
+    assert depth.is_repo is True
+    assert depth.is_shallow is True
+    assert depth.usable is False
