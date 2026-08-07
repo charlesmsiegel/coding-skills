@@ -23,6 +23,20 @@ def read_meta(path: Path) -> dict:
     return json.loads(match.group(1).replace("<\\/", "</"))
 
 
+# One detector per rubric category — what "python-code-doctor ran fully" means.
+# Tests that want a graded page have to supply this envelope, because a bare
+# JSON list is exactly what a single detector emits and no longer implies a
+# full run.
+FULL_RUN = ["mutation_hazards", "security", "untested_modules", "complexity",
+            "design_smells", "duplicates", "naming_issues", "findings"]
+
+
+def full_report(findings):
+    """An analyze_all.py-shaped report declaring every analyzer ran."""
+    return {"meta": {"analyzers_run": FULL_RUN, "analyzer_errors": {}},
+            "categories": {"findings": {"issues": findings}}}
+
+
 def finding(**kwargs):
     base = {"file": "src/app/thing.py", "line": 3, "severity": "medium",
             "description": "something", "suggestion": "fix it"}
@@ -42,7 +56,7 @@ def build(run_script, repo, findings, *args, out="src/app/docs/health.html", **k
     """Build a package health page. A doctor is named by default — without one
     nothing is graded, which is its own test below rather than the baseline."""
     report = repo.path / "findings.json"
-    report.write_text(json.dumps(findings), encoding="utf-8")
+    report.write_text(json.dumps(full_report(findings)), encoding="utf-8")
     target = repo.path / out
     run_script(BUILD_HEALTH, "--out", target, "--findings", report,
                "--repo", repo.path, "--name", "app", "--root-dir", "src/app",
@@ -109,9 +123,13 @@ def test_category_rows_carry_their_own_grade_and_counts(run_script, sized_repo):
 
 
 def test_a_doctors_blind_spot_is_ungraded_not_perfect(run_script, sized_repo):
+    """Evidence never exceeds what the named doctor can actually detect."""
     meta = read_meta(build(run_script, sized_repo, [finding(smell_type="n_plus_one_query")],
                            "--doctor", "django-code-doctor"))
-    assert "duplication" in meta["ungraded"]
+    assert "duplication" in meta["ungraded"], (
+        "the report's envelope claims a duplication analyzer ran, but django-code-doctor "
+        "has none — a mislabeled run is not a reason to grade the category"
+    )
     duplication = next(row for row in meta["categories"] if row["key"] == "duplication")
     assert duplication["graded"] is False
     assert duplication["score"] is None
@@ -186,9 +204,9 @@ def test_the_root_document_rolls_up_every_package(run_script, repo):
     reports = {}
     for package, count in (("alpha", 30), ("beta", 1)):
         report = repo.path / f"{package}.json"
-        report.write_text(json.dumps([
+        report.write_text(json.dumps(full_report([
             finding(category="security", severity="high", file=f"src/{package}/m0.py", line=n)
-            for n in range(count)]))
+            for n in range(count)])))
         reports[package] = report
         run_script(BUILD_HEALTH, "--out", repo.path / f"src/{package}/docs/health.html",
                    "--findings", report, "--repo", repo.path, "--name", package,
@@ -250,7 +268,7 @@ def test_no_recognized_doctor_grades_nothing(run_script, sized_repo):
     assert meta["score"] is None
     assert meta["grade"] == "—"
     assert set(meta["ungraded"]) == {row["key"] for row in meta["categories"]}
-    assert "no coverage profile" in result.stderr
+    assert "which analyzers ran" in result.stderr
     assert "--assume-full-coverage" in result.stderr, "the warning has to name the override"
 
 
@@ -698,9 +716,113 @@ def test_a_package_with_no_health_page_stays_in_the_roll_up(run_script, repo):
     assert "not generated" in out.read_text()
 
 
+def test_a_bare_list_grades_nothing_without_covers(run_script, sized_repo):
+    """`find_duplicates.py --format json` prints `[]` — the same shape as a full
+    Django run, so a bare list cannot imply a doctor's whole profile."""
+    report = sized_repo.path / "one.json"
+    report.write_text("[]")
+    out = sized_repo.path / "src/app/docs/health.html"
+    result = run_script(BUILD_HEALTH, "--out", out, "--findings", report,
+                        "--repo", sized_repo.path, "--name", "app", "--root-dir", "src/app",
+                        "--doctor", "python-code-doctor")
+    meta = read_meta(out)
+    assert meta["score"] is None, "one empty detector is not an A+ in seven categories"
+    assert meta["grade"] == "—"
+    assert "which analyzers ran" in result.stderr
+    assert "--covers" in result.stderr
+
+
+def test_a_django_only_run_is_graded_by_declaring_its_coverage(run_script, sized_repo):
+    """The documented path for a bare list: say what it covered."""
+    report = sized_repo.path / "dj.json"
+    report.write_text(json.dumps([finding(smell_type="n_plus_one_query", severity="high")]))
+    out = sized_repo.path / "src/app/docs/health.html"
+    run_script(BUILD_HEALTH, "--out", out, "--findings", report, "--repo", sized_repo.path,
+               "--name", "app", "--root-dir", "src/app", "--doctor", "django-code-doctor",
+               "--covers", "correctness,security,tests,complexity,design,hygiene")
+    meta = read_meta(out)
+    assert meta["score"] is not None
+    assert meta["ungraded"] == ["duplication"], "exactly django's blind spot, and nothing else"
+
+
+def test_a_stale_root_is_reported_rather_than_graded(run_script, sized_repo):
+    """Map drift: a root deleted between runs measures zero and would grade A+."""
+    report = sized_repo.path / "f.json"
+    report.write_text(json.dumps(full_report([])))
+    out = sized_repo.path / "docs/health.html"
+    result = run_script(BUILD_HEALTH, "--out", out, "--findings", report,
+                        "--repo", sized_repo.path, "--name", "gone",
+                        "--root-dir", "src/vanished", "--doctor", "python-code-doctor")
+    assert "do not exist" in result.stderr
+    assert read_meta(out)["missing_roots"] == ["src/vanished"]
+
+
+def test_the_duplicate_count_describes_this_package_only(run_script, repo):
+    """Dedup runs repo-wide; the count on a package page must not."""
+    for package in ("alpha", "beta"):
+        for module in range(3):
+            repo.write(f"src/{package}/m{module}.py", "\n".join(f"x{i}=1" for i in range(300)))
+    repo.commit("init")
+    shared = {"line": 2, "smell_type": "hardcoded_secret", "severity": "high"}
+    a = repo.path / "a.json"
+    a.write_text(json.dumps([{**shared, "file": f"src/beta/m{n}.py"} for n in range(5)]))
+    b = repo.path / "b.json"
+    b.write_text(json.dumps([{**shared, "file": f"src/beta/m{n}.py"} for n in range(5)]))
+
+    out = repo.path / "src/alpha/docs/health.html"
+    run_script(BUILD_HEALTH, "--out", out, "--findings", a, "--findings", b,
+               "--repo", repo.path, "--name", "alpha", "--root-dir", "src/alpha",
+               "--doctor", "django-code-doctor", "--covers", "security")
+    meta = read_meta(out)
+    assert meta["findings_total"] == 0
+    assert meta["duplicates_merged"] == 0, (
+        "the duplicates were all in beta; alpha's page must not claim them"
+    )
+    assert "were merged" not in out.read_text()
+
+
+def test_the_root_grade_excludes_packages_no_doctor_reviews(run_script, repo):
+    """Go lines must not dilute Python findings they cannot contribute to."""
+    for module in range(3):
+        repo.write(f"src/api/m{module}.py", "\n".join(f"x{i}=1" for i in range(200)))
+    for module in range(20):
+        repo.write(f"src/svc/m{module}.go", "\n".join(f"var x{i} = {i}" for i in range(300)))
+    repo.write("docs/code-overview.json", json.dumps({
+        "schema": "code-overview/1",
+        "packages": [
+            {"name": "api", "roots": ["src/api"], "docs": "src/api/docs",
+             "language": "python", "doctor": "python-code-doctor"},
+            {"name": "svc", "roots": ["src/svc"], "docs": "src/svc/docs",
+             "language": "go", "doctor": ""},
+        ],
+    }))
+    repo.commit("init")
+    report = repo.path / "f.json"
+    report.write_text(json.dumps(full_report(
+        [finding(file="src/api/m0.py", category="security", severity="high", line=n)
+         for n in range(5)])))
+    out = repo.path / "docs/health.html"
+    result = run_script(BUILD_HEALTH, "--root", "--out", out,
+                        "--map", repo.path / "docs/code-overview.json", "--findings", report,
+                        "--repo", repo.path, "--name", "whole-repo",
+                        "--doctor", "python-code-doctor")
+    meta = read_meta(out)
+    assert meta["roots"] == ["src/api"], "the Go package is not part of what was analyzed"
+    assert meta["size"]["loc"] < 1000, "and its 6000 lines are not in the denominator"
+    assert "no doctor" in result.stderr
+
+
 def test_malformed_findings_fail_loudly(run_script, sized_repo, tmp_path):
     broken = tmp_path / "broken.json"
     broken.write_text("{not json")
     result = run_script(BUILD_HEALTH, "--out", sized_repo.path / "h.html", "--findings", broken,
                         "--repo", sized_repo.path, "--name", "app", expect_rc=1)
     assert "not valid JSON" in result.stderr
+
+
+def test_a_missing_findings_file_fails_cleanly(run_script, sized_repo, tmp_path):
+    result = run_script(BUILD_HEALTH, "--out", sized_repo.path / "h.html",
+                        "--findings", tmp_path / "nope.json", "--repo", sized_repo.path,
+                        "--name", "app", expect_rc=1)
+    assert "cannot read findings file" in result.stderr
+    assert "Traceback" not in result.stderr

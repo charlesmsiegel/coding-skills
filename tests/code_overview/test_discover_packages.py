@@ -236,3 +236,53 @@ def test_sizes_exclude_generated_docs(run_script, repo):
         "a package's own generated documentation must not count as its source — "
         "it is the divisor every density is computed against"
     )
+
+
+def test_the_dominant_language_is_chosen_by_lines_not_files(run_script, repo):
+    """Nine tiny Python files beside one huge TypeScript file is a TypeScript
+    package: lines are what the grade is divided by, and what a doctor reads."""
+    for module in range(9):
+        repo.write(f"svc/tiny{module}.py", "x = 1\n")
+    repo.write("svc/__init__.py", "")
+    repo.write("svc/huge.ts", "\n".join(f"export const x{i} = {i};" for i in range(2000)))
+    repo.commit("init")
+    svc = next(p for p in propose(run_script, repo)["packages"] if p["name"] == "svc")
+    assert svc["languages"]["python"] > svc["languages"]["typescript"], "90/10 by file"
+    assert svc["language_lines"]["typescript"] > svc["language_lines"]["python"]
+    assert svc["language"] == "typescript", (
+        "picking by file count would have chosen Python and then divided its findings "
+        "by 2000 lines of TypeScript nothing read"
+    )
+    assert svc["doctor"] == "typescript-code-doctor"
+
+
+def test_mixed_language_significance_is_measured_in_lines(run_script, repo):
+    """A package that is genuinely both, by line, must still be questioned."""
+    for module in range(9):
+        repo.write(f"svc/mod{module}.py", "\n".join(f"x{i} = {i}" for i in range(100)))
+    repo.write("svc/__init__.py", "")
+    repo.write("svc/one.ts", "\n".join(f"export const x{i} = {i};" for i in range(600)))
+    repo.commit("init")
+    proposal = propose(run_script, repo)
+    svc = next(p for p in proposal["packages"] if p["name"] == "svc")
+    assert svc["language"] == "python"
+    assert svc["mixed_with"] == ["typescript"], (
+        "TypeScript is 10% of the files but 40% of the lines the grade divides by"
+    )
+    assert "mixed-languages" in {q["id"] for q in proposal["questions"]}
+
+
+def test_workspace_members_honour_exclusions(run_script, repo):
+    repo.write("package.json", '{"name": "root", "workspaces": ["legacy", "packages/*"]}')
+    for module in ("a", "b", "c"):
+        repo.write(f"legacy/{module}.ts", "export const x = 1;\n")
+    repo.write("legacy/package.json", '{"name": "legacy-app"}')
+    for module in ("a", "b", "c"):
+        repo.write(f"packages/keep/{module}.ts", "export const x = 1;\n")
+    repo.write("packages/keep/package.json", '{"name": "keep"}')
+    repo.commit("init")
+    found = names(propose(run_script, repo, "--exclude", "legacy"))
+    assert "keep" in found
+    assert "legacy-app" not in found, (
+        "a workspace glob must not re-add a tree the caller excluded"
+    )

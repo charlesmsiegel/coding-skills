@@ -236,3 +236,38 @@ def test_a_missing_map_fails_with_a_usable_message(run_script, repo, tmp_path):
     result = run_script(INJECT_NAV, "--map", tmp_path / "nope.json", "--repo", repo.path,
                         expect_rc=1)
     assert "no package map" in result.stderr
+
+
+def test_a_docs_directory_with_an_html_character_still_passes_the_gate(run_script, repo):
+    """An href is HTML; the filesystem is not. `a&b` serializes as `a&amp;b`."""
+    repo.write("docs/code-overview.json", json.dumps({
+        "schema": "code-overview/1",
+        "packages": [{"name": "a&b", "roots": ["src/a&b"], "docs": "src/a&b/docs"}],
+    }))
+    for kind in KINDS:
+        repo.write(f"docs/{kind}.html", page(kind))
+        repo.write(f"src/a&b/docs/{kind}.html", page(kind))
+    repo.commit("init")
+    run(run_script, repo)
+    text = (repo.path / "docs/summary.html").read_text()
+    assert "a&amp;b" in text, "the href is correctly escaped in the HTML"
+    result = run(run_script, repo, "--check")
+    assert "BROKEN LINK" not in result.stderr, (
+        "resolving the escaped text as a path would make the final gate unpassable"
+    )
+
+
+def test_a_package_claiming_the_repo_docs_directory_is_rejected(run_script, repo):
+    """Only a package that *is* the repo may write to docs/."""
+    repo.write("docs/code-overview.json", json.dumps({
+        "schema": "code-overview/1",
+        "packages": [
+            {"name": "api", "roots": ["src/api"], "docs": "docs"},
+            {"name": "web", "roots": ["src/web"], "docs": "src/web/docs"},
+        ],
+    }))
+    for kind in KINDS:
+        repo.write(f"docs/{kind}.html", page(kind))
+    repo.commit("init")
+    result = run(run_script, repo, expect_rc=1)
+    assert "repository's own docs directory" in result.stderr

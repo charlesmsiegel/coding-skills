@@ -124,19 +124,36 @@ def manifest_name(path: Path) -> str:
     return match.group(1) if match else ""
 
 
-def dominant_language(roots) -> tuple[str, Counter]:
-    counts: Counter = Counter()
+def dominant_language(roots) -> tuple[str, Counter, Counter]:
+    """The main language, plus per-language file and line counts.
+
+    Lines matter as much as files because the *line* count is what a grade is
+    divided by. Nine tiny Python modules beside one enormous TypeScript file is
+    a 90/10 split by file and closer to the reverse by line, and it is the lines
+    that end up in the denominator — so both are measured and the judgment below
+    is made on lines.
+    """
+    files: Counter = Counter()
+    lines: Counter = Counter()
     for path in iter_code_files(roots):
         language = LANGUAGE_BY_EXT.get(path.suffix)
-        if language:
-            counts[language] += 1
-    if not counts:
-        return "", counts
+        if not language:
+            continue
+        files[language] += 1
+        try:
+            text = path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        lines[language] += sum(1 for line in text.splitlines() if line.strip())
+    if not files:
+        return "", files, lines
     # TypeScript beats JavaScript whenever both are present: the TS doctor reads
     # both, and a project with any .ts is a TS project with JS left in it.
-    if counts.get("typescript") and counts.get("javascript"):
-        counts["typescript"] += counts.pop("javascript")
-    return counts.most_common(1)[0][0], counts
+    if files.get("typescript") and files.get("javascript"):
+        files["typescript"] += files.pop("javascript")
+        lines["typescript"] += lines.pop("javascript", 0)
+    ranked = lines if sum(lines.values()) else files
+    return ranked.most_common(1)[0][0], files, lines
 
 
 def find_django_root(found: dict[str, list[Path]]) -> Path | None:
@@ -220,25 +237,26 @@ def top_level_python_packages(found: dict[str, list[Path]]) -> list[Path]:
             if not (init.parent.parent / "__init__.py").is_file()]
 
 
-# A second language below this share of the files is incidental — a build script,
-# a couple of shims. At or above it, the package is genuinely mixed and one
-# doctor cannot speak for it.
+# A second language below this share of the package's *lines* is incidental — a
+# build script, a couple of shims. At or above it the package is genuinely
+# mixed and one doctor cannot speak for it. Lines, not files, because the harm
+# is that the unread language's lines land in the grade's denominator.
 MIXED_LANGUAGE_SHARE = 0.2
 
 
-def secondary_languages(counts: Counter) -> list[str]:
+def secondary_languages(lines: Counter, files: Counter, dominant: str) -> list[str]:
     """Languages that are a real part of a candidate beyond its dominant one."""
+    counts = lines if sum(lines.values()) else files
     total = sum(counts.values())
     if total == 0:
         return []
-    dominant = counts.most_common(1)[0][0]
     return sorted(language for language, count in counts.items()
                   if language != dominant and count / total >= MIXED_LANGUAGE_SHARE)
 
 
 def candidate(repo: Path, roots, name: str, evidence: str, kind: str) -> dict:
     roots = [Path(r) for r in roots]
-    language, counts = dominant_language(roots)
+    language, files, lines = dominant_language(roots)
     size = measure(roots)
     return {
         "name": name,
@@ -249,12 +267,13 @@ def candidate(repo: Path, roots, name: str, evidence: str, kind: str) -> dict:
         "kind": kind,
         "evidence": evidence,
         "size": size,
-        "languages": dict(counts.most_common()),
+        "languages": dict(files.most_common()),
+        "language_lines": dict(lines.most_common()),
         # The dominant language decides the doctor, which decides what the grade
         # claims to cover. When a real second language is present that choice is
-        # not the script's to make: the other language's files would swell the
-        # LOC denominator while no detector ever reads them.
-        "mixed_with": secondary_languages(counts),
+        # not the script's to make: the other language's lines would swell the
+        # denominator while no detector ever reads them.
+        "mixed_with": secondary_languages(lines, files, language),
     }
 
 
@@ -301,12 +320,20 @@ def discover(repo: Path, excluded: set[str], min_files: int) -> dict:
                 name = name or repo.name
             add([directory], name, f"{manifest_name_} at {directory.relative_to(repo).as_posix() or '.'}",
                 f"{family}-manifest")
+            # Workspace globs are expanded separately from the pruned walk, so
+            # they have to be filtered through the same exclusions — otherwise
+            # `workspaces: ["legacy"]` re-adds a tree the caller excluded, and a
+            # broad glob descends into vendored directories the walk skipped.
             if manifest_name_ == "package.json":
                 for workspace in npm_workspaces(repo, manifest):
+                    if is_skipped(workspace, repo, excluded):
+                        continue
                     add([workspace], manifest_name(workspace / "package.json") or workspace.name,
                         f"npm workspace member ({workspace.relative_to(repo).as_posix()})", "node-workspace")
             if manifest_name_ == "Cargo.toml":
                 for member in cargo_members(repo, manifest):
+                    if is_skipped(member, repo, excluded):
+                        continue
                     add([member], member.name,
                         f"cargo workspace member ({member.relative_to(repo).as_posix()})", "rust-workspace")
 

@@ -74,13 +74,20 @@ def warn(message: str) -> None:
 # --------------------------------------------------------------------------
 
 # What a findings file's JSON shape tells us about how much was examined.
-#   full     analyze_all.py's report — names the analyzers that ran, so coverage
-#            is evidence rather than assumption
-#   flat     django-code-doctor's bare list — no manifest of what ran, so only
-#            the doctor's own profile describes it
-#   partial  a single detector's {"issues": [...]} — one detector looked at one
-#            thing, and nothing in the file says which
-SHAPE_FULL, SHAPE_FLAT, SHAPE_PARTIAL = "full", "flat", "partial"
+#
+#   full     analyze_all.py's report — an envelope naming the analyzers that
+#            ran, so coverage is evidence rather than assumption
+#   partial  everything else: a bare JSON list, or a single detector's
+#            {"issues": [...]}. Neither says what was examined.
+#
+# There is deliberately no "flat means the whole doctor ran" shape. A bare list
+# is what `analyze_django.py` emits *and* what every bundled single detector
+# emits — `find_duplicates.py --format json` prints `[]` — so the shape cannot
+# tell a full Django run apart from one detector that found nothing. Inferring
+# the doctor's whole profile from it graded an empty one-detector run as an A+
+# in all seven categories. When a bare list really does cover the rubric, say so
+# with --covers; nothing else can know.
+SHAPE_FULL, SHAPE_PARTIAL = "full", "partial"
 
 
 def normalize_findings(data) -> dict:
@@ -99,7 +106,6 @@ def normalize_findings(data) -> dict:
     shape = SHAPE_PARTIAL
 
     if isinstance(data, list):
-        shape = SHAPE_FLAT
         findings = [item for item in data if isinstance(item, dict)]
     elif isinstance(data, dict):
         meta = data.get("meta", {}) if isinstance(data.get("meta"), dict) else {}
@@ -204,17 +210,21 @@ def dedupe(reports: list[dict]) -> tuple[list[dict], int]:
     return merged, total - len(merged)
 
 
-def load_findings(paths) -> tuple[list[dict], dict[str, str], set[str], list[dict], int]:
-    """Read and merge several findings files. `-` reads stdin.
+def load_reports(paths) -> tuple[list[dict], dict[str, str], set[str]]:
+    """Read several findings files into per-report records. `-` reads stdin.
 
-    Returns the deduplicated findings, the merged analyzer errors, the analyzers
-    no report ran, the per-report records (which is what coverage is computed
-    from), and how many duplicates were collapsed.
+    Deliberately does **not** merge or deduplicate. The caller scopes each
+    report to the unit being documented first, because deduplicating before
+    scoping lets a package page report duplicates that were merged in a
+    different package entirely.
     """
     reports: list[dict] = []
     errors: dict[str, str] = {}
     for raw in paths:
-        text = sys.stdin.read() if str(raw) == "-" else Path(raw).read_text(encoding="utf-8")
+        try:
+            text = sys.stdin.read() if str(raw) == "-" else Path(raw).read_text(encoding="utf-8")
+        except OSError as exc:
+            raise SystemExit(f"error: cannot read findings file {raw}: {exc}") from exc
         if not text.strip():
             # A zero-byte file is what a doctor leaves behind when it fails
             # *after* the shell created the redirect target. Dropping it would
@@ -241,9 +251,7 @@ def load_findings(paths) -> tuple[list[dict], dict[str, str], set[str], list[dic
     # is only for reporting.
     ran_anywhere = {name for report in reports for name in report["ran"]}
     skipped = {name for report in reports for name in report["skipped"]} - ran_anywhere
-
-    findings, duplicates = dedupe(reports)
-    return findings, errors, skipped, reports, duplicates
+    return reports, errors, skipped
 
 
 def sizing_extensions(findings: list[dict], extra=()) -> frozenset:
@@ -434,6 +442,16 @@ def load_map(path) -> dict:
         # directory. Symlinked aliases still slip through — resolving those
         # needs the repo root and a filesystem that already has the tree.
         resolved = Path(os.path.normpath(package["docs"])).as_posix().rstrip("/")
+        # `docs` is the repository's own document directory. A package may only
+        # claim it by *being* the repository; otherwise the root build would
+        # overwrite that package's pages and every roll-up would drop it.
+        if resolved == "docs" and not all(is_repo_root(r) for r in package["roots"]):
+            raise SystemExit(
+                f"error: {path} points {package['name']!r} at the repository's own docs "
+                f"directory while it is rooted at {', '.join(package['roots'])}. Only a "
+                'package covering the whole repo (roots: ["."]) may do that; give this one '
+                "its own docs directory."
+            )
         if resolved in by_docs:
             raise SystemExit(
                 f"error: {path} points {package['name']!r} and {by_docs[resolved]!r} at the same "
@@ -444,15 +462,24 @@ def load_map(path) -> dict:
     return data
 
 
-def is_root_collapsed(repo: Path, package: dict) -> bool:
-    """Does this package's document set *are* the repo's?
+def is_repo_root(path: str) -> bool:
+    """Does this repo-relative path denote the repository root itself?"""
+    return os.path.normpath(path or ".") in {".", "", os.sep}
 
-    True for the documented single-package map (`roots: ["."]`, `docs: "docs"`).
-    There is no package layer in that case, so every place that renders a
-    package list has to leave it out or the portal claims a second document set
-    that does not exist and links rows back to themselves.
+
+def is_root_collapsed(repo: Path, package: dict) -> bool:
+    """Is this package's document set the repository's own?
+
+    True only for the documented single-package map — `roots: ["."]` *and*
+    `docs: "docs"`. Both halves matter: a package rooted at `src/api` that
+    merely points `docs` at the repo's directory is not collapsed, it is
+    misconfigured, and treating it as collapsed would drop it from navigation
+    and every roll-up while its pages were silently overwritten by the root
+    build. `load_map` rejects that combination outright.
     """
-    return (Path(repo) / package.get("docs", "")).resolve() == (Path(repo) / "docs").resolve()
+    docs_is_root = (Path(repo) / package.get("docs", "")).resolve() == (Path(repo) / "docs").resolve()
+    roots_are_root = all(is_repo_root(root) for root in package.get("roots", []))
+    return docs_is_root and roots_are_root
 
 
 def listed_packages(repo: Path, packages: list[dict]) -> list[dict]:

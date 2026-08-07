@@ -24,6 +24,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import html
 import re
 import sys
 from pathlib import Path
@@ -171,6 +172,11 @@ def main(argv=None) -> int:
             audited = _BLOCK_RE.search(current) if args.check else None
             for href in re.findall(r'href="([^"#][^"]*)"',
                                    audited.group(0) if audited else block):
+                # The href is HTML, the filesystem is not: a docs directory
+                # named `a&b` is serialized as `a&amp;b`, and resolving that
+                # literally reports every valid link to it as broken — which
+                # makes the documented final gate impossible to pass.
+                href = html.unescape(href)
                 if not (path.parent / href).resolve().is_file():
                     broken.append(f"{path.relative_to(repo)} → {href}")
             if args.check:

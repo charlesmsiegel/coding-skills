@@ -75,15 +75,25 @@ def render_package_links(repo: Path, packages: list[dict], out: Path) -> str:
     if not packages:
         return ""
     rows = []
+    ungenerated = 0
     for package in packages:
         summary = doc_path(repo, package, "summary")
-        health = read_meta(doc_path(repo, package, "health")) or {}
+        health = read_meta(doc_path(repo, package, "health"))
+        # No health page is a documented choice ("codemap only" for a language
+        # with no doctor). A row of bare em-dashes reads as an unexplained hole,
+        # so say which it is.
+        generated = health is not None
+        health = health or {}
+        if not generated:
+            ungenerated += 1
         grade = health.get("grade", rubric.UNGRADED)
         score = health.get("score")
         size = health.get("size", {})
         name = esc(package["name"])
         label = (f'<a href="{esc(rel_href(out, summary))}">{name}</a>'
                  if summary.is_file() else name)
+        findings = ('<span class="badge neutral">not generated</span>' if not generated
+                    else health.get("findings_total", "—"))
         rows.append(
             f"<tr><td>{label}<br><span class=\"faint mono\">"
             f'{esc(", ".join(package["roots"]))}</span></td>'
@@ -92,10 +102,15 @@ def render_package_links(repo: Path, packages: list[dict], out: Path) -> str:
             f'<td class="num">{"—" if score is None else f"{score:.1f}"}</td>'
             f'<td class="{grade_class(grade)}" style="color:var(--grade);font-family:var(--mono);'
             f'font-weight:600">{esc(grade)}</td>'
-            f'<td class="num">{health.get("findings_total", "—")}</td></tr>'
+            f'<td class="num">{findings}</td></tr>'
         )
+    caption = ("Each package has its own summary, code map, and health page."
+               if not ungenerated else
+               f"Each package has its own summary and code map. {ungenerated} of them "
+               "has no health page and is therefore ungraded — marked <em>not generated</em> "
+               "below.")
     return ("<h2>Packages</h2>"
-            '<p class="dim">Each package has its own summary, code map, and health page.</p>'
+            f'<p class="dim">{caption}</p>'
             '<div class="tbl-wrap"><table><thead><tr><th>Package</th><th>Language</th>'
             '<th class="num">Lines</th><th class="num">Score</th><th>Grade</th>'
             '<th class="num">Findings</th></tr></thead><tbody>'
