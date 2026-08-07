@@ -1,0 +1,29 @@
+{
+  "skill_name": "code-overview",
+  "evals": [
+    {
+      "id": 1,
+      "prompt": "we've got a django monorepo at ./platform — five apps plus a react frontend. i want documentation per app rather than one giant page, and some kind of health score i can track each quarter.",
+      "expected_output": "Runs discover_packages.py first and puts its questions to the user before building anything — at minimum the nesting question and whether the frontend is one package or several. Does not guess the package structure silently. Writes the confirmed map to docs/code-overview.json. Per app: code-visualization with --exclude docs, then BOTH django-code-doctor and python-code-doctor (django alone leaves duplication and dead code ungraded), both findings files passed to build_health.py with --doctor python-code-doctor. Frontend gets typescript-code-doctor. Then repo-level: a genuine repo-wide atlas (not a collation), build_health.py --root over the union of every package's findings, build_summary.py --root. Finishes with inject_nav.py and its --check gate. Presents the grades and says the score is a density of detectable problems, not a verdict on the design.",
+      "files": []
+    },
+    {
+      "id": 2,
+      "prompt": "run the overview again on ./platform, we merged a bunch of PRs and split the billing app in two",
+      "expected_output": "Loads the existing docs/code-overview.json rather than re-deriving the structure from scratch, and asks the user only about the drift — the billing split. Does not re-litigate the settled packages. Rebuilds atlases, findings and health per package, then the root documents in that order (root health reads each package's health.html, so packages come first), then re-runs inject_nav.py — which replaces the existing nav blocks rather than stacking them — and --check to confirm no href dangles.",
+      "files": []
+    },
+    {
+      "id": 3,
+      "prompt": "overview + grades for this repo please. it's Go, three services under cmd/ and shared packages under internal/.",
+      "expected_output": "Recognizes that no code doctor ships for Go and ASKS the user which of the three treatments they want (ungraded health page, codemap only, or the closest doctor anyway) rather than picking one or running a Python doctor over Go and reporting the resulting empty findings list as a good grade. Still builds the code maps, which are language-agnostic enough to be useful, and notes in the summary that the dependency graph's Go resolution ratio should be checked. Any package that ends up ungraded appears as ungraded in the roll-up, not as an F.",
+      "files": []
+    },
+    {
+      "id": 4,
+      "prompt": "the health page says our api package is a C+ but honestly the architecture there is the worst part of the system. is the grade wrong?",
+      "expected_output": "Explains rather than re-scores: the grade measures the density of mechanically-detectable findings, so architecture that is wrong-but-tidy scores well by construction — the code map's Boundaries and Invariants tabs are where that judgment lives, which is why summary.html links both. Checks the metadata for ungraded categories and analyzer_errors before defending the number, since either would mean the grade covers less than it appears to. Only proposes a rubric change (references/scoring.md) if unmapped_types is non-empty or a category is genuinely mis-weighted — not to make one package's number match an intuition.",
+      "files": []
+    }
+  ]
+}

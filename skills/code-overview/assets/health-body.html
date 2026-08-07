@@ -1,0 +1,36 @@
+<!-- Body layout for health.html. Filled by build_health.py; every placeholder is
+     substituted with already-escaped HTML. Sections whose placeholder resolves
+     empty collapse to nothing, so a package with no repo-wide findings or no
+     package table simply does not show those headings. -->
+<section class="gradecard <!--GRADE_CLASS-->">
+  <div>
+    <div class="letter"><!--GRADE--></div>
+    <div class="score"><!--SCORE--> / 100</div>
+  </div>
+  <div class="what">
+    <h2><!--SUBJECT--></h2>
+    <p class="dim"><!--SUBJECT_DETAIL--></p>
+    <div><!--HEADLINE_BADGES--></div>
+  </div>
+</section>
+
+<!--UNGRADED_NOTE-->
+
+<h2>Category scores</h2>
+<p class="dim">Each category is severity-weighted findings per 1000 lines, mapped through
+its own tolerance. A category scores 50 at the density named in its tooltip; ungraded
+means nothing measured it, which is not the same as clean.</p>
+<div class="card"><!--CATEGORY_ROWS--></div>
+
+<!--PACKAGE_TABLE-->
+
+<h2>Findings</h2>
+<!--FINDINGS_SUMMARY-->
+<!--TOP_FINDINGS-->
+<!--BY_TYPE-->
+
+<!--CAVEATS-->
+
+<script type="application/json" id="code-health-meta">
+<!--META_JSON-->
+</script>

@@ -42,6 +42,21 @@ A repository of agentic skills to help with AI coding.
   review report for a PR, branch, or diff (change footprint, contracts, test delta,
   blast radius). It never touches `docs/codemap.html` — refreshing the atlas belongs to
   **code-visualization**.
+- **[code-overview](skills/code-overview/)** — the orchestrator. It analyzes nothing
+  itself; it decides *what the units are*, runs the others per unit, and binds the
+  results into one navigable set. `discover_packages.py` proposes packages from
+  manifests, Django `INSTALLED_APPS` and layout, each with its evidence, and returns
+  what it could not settle as questions for the user — the right unit is a design
+  judgment, not a heuristic. Per package it drives **code-visualization** into
+  `<pkg>/docs/codemap.html` and the matching doctor into a graded
+  `<pkg>/docs/health.html`: seven weighted categories, a 0–100 score, a letter grade,
+  and a `code-health-meta` JSON block so the numbers extract without an HTML parser.
+  A category nothing measured comes back *ungraded* and is dropped from the mean
+  rather than scored 0 or 100 — including when a detector crashed, where a zero count
+  means unknown, not clean. `inject_nav.py` then links every page up to the overall
+  document of its own type, across to its siblings, and back down; it is idempotent,
+  existence-checked, and styles itself with literal fallbacks so it can be injected
+  into an atlas **code-visualization** wrote without that skill knowing.
 
 ### Workflow skills
 
