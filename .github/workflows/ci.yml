@@ -6,8 +6,8 @@ on:
   pull_request:
 
 env:
-  # The detectors live in the python-simplifier skill; they police every skill's code.
-  DETECTORS: skills/python-simplifier/scripts
+  # The detectors live in the python-code-doctor skill; they police every skill's code.
+  DETECTORS: skills/python-code-doctor/scripts
 
 jobs:
   checks:
@@ -58,22 +58,22 @@ jobs:
             exit 1
           fi
 
-      # django-simplifier carries common.py and format_findings.py from
-      # python-simplifier for the same reason: it has to be installable on its own,
+      # django-code-doctor carries common.py and format_findings.py from
+      # python-code-doctor for the same reason: it has to be installable on its own,
       # and the documented reporting pipe must work with no sibling present.
-      - name: django-simplifier's shared files match python-simplifier's
+      - name: django-code-doctor's shared files match python-code-doctor's
         run: |
           set -e
           for f in common.py format_findings.py; do
-            cmp "skills/python-simplifier/scripts/$f" \
-                "skills/django-simplifier/scripts/$f" \
-              || { echo "::error::$f has drifted between the two simplifier skills"; exit 1; }
+            cmp "skills/python-code-doctor/scripts/$f" \
+                "skills/django-code-doctor/scripts/$f" \
+              || { echo "::error::$f has drifted between the two code-doctor skills"; exit 1; }
           done
 
       - name: Smoke tests (every detector fires on its fixture, quiet on clean code)
         run: pytest -q
 
-      # The ratchet (skills/python-simplifier/references/messy-repo-runbook.md, Phase 5):
+      # The ratchet (skills/python-code-doctor/references/messy-repo-runbook.md, Phase 5):
       # every bug-class detector is currently clean on this repo's own code, and it
       # stays that way. If one reports anything, a real defect class has crept back in.
       - name: Ratchet — bug-class detectors stay clean on our own code

@@ -1,6 +1,6 @@
 ---
 name: brutal-review
-description: Tear a change apart the way a hostile senior reviewer would — hunt for the input that breaks it, not for style. Use when the user wants a harsh, adversarial, or skeptical review of a diff, branch, PR, or pasted change: "brutal review", "tear this apart", "what would a hostile reviewer say", "what edge cases am I missing", "poke holes in this", "be harsh", "what's wrong with this". Language-agnostic. Every criticism must name the concrete input, sequence, or state that breaks the code — a complaint with no failing case is cut before it reaches the user. Produces a ranked findings artifact with a blocking/non-blocking verdict. For "simplify this", "clean this up", or "is this over-engineered", use python-simplifier instead; this skill uses its analyze_diff.py for Python diffs when that skill happens to be installed, and the repo's own tools otherwise.
+description: Tear a change apart the way a hostile senior reviewer would — hunt for the input that breaks it, not for style. Use when the user wants a harsh, adversarial, or skeptical review of a diff, branch, PR, or pasted change: "brutal review", "tear this apart", "what would a hostile reviewer say", "what edge cases am I missing", "poke holes in this", "be harsh", "what's wrong with this". Language-agnostic. Every criticism must name the concrete input, sequence, or state that breaks the code — a complaint with no failing case is cut before it reaches the user. Produces a ranked findings artifact with a blocking/non-blocking verdict. For "simplify this", "clean this up", or "is this over-engineered", use python-code-doctor instead; this skill uses its analyze_diff.py for Python diffs when that skill happens to be installed, and the repo's own tools otherwise.
 ---
 
 # Brutal Review
@@ -62,17 +62,17 @@ is nothing to install.
    own `make lint`). Prefer the repo's own configured tools; they encode rules the
    maintainers agreed to.
 
-   For a Python diff, the **python-simplifier** skill adds a diff-scoped detector
+   For a Python diff, the **python-code-doctor** skill adds a diff-scoped detector
    pass. It is optional and lives in a separate skill directory, so look before
    invoking:
 
    ```bash
    # sibling install (~/.claude/skills/, ~/.codex/skills/, .kiro/skills/, ...)
-   PS="$(dirname "$SKILL")/python-simplifier"
+   PS="$(dirname "$SKILL")/python-code-doctor"
    if [ -f "$PS/scripts/analyze_diff.py" ]; then
        python "$PS/scripts/analyze_diff.py" --format json    # non-zero here is a real failure
    else
-       echo "python-simplifier not installed — using the repo's own tools only"
+       echo "python-code-doctor not installed — using the repo's own tools only"
    fi
    ```
 

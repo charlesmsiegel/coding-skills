@@ -4,12 +4,12 @@ A repository of agentic skills to help with AI coding.
 
 ## Skills
 
-- **[python-simplifier](skills/python-simplifier/)** — critically review and simplify
+- **[python-code-doctor](skills/python-code-doctor/)** — critically review and simplify
   Python code: deterministic AST detectors (`scripts/`) plus judgment guides
   (`references/`). `run_external_tools.py` also drives the real tools when they are
   installed — ruff, mypy, black, isort, bandit, flake8, plus pip-audit (dependency
   advisories) and coverage (code that never executes).
-- **[typescript-simplifier](skills/typescript-simplifier/)** — the same idea for
+- **[typescript-code-doctor](skills/typescript-code-doctor/)** — the same idea for
   TypeScript, and fully standalone: it ships its own TS/TSX scanner (strings,
   template literals, regex-vs-division, JSX text, bracket matching) so the
   detectors run against a checkout with no `node_modules` and no build. Covers
@@ -19,7 +19,7 @@ A repository of agentic skills to help with AI coding.
   `run_external_tools.py` drives `tsc`, ESLint, Biome, Prettier, madge, knip,
   `npm audit` and coverage when the project already has them — the compiler
   answers what a syntax scanner structurally cannot.
-- **[django-simplifier](skills/django-simplifier/)** — the Django-specific companion,
+- **[django-code-doctor](skills/django-code-doctor/)** — the Django-specific companion,
   and the one that also writes and upgrades. Fifteen detectors: N+1 queries and
   per-row writes, model and migration problems, missing object-level authorization
   (in views, DRF viewsets, and the admin alike), insecure settings, work hidden in
@@ -50,7 +50,7 @@ mechanical.
 
 - **[brutal-review](skills/brutal-review/)** — adversarial review of a diff. Every
   finding must name the input that breaks the code; a complaint with no failing case
-  is cut. Delegates to python-simplifier's `analyze_diff.py` for Python.
+  is cut. Delegates to python-code-doctor's `analyze_diff.py` for Python.
 - **[fix-issue](skills/fix-issue/)** — GitHub issue to reviewable PR: reproduce, fail a
   test, fix the cause. `fetch_issue.py` pulls related PRs and scrapes repro leads out
   of the thread.
@@ -114,7 +114,7 @@ purpose and are NOT synced: `assets/template.html` (each skill has its own theme
 the renderers and placeholders match, which a test pins) and
 `references/llm-tabs.md` (different tab sets).
 
-django-simplifier ships its own copies of python-simplifier's `common.py` and
+django-code-doctor ships its own copies of python-code-doctor's `common.py` and
 `format_findings.py`, byte-identical and CI-enforced, for the same reason: a skill has
 to be self-contained to be installed on its own, and the reporting pipe its SKILL.md
 documents has to work with no sibling skill present.
@@ -122,11 +122,11 @@ documents has to work with no sibling skill present.
 No skill may reach into another skill's directory. A release archive holds exactly one
 skill, so `../other-skill/scripts/...` is a path that exists only in this monorepo.
 Where a companion genuinely adds something (brutal-review is better with
-python-simplifier's `analyze_diff.py`), the SKILL.md tests for it and documents the
+python-code-doctor's `analyze_diff.py`), the SKILL.md tests for it and documents the
 fallback. `tests/test_standalone_install.py` enforces this by installing each skill
 alone and running what its SKILL.md documents.
 
-CI also runs a ratchet: python-simplifier's bug-class detectors must stay silent on
+CI also runs a ratchet: python-code-doctor's bug-class detectors must stay silent on
 every skill's own `scripts/` directory.
 
 The visualization skills are tested through their CLIs — each analyzer runs as a
@@ -148,7 +148,7 @@ copy mirrors the release artifact: skill directory plus LICENSE, minus caches.
 
 ## Releasing a skill
 
-Tag `<skill>-v<version>` (e.g. `python-simplifier-v0.1.0`) — the tag names the
+Tag `<skill>-v<version>` (e.g. `python-code-doctor-v0.1.0`) — the tag names the
 directory under `skills/`. The release workflow validates that skill's frontmatter,
 packages `SKILL.md`, `LICENSE`, `references/`, `scripts/`, and `assets/` into
 `<skill>.skill`, and attaches it to a GitHub release. The archive unpacks to

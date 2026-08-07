@@ -2,14 +2,14 @@ name: Release
 
 on:
   push:
-    # One release track per skill: tag <skill>-v<version>, e.g. python-simplifier-v0.1.0.
+    # One release track per skill: tag <skill>-v<version>, e.g. python-code-doctor-v0.1.0.
     tags: ["*-v*"]
   # Manual fallback: creates the tag (pointed at the dispatched ref) along
   # with the release, for environments that can't push tags directly.
   workflow_dispatch:
     inputs:
       tag:
-        description: "Release tag to create (e.g. python-simplifier-v0.1.0)"
+        description: "Release tag to create (e.g. python-code-doctor-v0.1.0)"
         required: true
 
 permissions:

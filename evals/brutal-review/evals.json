@@ -4,7 +4,7 @@
     {
       "id": 1,
       "prompt": "Do a brutal review of my current diff. Be as harsh as you want, I can take it.",
-      "expected_output": "Gets the actual diff (git diff / merge-base) and reads enough surrounding code to see the seam between new and old — untouched callers of changed signatures are checked, since a diff structurally cannot show them. Runs the mechanical pass first where one applies (python-simplifier's analyze_diff.py for Python) instead of spending attacking attention on what a tool finds. Every finding names the concrete input, sequence, or state that produces the wrong result; no finding is phrased as an open worry like 'this could have race conditions' or 'consider error handling'. Findings are ranked and end in one explicit verdict. States what was NOT reviewed. Harsh about the code, never about the author.",
+      "expected_output": "Gets the actual diff (git diff / merge-base) and reads enough surrounding code to see the seam between new and old — untouched callers of changed signatures are checked, since a diff structurally cannot show them. Runs the mechanical pass first where one applies (python-code-doctor's analyze_diff.py for Python) instead of spending attacking attention on what a tool finds. Every finding names the concrete input, sequence, or state that produces the wrong result; no finding is phrased as an open worry like 'this could have race conditions' or 'consider error handling'. Findings are ranked and end in one explicit verdict. States what was NOT reviewed. Harsh about the code, never about the author.",
       "files": []
     },
     {

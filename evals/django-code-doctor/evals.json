@@ -1,0 +1,53 @@
+{
+  "skill_name": "django-code-doctor",
+  "evals": [
+    {
+      "id": 1,
+      "prompt": "This Django view module is slow and I think it's a mess. Can you sort it out? (attached: orders_views.py)",
+      "expected_output": "Runs analyze_django.py / find_query_issues.py first rather than reading by hand, and triages the mechanical findings before judgment. Identifies the N+1 on order.customer AND the second hop to customer.region (needs select_related('customer__region'), not just 'customer'); the .save() in the loop; the read-modify-write on viewed_count that needs F(); mark_safe on a concatenation containing order.note as an XSS risk; the hardcoded '/orders/' redirect; and OrderService as a CRUD-only wrapper. Crucially, flags missing_ownership_filter on order_detail — pk comes from the URL with no request.user scoping — and treats it as the most serious finding, above the performance ones. Says it verified the ownership finding by hand rather than trusting the detector. Recommends measuring with assertNumQueries or CaptureQueriesContext before and after, and does not claim a speedup it has not measured.",
+      "files": ["fixtures/orders_views.py"]
+    },
+    {
+      "id": 2,
+      "prompt": "Should I move all my business logic out of models.py into a services/ layer? Everyone on the team keeps saying the models are too fat.",
+      "expected_output": "Loads references/django-architecture.md rather than answering from general opinion. Does not accept 'fat model' as automatically a problem — asks what the methods actually do, and applies the distinction between behavior about one record (belongs on the model) and behavior about a process spanning records, transactions, or external services (belongs in a plain function). Warns that splitting by layer relocates volume without reducing it. Points out that a service class with one public method and no state is a function wearing a costume. Gives a concrete test the user can apply to their own methods rather than a blanket yes or no.",
+      "files": []
+    },
+    {
+      "id": 3,
+      "prompt": "Our team wants to replace every `for obj in qs: obj.save()` loop in the codebase with bulk_update. Can you do a sweep?",
+      "expected_output": "Agrees the loops are worth finding (find_query_issues.py, save_in_loop) but does NOT do a blanket mechanical replacement. Loads references/django-orm.md and raises what bulk_update skips: save() overrides, pre_save/post_save receivers, and auto_now fields. Checks each model for a save() override and each signal receiver before converting, and says which loops are safe to convert and which are not. States explicitly that a per-row loop with a comment explaining why is better than a bulk call that silently skips a signal. Treats query count as behavior, so the change is verified with assertNumQueries rather than assumed.",
+      "files": []
+    },
+    {
+      "id": 4,
+      "prompt": "Run your Django analysis over this repo please. [the repo is a Flask project with SQLAlchemy models]",
+      "expected_output": "Reports nothing and says why: the detectors are gated on the tree actually being a Django project, and this one is not. Does NOT apply Django rules to SQLAlchemy models or invent Django findings. Distinguishes 'no findings because this is not Django' from 'no findings because the code is clean' — the silence is explained rather than presented as a passing grade. Offers python-code-doctor as the applicable skill instead.",
+      "files": []
+    },
+    {
+      "id": 5,
+      "prompt": "We're on Django 4.2 and want to get to the latest. What's involved?",
+      "expected_output": "Runs find_version_issues.py rather than answering from memory, and reports the detected version along with where it read the pin from. Leads with the fact that Django 4.2 LTS reached end of life in April 2026, so the project currently receives no security fixes — treating that as the reason to move rather than a footnote. Offers both realistic destinations (5.2 LTS for the conservative path, 6.1 for current) rather than assuming one, and notes 6.0 is a stop rather than a destination. Loads references/django-upgrade-runbook.md and insists on one feature release at a time (4.2 → 5.0 → 5.1 → 5.2), because the deprecation shims are what make each step safe. Names the specific breakages that apply — index_together, DEFAULT_FILE_STORAGE/STATICFILES_STORAGE, USE_L10N, timezone.utc, CheckConstraint(check=) — with the replacement for each. Flags Python 3.12 as the floor for Django 6.0. Warns that removing a weak password hasher locks out users still stored under it. Insists the version bump and the idiom rewrites are separate commits, points at django-upgrade for the mechanical rewrites rather than hand-editing, and requires reading every generated migration. Says the change table only covers up to 6.1 and offers to check the release notes for anything newer instead of implying the check was complete.",
+      "files": []
+    },
+    {
+      "id": 6,
+      "prompt": "I'm starting a new Django project for a small SaaS. Set up the initial models and settings for me.",
+      "expected_output": "Loads references/django-idioms.md before writing code rather than producing generic Django from memory. Sets AUTH_USER_MODEL to a custom user model on day one and explains that this is the one Django decision with no cheap escape hatch, because after the first migration it means rewriting every historical foreign key to auth.User. Writes models with: related_name on every relation, a deliberate on_delete (not a copied CASCADE), blank=True/default='' rather than null=True on text fields, Meta.ordering with a tie-breaker so pagination is stable, TextChoices rather than a list of tuples, DecimalField with max_digits/decimal_places for money, __str__, and get_absolute_url. Settings are split by environment with DEBUG defaulting to False, SECRET_KEY read from the environment with no fallback, USE_TZ, DEFAULT_AUTO_FIELD, and the STORAGES dict rather than the removed storage settings. States which Django version it is targeting and flags anything that needs 5.0+ or 6.0+ rather than using a new feature silently.",
+      "files": []
+    },
+    {
+      "id": 7,
+      "prompt": "Can you review our DRF API? It's about 20 endpoints across three apps.",
+      "expected_output": "Runs find_drf_issues.py and loads references/django-drf.md. Leads with permissions: checks whether DEFAULT_PERMISSION_CLASSES is set, and explains that without it DRF falls back to AllowAny so a viewset with no permission_classes is public while looking exactly like one whose permissions are handled elsewhere. Distinguishes the two separate questions — permission_classes guards the endpoint, only get_queryset guards the row — and flags any ModelViewSet with a class-level queryset and no scoped get_queryset as the DRF spelling of the object-level authorization gap. Notes that has_object_permission only runs when get_object() is called, so it does not cover the list route. Also checks for fields='__all__' and missing read_only_fields, SerializerMethodField queries and nested serializers without a matching prefetch, depth=, missing pagination, and throttling. Recommends verifying with assertNumQueries against a fixture with at least two rows, and a test that another user's object returns 404 on both list and detail.",
+      "files": []
+    },
+    {
+      "id": 8,
+      "prompt": "Here's a data migration I wrote to backfill the new status column. Does it look OK? [migration imports the model at module level, has no reverse, and adds the column plus backfills in one file]",
+      "expected_output": "Loads references/django-migrations.md and identifies all three problems. The module-level model import is the serious one: apps.get_model('app', 'Model') gives the historical model, whereas the direct import gives today's model — so the migration works now and breaks the next time it runs from zero, which is every CI build and every new checkout. The missing reverse means the deploy cannot be rolled back and has to be fixed forward under pressure; RunPython.noop is a decision on the record where an absent argument is not. Schema and data in one migration means the DDL lock is held for the whole backfill. Recommends splitting into an AddField migration and a separate batched backfill, notes that a long data migration wants atomic = False and therefore an idempotent backfill, and says the historical model has no custom methods or save() override so any logic in them must be inlined. Recommends sqlmigrate to see the actual SQL before running it against a large table.",
+      "files": []
+    }
+  ]
+}

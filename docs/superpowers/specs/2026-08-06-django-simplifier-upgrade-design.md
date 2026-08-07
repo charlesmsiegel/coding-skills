@@ -1,11 +1,11 @@
-# django-simplifier: broaden the detectors, add version awareness, add an upgrade path
+# django-code-doctor: broaden the detectors, add version awareness, add an upgrade path
 
 **Date:** 2026-08-06
 **Status:** approved design, not yet implemented
 
 ## Why
 
-`django-simplifier` today ships six detectors and six judgment guides. They are
+`django-code-doctor` today ships six detectors and six judgment guides. They are
 good — the class graph in `django_context.py` makes "extended by nobody" a fact
 rather than a guess, and the gate keeps the detectors silent outside Django — but
 the coverage is narrow. Forms, the admin, DRF, migrations, settings hygiene,
@@ -47,7 +47,7 @@ conservative landing spot) and **6.1** (current).
 
 - Rewriting code. The skill reports; `django-upgrade` rewrites; the user decides.
   A codemod that is wrong is worse than a report that is right.
-- Replicating python-simplifier. Complexity, duplication, dead code, and
+- Replicating python-code-doctor. Complexity, duplication, dead code, and
   resource leaks stay out of scope; the report says so when that skill is absent.
 - Running the project. Every detector stays stdlib-`ast`-only: no import, no
   settings module, no database, no virtualenv. Things that genuinely require a
@@ -156,7 +156,7 @@ it with all of them.
 
 - `analyze_django.py` — orchestrator, extended to the new categories. Interface
   unchanged.
-- `analyze_diff.py` — new. The diff lens, mirroring python-simplifier: run the
+- `analyze_diff.py` — new. The diff lens, mirroring python-code-doctor: run the
   file-level detectors against only the changed files, for reviewing an
   AI-written Django feature or CR. Whole-project detectors (over-engineering,
   version, migrations) still need the full tree and say so.
@@ -204,7 +204,7 @@ installed:
 
 It **never installs anything**. Absent tools are listed under `missing_tools`
 with a `pip install` hint, and the skill asks before installing — the same policy
-python-simplifier already applies. `--fix` and `--run-migrations-check` are
+python-code-doctor already applies. `--fix` and `--run-migrations-check` are
 opt-in because they mutate or execute.
 
 ## References — eleven, loaded on demand
@@ -238,7 +238,7 @@ treated as the version authority.
 
 ## Testing
 
-Extends the repo's existing convention (`tests/django_simplifier/`, subprocess-
+Extends the repo's existing convention (`tests/django_code_doctor/`, subprocess-
 driven, fixtures written to `tmp_path` at runtime so the deliberately-bad Django
 never trips the repo's own linters).
 
@@ -259,7 +259,7 @@ Version-specific tests pin the derived severity: the same project reports
 `index_together` as 🟡 against a 4.2 target and 🔴 against 5.1+, and reports
 nothing at all when the version cannot be determined.
 
-`evals/django-simplifier/evals.json` grows from four cases to cover the new
+`evals/django-code-doctor/evals.json` grows from four cases to cover the new
 surface: an upgrade request, an authoring request, a DRF review, and a migration
 review.
 
@@ -271,7 +271,7 @@ review.
   present.
 - `tools/validate_skills.py` must pass: frontmatter flat, `description` ≤ 1024
   characters and free of unquoted `#`, every `python` invocation in SKILL.md
-  written as `python "$SKILL/scripts/..."`, and `evals/django-simplifier/evals.json`
+  written as `python "$SKILL/scripts/..."`, and `evals/django-code-doctor/evals.json`
   present with unique ids and an `expected_output` per case.
 - `ruff` clean under the repo's `E4,E7,E9,F` selection at line-length 120.
 

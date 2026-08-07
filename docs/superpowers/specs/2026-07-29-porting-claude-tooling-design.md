@@ -1,7 +1,7 @@
 # Porting skills from claude-tooling
 
 **Date:** 2026-07-29
-**Skills touched:** python-simplifier (modified); django-simplifier, brutal-review,
+**Skills touched:** python-code-doctor (modified); django-code-doctor, brutal-review,
 fix-issue, fix-pr, update-docs (new)
 
 ## Problem
@@ -17,7 +17,7 @@ one of the five skills is the direct ancestor of ours, and another duplicates it
 
 | Source | Destination | Treatment |
 |---|---|---|
-| `skills/django-simplifier` | `skills/django-simplifier` | Detectors restructured and rewritten to house standard |
+| `skills/django-code-doctor` | `skills/django-code-doctor` | Detectors restructured and rewritten to house standard |
 | `commands/brutal-review.md` | `skills/brutal-review` | Expanded: SKILL.md + two judgment guides |
 | `commands/fix-issue.md` | `skills/fix-issue` | Expanded: SKILL.md + guides + `fetch_issue.py` |
 | `commands/fix-pr.md` | `skills/fix-pr` | Expanded: SKILL.md + guides + `fetch_pr_feedback.py` |
@@ -25,10 +25,10 @@ one of the five skills is the direct ancestor of ours, and another duplicates it
 
 ### Not ported
 
-**`skills/python-simplifier`** — the ancestor of ours. Eight scripts against our forty.
+**`skills/python-code-doctor`** — the ancestor of ours. Eight scripts against our forty.
 Nothing in it that ours lacks.
 
-**`skills/technical-debt-detector`** — ~85% redundant with our python-simplifier:
+**`skills/technical-debt-detector`** — ~85% redundant with our python-code-doctor:
 
 | Their script | Our coverage | Verdict |
 |---|---|---|
@@ -51,14 +51,14 @@ documentation for a third-party library.
 **`agents/`, `hooks/`, `ide_plugins/`, `install.py`** — out of scope. This repo ships
 skills.
 
-## 1. django-simplifier
+## 1. django-code-doctor
 
 Their three detectors are already AST-based (`find_django_antipatterns.py`,
 `find_django_issues.py`, `find_django_overengineering.py`; only the template checks scan
 strings). The rewrite is therefore not about replacing regex. It is about three things:
 
 1. **Granularity.** Three monoliths spanning unrelated concerns become six detectors a
-   user can run and ignore individually, matching python-simplifier's shape.
+   user can run and ignore individually, matching python-code-doctor's shape.
 2. **Cross-file awareness.** Every interesting Django question — is this abstract model
    extended anywhere, does this manager earn its keep, is this FK missing
    `related_name` — needs a project-wide model. Their detectors are per-file.
@@ -68,10 +68,10 @@ strings). The rewrite is therefore not about replacing regex. It is about three 
 ### Layout
 
 ```
-skills/django-simplifier/
+skills/django-code-doctor/
   SKILL.md
   scripts/
-    common.py                       byte-identical copy of python-simplifier's; CI-synced
+    common.py                       byte-identical copy of python-code-doctor's; CI-synced
     django_context.py               project discovery: settings module, installed apps,
                                     model/field graph, template roots. Gates every
                                     detector so they stay silent on non-Django repos.
@@ -112,22 +112,22 @@ checklist) moves into `references/` rather than bloating SKILL.md.
 Every detector takes `--format text|json` and `--ignore type1,type2`, emits 🔴/🟡/🟢
 severities and a flat JSON list of findings, and is conservative — false negatives over
 false positives. `analyze_django.py` aggregates and supports `--skip`. Output feeds
-`python-simplifier/scripts/format_findings.py` unchanged.
+`python-code-doctor/scripts/format_findings.py` unchanged.
 
 `django_context.py` returns `None` when the tree is not a Django project (no `manage.py`,
 no settings module, no `django` import). Detectors given `None` report nothing and say so
 on stderr rather than emitting noise.
 
-`common.py` is a byte-identical copy of python-simplifier's, joining the set CI enforces
+`common.py` is a byte-identical copy of python-code-doctor's, joining the set CI enforces
 at `.github/workflows/ci.yml`. A skill directory has to be self-contained to be zipped
 and installed alone, so the duplication is deliberate — the same reasoning that governs
 the two visualization skills.
 
 ### Tests
 
-`tests/django_simplifier/`, one module per detector, each running the script as a
+`tests/django_code_doctor/`, one module per detector, each running the script as a
 subprocess over a throwaway Django-shaped repo built in `tmp_path` — asserting both the
-JSON the agent reads and the text a human reads. `evals/django-simplifier/` for the
+JSON the agent reads and the text a human reads. `evals/django-code-doctor/` for the
 judgment half.
 
 ## 2. The four workflow skills
@@ -138,7 +138,7 @@ judgment; three get a script where something is genuinely mechanical.
 ### brutal-review
 
 Adversarial review of a diff. No script — the mechanical half already exists as
-`python-simplifier/scripts/analyze_diff.py`, and SKILL.md delegates to it when the diff
+`python-code-doctor/scripts/analyze_diff.py`, and SKILL.md delegates to it when the diff
 is Python instead of re-deriving it.
 
 - `references/attack-checklist.md` — the angles a hostile reviewer takes: edge cases and
@@ -149,7 +149,7 @@ is Python instead of re-deriving it.
 
 **Trigger separation.** This is the one real collision risk in the port. brutal-review's
 description claims "tear this apart", "what would a hostile reviewer say", "what am I
-missing", "review my diff". python-simplifier keeps "simplify", "refactor", "clean up",
+missing", "review my diff". python-code-doctor keeps "simplify", "refactor", "clean up",
 "is this over-engineered". Neither description claims the other's phrases.
 
 ### fix-issue
@@ -190,7 +190,7 @@ Regenerate a project's own documentation skill.
 normalization layer. Tests exercise the normalization layer against captured `gh` JSON
 fixtures; the shell-out layer is a few lines and is not mocked.
 
-## 3. python-simplifier absorption
+## 3. python-code-doctor absorption
 
 `scripts/run_external_tools.py` already detects and runs ruff, mypy, black, isort,
 bandit, and flake8, merging their output into this skill's findings shape under a
@@ -228,24 +228,24 @@ to name both. Tests extend the existing `run_external_tools` suite.
 ## 4. Repository plumbing
 
 - README skills list gains five entries; the shared-`common.py` note names
-  django-simplifier.
-- CI's `common.py` sync check covers django-simplifier.
-- CI's ratchet — python-simplifier's bug-class detectors stay silent on every skill's
+  django-code-doctor.
+- CI's `common.py` sync check covers django-code-doctor.
+- CI's ratchet — python-code-doctor's bug-class detectors stay silent on every skill's
   `scripts/` — must pass on all four new script directories.
 - `install.sh` discovers skill directories by globbing for `SKILL.md`. No change.
 - `release.yml` is tag-driven per skill directory. No change.
 
 ## Build order
 
-1. python-simplifier absorption — smallest, independent, no new directories.
+1. python-code-doctor absorption — smallest, independent, no new directories.
 2. The four workflow skills — independent of each other.
-3. django-simplifier — largest.
+3. django-code-doctor — largest.
 4. README and CI.
 
 ## Known follow-ups
 
 Deliberately out of scope, recorded so they are not mistaken for oversights:
 
-- django-simplifier will be refined further after this lands; this port establishes the
+- django-code-doctor will be refined further after this lands; this port establishes the
   structure and interface, not the final detector set.
 - Both simplifier skills may be renamed later.

@@ -1,7 +1,7 @@
 """Every skill has to work when it is the only skill installed.
 
 A release archive holds exactly one skill directory plus LICENSE, and that is
-also what install.sh copies. So a path like `../python-simplifier/scripts/x.py`
+also what install.sh copies. So a path like `../python-code-doctor/scripts/x.py`
 resolves in this monorepo and nowhere a user will ever run it.
 
 These tests build that release layout in tmp_path — one skill, alone, with no
@@ -68,7 +68,7 @@ def sibling_reaches(text: str) -> list[int]:
 
 def test_sibling_reach_detector_catches_a_planted_path():
     """The guard below is only worth having if it fails on the thing it forbids."""
-    planted = 'run this:\n  python ../python-simplifier/scripts/format_findings.py\n'
+    planted = 'run this:\n  python ../python-code-doctor/scripts/format_findings.py\n'
     assert sibling_reaches(planted) == [2]
     assert sibling_reaches('python "$SKILL/scripts/format_findings.py"\n') == []
     assert sibling_reaches("see ../docs/notes.md\n") == [], "only skill names count"
@@ -128,9 +128,9 @@ def test_every_script_runs_from_a_foreign_cwd(installed, tmp_path):
         )
 
 
-def test_django_simplifier_reporting_pipe_runs_without_python_simplifier(tmp_path):
-    """The pipe django-simplifier's SKILL.md documents, run with no sibling present."""
-    installed = install_alone("django-simplifier", tmp_path / "skills")
+def test_django_code_doctor_reporting_pipe_runs_without_python_code_doctor(tmp_path):
+    """The pipe django-code-doctor's SKILL.md documents, run with no sibling present."""
+    installed = install_alone("django-code-doctor", tmp_path / "skills")
     project = tmp_path / "project"
     project.mkdir()
     (project / "manage.py").write_text("import django\n", encoding="utf-8")
@@ -155,9 +155,9 @@ def test_django_simplifier_reporting_pipe_runs_without_python_simplifier(tmp_pat
 
 
 def test_brutal_review_documents_a_fallback_for_its_optional_companion():
-    """It may use python-simplifier when present, but must not require it."""
+    """It may use python-code-doctor when present, but must not require it."""
     text = (SKILLS_DIR / "brutal-review" / "SKILL.md").read_text(encoding="utf-8")
     assert "not installed" in text, (
-        "brutal-review names python-simplifier's analyze_diff.py as an accelerator; "
+        "brutal-review names python-code-doctor's analyze_diff.py as an accelerator; "
         "it has to say what to do when that skill is absent"
     )

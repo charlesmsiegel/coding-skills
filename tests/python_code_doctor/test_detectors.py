@@ -1,0 +1,3208 @@
+"""Smoke tests: every detector fires on a known-bad fixture and stays quiet on clean code.
+
+These are characterization tests for the detectors themselves — the safety net the
+skill tells everyone else to build first. Fixtures are written to tmp_path at runtime
+(not committed) so the intentionally-bad code never trips the linters or the
+detectors' own path-based skip rules (e.g. files under a "tests" segment).
+"""
+
+import ast
+import json
+import os
+import subprocess
+import sys
+from pathlib import Path
+
+import pytest
+
+SCRIPTS_DIR = Path(__file__).resolve().parents[2] / "skills" / "python-code-doctor" / "scripts"
+
+
+def run_detector(script: str, target: Path, *extra: str) -> list[dict]:
+    result = subprocess.run(
+        [sys.executable, str(SCRIPTS_DIR / script), str(target), "--format", "json", *extra],
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    assert result.returncode == 0, f"{script} exited {result.returncode}: {result.stderr[:500]}"
+    return json.loads(result.stdout)
+
+
+def smell_types(findings: list[dict]) -> set[str]:
+    return {f["smell_type"] for f in findings}
+
+
+def ends_with_path(reported: str, suffix: str) -> bool:
+    """Suffix-match a reported path, which uses the host OS separator (``\\`` on Windows).
+
+    The suffix is always spelled with ``/`` so the assertions read the same everywhere.
+    """
+    return reported.replace(os.sep, "/").endswith(suffix)
+
+
+# (detector script, {relative path: file content}, smell types that must fire)
+CASES = [
+    (
+        "find_debug_leftovers.py",
+        {"sample.py": "import pdb\n\ndef f():\n    pdb.set_trace()\n    breakpoint()\n"},
+        {"pdb_trace", "breakpoint_call"},
+    ),
+    (
+        "find_resource_leaks.py",
+        {"sample.py": "def f(p):\n    handle = open(p)\n    return handle.read()\n"},
+        {"unmanaged_open"},
+    ),
+    (
+        "find_security_issues.py",
+        {
+            "sample.py": (
+                "import subprocess\n"
+                "password = 'hunter2secret'\n"
+                "def f(x, d):\n"
+                "    eval(x)\n"
+                "    subprocess.run(f'ls {d}', shell=True)\n"
+                "    cursor.execute(f'select * from t where id={x}')\n"
+            )
+        },
+        {"eval_exec", "command_injection", "sql_injection", "hardcoded_secret"},
+    ),
+    (
+        "find_exception_issues.py",
+        {
+            "sample.py": (
+                "def f():\n"
+                "    try:\n"
+                "        g()\n"
+                "    except Exception:\n"
+                "        pass\n"
+                "    try:\n"
+                "        g()\n"
+                "    except KeyError:\n"
+                "        raise RuntimeError('boom')\n"
+            )
+        },
+        {"swallowed_exception", "raise_without_from"},
+    ),
+    (
+        "find_global_state.py",
+        {"sample.py": "CACHE = {}\n\ndef put(k, v):\n    CACHE[k] = v\n"},
+        {"mutated_global"},
+    ),
+    (
+        "find_ai_scaffolding.py",
+        {
+            "sample.py": (
+                "API_KEY = 'your-api-key'\n"
+                "# TODO: implement the parser\n"
+                "def f():\n"
+                "    raise NotImplementedError\n"
+                "def g(a, **kwargs):\n"
+                "    return a + 1\n"
+            )
+        },
+        {"placeholder_value", "todo_implement", "stub_not_implemented", "unused_kwargs"},
+    ),
+    (
+        "find_duplicate_definitions.py",
+        {"sample.py": "def f():\n    return 1\n\ndef f():\n    return 2\n"},
+        {"duplicate_definition"},
+    ),
+    (
+        "find_duplicate_definitions.py",
+        {"conflicted.py": "<<<<<<< HEAD\nx = 1\n=======\nx = 2\n>>>>>>> branch\n"},
+        {"merge_conflict_marker"},
+    ),
+    (
+        "find_unawaited_coroutines.py",
+        {"sample.py": "async def work():\n    return 1\n\ndef main():\n    work()\n"},
+        {"unawaited_coroutine"},
+    ),
+    (
+        "find_local_imports.py",
+        {"sample.py": "x = 1\nimport os\n\ndef f():\n    import re\n    return re, os\n"},
+        {"local_import", "import_not_at_top"},
+    ),
+    (
+        "find_redundant_comments.py",
+        {"sample.py": "def f(count):\n    # increment count\n    count += 1\n    return count\n"},
+        {"redundant_comment"},
+    ),
+    (
+        "find_outdated_idioms.py",
+        {
+            "sample.py": (
+                "import os\n"
+                "def f(name, d):\n"
+                "    a = '%s!' % name\n"
+                "    b = '{}!'.format(name)\n"
+                "    return a, b, os.path.join(d, 'x')\n"
+            )
+        },
+        {"percent_format", "str_format_call", "os_path_join"},
+    ),
+    (
+        "find_missing_docstrings.py",
+        {"sample.py": "def visible(a):\n    b = a + 1\n    c = b * 2\n    return c\n"},
+        {"public_function_no_docstring"},
+    ),
+    (
+        "find_type_gaps.py",
+        {
+            "sample.py": (
+                "from typing import Any\n"
+                "def f(a):\n"
+                "    return a\n"
+                "def g(b: Any) -> Any:\n"
+                "    return b\n"
+                "x = 1  # type: ignore\n"
+            )
+        },
+        {"missing_return_annotation", "missing_param_annotation", "any_overuse", "broad_type_ignore"},
+    ),
+    (
+        "find_test_smells.py",
+        {
+            "test_sample.py": (
+                "def test_nothing():\n"
+                "    x = 1\n"
+                "def test_trivial():\n"
+                "    assert True\n"
+            )
+        },
+        {"test_without_assertion", "trivial_assertion"},
+    ),
+    (
+        "find_untested_modules.py",
+        {"sample.py": "def thing():\n    return 1\n"},
+        {"no_tests_in_repo"},
+    ),
+    (
+        "find_import_cycles.py",
+        {
+            "pkg/__init__.py": "",
+            "pkg/a.py": "from pkg import b\n",
+            "pkg/b.py": "from pkg import a\n",
+            "pkg/c.py": "from os import *\n",
+        },
+        {"circular_import", "wildcard_import"},
+    ),
+    (
+        "find_dependency_issues.py",
+        {
+            "requirements.txt": "leftpadpy\n",
+            "main.py": "import requests\n\ndef f():\n    return requests\n",
+        },
+        {"missing_dependency", "unpinned_dependency"},
+    ),
+    (
+        "find_design_smells.py",
+        {
+            "sample.py": (
+                "def dispatch(kind, other):\n"
+                "    print(other._secret)\n"
+                "    if kind == 'a':\n"
+                "        out = 1\n"
+                "        log()\n"
+                "    elif kind == 'b':\n"
+                "        out = 2\n"
+                "        log()\n"
+                "    elif kind == 'c':\n"
+                "        out = 3\n"
+                "        log()\n"
+                "    elif kind == 'd':\n"
+                "        out = 4\n"
+                "        log()\n"
+                "    else:\n"
+                "        out = 5\n"
+                "        log()\n"
+                "    return out\n"
+                "\n"
+                "def wait(jobs):\n"
+                "    done = False\n"
+                "    while not done:\n"
+                "        if not jobs:\n"
+                "            done = True\n"
+            )
+        },
+        {"type_switch", "duplicate_conditional_fragment", "control_flag", "inappropriate_intimacy"},
+    ),
+    (
+        "find_design_smells.py",
+        {
+            "sample.py": (
+                "class Base:\n"
+                "    def render(self):\n"
+                "        return 'base'\n"
+                "\n"
+                "class Child(Base):\n"
+                "    def __init__(self):\n"
+                "        self.scratch = None\n"
+                "        self.kept = 1\n"
+                "\n"
+                "    def render(self):\n"
+                "        raise NotImplementedError\n"
+                "\n"
+                "    def only_user(self):\n"
+                "        self.scratch = object()\n"
+                "        log(self.scratch)\n"
+                "\n"
+                "class Echo(Child):\n"
+                "    pass\n"
+            )
+        },
+        {"refused_bequest", "temporary_field", "lazy_class"},
+    ),
+    (
+        "find_pattern_issues.py",
+        {
+            "sample.py": (
+                "_CACHE = {}\n"
+                "\n"
+                "def slow(x):\n"
+                "    if x in _CACHE:\n"
+                "        return _CACHE[x]\n"
+                "    _CACHE[x] = x * 2\n"
+                "    return _CACHE[x]\n"
+                "\n"
+                "class Config:\n"
+                "    _instance = None\n"
+                "    def __new__(cls):\n"
+                "        if cls._instance is None:\n"
+                "            cls._instance = super().__new__(cls)\n"
+                "        return cls._instance\n"
+                "\n"
+                "class Borg:\n"
+                "    _shared = {}\n"
+                "    def __init__(self):\n"
+                "        self.__dict__ = self._shared\n"
+                "\n"
+                "class RegistryMeta(type):\n"
+                "    REGISTRY = {}\n"
+                "    def __new__(mcs, name, bases, ns):\n"
+                "        new_cls = super().__new__(mcs, name, bases, ns)\n"
+                "        mcs.REGISTRY[name] = new_cls\n"
+                "        return new_cls\n"
+                "\n"
+                "class Person:\n"
+                "    def get_name(self):\n"
+                "        return self._name\n"
+                "    def set_name(self, value):\n"
+                "        self._name = value\n"
+                "    @property\n"
+                "    def conn(self):\n"
+                "        if self._conn is None:\n"
+                "            self._conn = object()\n"
+                "        return self._conn\n"
+            )
+        },
+        {"handrolled_memoize", "handrolled_singleton", "borg_shared_state",
+         "registry_metaclass", "getter_setter_pair", "handrolled_lazy_property"},
+    ),
+    (
+        "find_pattern_issues.py",
+        {
+            "sample.py": (
+                "class CountUp:\n"
+                "    def __iter__(self):\n"
+                "        return self\n"
+                "    def __next__(self):\n"
+                "        self.i += 1\n"
+                "        return self.i\n"
+                "\n"
+                "class QueryBuilder:\n"
+                "    def set_table(self, t):\n"
+                "        self.table = t\n"
+                "        return self\n"
+                "    def set_cols(self, c):\n"
+                "        self.cols = c\n"
+                "        return self\n"
+                "    def set_limit(self, n):\n"
+                "        self.limit = n\n"
+                "        return self\n"
+                "    def build(self):\n"
+                "        return (self.table, self.cols, self.limit)\n"
+                "\n"
+                "class Conn:\n"
+                "    def __del__(self):\n"
+                "        self.sock.close()\n"
+                "\n"
+                "class Order:\n"
+                "    def pay(self):\n"
+                "        if self.status == 'new':\n"
+                "            self.status = 'paid'\n"
+                "    def ship(self):\n"
+                "        if self.status == 'paid':\n"
+                "            self.status = 'shipped'\n"
+                "    def cancel(self):\n"
+                "        if self.status == 'shipped':\n"
+                "            raise ValueError\n"
+                "        self.status = 'cancelled'\n"
+                "\n"
+                "class Discount:\n"
+                "    def apply(self, order):\n"
+                "        raise NotImplementedError\n"
+                "\n"
+                "class TenPercent(Discount):\n"
+                "    def apply(self, order):\n"
+                "        return order * 0.9\n"
+                "\n"
+                "class OnSale(Discount):\n"
+                "    def apply(self, order):\n"
+                "        return order * 0.5\n"
+                "\n"
+                "def read(f):\n"
+                "    try:\n"
+                "        return f.read()\n"
+                "    finally:\n"
+                "        f.close()\n"
+            )
+        },
+        {"iterator_class", "fluent_builder", "finalizer_del",
+         "string_state_machine", "stateless_strategy_classes", "try_finally_close"},
+    ),
+]
+
+
+@pytest.mark.parametrize(
+    "script,files,expected", CASES, ids=[f"{c[0]}:{'+'.join(sorted(c[2]))}" for c in CASES]
+)
+def test_detector_fires_on_known_bad_fixture(tmp_path, script, files, expected):
+    for rel, content in files.items():
+        target = tmp_path / rel
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(content)
+    found = smell_types(run_detector(script, tmp_path))
+    missing = expected - found
+    assert not missing, f"{script} did not report {missing}; reported {found or '{}'}"
+
+
+CLEAN_CODE = '''"""A clean module."""
+
+
+def add(first: int, second: int) -> int:
+    """Add two integers."""
+    return first + second
+'''
+
+QUIET_ON_CLEAN = [
+    "find_debug_leftovers.py",
+    "find_resource_leaks.py",
+    "find_security_issues.py",
+    "find_exception_issues.py",
+    "find_global_state.py",
+    "find_ai_scaffolding.py",
+    "find_duplicate_definitions.py",
+    "find_unawaited_coroutines.py",
+    "find_local_imports.py",
+    "find_redundant_comments.py",
+    "find_outdated_idioms.py",
+    "find_missing_docstrings.py",
+    "find_type_gaps.py",
+    "find_test_smells.py",
+    "find_design_smells.py",
+    "find_pattern_issues.py",
+]
+
+
+@pytest.mark.parametrize("script", QUIET_ON_CLEAN)
+def test_detector_quiet_on_clean_code(tmp_path, script):
+    (tmp_path / "sample.py").write_text(CLEAN_CODE)
+    findings = run_detector(script, tmp_path)
+    assert findings == [], f"{script} false-positives on clean code: {smell_types(findings)}"
+
+
+def test_ignore_flag_suppresses_smell_type(tmp_path):
+    (tmp_path / "sample.py").write_text("def f(x):\n    return eval(x)\n")
+    assert "eval_exec" in smell_types(run_detector("find_security_issues.py", tmp_path))
+    suppressed = run_detector("find_security_issues.py", tmp_path, "--ignore", "eval_exec")
+    assert "eval_exec" not in smell_types(suppressed)
+
+
+def test_analyze_all_aggregates_and_is_valid_json(tmp_path):
+    (tmp_path / "sample.py").write_text("def f(x):\n    return eval(x)\n")
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(SCRIPTS_DIR / "analyze_all.py"),
+            str(tmp_path),
+            "--format",
+            "json",
+            "--skip-duplicates",
+        ],
+        capture_output=True,
+        text=True,
+        timeout=600,
+    )
+    assert result.returncode == 0, result.stderr[:500]
+    report = json.loads(result.stdout)
+    assert {"meta", "summary", "categories"} <= report.keys()
+    assert report["summary"]["by_category"].get("security", 0) >= 1
+
+
+def test_every_script_parses():
+    scripts = sorted(SCRIPTS_DIR.glob("*.py"))
+    assert len(scripts) >= 30
+    for script in scripts:
+        ast.parse(script.read_text(encoding="utf-8"), filename=str(script))
+
+
+# --------------------------------------------------------------------------- #
+# Regression tests for review findings (each pins a fixed false pos/neg)
+# --------------------------------------------------------------------------- #
+
+
+def test_cross_kind_duplicate_definition_is_flagged(tmp_path):
+    (tmp_path / "sample.py").write_text("def thing():\n    return 1\n\nclass thing:\n    pass\n")
+    assert "duplicate_definition" in smell_types(run_detector("find_duplicate_definitions.py", tmp_path))
+
+
+def test_subprocess_without_shell_is_not_command_injection(tmp_path):
+    (tmp_path / "sample.py").write_text(
+        "import subprocess\n\ndef f(name):\n    subprocess.run(f'tool-{name}')\n"
+    )
+    assert "command_injection" not in smell_types(run_detector("find_security_issues.py", tmp_path))
+
+
+def test_open_closed_in_finally_is_not_a_leak(tmp_path):
+    (tmp_path / "sample.py").write_text(
+        "def f(p):\n"
+        "    handle = open(p)\n"
+        "    try:\n"
+        "        return handle.read()\n"
+        "    finally:\n"
+        "        handle.close()\n"
+    )
+    assert "unmanaged_open" not in smell_types(run_detector("find_resource_leaks.py", tmp_path))
+
+
+def test_assert_in_nested_helper_does_not_count_as_test_assertion(tmp_path):
+    (tmp_path / "test_sample.py").write_text(
+        "def test_a():\n"
+        "    def helper():\n"
+        "        assert False\n"
+        "    helper()\n"
+    )
+    assert "test_without_assertion" in smell_types(run_detector("find_test_smells.py", tmp_path))
+
+
+def test_sync_method_sharing_name_with_async_function_not_flagged(tmp_path):
+    (tmp_path / "sample.py").write_text(
+        "async def fetch():\n"
+        "    return 1\n"
+        "\n"
+        "class Cache:\n"
+        "    def fetch(self):\n"
+        "        return 2\n"
+        "\n"
+        "def main():\n"
+        "    Cache().fetch()\n"
+    )
+    assert "unawaited_coroutine" not in smell_types(run_detector("find_unawaited_coroutines.py", tmp_path))
+
+
+def test_import_cycle_detected_in_src_layout(tmp_path):
+    pkg = tmp_path / "src" / "pkg"
+    pkg.mkdir(parents=True)
+    (pkg / "__init__.py").write_text("")
+    (pkg / "a.py").write_text("from pkg import b\n")
+    (pkg / "b.py").write_text("from pkg import a\n")
+    assert "circular_import" in smell_types(run_detector("find_import_cycles.py", tmp_path))
+
+
+def test_empty_manifest_yields_missing_dependency_not_no_manifest(tmp_path):
+    (tmp_path / "pyproject.toml").write_text('[project]\nname = "x"\nversion = "0"\ndependencies = []\n')
+    (tmp_path / "main.py").write_text("import requests\n\ndef f():\n    return requests\n")
+    found = smell_types(run_detector("find_dependency_issues.py", tmp_path))
+    assert "missing_dependency" in found
+    assert "no_dependency_manifest" not in found
+
+
+def test_dotted_test_import_does_not_bless_same_stem_module(tmp_path):
+    for pkg in ("pkg1", "pkg2"):
+        d = tmp_path / pkg
+        d.mkdir()
+        (d / "__init__.py").write_text("")
+        (d / "util.py").write_text("def helper():\n    return 1\n")
+    tests_dir = tmp_path / "tests"
+    tests_dir.mkdir()
+    (tests_dir / "test_u.py").write_text("from pkg1 import util\n\ndef test_x():\n    assert util.helper() == 1\n")
+    findings = run_detector("find_untested_modules.py", tmp_path)
+    untested_files = {f["file"] for f in findings if f["smell_type"] == "untested_module"}
+    assert any(ends_with_path(f, "pkg2/util.py") for f in untested_files)
+    assert not any(ends_with_path(f, "pkg1/util.py") for f in untested_files)
+
+
+def _git(repo: Path, *args: str) -> None:
+    subprocess.run(
+        ["git", "-c", "user.email=t@t.co", "-c", "user.name=t", "-c", "commit.gpgsign=false", *args],
+        cwd=repo, check=True, capture_output=True, text=True,
+    )
+
+
+def test_analyze_diff_rejects_invalid_base_ref(tmp_path):
+    _git(tmp_path, "init", "-q")
+    result = subprocess.run(
+        [sys.executable, str(SCRIPTS_DIR / "analyze_diff.py"), "no-such-ref"],
+        cwd=tmp_path, capture_output=True, text=True, timeout=60,
+    )
+    assert result.returncode != 0
+    assert "does not resolve" in result.stderr
+
+
+def test_analyze_diff_retains_findings_anchored_at_changed_definition(tmp_path):
+    _git(tmp_path, "init", "-q")
+    target = tmp_path / "mod.py"
+    target.write_text("def f(x):\n    return x\n")
+    _git(tmp_path, "add", "-A")
+    _git(tmp_path, "commit", "-qm", "base")
+    # Change only the body; the missing-annotation finding anchors at the def line.
+    target.write_text("def f(x):\n    return x + 1\n")
+    result = subprocess.run(
+        [sys.executable, str(SCRIPTS_DIR / "analyze_diff.py"), "HEAD", "--format", "json"],
+        cwd=tmp_path, capture_output=True, text=True, timeout=120,
+    )
+    assert result.returncode == 0, result.stderr[:500]
+    found = {f["smell_type"] for f in json.loads(result.stdout)}
+    assert "missing_return_annotation" in found
+
+
+# --------------------------------------------------------------------------- #
+# Regression tests for the second review round
+# --------------------------------------------------------------------------- #
+
+
+def test_conditional_close_is_still_a_leak(tmp_path):
+    (tmp_path / "sample.py").write_text(
+        "def f(p, ok):\n"
+        "    handle = open(p)\n"
+        "    if ok:\n"
+        "        handle.close()\n"
+        "    return ok\n"
+    )
+    assert "unmanaged_open" in smell_types(run_detector("find_resource_leaks.py", tmp_path))
+
+
+def test_unconditional_close_is_not_a_leak(tmp_path):
+    (tmp_path / "sample.py").write_text(
+        "def f(p):\n"
+        "    handle = open(p)\n"
+        "    data = handle.read()\n"
+        "    handle.close()\n"
+        "    return data\n"
+    )
+    assert "unmanaged_open" not in smell_types(run_detector("find_resource_leaks.py", tmp_path))
+
+
+def test_yaml_load_with_positional_safe_loader_not_flagged(tmp_path):
+    (tmp_path / "sample.py").write_text(
+        "import yaml\n\ndef f(x):\n    a = yaml.load(x)\n    b = yaml.load(x, yaml.SafeLoader)\n    return a, b\n"
+    )
+    findings = [f for f in run_detector("find_security_issues.py", tmp_path) if f["smell_type"] == "unsafe_yaml"]
+    assert len(findings) == 1 and findings[0]["line"] == 4
+
+
+def test_weak_hash_usedforsecurity_false_not_flagged(tmp_path):
+    (tmp_path / "sample.py").write_text(
+        "import hashlib\n\ndef f(b):\n    return hashlib.md5(b, usedforsecurity=False).hexdigest()\n"
+    )
+    assert "weak_hash" not in smell_types(run_detector("find_security_issues.py", tmp_path))
+
+
+def test_verify_false_only_flagged_on_http_apis(tmp_path):
+    (tmp_path / "sample.py").write_text(
+        "import requests\n"
+        "\n"
+        "def f(url, v):\n"
+        "    check_result(v, verify=False)\n"
+        "    return requests.get(url, verify=False)\n"
+    )
+    findings = [f for f in run_detector("find_security_issues.py", tmp_path) if f["smell_type"] == "tls_verify_disabled"]
+    assert len(findings) == 1 and findings[0]["line"] == 5
+
+
+def test_pytest_approx_alone_is_not_an_assertion(tmp_path):
+    (tmp_path / "test_sample.py").write_text(
+        "import pytest\n\ndef test_x(actual):\n    pytest.approx(actual)\n"
+    )
+    assert "test_without_assertion" in smell_types(run_detector("find_test_smells.py", tmp_path))
+
+
+def test_src_layout_local_package_is_not_missing_dependency(tmp_path):
+    (tmp_path / "pyproject.toml").write_text('[project]\nname = "x"\nversion = "0"\ndependencies = []\n')
+    pkg = tmp_path / "src" / "pkg"
+    pkg.mkdir(parents=True)
+    (pkg / "__init__.py").write_text("")
+    (pkg / "a.py").write_text("from pkg import b\n")
+    (pkg / "b.py").write_text("x = 1\n")
+    missing = {f["description"] for f in run_detector("find_dependency_issues.py", tmp_path)
+               if f["smell_type"] == "missing_dependency"}
+    assert not any("pkg" in d.split("'")[1] for d in missing if "'" in d), missing
+
+
+def test_plain_def_after_property_group_is_flagged(tmp_path):
+    (tmp_path / "sample.py").write_text(
+        "class C:\n"
+        "    @property\n"
+        "    def x(self):\n"
+        "        return self._x\n"
+        "    @x.setter\n"
+        "    def x(self, v):\n"
+        "        self._x = v\n"
+        "    def x(self):\n"
+        "        return 1\n"
+    )
+    assert "duplicate_definition" in smell_types(run_detector("find_duplicate_definitions.py", tmp_path))
+
+
+def test_overload_set_with_implementation_not_flagged(tmp_path):
+    (tmp_path / "sample.py").write_text(
+        "from typing import overload\n"
+        "\n"
+        "@overload\n"
+        "def f(x: int) -> int: ...\n"
+        "@overload\n"
+        "def f(x: str) -> str: ...\n"
+        "def f(x):\n"
+        "    return x\n"
+    )
+    assert "duplicate_definition" not in smell_types(run_detector("find_duplicate_definitions.py", tmp_path))
+
+
+def test_nested_stub_in_abstract_class_is_flagged(tmp_path):
+    (tmp_path / "sample.py").write_text(
+        "from abc import ABC, abstractmethod\n"
+        "\n"
+        "class C(ABC):\n"
+        "    @abstractmethod\n"
+        "    def m(self): ...\n"
+        "    def concrete(self):\n"
+        "        def helper():\n"
+        "            pass\n"
+        "        return helper\n"
+    )
+    found = smell_types(run_detector("find_ai_scaffolding.py", tmp_path))
+    assert "empty_stub" in found
+
+
+def test_docstring_with_example_url_is_not_a_placeholder(tmp_path):
+    (tmp_path / "sample.py").write_text(
+        '"""See https://example.com/docs for details."""\n'
+        "\n"
+        "def f() -> int:\n"
+        '    """Compute. See https://example.com/docs."""\n'
+        "    return 1\n"
+    )
+    assert "placeholder_value" not in smell_types(run_detector("find_ai_scaffolding.py", tmp_path))
+
+
+def test_design_smells_skip_idiomatic_patterns(tmp_path):
+    """Lazy-init property, dunder privates, namedtuple API, imported modules,
+    exception subclasses and short ladders are idioms, not smells."""
+    (tmp_path / "sample.py").write_text(
+        "import os\n"
+        "from collections import namedtuple\n"
+        "\n"
+        "Point = namedtuple('Point', 'x y')\n"
+        "\n"
+        "class Config:\n"
+        "    def __init__(self):\n"
+        "        self._cache = None\n"
+        "\n"
+        "    @property\n"
+        "    def cache(self):\n"
+        "        if self._cache is None:\n"
+        "            self._cache = os.environ.get('X')\n"
+        "        return self._cache\n"
+        "\n"
+        "    def __eq__(self, other):\n"
+        "        return self._cache == other._cache\n"
+        "\n"
+        "class MyError(ValueError):\n"
+        "    pass\n"
+        "\n"
+        "def move(p):\n"
+        "    os._exit\n"
+        "    return p._replace(x=p.x + 1)\n"
+        "\n"
+        "def two_way(kind):\n"
+        "    if kind == 'a':\n"
+        "        return 1\n"
+        "    elif kind == 'b':\n"
+        "        return 2\n"
+        "    return 3\n"
+    )
+    assert smell_types(run_detector("find_design_smells.py", tmp_path)) == set()
+
+
+def test_ladder_on_mixed_subjects_is_not_a_type_switch(tmp_path):
+    (tmp_path / "sample.py").write_text(
+        "def f(kind, size, mode, flag):\n"
+        "    if kind == 'a':\n"
+        "        return 1\n"
+        "    elif size == 2:\n"
+        "        return 2\n"
+        "    elif mode == 'x':\n"
+        "        return 3\n"
+        "    elif flag == 'y':\n"
+        "        return 4\n"
+        "    else:\n"
+        "        return 5\n"
+    )
+    assert "type_switch" not in smell_types(run_detector("find_design_smells.py", tmp_path))
+
+
+def test_flag_assigned_only_in_nested_scope_is_not_a_control_flag(tmp_path):
+    (tmp_path / "sample.py").write_text(
+        "def wait(register):\n"
+        "    done = False\n"
+        "    while not done:\n"
+        "        def callback():\n"
+        "            done = True\n"
+        "        register(callback)\n"
+    )
+    assert "control_flag" not in smell_types(run_detector("find_design_smells.py", tmp_path))
+
+
+def test_documented_marker_subclass_is_not_lazy(tmp_path):
+    (tmp_path / "sample.py").write_text(
+        "class Node:\n"
+        "    def walk(self):\n"
+        "        return []\n"
+        "\n"
+        "class Leaf(Node):\n"
+        '    """Marker type: distinguishes terminal nodes in isinstance checks."""\n'
+    )
+    assert "lazy_class" not in smell_types(run_detector("find_design_smells.py", tmp_path))
+
+
+def test_annotated_none_field_is_a_temporary_field(tmp_path):
+    (tmp_path / "sample.py").write_text(
+        "class Job:\n"
+        "    def __init__(self):\n"
+        "        self.scratch: object | None = None\n"
+        "\n"
+        "    def run(self):\n"
+        "        self.scratch = object()\n"
+        "        log(self.scratch)\n"
+    )
+    assert "temporary_field" in smell_types(run_detector("find_design_smells.py", tmp_path))
+
+
+def test_nested_classes_sharing_a_name_do_not_cross_hierarchies(tmp_path):
+    (tmp_path / "sample.py").write_text(
+        "class ContainerA:\n"
+        "    class Base:\n"
+        "        def render(self):\n"
+        "            return 'a'\n"
+        "\n"
+        "class ContainerB:\n"
+        "    class Base:\n"
+        "        pass\n"
+        "\n"
+        "    class Child(Base):\n"
+        "        def render(self):\n"
+        "            raise NotImplementedError\n"
+    )
+    assert "refused_bequest" not in smell_types(run_detector("find_design_smells.py", tmp_path))
+
+
+def test_analyze_diff_keeps_finding_anchored_at_unchanged_conditional(tmp_path):
+    _git(tmp_path, "init", "-q")
+    target = tmp_path / "mod.py"
+    target.write_text(
+        "def f(kind):\n"
+        "    if kind == 'a':\n"
+        "        first()\n"
+        "    else:\n"
+        "        second()\n"
+    )
+    _git(tmp_path, "add", "-A")
+    _git(tmp_path, "commit", "-qm", "base")
+    # Edit only the branch bodies so they now end identically; the resulting
+    # duplicate_conditional_fragment finding anchors at the unchanged `if` line.
+    target.write_text(
+        "def f(kind):\n"
+        "    if kind == 'a':\n"
+        "        log()\n"
+        "    else:\n"
+        "        log()\n"
+    )
+    result = subprocess.run(
+        [sys.executable, str(SCRIPTS_DIR / "analyze_diff.py"), "HEAD", "--format", "json"],
+        cwd=tmp_path, capture_output=True, text=True, timeout=120,
+    )
+    assert result.returncode == 0, result.stderr[:500]
+    found = {f["smell_type"] for f in json.loads(result.stdout)}
+    assert "duplicate_conditional_fragment" in found
+
+
+def test_deferred_none_assignment_in_init_callback_is_not_a_temporary_field(tmp_path):
+    (tmp_path / "sample.py").write_text(
+        "class Job:\n"
+        "    def __init__(self, register):\n"
+        "        def reset():\n"
+        "            self.scratch = None\n"
+        "        register(reset)\n"
+        "\n"
+        "    def run(self):\n"
+        "        self.scratch = object()\n"
+        "        return self.scratch\n"
+    )
+    assert "temporary_field" not in smell_types(run_detector("find_design_smells.py", tmp_path))
+
+
+def test_field_only_read_back_as_none_is_not_a_temporary_field(tmp_path):
+    (tmp_path / "sample.py").write_text(
+        "class Job:\n"
+        "    def __init__(self):\n"
+        "        self.result = None\n"
+        "\n"
+        "    def run(self):\n"
+        "        return self.result\n"
+    )
+    assert "temporary_field" not in smell_types(run_detector("find_design_smells.py", tmp_path))
+
+
+def test_nested_concrete_hierarchy_still_reports_refused_bequest(tmp_path):
+    (tmp_path / "sample.py").write_text(
+        "class Container:\n"
+        "    class Base:\n"
+        "        def render(self):\n"
+        "            return 'base'\n"
+        "\n"
+        "    class Child(Base):\n"
+        "        def render(self):\n"
+        "            raise NotImplementedError\n"
+    )
+    assert "refused_bequest" in smell_types(run_detector("find_design_smells.py", tmp_path))
+
+
+def test_enum_member_ladder_is_a_type_switch(tmp_path):
+    (tmp_path / "sample.py").write_text(
+        "def f(kind):\n"
+        "    if kind == Kind.CREATE:\n"
+        "        return 1\n"
+        "    elif kind == Kind.UPDATE:\n"
+        "        return 2\n"
+        "    elif kind == Kind.DELETE:\n"
+        "        return 3\n"
+        "    elif kind == Kind.LIST:\n"
+        "        return 4\n"
+        "    return 0\n"
+    )
+    assert "type_switch" in smell_types(run_detector("find_design_smells.py", tmp_path))
+
+
+def test_chained_receivers_are_inappropriate_intimacy(tmp_path):
+    (tmp_path / "sample.py").write_text(
+        "class Billing:\n"
+        "    def charge(self, request):\n"
+        "        token = self.account._token\n"
+        "        state = request.user._state\n"
+        "        return token, state\n"
+    )
+    findings = [f for f in run_detector("find_design_smells.py", tmp_path)
+                if f["smell_type"] == "inappropriate_intimacy"]
+    assert len(findings) == 2
+
+
+def test_callback_inside_dunder_is_not_exempt_from_intimacy(tmp_path):
+    (tmp_path / "sample.py").write_text(
+        "class Watcher:\n"
+        "    def __init__(self, other, register):\n"
+        "        def callback():\n"
+        "            return other._secret\n"
+        "        register(callback)\n"
+    )
+    assert "inappropriate_intimacy" in smell_types(run_detector("find_design_smells.py", tmp_path))
+
+
+def test_parameter_shadowing_class_name_is_not_exempt_from_intimacy(tmp_path):
+    (tmp_path / "sample.py").write_text(
+        "class Account:\n"
+        "    def balance(self):\n"
+        "        return 0\n"
+        "\n"
+        "def expose(Account):\n"
+        "    return Account._token\n"
+    )
+    assert "inappropriate_intimacy" in smell_types(run_detector("find_design_smells.py", tmp_path))
+
+
+def test_analyze_diff_skips_preexisting_finding_at_unchanged_conditional(tmp_path):
+    _git(tmp_path, "init", "-q")
+    target = tmp_path / "mod.py"
+    ladder = (
+        "def f(kind):\n"
+        "    if kind == 'a':\n"
+        "        return {}\n"
+        "    elif kind == 'b':\n"
+        "        return 2\n"
+        "    elif kind == 'c':\n"
+        "        return 3\n"
+        "    elif kind == 'd':\n"
+        "        return 4\n"
+        "    return 0\n"
+    )
+    target.write_text(ladder)
+    _git(tmp_path, "add", "-A")
+    _git(tmp_path, "commit", "-qm", "base")
+    # Edit one branch body; the dispatch structure is unchanged, so the
+    # pre-existing type_switch at the `if` header must not resurface.
+    target.write_text(ladder.replace("return {}", "return 10"))
+    result = subprocess.run(
+        [sys.executable, str(SCRIPTS_DIR / "analyze_diff.py"), "HEAD", "--format", "json"],
+        cwd=tmp_path, capture_output=True, text=True, timeout=240,
+    )
+    assert result.returncode == 0, result.stderr[:500]
+    found = {f["smell_type"] for f in json.loads(result.stdout)}
+    assert "type_switch" not in found
+
+
+def test_local_reassignment_of_class_name_is_not_exempt_from_intimacy(tmp_path):
+    (tmp_path / "sample.py").write_text(
+        "class Account:\n"
+        "    def balance(self):\n"
+        "        return 0\n"
+        "\n"
+        "def expose(factory):\n"
+        "    Account = factory()\n"
+        "    return Account._token\n"
+    )
+    assert "inappropriate_intimacy" in smell_types(run_detector("find_design_smells.py", tmp_path))
+
+
+def test_noop_method_on_earlier_base_shadows_concrete_later_base(tmp_path):
+    (tmp_path / "sample.py").write_text(
+        "class NoopBase:\n"
+        "    def render(self):\n"
+        "        pass\n"
+        "\n"
+        "class Concrete:\n"
+        "    def render(self):\n"
+        "        return 'x'\n"
+        "\n"
+        "class FollowsNoop(NoopBase, Concrete):\n"
+        "    def render(self):\n"
+        "        raise NotImplementedError\n"
+        "\n"
+        "class FollowsConcrete(Concrete, NoopBase):\n"
+        "    def render(self):\n"
+        "        raise NotImplementedError\n"
+    )
+    findings = [f for f in run_detector("find_design_smells.py", tmp_path)
+                if f["smell_type"] == "refused_bequest"]
+    # MRO reaches NoopBase.render first for FollowsNoop: nothing concrete is refused.
+    assert len(findings) == 1 and "FollowsConcrete" in findings[0]["description"]
+
+
+def test_annotated_flag_assignment_is_a_control_flag(tmp_path):
+    (tmp_path / "sample.py").write_text(
+        "def wait(jobs):\n"
+        "    done = False\n"
+        "    while not done:\n"
+        "        if not jobs:\n"
+        "            done: bool = True\n"
+    )
+    assert "control_flag" in smell_types(run_detector("find_design_smells.py", tmp_path))
+
+
+def test_suffix_named_test_module_is_exempt_from_intimacy(tmp_path):
+    (tmp_path / "account_test.py").write_text(
+        "def check(account):\n"
+        "    assert account._token is None\n"
+    )
+    assert "inappropriate_intimacy" not in smell_types(run_detector("find_design_smells.py", tmp_path))
+
+
+def test_analyze_diff_uses_prerename_path_for_baseline(tmp_path):
+    _git(tmp_path, "init", "-q")
+    ladder = (
+        "def f(kind):\n"
+        "    if kind == 'a':\n"
+        "        return {}\n"
+        "    elif kind == 'b':\n"
+        "        return 2\n"
+        "    elif kind == 'c':\n"
+        "        return 3\n"
+        "    elif kind == 'd':\n"
+        "        return 4\n"
+        "    return 0\n"
+    )
+    (tmp_path / "mod.py").write_text(ladder)
+    _git(tmp_path, "add", "-A")
+    _git(tmp_path, "commit", "-qm", "base")
+    _git(tmp_path, "mv", "mod.py", "renamed.py")
+    (tmp_path / "renamed.py").write_text(ladder.replace("return {}", "return 10"))
+    result = subprocess.run(
+        [sys.executable, str(SCRIPTS_DIR / "analyze_diff.py"), "HEAD", "--format", "json"],
+        cwd=tmp_path, capture_output=True, text=True, timeout=240,
+    )
+    assert result.returncode == 0, result.stderr[:500]
+    found = {f["smell_type"] for f in json.loads(result.stdout)}
+    assert "type_switch" not in found
+
+
+def test_analyze_diff_baseline_does_not_mask_identical_finding_elsewhere(tmp_path):
+    _git(tmp_path, "init", "-q")
+    f1 = (
+        "def f1(kind):\n"
+        "    if kind == 'a':\n"
+        "        return 1\n"
+        "    elif kind == 'b':\n"
+        "        return 2\n"
+        "    elif kind == 'c':\n"
+        "        return 3\n"
+        "    elif kind == 'd':\n"
+        "        return 4\n"
+        "    return 0\n"
+    )
+    f2_base = (
+        "def f2(kind):\n"
+        "    if kind == 'a':\n"
+        "        return 1\n"
+        "    elif kind == 'b':\n"
+        "        return 2\n"
+        "    elif kind == 'c':\n"
+        "        return 3\n"
+        "    return 0\n"
+    )
+    target = tmp_path / "mod.py"
+    target.write_text(f1 + "\n" + f2_base)
+    _git(tmp_path, "add", "-A")
+    _git(tmp_path, "commit", "-qm", "base")
+    # f2 grows a fourth branch: a NEW type_switch with a description identical
+    # to f1's pre-existing one. The def-scoped baseline must not consume it.
+    f2_head = f2_base.replace(
+        "    return 0\n",
+        "    elif kind == 'd':\n        return 4\n    return 0\n",
+    )
+    target.write_text(f1 + "\n" + f2_head)
+    result = subprocess.run(
+        [sys.executable, str(SCRIPTS_DIR / "analyze_diff.py"), "HEAD", "--format", "json"],
+        cwd=tmp_path, capture_output=True, text=True, timeout=240,
+    )
+    assert result.returncode == 0, result.stderr[:500]
+    switches = [f for f in json.loads(result.stdout) if f["smell_type"] == "type_switch"]
+    assert len(switches) == 1
+
+
+def test_callback_only_usage_is_not_a_temporary_field(tmp_path):
+    (tmp_path / "sample.py").write_text(
+        "class Job:\n"
+        "    def __init__(self):\n"
+        "        self.scratch = None\n"
+        "\n"
+        "    def run(self, register):\n"
+        "        def callback():\n"
+        "            self.scratch = object()\n"
+        "            return self.scratch\n"
+        "        register(callback)\n"
+    )
+    assert "temporary_field" not in smell_types(run_detector("find_design_smells.py", tmp_path))
+
+
+def test_diamond_mro_resolves_noop_before_concrete(tmp_path):
+    (tmp_path / "sample.py").write_text(
+        "class A:\n"
+        "    def render(self):\n"
+        "        return 'a'\n"
+        "\n"
+        "class B(A):\n"
+        "    def other(self):\n"
+        "        return 1\n"
+        "\n"
+        "class C(A):\n"
+        "    def render(self):\n"
+        "        pass\n"
+        "\n"
+        "class D(B, C):\n"
+        "    def render(self):\n"
+        "        raise NotImplementedError\n"
+    )
+    # Python's MRO for D is [D, B, C, A]: lookup reaches C's no-op render, so
+    # D refuses nothing concrete (C itself legitimately overrides A's).
+    findings = [f for f in run_detector("find_design_smells.py", tmp_path)
+                if f["smell_type"] == "refused_bequest" and "'D." in f["description"]]
+    assert findings == []
+
+
+def test_analyze_diff_baseline_distinguishes_same_named_methods(tmp_path):
+    _git(tmp_path, "init", "-q")
+
+    def handle(cls_name, branches):
+        body = "".join(
+            f"        {'if' if i == 0 else 'elif'} kind == '{chr(97 + i)}':\n            return {i}\n"
+            for i in range(branches)
+        )
+        return f"class {cls_name}:\n    def handle(self, kind):\n{body}        return -1\n"
+
+    target = tmp_path / "mod.py"
+    target.write_text(handle("First", 4) + "\n" + handle("Second", 3))
+    _git(tmp_path, "add", "-A")
+    _git(tmp_path, "commit", "-qm", "base")
+    # Second.handle grows to four branches: identical description to the
+    # pre-existing switch in First.handle, but a different qualified def.
+    target.write_text(handle("First", 4) + "\n" + handle("Second", 4))
+    result = subprocess.run(
+        [sys.executable, str(SCRIPTS_DIR / "analyze_diff.py"), "HEAD", "--format", "json"],
+        cwd=tmp_path, capture_output=True, text=True, timeout=240,
+    )
+    assert result.returncode == 0, result.stderr[:500]
+    switches = [f for f in json.loads(result.stdout) if f["smell_type"] == "type_switch"]
+    assert len(switches) == 1
+
+
+def test_unresolved_base_in_hierarchy_silences_refused_bequest(tmp_path):
+    (tmp_path / "sample.py").write_text(
+        "from somewhere import External\n"
+        "\n"
+        "class Local:\n"
+        "    def render(self):\n"
+        "        return 'local'\n"
+        "\n"
+        "class Child(External, Local):\n"
+        "    def render(self):\n"
+        "        raise NotImplementedError\n"
+    )
+    assert "refused_bequest" not in smell_types(run_detector("find_design_smells.py", tmp_path))
+
+
+def test_flag_exiting_enclosing_loop_from_inner_loop_is_not_a_control_flag(tmp_path):
+    (tmp_path / "sample.py").write_text(
+        "def drain(queues):\n"
+        "    done = False\n"
+        "    while not done:\n"
+        "        for q in queues:\n"
+        "            if q.empty():\n"
+        "                done = True\n"
+    )
+    assert "control_flag" not in smell_types(run_detector("find_design_smells.py", tmp_path))
+
+
+def test_analyze_diff_reports_finding_introduced_by_pure_deletion(tmp_path):
+    _git(tmp_path, "init", "-q")
+    target = tmp_path / "mod.py"
+    target.write_text(
+        "def f(ok):\n"
+        "    if ok:\n"
+        "        log()\n"
+        "    else:\n"
+        "        log()\n"
+        "        other()\n"
+    )
+    _git(tmp_path, "add", "-A")
+    _git(tmp_path, "commit", "-qm", "base")
+    # Deleting the else-branch's distinct final statement makes every branch
+    # end identically — a finding introduced purely by deletion.
+    target.write_text(
+        "def f(ok):\n"
+        "    if ok:\n"
+        "        log()\n"
+        "    else:\n"
+        "        log()\n"
+    )
+    result = subprocess.run(
+        [sys.executable, str(SCRIPTS_DIR / "analyze_diff.py"), "HEAD", "--format", "json"],
+        cwd=tmp_path, capture_output=True, text=True, timeout=240,
+    )
+    assert result.returncode == 0, result.stderr[:500]
+    found = {f["smell_type"] for f in json.loads(result.stdout)}
+    assert "duplicate_conditional_fragment" in found
+
+
+def test_analyze_diff_baseline_distinguishes_twin_ladders_in_one_def(tmp_path):
+    _git(tmp_path, "init", "-q")
+
+    def ladder(branches):
+        return "".join(
+            f"    {'if' if i == 0 else 'elif'} kind == '{chr(97 + i)}':\n        pass\n"
+            for i in range(branches)
+        )
+
+    target = tmp_path / "mod.py"
+    target.write_text("def f(kind):\n" + ladder(4) + ladder(3) + "    return kind\n")
+    _git(tmp_path, "add", "-A")
+    _git(tmp_path, "commit", "-qm", "base")
+    # The second ladder in the SAME function grows to four branches: identical
+    # description and enclosing def as the first — only the ordinal differs.
+    target.write_text("def f(kind):\n" + ladder(4) + ladder(4) + "    return kind\n")
+    result = subprocess.run(
+        [sys.executable, str(SCRIPTS_DIR / "analyze_diff.py"), "HEAD", "--format", "json"],
+        cwd=tmp_path, capture_output=True, text=True, timeout=240,
+    )
+    assert result.returncode == 0, result.stderr[:500]
+    switches = [f for f in json.loads(result.stdout) if f.get("smell_type") == "type_switch"]
+    assert len(switches) == 1
+
+
+def test_private_decorator_on_dunder_is_still_intimacy(tmp_path):
+    (tmp_path / "sample.py").write_text(
+        "class C:\n"
+        "    @registry._private_hook\n"
+        "    def __init__(self):\n"
+        "        self.x = 1\n"
+    )
+    assert "inappropriate_intimacy" in smell_types(run_detector("find_design_smells.py", tmp_path))
+
+
+def test_flag_assignment_away_from_termination_is_not_a_control_flag(tmp_path):
+    (tmp_path / "sample.py").write_text(
+        "def spin(q):\n"
+        "    done = False\n"
+        "    while not done:\n"
+        "        if q.reset():\n"
+        "            done = False\n"
+    )
+    assert "control_flag" not in smell_types(run_detector("find_design_smells.py", tmp_path))
+
+
+def test_mixed_eq_and_isinstance_ladder_is_not_a_type_switch(tmp_path):
+    (tmp_path / "sample.py").write_text(
+        "def f(value):\n"
+        "    if value == 0:\n"
+        "        return 1\n"
+        "    elif isinstance(value, str):\n"
+        "        return 2\n"
+        "    elif value == 3:\n"
+        "        return 3\n"
+        "    elif isinstance(value, bytes):\n"
+        "        return 4\n"
+        "    return 0\n"
+    )
+    assert "type_switch" not in smell_types(run_detector("find_design_smells.py", tmp_path))
+
+
+def test_analyze_diff_reports_temporary_field_introduced_by_method_edit(tmp_path):
+    _git(tmp_path, "init", "-q")
+    target = tmp_path / "mod.py"
+    target.write_text(
+        "class Job:\n"
+        "    def __init__(self):\n"
+        "        self.scratch = None\n"
+        "\n"
+        "    def run(self):\n"
+        "        return 1\n"
+    )
+    _git(tmp_path, "add", "-A")
+    _git(tmp_path, "commit", "-qm", "base")
+    # Editing only run() introduces the temporary field; the finding anchors at
+    # the unchanged initializer line, outside the changed lines and def headers.
+    target.write_text(
+        "class Job:\n"
+        "    def __init__(self):\n"
+        "        self.scratch = None\n"
+        "\n"
+        "    def run(self):\n"
+        "        self.scratch = object()\n"
+        "        log(self.scratch)\n"
+    )
+    result = subprocess.run(
+        [sys.executable, str(SCRIPTS_DIR / "analyze_diff.py"), "HEAD", "--format", "json"],
+        cwd=tmp_path, capture_output=True, text=True, timeout=240,
+    )
+    assert result.returncode == 0, result.stderr[:500]
+    found = {f.get("smell_type") for f in json.loads(result.stdout)}
+    assert "temporary_field" in found
+
+
+def test_analyze_diff_line_mapping_beats_ordinal_shifts(tmp_path):
+    _git(tmp_path, "init", "-q")
+
+    def ladder(branches):
+        return "".join(
+            f"    {'if' if i == 0 else 'elif'} kind == '{chr(97 + i)}':\n        pass\n"
+            for i in range(branches)
+        )
+
+    target = tmp_path / "mod.py"
+    target.write_text("def f(kind):\n" + ladder(3) + ladder(4) + "    return kind\n")
+    _git(tmp_path, "add", "-A")
+    _git(tmp_path, "commit", "-qm", "base")
+    # The EARLIER ladder grows to four branches: by rank it becomes ordinal 0,
+    # stealing the later pre-existing finding's baseline slot — line mapping
+    # must attribute the baseline finding to the later (unchanged) construct.
+    target.write_text("def f(kind):\n" + ladder(4) + ladder(4) + "    return kind\n")
+    result = subprocess.run(
+        [sys.executable, str(SCRIPTS_DIR / "analyze_diff.py"), "HEAD", "--format", "json"],
+        cwd=tmp_path, capture_output=True, text=True, timeout=240,
+    )
+    assert result.returncode == 0, result.stderr[:500]
+    switches = [f for f in json.loads(result.stdout) if f.get("smell_type") == "type_switch"]
+    assert len(switches) == 1 and switches[0]["line"] == 2
+
+
+def test_definition_order_resolves_base_bound_at_class_execution(tmp_path):
+    (tmp_path / "sample.py").write_text(
+        "class Base:\n"
+        "    def render(self):\n"
+        "        return 'module level'\n"
+        "\n"
+        "class Container:\n"
+        "    class Child(Base):\n"
+        "        def render(self):\n"
+        "            raise NotImplementedError\n"
+        "\n"
+        "    class Base:\n"
+        "        pass\n"
+    )
+    # At execution time Child(Base) binds the concrete module-level Base — the
+    # later nested Base must not shadow it retroactively.
+    assert "refused_bequest" in smell_types(run_detector("find_design_smells.py", tmp_path))
+
+
+def test_function_local_import_exempts_only_its_own_scope(tmp_path):
+    (tmp_path / "sample.py").write_text(
+        "helper = make_object()\n"
+        "\n"
+        "def uses_import():\n"
+        "    import registry as helper\n"
+        "    return helper._registry_internal\n"
+        "\n"
+        "def uses_module_object():\n"
+        "    return helper._secret\n"
+    )
+    findings = [f for f in run_detector("find_design_smells.py", tmp_path)
+                if f["smell_type"] == "inappropriate_intimacy"]
+    assert len(findings) == 1 and "_secret" in findings[0]["description"]
+
+
+def test_inherited_usage_disqualifies_temporary_field(tmp_path):
+    (tmp_path / "sample.py").write_text(
+        "class Base:\n"
+        "    def consume(self):\n"
+        "        return self.scratch\n"
+        "\n"
+        "class Child(Base):\n"
+        "    def __init__(self):\n"
+        "        self.scratch = None\n"
+        "\n"
+        "    def run(self):\n"
+        "        self.scratch = object()\n"
+        "        return self.scratch\n"
+    )
+    assert "temporary_field" not in smell_types(run_detector("find_design_smells.py", tmp_path))
+
+
+def test_while_else_loop_is_not_a_control_flag(tmp_path):
+    (tmp_path / "sample.py").write_text(
+        "def wait(jobs):\n"
+        "    done = False\n"
+        "    while not done:\n"
+        "        if not jobs:\n"
+        "            done = True\n"
+        "    else:\n"
+        "        finish()\n"
+    )
+    assert "control_flag" not in smell_types(run_detector("find_design_smells.py", tmp_path))
+
+
+def test_overload_declarations_are_not_refused_bequest(tmp_path):
+    (tmp_path / "sample.py").write_text(
+        "from typing import overload\n"
+        "\n"
+        "class Base:\n"
+        "    def convert(self, x):\n"
+        "        return x\n"
+        "\n"
+        "class Child(Base):\n"
+        "    @overload\n"
+        "    def convert(self, x: int) -> int: ...\n"
+        "    @overload\n"
+        "    def convert(self, x: str) -> str: ...\n"
+        "    def convert(self, x):\n"
+        "        return x * 2\n"
+    )
+    assert "refused_bequest" not in smell_types(run_detector("find_design_smells.py", tmp_path))
+
+
+def test_analyze_diff_baseline_keeps_test_directory_context(tmp_path):
+    _git(tmp_path, "init", "-q")
+    tests_dir = tmp_path / "tests"
+    tests_dir.mkdir()
+    (tests_dir / "helpers.py").write_text(
+        "def test_no_assert():\n"
+        "    x = 1\n"
+        "\n"
+        "def other():\n"
+        "    return 2\n"
+    )
+    _git(tmp_path, "add", "-A")
+    _git(tmp_path, "commit", "-qm", "base")
+    # Edit only other(): the pre-existing assertion-less test elsewhere in the
+    # file must not resurface — its baseline requires the tests/ context.
+    (tests_dir / "helpers.py").write_text(
+        "def test_no_assert():\n"
+        "    x = 1\n"
+        "\n"
+        "def other():\n"
+        "    return 3\n"
+    )
+    result = subprocess.run(
+        [sys.executable, str(SCRIPTS_DIR / "analyze_diff.py"), "HEAD", "--format", "json"],
+        cwd=tmp_path, capture_output=True, text=True, timeout=240,
+    )
+    assert result.returncode == 0, result.stderr[:500]
+    found = {f.get("smell_type") for f in json.loads(result.stdout)}
+    assert "test_without_assertion" not in found
+
+
+def test_analyze_diff_reports_refusal_introduced_by_base_edit(tmp_path):
+    _git(tmp_path, "init", "-q")
+    target = tmp_path / "mod.py"
+    target.write_text(
+        "class Base:\n"
+        "    def render(self):\n"
+        "        pass\n"
+        "\n"
+        "class Child(Base):\n"
+        "    def render(self):\n"
+        "        pass\n"
+    )
+    _git(tmp_path, "add", "-A")
+    _git(tmp_path, "commit", "-qm", "base")
+    # Making Base.render concrete turns Child's unchanged no-op override into a
+    # refused bequest — a finding introduced outside the edited class's span.
+    target.write_text(
+        "class Base:\n"
+        "    def render(self):\n"
+        "        return 'real'\n"
+        "\n"
+        "class Child(Base):\n"
+        "    def render(self):\n"
+        "        pass\n"
+    )
+    result = subprocess.run(
+        [sys.executable, str(SCRIPTS_DIR / "analyze_diff.py"), "HEAD", "--format", "json"],
+        cwd=tmp_path, capture_output=True, text=True, timeout=240,
+    )
+    assert result.returncode == 0, result.stderr[:500]
+    found = {f.get("smell_type") for f in json.loads(result.stdout)}
+    assert "refused_bequest" in found
+
+
+def test_rebound_class_name_invalidates_base_resolution(tmp_path):
+    (tmp_path / "sample.py").write_text(
+        "class Base:\n"
+        "    def render(self):\n"
+        "        return 'class'\n"
+        "\n"
+        "Base = make_base()\n"
+        "\n"
+        "class Child(Base):\n"
+        "    def render(self):\n"
+        "        raise NotImplementedError\n"
+    )
+    assert "refused_bequest" not in smell_types(run_detector("find_design_smells.py", tmp_path))
+
+
+def test_lambda_and_comprehension_targets_shadow_module_names(tmp_path):
+    (tmp_path / "sample.py").write_text(
+        "import account\n"
+        "\n"
+        "grab = lambda account: account._secret\n"
+        "\n"
+        "def collect(accounts):\n"
+        "    return [account._secret for account in accounts]\n"
+    )
+    findings = [f for f in run_detector("find_design_smells.py", tmp_path)
+                if f["smell_type"] == "inappropriate_intimacy"]
+    assert len(findings) == 2
+
+
+def test_genexp_inside_dunder_keeps_dunder_exemption(tmp_path):
+    (tmp_path / "sample.py").write_text(
+        "class Vec:\n"
+        "    def __eq__(self, other):\n"
+        "        return all(a._v == b._v for a, b in zip(self._parts, other._parts))\n"
+    )
+    assert "inappropriate_intimacy" not in smell_types(run_detector("find_design_smells.py", tmp_path))
+
+
+def test_call_result_receiver_is_intimacy_but_super_is_not(tmp_path):
+    (tmp_path / "sample.py").write_text(
+        "class C(Base):\n"
+        "    def setup(self):\n"
+        "        super()._configure()\n"
+        "        return get_user()._token\n"
+    )
+    findings = [f for f in run_detector("find_design_smells.py", tmp_path)
+                if f["smell_type"] == "inappropriate_intimacy"]
+    assert len(findings) == 1 and "_token" in findings[0]["description"]
+
+
+def test_name_mangled_attribute_outside_class_is_intimacy(tmp_path):
+    (tmp_path / "sample.py").write_text(
+        "def leak(other):\n"
+        "    return other.__secret\n"
+        "\n"
+        "class Account:\n"
+        "    def merge(self, other):\n"
+        "        return other.__balance\n"
+    )
+    findings = [f for f in run_detector("find_design_smells.py", tmp_path)
+                if f["smell_type"] == "inappropriate_intimacy"]
+    # Module level: foreign private state. Inside the class: mangling makes it
+    # same-class-only access by construction.
+    assert len(findings) == 1 and "__secret" in findings[0]["description"]
+
+
+def test_repeated_identical_conditions_are_not_a_type_switch(tmp_path):
+    (tmp_path / "sample.py").write_text(
+        "def f(kind):\n"
+        "    if kind == 1:\n"
+        "        return 1\n"
+        "    elif kind == 1:\n"
+        "        return 2\n"
+        "    elif kind == 1:\n"
+        "        return 3\n"
+        "    elif kind == 1:\n"
+        "        return 4\n"
+        "    return 0\n"
+    )
+    assert "type_switch" not in smell_types(run_detector("find_design_smells.py", tmp_path))
+
+
+def test_flag_reset_after_terminating_assignment_is_not_a_control_flag(tmp_path):
+    (tmp_path / "sample.py").write_text(
+        "def spin():\n"
+        "    done = False\n"
+        "    while not done:\n"
+        "        done = True\n"
+        "        done = False\n"
+    )
+    assert "control_flag" not in smell_types(run_detector("find_design_smells.py", tmp_path))
+
+
+def test_analyze_diff_gates_findings_on_lines_shifted_by_deletion(tmp_path):
+    _git(tmp_path, "init", "-q")
+    target = tmp_path / "mod.py"
+    target.write_text(
+        "def f():\n"
+        "    cleanup()\n"
+        "    try:\n"
+        "        g()\n"
+        "    except:\n"
+        "        pass\n"
+    )
+    _git(tmp_path, "add", "-A")
+    _git(tmp_path, "commit", "-qm", "base")
+    # Deleting cleanup() shifts the unchanged bare except onto a seeded line;
+    # the pre-existing bare_except must stay suppressed by the baseline.
+    target.write_text(
+        "def f():\n"
+        "    try:\n"
+        "        g()\n"
+        "    except:\n"
+        "        pass\n"
+    )
+    result = subprocess.run(
+        [sys.executable, str(SCRIPTS_DIR / "analyze_diff.py"), "HEAD", "--format", "json"],
+        cwd=tmp_path, capture_output=True, text=True, timeout=240,
+    )
+    assert result.returncode == 0, result.stderr[:500]
+    found = {f.get("smell_type") for f in json.loads(result.stdout)}
+    assert "bare_except" not in found
+
+
+def test_lambda_default_evaluates_in_enclosing_scope(tmp_path):
+    (tmp_path / "sample.py").write_text(
+        "import account\n"
+        "\n"
+        "grab = lambda account=account._secret: account\n"
+    )
+    assert "inappropriate_intimacy" not in smell_types(run_detector("find_design_smells.py", tmp_path))
+
+
+def test_module_rebinding_revokes_import_exemption(tmp_path):
+    (tmp_path / "sample.py").write_text(
+        "import helper\n"
+        "\n"
+        "helper = make_object()\n"
+        "\n"
+        "def f():\n"
+        "    return helper._secret\n"
+    )
+    assert "inappropriate_intimacy" in smell_types(run_detector("find_design_smells.py", tmp_path))
+
+
+def test_class_defined_in_both_branches_is_ambiguous(tmp_path):
+    (tmp_path / "sample.py").write_text(
+        "if fast_mode():\n"
+        "    class Base:\n"
+        "        def render(self):\n"
+        "            pass\n"
+        "else:\n"
+        "    class Base:\n"
+        "        def render(self):\n"
+        "            return 'slow'\n"
+        "\n"
+        "class Child(Base):\n"
+        "    def render(self):\n"
+        "        raise NotImplementedError\n"
+    )
+    assert "refused_bequest" not in smell_types(run_detector("find_design_smells.py", tmp_path))
+
+
+def test_first_comprehension_iterable_evaluates_in_enclosing_scope(tmp_path):
+    (tmp_path / "sample.py").write_text(
+        "import account\n"
+        "\n"
+        "def f():\n"
+        "    return [x for account in account._items for x in account]\n"
+    )
+    assert "inappropriate_intimacy" not in smell_types(run_detector("find_design_smells.py", tmp_path))
+
+
+def test_class_decorator_evaluates_outside_class_context(tmp_path):
+    (tmp_path / "sample.py").write_text(
+        "@other.__private_hook\n"
+        "class C:\n"
+        "    def m(self):\n"
+        "        return 1\n"
+    )
+    assert "inappropriate_intimacy" in smell_types(run_detector("find_design_smells.py", tmp_path))
+
+
+def test_destructuring_write_populates_temporary_field(tmp_path):
+    (tmp_path / "sample.py").write_text(
+        "class Job:\n"
+        "    def __init__(self):\n"
+        "        self.scratch = None\n"
+        "\n"
+        "    def run(self):\n"
+        "        self.scratch, status = make_pair()\n"
+        "        log(self.scratch)\n"
+        "        return status\n"
+    )
+    assert "temporary_field" in smell_types(run_detector("find_design_smells.py", tmp_path))
+
+
+def test_same_named_methods_in_distinct_classes_do_not_collapse(tmp_path):
+    (tmp_path / "sample.py").write_text(
+        "class Base:\n"
+        "    def __init__(self):\n"
+        "        self.scratch = None\n"
+        "\n"
+        "class Outer1:\n"
+        "    class Child(Base):\n"
+        "        def run(self):\n"
+        "            self.scratch = object()\n"
+        "            return self.scratch\n"
+        "\n"
+        "class Outer2:\n"
+        "    class Child(Base):\n"
+        "        def run(self):\n"
+        "            self.scratch = object()\n"
+        "            return self.scratch\n"
+    )
+    # Two distinct Child.run methods use the field — not confined to one.
+    assert "temporary_field" not in smell_types(run_detector("find_design_smells.py", tmp_path))
+
+
+def test_analyze_diff_pure_rename_out_of_tests_is_analyzed(tmp_path):
+    _git(tmp_path, "init", "-q")
+    tests_dir = tmp_path / "tests"
+    tests_dir.mkdir()
+    (tests_dir / "account.py").write_text(
+        "def check(account):\n"
+        "    return account._token\n"
+    )
+    _git(tmp_path, "add", "-A")
+    _git(tmp_path, "commit", "-qm", "base")
+    src_dir = tmp_path / "src"
+    src_dir.mkdir()
+    _git(tmp_path, "mv", "tests/account.py", "src/account.py")
+    result = subprocess.run(
+        [sys.executable, str(SCRIPTS_DIR / "analyze_diff.py"), "HEAD", "--format", "json"],
+        cwd=tmp_path, capture_output=True, text=True, timeout=240,
+    )
+    assert result.returncode == 0, result.stderr[:500]
+    found = {f.get("smell_type") for f in json.loads(result.stdout)}
+    # In tests/ the private access was exempt; as production code it's a
+    # finding the (pure) rename introduced.
+    assert "inappropriate_intimacy" in found
+
+
+def test_abstract_stub_with_imported_base_is_not_refused_bequest(tmp_path):
+    (tmp_path / "sample.py").write_text(
+        "from abc import ABC, abstractmethod\n"
+        "\n"
+        "class Renderer(ABC):\n"
+        "    @abstractmethod\n"
+        "    def render(self):\n"
+        "        raise NotImplementedError\n"
+    )
+    assert "refused_bequest" not in smell_types(run_detector("find_design_smells.py", tmp_path))
+
+
+def test_analyze_diff_surfaces_detector_failures(tmp_path):
+    import shutil
+
+    broken_scripts = tmp_path / "scripts"
+    shutil.copytree(SCRIPTS_DIR, broken_scripts)
+    (broken_scripts / "find_type_gaps.py").write_text("import sys\nsys.exit(3)\n")
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _git(repo, "init", "-q")
+    (repo / "m.py").write_text("def f(x):\n    return x\n")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-qm", "base")
+    (repo / "m.py").write_text("def f(x):\n    return x + 1\n")
+    result = subprocess.run(
+        [sys.executable, str(broken_scripts / "analyze_diff.py"), "HEAD", "--format", "json"],
+        cwd=repo, capture_output=True, text=True, timeout=240,
+    )
+    assert result.returncode == 0, result.stderr[:500]
+    errors = [f for f in json.loads(result.stdout) if f["smell_type"] == "detector_error"]
+    assert errors and "find_type_gaps.py" in errors[0]["description"]
+
+
+def test_working_metaclass_is_not_a_registry(tmp_path):
+    # EnumType-style metaclasses subscript-assign while building the class;
+    # only storing the *new class itself* into a mapping is registration.
+    (tmp_path / "sample.py").write_text(
+        "class WorkingMeta(type):\n"
+        "    def __new__(mcs, name, bases, ns):\n"
+        "        ns['_value_map'] = {}\n"
+        "        new_cls = super().__new__(mcs, name, bases, ns)\n"
+        "        new_cls._value_map['x'] = 1\n"
+        "        return new_cls\n"
+    )
+    assert "registry_metaclass" not in smell_types(
+        run_detector("find_pattern_issues.py", tmp_path)
+    )
+
+
+def test_self_release_in_finally_is_not_flagged(tmp_path):
+    # logging.Handler-style self.acquire()/self.release() is internal lifecycle
+    # management, not a drop-in `with` candidate.
+    (tmp_path / "sample.py").write_text(
+        "class Handler:\n"
+        "    def emit(self):\n"
+        "        self.acquire()\n"
+        "        try:\n"
+        "            self.write()\n"
+        "        finally:\n"
+        "            self.release()\n"
+    )
+    assert "try_finally_close" not in smell_types(
+        run_detector("find_pattern_issues.py", tmp_path)
+    )
+
+
+def test_stateful_strategy_classes_are_not_flagged(tmp_path):
+    # Strategies that carry configuration earn their classes.
+    (tmp_path / "sample.py").write_text(
+        "class Discount:\n"
+        "    def apply(self, order):\n"
+        "        raise NotImplementedError\n"
+        "\n"
+        "class Percent(Discount):\n"
+        "    def __init__(self, rate):\n"
+        "        self.rate = rate\n"
+        "\n"
+        "    def apply(self, order):\n"
+        "        return order * self.rate\n"
+        "\n"
+        "class OnSale(Discount):\n"
+        "    def apply(self, order):\n"
+        "        return order * 0.5\n"
+    )
+    assert "stateless_strategy_classes" not in smell_types(
+        run_detector("find_pattern_issues.py", tmp_path)
+    )
+
+
+def test_validating_metaclass_is_not_a_singleton(tmp_path):
+    # An if-gate plus a *local* assignment from super().__call__ is validation,
+    # not instance caching — only persistent storage counts.
+    (tmp_path / "sample.py").write_text(
+        "class ValidatingMeta(type):\n"
+        "    def __call__(cls, *args, **kwargs):\n"
+        "        obj = super().__call__(*args, **kwargs)\n"
+        "        if not obj.is_valid():\n"
+        "            raise ValueError(obj)\n"
+        "        return obj\n"
+    )
+    assert "handrolled_singleton" not in smell_types(
+        run_detector("find_pattern_issues.py", tmp_path)
+    )
+
+
+def test_instance_factory_recording_latest_is_not_a_singleton(tmp_path):
+    # create_instance() builds a fresh object every call and records the latest;
+    # without a guard/read of the stored attribute it is a factory, not a Singleton.
+    (tmp_path / "sample.py").write_text(
+        "class Widget:\n"
+        "    @classmethod\n"
+        "    def create_instance(cls, name):\n"
+        "        obj = cls(name)\n"
+        "        cls._last_instance = obj\n"
+        "        return obj\n"
+    )
+    assert "handrolled_singleton" not in smell_types(
+        run_detector("find_pattern_issues.py", tmp_path)
+    )
+
+
+def test_dict_restore_in_init_is_not_borg(tmp_path):
+    # Restoring per-instance state from a parameter shares nothing.
+    (tmp_path / "sample.py").write_text(
+        "class Snapshot:\n"
+        "    def __init__(self, state):\n"
+        "        self.__dict__ = state\n"
+    )
+    assert "borg_shared_state" not in smell_types(
+        run_detector("find_pattern_issues.py", tmp_path)
+    )
+
+
+def test_outer_function_not_blamed_for_nested_memoize(tmp_path):
+    # Only the nested helper hand-rolls memoization; the outer function must not
+    # receive a duplicate, mislocated finding.
+    (tmp_path / "sample.py").write_text(
+        "_CACHE = {}\n"
+        "\n"
+        "def outer(x):\n"
+        "    def helper(k):\n"
+        "        if k in _CACHE:\n"
+        "            return _CACHE[k]\n"
+        "        _CACHE[k] = k * 2\n"
+        "        return _CACHE[k]\n"
+        "    return helper(x)\n"
+    )
+    findings = [f for f in run_detector("find_pattern_issues.py", tmp_path)
+                if f["smell_type"] == "handrolled_memoize"]
+    assert [f["description"] for f in findings] == [
+        "'helper' hand-rolls memoization through module-level dict '_CACHE'"
+    ]
+
+
+def test_warn_only_del_is_not_flagged(tmp_path):
+    # A diagnostic finalizer reports the leak; it does not clean up.
+    (tmp_path / "sample.py").write_text(
+        "import warnings\n"
+        "\n"
+        "class Conn:\n"
+        "    def __del__(self):\n"
+        "        if not self.closed:\n"
+        "            warnings.warn('unclosed Conn', ResourceWarning)\n"
+    )
+    assert "finalizer_del" not in smell_types(
+        run_detector("find_pattern_issues.py", tmp_path)
+    )
+
+
+def test_async_stateless_strategies_are_flagged(tmp_path):
+    (tmp_path / "sample.py").write_text(
+        "class Transport:\n"
+        "    async def send(self, payload):\n"
+        "        raise NotImplementedError\n"
+        "\n"
+        "class Http(Transport):\n"
+        "    async def send(self, payload):\n"
+        "        return 'http'\n"
+        "\n"
+        "class Grpc(Transport):\n"
+        "    async def send(self, payload):\n"
+        "        return 'grpc'\n"
+    )
+    assert "stateless_strategy_classes" in smell_types(
+        run_detector("find_pattern_issues.py", tmp_path)
+    )
+
+
+def test_nested_class_base_not_resolved_against_module_scope(tmp_path):
+    # The nested Child's Base is the container's, not the unrelated top-level
+    # Base — refused_bequest must not fire on the wrong hierarchy.
+    (tmp_path / "sample.py").write_text(
+        "class Base:\n"
+        "    def render(self):\n"
+        "        return 'top-level'\n"
+        "\n"
+        "class Container:\n"
+        "    class Base:\n"
+        "        pass\n"
+        "\n"
+        "    class Child(Base):\n"
+        "        def render(self):\n"
+        "            raise NotImplementedError\n"
+    )
+    assert "refused_bequest" not in smell_types(
+        run_detector("find_design_smells.py", tmp_path)
+    )
+
+
+def test_factory_returning_recorded_attr_is_not_a_singleton(tmp_path):
+    # Assign-then-return still constructs a fresh object per call; only a guard
+    # that reads the stored attribute before constructing is singleton reuse.
+    (tmp_path / "sample.py").write_text(
+        "class Widget:\n"
+        "    @classmethod\n"
+        "    def create_instance(cls, name):\n"
+        "        cls._last_instance = cls(name)\n"
+        "        return cls._last_instance\n"
+    )
+    assert "handrolled_singleton" not in smell_types(
+        run_detector("find_pattern_issues.py", tmp_path)
+    )
+
+
+def test_accessors_over_different_attrs_are_not_a_pair(tmp_path):
+    (tmp_path / "sample.py").write_text(
+        "class Reading:\n"
+        "    def get_value(self):\n"
+        "        return self.normalized_value\n"
+        "    def set_value(self, value):\n"
+        "        self.raw_value = value\n"
+    )
+    assert "getter_setter_pair" not in smell_types(
+        run_detector("find_pattern_issues.py", tmp_path)
+    )
+
+
+def test_cursor_with_other_methods_is_not_an_iterator_class(tmp_path):
+    (tmp_path / "sample.py").write_text(
+        "class Cursor:\n"
+        "    def __iter__(self):\n"
+        "        return self\n"
+        "    def __next__(self):\n"
+        "        return self.fetchone()\n"
+        "    def execute(self, sql):\n"
+        "        self.sql = sql\n"
+    )
+    assert "iterator_class" not in smell_types(
+        run_detector("find_pattern_issues.py", tmp_path)
+    )
+
+
+def test_accumulator_dict_is_not_memoization(tmp_path):
+    # Gate + read + write of a session store is stateful accumulation;
+    # lru_cache would suppress the updates.
+    (tmp_path / "sample.py").write_text(
+        "SESSIONS = {}\n"
+        "\n"
+        "def update_session(key, value):\n"
+        "    if key not in SESSIONS:\n"
+        "        SESSIONS[key] = []\n"
+        "    SESSIONS[key].append(value)\n"
+        "    return SESSIONS[key]\n"
+    )
+    assert "handrolled_memoize" not in smell_types(
+        run_detector("find_pattern_issues.py", tmp_path)
+    )
+
+
+def test_exitstack_advice_names_the_actual_receiver(tmp_path):
+    (tmp_path / "sample.py").write_text(
+        "def send(conn, payload):\n"
+        "    try:\n"
+        "        conn.send(payload)\n"
+        "    finally:\n"
+        "        conn.disconnect()\n"
+    )
+    findings = [f for f in run_detector("find_pattern_issues.py", tmp_path)
+                if f["smell_type"] == "try_finally_close"]
+    assert findings and "conn.disconnect" in findings[0]["suggestion"]
+
+
+def test_analyze_diff_keeps_cross_definition_finding_on_unchanged_anchor(tmp_path):
+    # Adding set_name beside an existing get_name completes the accessor pair;
+    # the finding anchors at the *unchanged* getter and must survive the filter.
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _git(repo, "init", "-q")
+    (repo / "m.py").write_text(
+        "class Person:\n"
+        "    def get_name(self):\n"
+        "        return self._name\n"
+    )
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-qm", "base")
+    (repo / "m.py").write_text(
+        "class Person:\n"
+        "    def get_name(self):\n"
+        "        return self._name\n"
+        "\n"
+        "    def set_name(self, value):\n"
+        "        self._name = value\n"
+    )
+    result = subprocess.run(
+        [sys.executable, str(SCRIPTS_DIR / "analyze_diff.py"), "HEAD", "--format", "json"],
+        cwd=repo, capture_output=True, text=True, timeout=240,
+    )
+    assert result.returncode == 0, result.stderr[:500]
+    assert "getter_setter_pair" in {f["smell_type"] for f in json.loads(result.stdout)}
+
+
+def test_recording_new_is_not_a_singleton(tmp_path):
+    # cls.last_created = super().__new__(cls); return — constructs every call.
+    (tmp_path / "sample.py").write_text(
+        "class Tracker:\n"
+        "    def __new__(cls):\n"
+        "        cls.last_created = super().__new__(cls)\n"
+        "        return cls.last_created\n"
+    )
+    assert "handrolled_singleton" not in smell_types(
+        run_detector("find_pattern_issues.py", tmp_path)
+    )
+
+
+def test_local_dict_in_metaclass_is_not_a_registry(tmp_path):
+    (tmp_path / "sample.py").write_text(
+        "class CheckingMeta(type):\n"
+        "    def __new__(mcs, name, bases, ns):\n"
+        "        new_cls = super().__new__(mcs, name, bases, ns)\n"
+        "        local = {}\n"
+        "        local[name] = new_cls\n"
+        "        validate(local)\n"
+        "        return new_cls\n"
+    )
+    assert "registry_metaclass" not in smell_types(
+        run_detector("find_pattern_issues.py", tmp_path)
+    )
+
+
+def test_working_setters_are_not_a_fluent_builder(tmp_path):
+    # Setters that validate / call collaborators are not builder boilerplate.
+    (tmp_path / "sample.py").write_text(
+        "class Pipeline:\n"
+        "    def set_source(self, src):\n"
+        "        self.source = validate_source(src)\n"
+        "        self.refresh()\n"
+        "        return self\n"
+        "    def set_sink(self, sink):\n"
+        "        if sink is None:\n"
+        "            raise ValueError\n"
+        "        self.sink = sink\n"
+        "        return self\n"
+        "    def set_mode(self, mode):\n"
+        "        self.mode = mode\n"
+        "        self.log.info(mode)\n"
+        "        return self\n"
+        "    def build(self):\n"
+        "        return (self.source, self.sink, self.mode)\n"
+    )
+    assert "fluent_builder" not in smell_types(
+        run_detector("find_pattern_issues.py", tmp_path)
+    )
+
+
+def test_result_field_only_written_is_not_temporary(tmp_path):
+    # An output field populated for callers is part of the state model.
+    (tmp_path / "sample.py").write_text(
+        "class Job:\n"
+        "    def __init__(self):\n"
+        "        self.result = None\n"
+        "\n"
+        "    def run(self):\n"
+        "        self.result = compute()\n"
+    )
+    assert "temporary_field" not in smell_types(
+        run_detector("find_design_smells.py", tmp_path)
+    )
+
+
+def test_non_terminating_flag_assignment_is_not_a_control_flag(tmp_path):
+    # `running = True` inside `while running` keeps the loop going.
+    (tmp_path / "sample.py").write_text(
+        "def serve(jobs):\n"
+        "    running = False\n"
+        "    while running:\n"
+        "        if jobs:\n"
+        "            running = True\n"
+    )
+    assert "control_flag" not in smell_types(
+        run_detector("find_design_smells.py", tmp_path)
+    )
+
+
+def test_analyze_diff_drops_cross_definition_finding_on_unrelated_edit(tmp_path):
+    # A pre-existing accessor pair must not surface when the change touches
+    # only an unrelated function in the same file.
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _git(repo, "init", "-q")
+    pair = (
+        "class Person:\n"
+        "    def get_name(self):\n"
+        "        return self._name\n"
+        "\n"
+        "    def set_name(self, value):\n"
+        "        self._name = value\n"
+        "\n"
+    )
+    (repo / "m.py").write_text(pair + "\ndef unrelated():\n    return 1\n")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-qm", "base")
+    (repo / "m.py").write_text(pair + "\ndef unrelated():\n    return 2\n")
+    result = subprocess.run(
+        [sys.executable, str(SCRIPTS_DIR / "analyze_diff.py"), "HEAD", "--format", "json"],
+        cwd=repo, capture_output=True, text=True, timeout=240,
+    )
+    assert result.returncode == 0, result.stderr[:500]
+    assert "getter_setter_pair" not in {f["smell_type"] for f in json.loads(result.stdout)}
+
+
+def test_validating_recorder_metaclass_is_not_a_singleton(tmp_path):
+    # A validation branch beside a recorder assignment is not instance caching:
+    # the guard must read the storage the instance lands in.
+    (tmp_path / "sample.py").write_text(
+        "class RecordingMeta(type):\n"
+        "    def __call__(cls, *args, **kwargs):\n"
+        "        if not args:\n"
+        "            raise ValueError('args required')\n"
+        "        cls.last_created = super().__call__(*args, **kwargs)\n"
+        "        return cls.last_created\n"
+    )
+    assert "handrolled_singleton" not in smell_types(
+        run_detector("find_pattern_issues.py", tmp_path)
+    )
+
+
+def test_metaclass_doing_more_than_registering_is_not_flagged(tmp_path):
+    # __init_subclass__ would not preserve the namespace rewriting.
+    (tmp_path / "sample.py").write_text(
+        "class BusyMeta(type):\n"
+        "    REGISTRY = {}\n"
+        "    def __new__(mcs, name, bases, ns):\n"
+        "        ns['extra'] = build_extra(ns)\n"
+        "        new_cls = super().__new__(mcs, name, bases, ns)\n"
+        "        mcs.REGISTRY[name] = new_cls\n"
+        "        return new_cls\n"
+    )
+    assert "registry_metaclass" not in smell_types(
+        run_detector("find_pattern_issues.py", tmp_path)
+    )
+
+
+def test_unconditional_recompute_is_not_memoization(tmp_path):
+    # Membership gate + write + return without hit-branch reuse: every call
+    # recomputes, so lru_cache would change behavior.
+    (tmp_path / "sample.py").write_text(
+        "CACHE = {}\n"
+        "\n"
+        "def refresh(key):\n"
+        "    if key in CACHE:\n"
+        "        audit(key)\n"
+        "    CACHE[key] = calculate(key)\n"
+        "    return CACHE[key]\n"
+    )
+    assert "handrolled_memoize" not in smell_types(
+        run_detector("find_pattern_issues.py", tmp_path)
+    )
+
+
+def test_async_accessors_are_not_a_getter_setter_pair(tmp_path):
+    (tmp_path / "sample.py").write_text(
+        "class Remote:\n"
+        "    async def get_name(self):\n"
+        "        return self._name\n"
+        "    async def set_name(self, value):\n"
+        "        self._name = value\n"
+    )
+    assert "getter_setter_pair" not in smell_types(
+        run_detector("find_pattern_issues.py", tmp_path)
+    )
+
+
+def test_async_lazy_property_not_pushed_to_cached_property(tmp_path):
+    # cached_property would cache the coroutine, which cannot be re-awaited.
+    (tmp_path / "sample.py").write_text(
+        "class Client:\n"
+        "    @property\n"
+        "    async def conn(self):\n"
+        "        if self._conn is None:\n"
+        "            self._conn = await connect()\n"
+        "        return self._conn\n"
+    )
+    assert "handrolled_lazy_property" not in smell_types(
+        run_detector("find_pattern_issues.py", tmp_path)
+    )
+
+
+def test_decorated_strategy_classes_are_not_flagged(tmp_path):
+    (tmp_path / "sample.py").write_text(
+        "class Discount:\n"
+        "    def apply(self, order):\n"
+        "        raise NotImplementedError\n"
+        "\n"
+        "@register\n"
+        "class TenPercent(Discount):\n"
+        "    def apply(self, order):\n"
+        "        return order * 0.9\n"
+        "\n"
+        "@register\n"
+        "class OnSale(Discount):\n"
+        "    def apply(self, order):\n"
+        "        return order * 0.5\n"
+    )
+    assert "stateless_strategy_classes" not in smell_types(
+        run_detector("find_pattern_issues.py", tmp_path)
+    )
+
+
+def test_nested_function_state_does_not_implicate_outer_method(tmp_path):
+    # Compares/assigns inside a nested helper belong to that scope; with only
+    # one real outer method touching self.status there is no state machine.
+    (tmp_path / "sample.py").write_text(
+        "class Worker:\n"
+        "    def run(self):\n"
+        "        if self.status == 'new':\n"
+        "            self.status = 'busy'\n"
+        "\n"
+        "    def schedule(self):\n"
+        "        def helper():\n"
+        "            if self.status == 'busy':\n"
+        "                self.status = 'done'\n"
+        "        return helper\n"
+    )
+    assert "string_state_machine" not in smell_types(
+        run_detector("find_pattern_issues.py", tmp_path)
+    )
+
+
+def test_returned_result_field_is_not_temporary(tmp_path):
+    # run() populates and returns self.result — an output, not scratch.
+    (tmp_path / "sample.py").write_text(
+        "class Job:\n"
+        "    def __init__(self):\n"
+        "        self.result = None\n"
+        "\n"
+        "    def run(self):\n"
+        "        self.result = compute()\n"
+        "        return self.result\n"
+    )
+    assert "temporary_field" not in smell_types(
+        run_detector("find_design_smells.py", tmp_path)
+    )
+
+
+def test_field_reset_to_none_is_temporary(tmp_path):
+    # An explicit reset proves the None-except-during-one-operation lifecycle.
+    (tmp_path / "sample.py").write_text(
+        "class Parser:\n"
+        "    def __init__(self):\n"
+        "        self.buffer = None\n"
+        "\n"
+        "    def parse(self, text):\n"
+        "        self.buffer = text.split()\n"
+        "        out = transform(self.buffer)\n"
+        "        self.buffer = None\n"
+        "        return out\n"
+    )
+    assert "temporary_field" in smell_types(
+        run_detector("find_design_smells.py", tmp_path)
+    )
+
+
+def test_empty_subclass_of_registering_base_is_not_lazy(tmp_path):
+    (tmp_path / "sample.py").write_text(
+        "class Plugin:\n"
+        "    registry = []\n"
+        "    def __init_subclass__(cls, **kwargs):\n"
+        "        super().__init_subclass__(**kwargs)\n"
+        "        Plugin.registry.append(cls)\n"
+        "\n"
+        "class CsvPlugin(Plugin):\n"
+        "    pass\n"
+    )
+    assert "lazy_class" not in smell_types(
+        run_detector("find_design_smells.py", tmp_path)
+    )
+
+
+def test_flag_set_in_nested_loop_is_not_a_control_flag(tmp_path):
+    # A break at the assignment would exit only the inner for loop.
+    (tmp_path / "sample.py").write_text(
+        "def scan(batches):\n"
+        "    done = False\n"
+        "    while not done:\n"
+        "        for item in next_batch():\n"
+        "            if item.is_last:\n"
+        "                done = True\n"
+        "        commit()\n"
+    )
+    assert "control_flag" not in smell_types(
+        run_detector("find_design_smells.py", tmp_path)
+    )
+
+
+def test_nested_helper_singleton_machinery_not_attributed_to_outer(tmp_path):
+    # The guard and cache assignment live in a nested helper; the outer
+    # accessor constructs fresh on every call.
+    (tmp_path / "sample.py").write_text(
+        "class Service:\n"
+        "    @classmethod\n"
+        "    def make_instance(cls):\n"
+        "        def helper():\n"
+        "            if cls._instance is None:\n"
+        "                cls._instance = cls()\n"
+        "            return cls._instance\n"
+        "        return cls()\n"
+    )
+    assert "handrolled_singleton" not in smell_types(
+        run_detector("find_pattern_issues.py", tmp_path)
+    )
+
+
+def test_async_fluent_setters_are_not_a_builder(tmp_path):
+    (tmp_path / "sample.py").write_text(
+        "class Session:\n"
+        "    async def set_host(self, h):\n"
+        "        self.host = h\n"
+        "        return self\n"
+        "    async def set_port(self, p):\n"
+        "        self.port = p\n"
+        "        return self\n"
+        "    async def set_user(self, u):\n"
+        "        self.user = u\n"
+        "        return self\n"
+        "    def build(self):\n"
+        "        return (self.host, self.port, self.user)\n"
+    )
+    assert "fluent_builder" not in smell_types(
+        run_detector("find_pattern_issues.py", tmp_path)
+    )
+
+
+def test_classmethod_strategies_are_not_flagged(tmp_path):
+    (tmp_path / "sample.py").write_text(
+        "class Codec:\n"
+        "    def decode(self, raw):\n"
+        "        raise NotImplementedError\n"
+        "\n"
+        "class JsonCodec(Codec):\n"
+        "    @classmethod\n"
+        "    def decode(cls, raw):\n"
+        "        return cls.loads(raw)\n"
+        "\n"
+        "class XmlCodec(Codec):\n"
+        "    @classmethod\n"
+        "    def decode(cls, raw):\n"
+        "        return cls.parse(raw)\n"
+    )
+    assert "stateless_strategy_classes" not in smell_types(
+        run_detector("find_pattern_issues.py", tmp_path)
+    )
+
+
+def test_lazy_property_with_setter_not_pushed_to_cached_property(tmp_path):
+    # cached_property has no setter API; client.conn = x would stop working.
+    (tmp_path / "sample.py").write_text(
+        "class Client:\n"
+        "    @property\n"
+        "    def conn(self):\n"
+        "        if self._conn is None:\n"
+        "            self._conn = connect()\n"
+        "        return self._conn\n"
+        "\n"
+        "    @conn.setter\n"
+        "    def conn(self, value):\n"
+        "        self._conn = value\n"
+    )
+    assert "handrolled_lazy_property" not in smell_types(
+        run_detector("find_pattern_issues.py", tmp_path)
+    )
+
+
+def test_uncalled_nested_helper_does_not_make_del_cleanup(tmp_path):
+    (tmp_path / "sample.py").write_text(
+        "import warnings\n"
+        "\n"
+        "class Conn:\n"
+        "    def __del__(self):\n"
+        "        def cleanup():\n"
+        "            self.handle.close()\n"
+        "        warnings.warn('unclosed Conn', ResourceWarning)\n"
+    )
+    assert "finalizer_del" not in smell_types(
+        run_detector("find_pattern_issues.py", tmp_path)
+    )
+
+
+def test_callback_field_use_is_not_a_temporary_field(tmp_path):
+    # The nested callback runs later; self.current persists between calls and
+    # is not scratch local to make_callback.
+    (tmp_path / "sample.py").write_text(
+        "class Tracker:\n"
+        "    def __init__(self):\n"
+        "        self.current = None\n"
+        "\n"
+        "    def make_callback(self):\n"
+        "        def on_event(value):\n"
+        "            self.current = value\n"
+        "            log(self.current)\n"
+        "        return on_event\n"
+    )
+    assert "temporary_field" not in smell_types(
+        run_detector("find_design_smells.py", tmp_path)
+    )
+
+
+# --------------------------------------------------------------------------- #
+# Shared plumbing (scripts/common.py): console encoding, error surfacing,
+# vendored-dir exclusion, and the first-commit diff fallback
+# --------------------------------------------------------------------------- #
+
+
+def test_text_output_survives_cp1252_console(tmp_path):
+    # On Windows stdout often defaults to cp1252; the severity icons must
+    # degrade instead of raising UnicodeEncodeError.
+    (tmp_path / "sample.py").write_text("import pdb\n\ndef f():\n    pdb.set_trace()\n")
+    result = subprocess.run(
+        [sys.executable, str(SCRIPTS_DIR / "find_debug_leftovers.py"), str(tmp_path)],
+        capture_output=True, text=True, timeout=120,
+        env={**os.environ, "PYTHONIOENCODING": "cp1252"},
+    )
+    assert result.returncode == 0, result.stderr[:500]
+    assert "pdb_trace" in result.stdout
+
+
+def test_unparseable_file_is_noted_on_stderr_not_silently_skipped(tmp_path):
+    (tmp_path / "broken.py").write_text("def f(:\n")
+    (tmp_path / "good.py").write_text("def g():\n    return eval('1')\n")
+    result = subprocess.run(
+        [sys.executable, str(SCRIPTS_DIR / "find_security_issues.py"), str(tmp_path),
+         "--format", "json"],
+        capture_output=True, text=True, timeout=120,
+    )
+    assert result.returncode == 0, result.stderr[:500]
+    findings = json.loads(result.stdout)
+    assert "eval_exec" in smell_types(findings), "good file must still be analyzed"
+    assert "broken.py" in result.stderr, "the skipped file must be named on stderr"
+
+
+def test_vendored_dirs_excluded_only_below_the_scanned_root(tmp_path):
+    # A repo that happens to LIVE inside a directory named 'build' is still
+    # scanned; a .venv INSIDE the repo is not.
+    repo = tmp_path / "build" / "myrepo"
+    (repo / ".venv").mkdir(parents=True)
+    (repo / "sample.py").write_text("def f(x):\n    return eval(x)\n")
+    (repo / ".venv" / "vendored.py").write_text("def f(x):\n    return eval(x)\n")
+    findings = run_detector("find_security_issues.py", repo)
+    files = {f["file"] for f in findings}
+    assert any(ends_with_path(f, "myrepo/sample.py") for f in files)
+    assert not any(".venv" in f for f in files)
+
+
+def test_analyze_diff_single_commit_repo_uses_empty_tree_base(tmp_path):
+    # A repo whose HEAD is the first commit has no HEAD~1; with no main/master
+    # branch to diff against either, the fallback must diff against the empty
+    # tree (portably — no /dev/null) instead of crashing.
+    def git(*args):
+        subprocess.run(["git", "-C", str(tmp_path), *args], check=True,
+                       capture_output=True, timeout=60)
+    git("init", "-q", "-b", "trunk")
+    git("config", "user.email", "t@t.co")
+    git("config", "user.name", "t")
+    git("config", "commit.gpgsign", "false")
+    (tmp_path / "sample.py").write_text("def f(x):\n    return eval(x)\n")
+    git("add", "-A")
+    git("commit", "-qm", "first")
+    result = subprocess.run(
+        [sys.executable, str(SCRIPTS_DIR / "analyze_diff.py"), "--format", "json"],
+        capture_output=True, text=True, timeout=600, cwd=str(tmp_path),
+    )
+    assert result.returncode == 0, result.stderr[:500]
+    findings = json.loads(result.stdout)
+    assert smell_types([f for f in findings if "smell_type" in f]) >= {"eval_exec"}
+
+
+def test_analyze_all_output_file_is_utf8(tmp_path):
+    (tmp_path / "sample.py").write_text("x = 1\n")
+    out = tmp_path / "report.txt"
+    result = subprocess.run(
+        [sys.executable, str(SCRIPTS_DIR / "analyze_all.py"), str(tmp_path),
+         "--skip-duplicates", "--output", str(out)],
+        capture_output=True, text=True, timeout=600,
+        env={**os.environ, "PYTHONIOENCODING": "cp1252"},
+    )
+    assert result.returncode == 0, result.stderr[:800]
+    out.read_text(encoding="utf-8")  # must decode; emoji land here regardless of console
+
+
+# --------------------------------------------------------------------------- #
+# Detector-noise fixes: magic numbers, data_class, unpythonic, and the
+# unified --ignore / flat-JSON interface
+# --------------------------------------------------------------------------- #
+
+
+def test_named_constant_is_not_a_magic_number(tmp_path):
+    (tmp_path / "sample.py").write_text(
+        "TIMEOUT = 30\n"
+        "def fetch(url, get):\n"
+        "    return get(url, timeout=30)\n"
+        "def clip(text):\n"
+        "    return text[:200]\n"
+        "def pick(xs):\n"
+        "    weights = [0.3, 0.5, 9]\n"
+        "    return weights\n"
+    )
+    assert "magic_number" not in smell_types(run_detector("find_code_smells.py", tmp_path))
+
+
+def test_unnamed_threshold_is_still_a_magic_number(tmp_path):
+    (tmp_path / "sample.py").write_text(
+        "def stale(age):\n"
+        "    return age > 86400\n"
+    )
+    assert "magic_number" in smell_types(run_detector("find_code_smells.py", tmp_path))
+
+
+def test_declared_dataclass_is_not_a_data_class_smell(tmp_path):
+    (tmp_path / "sample.py").write_text(
+        "from dataclasses import dataclass\n"
+        "from typing import NamedTuple\n"
+        "@dataclass\n"
+        "class Point:\n"
+        "    x: int = 0\n"
+        "    y: int = 0\n"
+        "    z: int = 0\n"
+        "    w: int = 0\n"
+        "class Pair(NamedTuple):\n"
+        "    a: int = 0\n"
+        "    b: int = 0\n"
+        "    c: int = 0\n"
+        "    d: int = 0\n"
+    )
+    assert "data_class" not in smell_types(run_detector("find_code_smells.py", tmp_path))
+
+
+def test_sorted_dict_keys_fires(tmp_path):
+    # This branch was unreachable before (nested under the wrong isinstance).
+    (tmp_path / "sample.py").write_text("def f(d):\n    return sorted(d.keys())\n")
+    findings = run_detector("find_unpythonic.py", tmp_path)
+    assert "sorted_dict_keys" in {f["pattern_type"] for f in findings}
+
+
+def test_keys_flagged_only_in_iteration_and_membership(tmp_path):
+    (tmp_path / "sample.py").write_text(
+        "def f(d, other):\n"
+        "    snapshot = list(d.keys())\n"          # required use: not flagged
+        "    shared = d.keys() & other.keys()\n"   # required use: not flagged
+        "    return snapshot, shared\n"
+    )
+    findings = run_detector("find_unpythonic.py", tmp_path)
+    assert "dict_keys_iteration" not in {f["pattern_type"] for f in findings}
+    (tmp_path / "sample.py").write_text(
+        "def f(d):\n"
+        "    for k in d.keys():\n"
+        "        print(k)\n"
+        "    return 'x' in d.keys()\n"
+    )
+    findings = run_detector("find_unpythonic.py", tmp_path)
+    assert "dict_keys_iteration" in {f["pattern_type"] for f in findings}
+
+
+def test_accumulator_is_not_manual_index_tracking(tmp_path):
+    (tmp_path / "sample.py").write_text(
+        "def f(items):\n"
+        "    errors = 0\n"
+        "    for item in items:\n"
+        "        errors += 1\n"
+        "    return errors\n"
+    )
+    findings = run_detector("find_unpythonic.py", tmp_path)
+    assert "manual_index" not in {f["pattern_type"] for f in findings}
+
+
+def test_x_plus_y_rewrite_suggestion_removed(tmp_path):
+    # x = x + y is not equivalent to x += y for lists/arrays; the detector
+    # must not propose a behavior-changing edit.
+    (tmp_path / "sample.py").write_text("def f(x, y):\n    x = x + y\n    return x\n")
+    findings = run_detector("find_unpythonic.py", tmp_path)
+    assert "augmented_assignment" not in {f["pattern_type"] for f in findings}
+
+
+IGNORE_INTERFACE = [
+    ("analyze_complexity.py", "def f(a, b, c, d, e, g, h, i):\n    return a\n", "parameter_count"),
+    ("find_dead_code.py", "import os\n\nx = 1\n", "unused_import"),
+    ("find_unpythonic.py", "def f(d):\n    return sorted(d.keys())\n", "sorted_dict_keys"),
+]
+
+
+@pytest.mark.parametrize("script,code,finding_type", IGNORE_INTERFACE)
+def test_ignore_flag_on_previously_missing_detectors(tmp_path, script, code, finding_type):
+    (tmp_path / "sample.py").write_text(code)
+    type_field = {"analyze_complexity.py": "issue_type", "find_dead_code.py": "issue_type",
+                  "find_unpythonic.py": "pattern_type"}[script]
+    fired = {f[type_field] for f in run_detector(script, tmp_path)}
+    assert finding_type in fired, f"expected {finding_type}, got {fired}"
+    suppressed = {f[type_field] for f in run_detector(script, tmp_path, "--ignore", finding_type)}
+    assert finding_type not in suppressed
+
+
+def test_find_duplicates_emits_flat_findings(tmp_path):
+    body = "    a = 1\n    b = a + 2\n    c = b * a\n    d = c - a\n    return d\n"
+    (tmp_path / "one.py").write_text(f"def first(x):\n{body}")
+    (tmp_path / "two.py").write_text(f"def second(y):\n{body}")
+    findings = run_detector("find_duplicates.py", tmp_path)
+    assert findings, "duplicate pair must be reported"
+    f = findings[0]
+    assert {"file", "line", "smell_type", "description", "severity"} <= f.keys()
+    assert f["smell_type"] == "duplicate_code"
+    assert f["line"] > 0 and f["file"].endswith(".py")
+    assert "also at" in f["description"]
+
+
+def test_find_overengineering_emits_flat_list(tmp_path):
+    (tmp_path / "sample.py").write_text(
+        "from abc import ABC, abstractmethod\n"
+        "class Base(ABC):\n"
+        "    @abstractmethod\n"
+        "    def run(self):\n"
+        "        ...\n"
+        "class Only(Base):\n"
+        "    def run(self):\n"
+        "        return 1\n"
+    )
+    findings = run_detector("find_overengineering.py", tmp_path)
+    assert isinstance(findings, list) and findings
+    assert {"file", "line", "issue_type", "severity"} <= findings[0].keys()
+
+
+def test_analyze_all_skip_flag(tmp_path):
+    (tmp_path / "sample.py").write_text("def f(x):\n    return eval(x)\n")
+    result = subprocess.run(
+        [sys.executable, str(SCRIPTS_DIR / "analyze_all.py"), str(tmp_path),
+         "--format", "json", "--skip", "duplicates,security"],
+        capture_output=True, text=True, timeout=600,
+    )
+    assert result.returncode == 0, result.stderr[:500]
+    report = json.loads(result.stdout)
+    assert "security" not in report["categories"]
+    assert "duplicates" not in report["categories"]
+    assert set(report["meta"]["analyzers_skipped"]) == {"duplicates", "security"}
+
+
+# --------------------------------------------------------------------------- #
+# Behavioral coverage for the remaining under-tested detectors: each detector
+# gets a fires-on-known-bad case and a quiet-on-clean/edge case that pins a
+# plausible false positive.
+# --------------------------------------------------------------------------- #
+
+
+def issue_types(findings: list[dict]) -> set[str]:
+    return {f["issue_type"] for f in findings}
+
+
+def pattern_types(findings: list[dict]) -> set[str]:
+    return {f["pattern_type"] for f in findings}
+
+
+# ---- analyze_complexity --------------------------------------------------- #
+
+
+def test_deeply_nested_function_exceeds_nesting_threshold(tmp_path):
+    # Five nested ifs exceed the default max_nesting of 4.
+    (tmp_path / "sample.py").write_text(
+        "def route(a):\n"
+        "    if a:\n"
+        "        if a > 1:\n"
+        "            if a > 2:\n"
+        "                if a > 3:\n"
+        "                    if a > 4:\n"
+        "                        return a\n"
+        "    return 0\n"
+    )
+    assert "nesting_depth" in issue_types(run_detector("analyze_complexity.py", tmp_path))
+
+
+def test_simple_function_has_no_complexity_findings(tmp_path):
+    # A two-line function is under every default threshold.
+    (tmp_path / "sample.py").write_text(
+        "def add(first, second):\n"
+        "    return first + second\n"
+    )
+    assert run_detector("analyze_complexity.py", tmp_path) == []
+
+
+# ---- find_boolean_params -------------------------------------------------- #
+
+
+def test_positional_boolean_defaults_are_flagged(tmp_path):
+    (tmp_path / "sample.py").write_text(
+        "def render(data, plain=True, compact=False):\n"
+        "    return (data, plain, compact)\n"
+    )
+    found = smell_types(run_detector("find_boolean_params.py", tmp_path))
+    assert {"multiple_boolean_flags", "boolean_positional_param"} <= found
+
+
+def test_single_keyword_only_boolean_is_not_flagged(tmp_path):
+    # One keyword-only flag is already self-documenting at every call site.
+    (tmp_path / "sample.py").write_text(
+        "def render(data, *, verbose=False):\n"
+        "    return (data, verbose)\n"
+    )
+    assert run_detector("find_boolean_params.py", tmp_path) == []
+
+
+# ---- find_code_smells ----------------------------------------------------- #
+
+
+def test_code_smells_fire_on_bare_except_and_mutable_default(tmp_path):
+    (tmp_path / "sample.py").write_text(
+        "def load(parse, p, opts={}):\n"
+        "    try:\n"
+        "        return parse(p, opts)\n"
+        "    except:\n"
+        "        return None\n"
+        "\n"
+        "def is_dict(x):\n"
+        "    return type(x) == dict\n"
+    )
+    found = smell_types(run_detector("find_code_smells.py", tmp_path))
+    assert {"bare_except", "mutable_default", "type_comparison"} <= found
+
+
+def test_specific_except_and_isinstance_are_not_smells(tmp_path):
+    # `except Exception:` is the suggested fix for bare_except and isinstance
+    # is the suggested fix for type_comparison; neither may re-fire.
+    (tmp_path / "sample.py").write_text(
+        "def load(parse, p):\n"
+        "    try:\n"
+        "        return parse(p)\n"
+        "    except Exception:\n"
+        "        return None\n"
+        "\n"
+        "def is_dict(x):\n"
+        "    return isinstance(x, dict)\n"
+    )
+    assert run_detector("find_code_smells.py", tmp_path) == []
+
+
+# ---- find_comment_smells -------------------------------------------------- #
+
+
+def test_comment_smells_fire_on_todo_and_commented_out_code(tmp_path):
+    (tmp_path / "sample.py").write_text(
+        "def f(x):\n"
+        "    # TODO: rewrite this parser\n"
+        "    # result = compute(x)\n"
+        "    return x\n"
+    )
+    found = smell_types(run_detector("find_comment_smells.py", tmp_path))
+    assert {"todo_comment", "commented_out_code"} <= found
+
+
+def test_pragmas_and_keyword_prose_are_not_commented_out_code(tmp_path):
+    # "# return early" parses as a Return node but is prose; pragma comments
+    # (noqa / type:) are tool directives, not dead code.
+    (tmp_path / "sample.py").write_text(
+        "def scale(value):\n"
+        "    # noqa: E501\n"
+        "    # type: ignore[arg-type]\n"
+        "    # return early\n"
+        "    # doubles the incoming measurement\n"
+        "    return value * 2\n"
+    )
+    assert run_detector("find_comment_smells.py", tmp_path) == []
+
+
+# ---- find_coupling_issues ------------------------------------------------- #
+
+
+def test_feature_envy_and_message_chain_are_flagged(tmp_path):
+    (tmp_path / "sample.py").write_text(
+        "class Report:\n"
+        "    def __init__(self):\n"
+        "        self.title = ''\n"
+        "\n"
+        "    def summarize(self, order):\n"
+        "        return order.subtotal + order.tax + order.shipping\n"
+        "\n"
+        "    def cursor(self):\n"
+        "        return self.conf.db.pool.conn.cursor\n"
+    )
+    found = issue_types(run_detector("find_coupling_issues.py", tmp_path))
+    assert {"feature_envy", "message_chain"} <= found
+
+
+def test_small_cohesive_class_is_not_flagged(tmp_path):
+    # Every method works on the same attribute: LCOM is 0 and nothing is
+    # delegated, so no coupling finding may fire.
+    (tmp_path / "sample.py").write_text(
+        "class Tally:\n"
+        "    def __init__(self):\n"
+        "        self.count = 0\n"
+        "\n"
+        "    def increment(self):\n"
+        "        self.count += 1\n"
+        "\n"
+        "    def current(self):\n"
+        "        return self.count\n"
+    )
+    assert run_detector("find_coupling_issues.py", tmp_path) == []
+
+
+# ---- find_dead_code ------------------------------------------------------- #
+
+
+def test_dead_code_fires_on_unused_import_unreachable_and_constant_condition(tmp_path):
+    (tmp_path / "sample.py").write_text(
+        "import os\n"
+        "import sys\n"
+        "\n"
+        "def f():\n"
+        "    return 1\n"
+        "    print(2)\n"
+        "\n"
+        "if True:\n"
+        "    x = os.sep\n"
+    )
+    found = issue_types(run_detector("find_dead_code.py", tmp_path))
+    assert {"unused_import", "unreachable_code", "constant_condition"} <= found
+
+
+def test_used_import_called_function_and_used_param_are_not_dead(tmp_path):
+    # Everything is referenced: the import is used, the function is called and
+    # its parameter is read — no finding may fire at the default confidence.
+    (tmp_path / "sample.py").write_text(
+        "import os\n"
+        "\n"
+        "def helper(flag):\n"
+        "    if flag:\n"
+        "        return os.sep\n"
+        "    return ''\n"
+        "\n"
+        "RESULT = helper(True)\n"
+    )
+    assert run_detector("find_dead_code.py", tmp_path) == []
+
+
+# ---- find_duplicates ------------------------------------------------------ #
+
+
+def test_duplicates_below_min_lines_are_not_reported(tmp_path):
+    # Identical 4-line functions sit below the default --min-lines of 5;
+    # reporting every tiny idiom as a duplicate would be pure noise.
+    body = "    a = x + 1\n    b = a * 2\n    return b\n"
+    (tmp_path / "one.py").write_text(f"def first(x):\n{body}")
+    (tmp_path / "two.py").write_text(f"def second(x):\n{body}")
+    assert run_detector("find_duplicates.py", tmp_path) == []
+
+
+# ---- find_loop_simplifications -------------------------------------------- #
+
+
+def test_loop_simplifications_fire_on_known_bad_loops(tmp_path):
+    (tmp_path / "sample.py").write_text(
+        "def f(items):\n"
+        "    out = []\n"
+        "    for x in items:\n"
+        "        out.append(x * 2)\n"
+        "    s = ''\n"
+        "    for x in items:\n"
+        "        s += f'{x},'\n"
+        "    found = False\n"
+        "    for x in items:\n"
+        "        if x > 3:\n"
+        "            found = True\n"
+        "            break\n"
+        "    return out, s, found\n"
+    )
+    found = smell_types(run_detector("find_loop_simplifications.py", tmp_path))
+    assert {"loop_to_comprehension", "string_concat_in_loop", "manual_any_all"} <= found
+
+
+def test_loops_with_early_exit_or_side_effects_are_not_comprehensions(tmp_path):
+    # A break or an extra side-effecting statement cannot be expressed as a
+    # comprehension, and a numeric accumulator is not string concatenation.
+    (tmp_path / "sample.py").write_text(
+        "def g(items, target, log):\n"
+        "    out = []\n"
+        "    for x in items:\n"
+        "        out.append(x)\n"
+        "        if x == target:\n"
+        "            break\n"
+        "    for x in items:\n"
+        "        log(x)\n"
+        "        out.append(x)\n"
+        "    total = 0\n"
+        "    for x in items:\n"
+        "        total += x\n"
+        "    return out, total\n"
+    )
+    assert run_detector("find_loop_simplifications.py", tmp_path) == []
+
+
+# ---- find_mutation_hazards ------------------------------------------------ #
+
+
+def test_mutation_hazards_fire_on_shared_and_aliased_state(tmp_path):
+    (tmp_path / "sample.py").write_text(
+        "class Registry:\n"
+        "    entries = []\n"
+        "\n"
+        "def collect(item, acc=[]):\n"
+        "    acc.append(item)\n"
+        "    return acc\n"
+        "\n"
+        "def prune(items):\n"
+        "    for item in items:\n"
+        "        items.remove(item)\n"
+    )
+    findings = run_detector("find_mutation_hazards.py", tmp_path)
+    found = smell_types(findings)
+    assert {"mutable_class_attribute", "mutated_default_arg", "modify_during_iteration"} <= found
+    assert all(ends_with_path(f["file"], "sample.py") for f in findings)
+
+
+def test_instance_state_classvar_snapshot_and_rebound_default_are_safe(tmp_path):
+    # A per-instance list initialized in __init__, an explicit ClassVar, a
+    # snapshot iteration (list(...)), a mutate-then-break loop, and a default
+    # rebound to a fresh copy are all safe patterns that must not be flagged.
+    (tmp_path / "sample.py").write_text(
+        "from typing import ClassVar\n"
+        "\n"
+        "class Widget:\n"
+        "    registry: ClassVar[list] = []\n"
+        "\n"
+        "    def __init__(self):\n"
+        "        self.items = []\n"
+        "\n"
+        "def prune(items):\n"
+        "    for item in list(items):\n"
+        "        items.remove(item)\n"
+        "\n"
+        "def drop_first(items, target):\n"
+        "    for item in items:\n"
+        "        if item == target:\n"
+        "            items.remove(item)\n"
+        "            break\n"
+        "\n"
+        "def collect(item, acc=[]):\n"
+        "    acc = list(acc)\n"
+        "    acc.append(item)\n"
+        "    return acc\n"
+    )
+    assert run_detector("find_mutation_hazards.py", tmp_path) == []
+
+
+# ---- find_naming_issues --------------------------------------------------- #
+
+
+def test_naming_issues_fire_on_case_violations_and_builtin_shadowing(tmp_path):
+    (tmp_path / "sample.py").write_text(
+        "def parseValue(input):\n"
+        "    return input\n"
+        "\n"
+        "class http_client:\n"
+        "    pass\n"
+    )
+    found = smell_types(run_detector("find_naming_issues.py", tmp_path))
+    assert {"non_snake_case_function", "shadows_builtin", "non_pascal_case_class"} <= found
+
+
+def test_pep8_names_and_self_cls_params_are_not_flagged(tmp_path):
+    # snake_case functions, PascalCase classes, dunders, and the conventional
+    # self/cls parameters are all compliant.
+    (tmp_path / "sample.py").write_text(
+        "class HttpClient:\n"
+        "    def __init__(self):\n"
+        "        self.timeout = None\n"
+        "\n"
+        "    def parse_value(self, data):\n"
+        "        return data\n"
+        "\n"
+        "    @classmethod\n"
+        "    def from_url(cls, url):\n"
+        "        return cls()\n"
+    )
+    assert run_detector("find_naming_issues.py", tmp_path) == []
+
+
+# ---- find_overengineering ------------------------------------------------- #
+
+
+def test_abstract_class_without_implementations_is_flagged(tmp_path):
+    (tmp_path / "sample.py").write_text(
+        "from abc import ABC, abstractmethod\n"
+        "\n"
+        "class Renderer(ABC):\n"
+        "    @abstractmethod\n"
+        "    def render(self):\n"
+        "        ...\n"
+    )
+    assert "unused_abstraction" in issue_types(run_detector("find_overengineering.py", tmp_path))
+
+
+def test_abstraction_with_two_implementations_is_earned(tmp_path):
+    # Two concrete implementations justify the abstract base: neither
+    # unused_abstraction nor single_implementation may fire.
+    (tmp_path / "sample.py").write_text(
+        "from abc import ABC, abstractmethod\n"
+        "\n"
+        "class Shape(ABC):\n"
+        "    @abstractmethod\n"
+        "    def area(self):\n"
+        "        ...\n"
+        "\n"
+        "class Circle(Shape):\n"
+        "    def __init__(self, radius):\n"
+        "        self.radius = radius\n"
+        "\n"
+        "    def area(self):\n"
+        "        return self.radius * self.radius\n"
+        "\n"
+        "class Square(Shape):\n"
+        "    def __init__(self, side):\n"
+        "        self.side = side\n"
+        "\n"
+        "    def area(self):\n"
+        "        return self.side * self.side\n"
+    )
+    assert run_detector("find_overengineering.py", tmp_path) == []
+
+
+# ---- find_parameter_objects ----------------------------------------------- #
+
+
+def test_parameter_group_recurring_in_three_functions_is_a_data_clump(tmp_path):
+    (tmp_path / "sample.py").write_text(
+        "def connect(host, port, timeout):\n"
+        "    return (host, port, timeout)\n"
+        "\n"
+        "def ping(host, port, timeout):\n"
+        "    return (host, port, timeout)\n"
+        "\n"
+        "def close_conn(host, port, timeout):\n"
+        "    return (host, port, timeout)\n"
+    )
+    assert "data_clump" in smell_types(run_detector("find_parameter_objects.py", tmp_path))
+
+
+def test_parameter_group_in_only_two_functions_is_not_a_clump(tmp_path):
+    # Two co-occurrences sit below the MIN_FUNCS threshold of 3; extracting a
+    # parameter object for a pair of functions would be premature.
+    (tmp_path / "sample.py").write_text(
+        "def connect(host, port, timeout):\n"
+        "    return (host, port, timeout)\n"
+        "\n"
+        "def ping(host, port, timeout):\n"
+        "    return (host, port, timeout)\n"
+    )
+    assert run_detector("find_parameter_objects.py", tmp_path) == []
+
+
+# ---- find_return_issues --------------------------------------------------- #
+
+
+def test_return_issues_fire_on_mixed_returns_and_boolean_ladder(tmp_path):
+    (tmp_path / "sample.py").write_text(
+        "def lookup(d, k):\n"
+        "    if k in d:\n"
+        "        return d[k]\n"
+        "    return\n"
+        "\n"
+        "def is_big(x):\n"
+        "    if x > 10:\n"
+        "        return True\n"
+        "    return False\n"
+    )
+    found = smell_types(run_detector("find_return_issues.py", tmp_path))
+    assert {"inconsistent_returns", "return_bool_condition"} <= found
+
+
+def test_generator_bare_return_and_same_bool_paths_are_not_flagged(tmp_path):
+    # A bare return in a generator is the idiomatic early exit, and returning
+    # the SAME bool on both paths is not `return <condition>`.
+    (tmp_path / "sample.py").write_text(
+        "def stream(items):\n"
+        "    if not items:\n"
+        "        return\n"
+        "    yield from items\n"
+        "\n"
+        "def confirmed(flag):\n"
+        "    if flag:\n"
+        "        return True\n"
+        "    return True\n"
+    )
+    assert run_detector("find_return_issues.py", tmp_path) == []
+
+
+# ---- find_unpythonic ------------------------------------------------------ #
+
+
+def test_unpythonic_fires_on_range_len_and_literal_comparisons(tmp_path):
+    (tmp_path / "sample.py").write_text(
+        "def f(items, x):\n"
+        "    for i in range(len(items)):\n"
+        "        print(items[i])\n"
+        "    if x == True:\n"
+        "        return 1\n"
+        "    if x == None:\n"
+        "        return 2\n"
+        "    return 0\n"
+    )
+    found = pattern_types(run_detector("find_unpythonic.py", tmp_path))
+    assert {"range_len_loop", "compare_to_true", "compare_none_equality"} <= found
+
+
+def test_enumerate_and_is_none_are_already_pythonic(tmp_path):
+    # The suggested fixes — enumerate() and `is None` — must not re-fire.
+    (tmp_path / "sample.py").write_text(
+        "def g(items, x):\n"
+        "    for i, item in enumerate(items):\n"
+        "        print(i, item)\n"
+        "    if x is None:\n"
+        "        return None\n"
+        "    return x\n"
+    )
+    assert run_detector("find_unpythonic.py", tmp_path) == []
+
+
+# ---- format_findings ------------------------------------------------------ #
+
+
+FORMAT_FIXTURE = [
+    {"file": "src/sample.py", "line": 3, "smell_type": "bare_except",
+     "description": "Bare except catches everything",
+     "suggestion": "Catch a specific exception type", "severity": "high"},
+    {"file": "src/sample.py", "line": 9, "pattern_type": "range_len_loop",
+     "description": "Using range(len()) instead of enumerate", "severity": "low"},
+]
+
+
+def _run_formatter(*extra: str, stdin_text: str | None = None) -> str:
+    result = subprocess.run(
+        [sys.executable, str(SCRIPTS_DIR / "format_findings.py"), *extra],
+        capture_output=True, text=True, timeout=60, input=stdin_text,
+    )
+    assert result.returncode == 0, f"format_findings exited {result.returncode}: {result.stderr[:500]}"
+    return result.stdout
+
+
+def test_format_findings_list_from_stdin_has_location_and_description():
+    out = _run_formatter(stdin_text=json.dumps(FORMAT_FIXTURE))
+    assert "sample.py:3" in out
+    assert "Bare except catches everything" in out
+    assert "range_len_loop" in out
+
+
+def test_format_findings_cards_and_json_from_file(tmp_path):
+    src = tmp_path / "findings.json"
+    src.write_text(json.dumps(FORMAT_FIXTURE))
+    cards = _run_formatter(str(src), "--format", "cards")
+    assert "`src/sample.py:3`" in cards
+    assert "Bare except catches everything" in cards
+    assert "Catch a specific exception type" in cards
+    tickets = json.loads(_run_formatter(str(src), "--format", "json"))
+    assert len(tickets) == 2
+    assert tickets[0]["location"] == "src/sample.py:3"          # high sorts first
+    assert tickets[0]["description"] == "Bare except catches everything"
+    assert tickets[1]["smell"] == "range_len_loop"              # pattern_type honored
+
+
+def test_format_findings_min_severity_filters_low_findings():
+    out = _run_formatter("--min-severity", "high", stdin_text=json.dumps(FORMAT_FIXTURE))
+    assert "bare_except" in out
+    assert "range_len_loop" not in out
+
+
+# run_external_tools lives in tests/python_code_doctor/test_external_tools.py —
+# it needs stub-executable fixtures the rest of these detectors have no use for.

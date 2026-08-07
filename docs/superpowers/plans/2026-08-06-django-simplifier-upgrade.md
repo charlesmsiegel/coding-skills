@@ -1,8 +1,8 @@
-# django-simplifier Upgrade Implementation Plan
+# django-code-doctor Upgrade Implementation Plan
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Grow `django-simplifier` from six detectors to fifteen, make every detector version-aware across Django 4/5/6, add a 4→5→6 upgrade detector driven by a declarative change table, and add a prescriptive idioms guide so the skill serves authoring as well as review.
+**Goal:** Grow `django-code-doctor` from six detectors to fifteen, make every detector version-aware across Django 4/5/6, add a 4→5→6 upgrade detector driven by a declarative change table, and add a prescriptive idioms guide so the skill serves authoring as well as review.
 
 **Architecture:** Unchanged in shape — deterministic stdlib-`ast` detectors plus judgment guides loaded on demand. Three additions: `django_versions.py` (a declarative table of Django changes with a generic matcher), version detection from the project's dependency manifests, and `run_external_tools.py` to drive the tools that require a live Django.
 
@@ -14,7 +14,7 @@ Copied verbatim from the spec and the repo's `pyproject.toml`:
 
 - **Python 3.11+, stdlib only.** No runtime dependencies. Detectors never import the project, never start Django, never need a settings module or a database.
 - **No PEP 701 f-strings** — no nested same-quote expressions, no backslashes inside the expression part. A standalone install runs on whatever interpreter is present.
-- **`tools/validate_skills.py` must pass:** flat frontmatter; `description` ≤ 1024 chars with no unquoted `#`; every SKILL.md invocation written `python "$SKILL/scripts/..."`; `evals/django-simplifier/evals.json` present, unique ids, `expected_output` per case.
+- **`tools/validate_skills.py` must pass:** flat frontmatter; `description` ≤ 1024 chars with no unquoted `#`; every SKILL.md invocation written `python "$SKILL/scripts/..."`; `evals/django-code-doctor/evals.json` present, unique ids, `expected_output` per case.
 - **`ruff` clean** under `select = ["E4","E7","E9","F"]`, `line-length = 120`.
 - **Every detector keeps the shared contract:** `--format text|json`, `--ignore type1,type2`, 🔴/🟡/🟢, findings shaped `{file, line, smell_type, description, suggestion, severity}`, and `collect(ctx) -> [finding]` + `sys.exit(run(name, description, collect))`.
 - **Silence outside Django is explained on stderr**, never presented as a clean bill of health.
@@ -58,7 +58,7 @@ New: `django-idioms.md`, `django-upgrade-runbook.md`, `django-forms-and-admin.md
 
 ### Tests and evals
 
-`tests/django_simplifier/test_detectors.py` (extend), `test_analyze_django.py` (extend), plus new `test_versions.py` and `test_external_tools.py`. `evals/django-simplifier/evals.json` grows to cover upgrade, authoring, DRF, and migration cases.
+`tests/django_code_doctor/test_detectors.py` (extend), `test_analyze_django.py` (extend), plus new `test_versions.py` and `test_external_tools.py`. `evals/django-code-doctor/evals.json` grows to cover upgrade, authoring, DRF, and migration cases.
 
 ---
 
@@ -117,7 +117,7 @@ The complete list of `smell_type` values. This is the contract between tasks: a 
 
 ### Task 1: The version table and version detection
 
-**Files:** Create `skills/django-simplifier/scripts/django_versions.py`, `skills/django-simplifier/scripts/django_detect_version.py`; create `tests/django_simplifier/test_versions.py`.
+**Files:** Create `skills/django-code-doctor/scripts/django_versions.py`, `skills/django-code-doctor/scripts/django_detect_version.py`; create `tests/django_code_doctor/test_versions.py`.
 
 **Interfaces produced:**
 ```python
@@ -141,14 +141,14 @@ def detect_django_version(root) -> tuple[tuple[int,int] | None, str]   # (versio
 ```
 
 - [ ] Write `test_versions.py`: `parse_version` handles `"5.2"`, `"Django>=4.2,<5.0"`, `"~=6.1.0"`, and rejects junk; every `CHANGES` entry has a known `match["kind"]` and at least one of `deprecated_in`/`removed_in`; `detect_django_version` reads pyproject PEP 621, Poetry, `requirements.txt`, and returns `(None, reason)` on a bare tree.
-- [ ] Run: `pytest tests/django_simplifier/test_versions.py -v` → FAIL (no modules).
+- [ ] Run: `pytest tests/django_code_doctor/test_versions.py -v` → FAIL (no modules).
 - [ ] Implement `django_versions.py` — seed `CHANGES` from the researched release notes for 4.0 → 6.1, prioritising application-level constructs over database-backend internals.
 - [ ] Implement `django_detect_version.py`.
 - [ ] Run tests → PASS. Commit.
 
 ### Task 2: Extend the shared project context
 
-**Files:** Modify `skills/django-simplifier/scripts/django_context.py`; extend `tests/django_simplifier/test_analyze_django.py`.
+**Files:** Modify `skills/django-code-doctor/scripts/django_context.py`; extend `tests/django_code_doctor/test_analyze_django.py`.
 
 **Interfaces produced:** on `DjangoContext` —
 ```python
@@ -212,7 +212,7 @@ ctx.at_least(major, minor) -> bool          # False when the version is unknown
 
 ### Task 11: Orchestrator, diff lens, external tools
 
-**Files:** Modify `analyze_django.py`; create `analyze_diff.py`, `run_external_tools.py`; create `tests/django_simplifier/test_external_tools.py`.
+**Files:** Modify `analyze_django.py`; create `analyze_diff.py`, `run_external_tools.py`; create `tests/django_code_doctor/test_external_tools.py`.
 
 - [ ] Tests: all fifteen categories register; `--skip` drops a new category; the diff lens only reports changed files; `run_external_tools` lists a missing tool under `missing_tools` rather than failing, and never installs.
 - [ ] Run → FAIL. Implement. Run → PASS. Commit.
@@ -224,14 +224,14 @@ ctx.at_least(major, minor) -> bool          # False when the version is unknown
 ### Task 13: SKILL.md and evals
 
 - [ ] Rewrite SKILL.md: the fifteen detectors, the version/upgrade workflow, the authoring entry point, the reference index, the web-search-for-newer-versions instruction. Keep `description` ≤ 1024 chars.
-- [ ] Extend `evals/django-simplifier/evals.json` with upgrade, authoring, DRF, and migration cases.
+- [ ] Extend `evals/django-code-doctor/evals.json` with upgrade, authoring, DRF, and migration cases.
 - [ ] Run `python tools/validate_skills.py` → PASS. Commit.
 
 ### Task 14: Full verification
 
-- [ ] `pytest tests/django_simplifier -v` → all pass.
+- [ ] `pytest tests/django_code_doctor -v` → all pass.
 - [ ] `pytest tests/ -q` → no regression in other skills.
-- [ ] `ruff check skills/django-simplifier` → clean.
+- [ ] `ruff check skills/django-code-doctor` → clean.
 - [ ] `python tools/validate_skills.py` → exit 0.
 - [ ] Run `analyze_django.py` over a synthetic multi-app project end to end; confirm findings are worst-first and the version line appears in the report.
 - [ ] Commit.
@@ -272,5 +272,5 @@ Two further changes made while building:
   rather than kept alongside it, as the spec anticipated.
 
 **Final state:** 15 detectors, 122 distinct `smell_type` values, 11 references,
-312 tests in `tests/django_simplifier/` (963 across the repo), ruff clean,
+312 tests in `tests/django_code_doctor/` (963 across the repo), ruff clean,
 `validate_skills.py` passing.
