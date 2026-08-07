@@ -6,6 +6,10 @@ any code appearing to do so: `{{ order.customer.name }}` inside a `{% for %}` is
 an N+1 that no amount of reading views.py will reveal. Templates are not Python,
 so this is a line scanner rather than an AST pass — kept deliberately narrow, and
 every finding names the tag it saw.
+
+The escaping checks (|safe, {% autoescape off %}) live in
+find_django_security.py rather than here, because they are the same finding as
+mark_safe and belong beside it.
 """
 
 import re
@@ -17,14 +21,28 @@ from django_report import finding, run
 _FOR_RE = re.compile(r"{%-?\s*for\s+(\w+)\s+in\s+([\w.]+)")
 _ENDFOR_RE = re.compile(r"{%-?\s*endfor")
 _VAR_RE = re.compile(r"{{\s*([\w.]+)")
+_INCLUDE_RE = re.compile(r"{%-?\s*include\s")
+_FORM_OPEN_RE = re.compile(r"<form\b[^>]*>", re.IGNORECASE)
+_METHOD_POST_RE = re.compile(r"method\s*=\s*[\"']?post", re.IGNORECASE)
+_CSRF_RE = re.compile(r"{%-?\s*csrf_token")
+_SCRIPT_OPEN_RE = re.compile(r"<script\b", re.IGNORECASE)
+_SCRIPT_CLOSE_RE = re.compile(r"</script>", re.IGNORECASE)
+_STATIC_URL_VAR_RE = re.compile(r"{{\s*STATIC_URL\s*}}|{{\s*MEDIA_URL\s*}}")
+# href/src pointing at an app path rather than a named route.
+_HARDCODED_HREF_RE = re.compile(r"""(?:href|action)\s*=\s*["'](/[\w\-/]*)["']""", re.IGNORECASE)
 # Callables that hit the database when a template evaluates them.
 _QUERY_ACCESSORS = ("all", "count", "first", "last", "exists")
+# Filters that make a value safe for a script context.
+_SCRIPT_SAFE_FILTERS = ("json_script", "escapejs")
 
 
 def _scan(path, text):
     findings = []
     # (loop variable, the expression iterated, depth at entry)
     stack = []
+    in_script = False
+    # (line where the <form> opened, whether a csrf_token was seen since)
+    open_post_form = None
 
     for number, line in enumerate(text.splitlines(), start=1):
         for match in _FOR_RE.finditer(line):
@@ -32,15 +50,79 @@ def _scan(path, text):
             if len(stack) >= 3:
                 findings.append(finding(
                     path, number, "deeply_nested_template_loop",
-                    f"{len(stack)} nested {{% for %}} loops — the innermost body runs the "
-                    f"product of all three",
+                    str(len(stack)) + " nested {% for %} loops — the innermost body runs the "
+                    "product of all three",
                     "Flatten the data in the view, or paginate; a template is a bad place to "
                     "discover a quadratic.",
                     "medium"))
 
+        if stack and _INCLUDE_RE.search(line):
+            findings.append(finding(
+                path, number, "include_in_loop",
+                "{% include %} inside a loop re-resolves and re-renders the included template "
+                "once per row",
+                "Use {% include ... only %} to cut the context it copies, or inline the fragment. "
+                "For a fragment used on every row, an inclusion tag caches better.",
+                "low"))
+
         for _ in _ENDFOR_RE.finditer(line):
             if stack:
                 stack.pop()
+
+        # ---- forms and CSRF ------------------------------------------------ #
+        form_match = _FORM_OPEN_RE.search(line)
+        if form_match and _METHOD_POST_RE.search(form_match.group(0)):
+            open_post_form = number
+        if open_post_form is not None and _CSRF_RE.search(line):
+            open_post_form = None
+        if open_post_form is not None and "</form>" in line.lower():
+            findings.append(finding(
+                path, open_post_form, "missing_csrf_token",
+                "a POST form with no {% csrf_token %} — Django rejects the submission with a 403, "
+                "and the usual 'fix' is to reach for csrf_exempt, which removes the protection "
+                "instead of satisfying it",
+                "Add {% csrf_token %} as the first thing inside the <form>.",
+                "high"))
+            open_post_form = None
+
+        # ---- scripts -------------------------------------------------------- #
+        if _SCRIPT_OPEN_RE.search(line):
+            in_script = True
+        if in_script:
+            for match in _VAR_RE.finditer(line):
+                expression = match.group(1)
+                tail = line[match.end():match.end() + 60]
+                if not any(f in tail for f in _SCRIPT_SAFE_FILTERS):
+                    findings.append(finding(
+                        path, number, "template_var_in_script",
+                        "`" + expression + "` is interpolated into a <script> block, where HTML "
+                        "escaping does not protect you — a value containing </script> or a quote "
+                        "breaks out into executable JavaScript",
+                        "Use {{ value|json_script:'id' }} and read it from JavaScript with "
+                        "JSON.parse(document.getElementById('id').textContent).",
+                        "high"))
+        if _SCRIPT_CLOSE_RE.search(line):
+            in_script = False
+
+        # ---- URLs and static ------------------------------------------------ #
+        if _STATIC_URL_VAR_RE.search(line):
+            findings.append(finding(
+                path, number, "static_url_variable",
+                "{{ STATIC_URL }} builds the path by string concatenation, so it misses the hashed "
+                "filename that ManifestStaticFilesStorage produces and serves a stale asset",
+                "Use {% load static %} and {% static 'app/style.css' %}.",
+                "medium"))
+
+        for match in _HARDCODED_HREF_RE.finditer(line):
+            target = match.group(1)
+            if target in ("/", "#"):
+                continue
+            findings.append(finding(
+                path, number, "hardcoded_url_in_template",
+                "the literal path '" + target + "' is written into the template, so renaming the "
+                "route breaks this link silently",
+                "Use {% url 'route-name' %}, or the model's get_absolute_url.",
+                "low"))
 
         for match in _VAR_RE.finditer(line):
             expression = match.group(1)
@@ -51,8 +133,8 @@ def _scan(path, text):
             if parts[-1] in _QUERY_ACCESSORS:
                 findings.append(finding(
                     path, number, "query_in_template",
-                    f"`{{{{ {expression} }}}}` calls .{parts[-1]}() during rendering, so the "
-                    f"query happens after the view has returned and cannot be optimised there",
+                    "`{{ " + expression + " }}` calls ." + parts[-1] + "() during rendering, so "
+                    "the query happens after the view has returned and cannot be optimised there",
                     "Do it in the view and pass the result in; annotate() for a count.",
                     "high" if stack else "medium"))
                 continue
@@ -62,11 +144,11 @@ def _scan(path, text):
                 loop_line = next(ln for var, _, ln in stack if var == parts[0])
                 findings.append(finding(
                     path, number, "relation_walk_in_loop",
-                    f"`{{{{ {expression} }}}}` walks {len(parts) - 1} relations inside the "
-                    f"loop opened on line {loop_line} — one query per row unless it is "
-                    f"prefetched",
-                    f"select_related/prefetch_related '{'__'.join(parts[1:-1])}' on the "
-                    f"queryset the view passes in.",
+                    "`{{ " + expression + " }}` walks " + str(len(parts) - 1) + " relations inside "
+                    "the loop opened on line " + str(loop_line) + " — one query per row unless it "
+                    "is prefetched",
+                    "select_related/prefetch_related '" + "__".join(parts[1:-1]) + "' on the "
+                    "queryset the view passes in.",
                     "high"))
 
     return findings
