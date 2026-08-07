@@ -50,6 +50,16 @@ NON_CODE_SUFFIXES = frozenset({
     ".po", ".pot", ".snap", ".map",
 })
 
+# Conventionally extensionless prose and metadata. `Path.suffix` is empty for
+# these, so the unknown-extension-is-code rule would otherwise feed a README
+# through the complexity and duplication detectors — the exact prose-derived
+# metrics the denylist exists to prevent. Compared case-insensitively.
+NON_CODE_BASENAMES = frozenset({
+    "readme", "license", "licence", "copying", "notice", "authors",
+    "contributors", "changelog", "changes", "history", "news", "todo",
+    "install", "manifest", "codeowners", "maintainers", "version",
+})
+
 # Directories whose contents are documentation regardless of extension. A .py
 # under docs/ is an example, not the product.
 DOC_DIR_NAMES = frozenset({"docs", "doc", "documentation", "examples", "example", "samples"})
@@ -98,6 +108,8 @@ def is_source(rel_parts: tuple[str, ...], path: Path) -> bool:
     if path.suffix.lower() in NON_CODE_SUFFIXES:
         return False
     name = path.name.lower()
+    if not path.suffix and name.split(".")[0] in NON_CODE_BASENAMES:
+        return False
     return not any(marker in name for marker in GENERATED_MARKERS)
 
 
@@ -290,10 +302,21 @@ class HistoryDepth:
     commit_count: int
     oldest_commit_days: int | None
     min_commits: int = 20
+    window_days: int | None = None
 
     @property
     def usable(self) -> bool:
-        return self.is_repo and not self.is_shallow and self.commit_count >= self.min_commits
+        if not (self.is_repo and not self.is_shallow
+                and self.commit_count >= self.min_commits):
+            return False
+        # 20 commits spanning three weeks cannot answer a question about the
+        # last year. A history rewrite or a truncated migration produces
+        # exactly that shape, and it is not shallow by git's definition.
+        if self.window_days is not None:
+            if self.oldest_commit_days is None:
+                return False
+            return self.oldest_commit_days >= self.window_days
+        return True
 
     def explain(self) -> str:
         if not self.is_repo:
@@ -304,18 +327,31 @@ class HistoryDepth:
         if self.commit_count < self.min_commits:
             return (f"only {self.commit_count} commit(s) of history — too few to support "
                     "churn or ownership claims; findings skipped")
+        if self.window_days is not None and not self.usable:
+            return (f"history reaches back {self.oldest_commit_days} day(s), short of the "
+                    f"{self.window_days}-day window asked for; findings skipped")
         return f"{self.commit_count} commits of history"
 
 
-def probe_history(repo: Path, *, min_commits: int = 20) -> HistoryDepth:
-    """Establish what may be claimed from this repository's history."""
+def probe_history(repo: Path, *, min_commits: int = 20,
+                  window_days: int | None = None) -> HistoryDepth:
+    """Establish what may be claimed from this repository's history.
+
+    ``window_days`` is the span a caller intends to reason over; history that
+    does not reach back that far cannot answer, even when it is deep enough
+    by commit count.
+    """
     if not is_git_repo(repo):
-        return HistoryDepth(False, False, 0, None, min_commits=min_commits)
+        return HistoryDepth(False, False, 0, None, min_commits=min_commits,
+                            window_days=window_days)
 
     try:
         shallow = git(repo, "rev-parse", "--is-shallow-repository").strip() == "true"
     except Exception:
-        shallow = False
+        # Failing to DETERMINE shallowness is not evidence of depth. A probe
+        # whose job is "a wrong answer is worse than no answer" must fail
+        # toward unusable, so an unanswerable query counts as shallow.
+        shallow = True
 
     try:
         count = int(git(repo, "rev-list", "--count", "HEAD").strip() or 0)
@@ -334,7 +370,65 @@ def probe_history(repo: Path, *, min_commits: int = 20) -> HistoryDepth:
     except Exception:
         oldest_days = None
 
-    return HistoryDepth(True, shallow, count, oldest_days, min_commits=min_commits)
+    return HistoryDepth(True, shallow, count, oldest_days, min_commits=min_commits,
+                        window_days=window_days)
+
+
+def git_dir_for(root: Path) -> Path:
+    """The directory to run git from.
+
+    `git -C <file>` fails, so scanning a single file directly — the advertised
+    `find_hygiene_issues.py conflicted.go` form — would otherwise report git as
+    unavailable and downgrade a genuine conflict to a candidate purely because
+    of how it was invoked.
+    """
+    return root if root.is_dir() else root.parent
+
+
+def _git_listing(root: Path, *args: str) -> tuple[list[str], Path] | None:
+    base = git_dir_for(root)
+    if not is_git_repo(base):
+        return None
+    try:
+        listing = git(base, "-c", "core.quotepath=false", *args)
+        toplevel = Path(git(base, "rev-parse", "--show-toplevel").strip())
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError):
+        return None
+    return listing.splitlines(), toplevel
+
+
+def unmerged_paths(root: Path) -> set[Path] | None:
+    """Paths git reports as unmerged, or None when git cannot answer.
+
+    This is what separates a real unresolved conflict from a fixture that
+    contains marker text on purpose. Without it the detector would report this
+    repository's own test fixtures as defects.
+    """
+    result = _git_listing(root, "ls-files", "-u", "--full-name")
+    if result is None:
+        return None
+    entries, toplevel = result
+    paths = set()
+    for entry in entries:
+        _, _, rel = entry.partition("\t")
+        if rel:
+            paths.add((toplevel / rel.strip()).resolve())
+    return paths
+
+
+def tracked_paths(root: Path) -> set[Path] | None:
+    """Paths git actually tracks, or None when git cannot answer.
+
+    An untracked or ignored `.env` on a developer's machine is correct
+    practice, not a leak. Asserting it is committed — and telling someone to
+    rotate credentials and purge history over it — is a false positive with a
+    real cost attached.
+    """
+    result = _git_listing(root, "ls-files", "--full-name")
+    if result is None:
+        return None
+    entries, toplevel = result
+    return {(toplevel / rel.strip()).resolve() for rel in entries if rel.strip()}
 
 
 # --------------------------------------------------------------------------- #
