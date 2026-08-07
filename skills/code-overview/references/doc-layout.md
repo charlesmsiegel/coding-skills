@@ -113,7 +113,13 @@ Every `health.html` carries its numbers in machine-readable form:
 | `analyzers_skipped[]` | detectors the doctor was told not to run, or that never ran |
 | `findings_out_of_scope` | findings dropped as being about code outside this unit |
 | `duplicates_merged` | same defect reported by two doctors, collapsed to one |
+| `sized_extensions[]` | non-code extensions counted in the denominator (templates the findings reached) |
 | `findings_total`, `findings_by_severity` | counts, after scoping and deduplication |
+
+Root-scope `packages[]` rows carry `generated: false` when a package has no
+health page — the documented "codemap only" answer. Those rows stay in the table
+rather than being dropped, so a roll-up missing a whole package cannot look
+complete.
 | `top_findings[]` | the worst N, with repo-relative paths |
 | `packages[]` | root scope only: one row per package, with its grade |
 

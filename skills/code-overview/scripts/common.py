@@ -33,6 +33,14 @@ CODE_EXTENSIONS = frozenset({
     ".svelte", ".sql", ".sh", ".bash",
 })
 
+# Markup the doctors analyze but that is not "source" by default. Django's
+# detectors report `missing_csrf_token` and `query_in_template` from .html, so
+# when such findings are present those lines are part of what was analyzed and
+# have to be in the denominator — otherwise a template-heavy package divides
+# template findings by Python lines alone and scores far worse than it is.
+# Counted only when the findings show they were analyzed; see sizing_extensions.
+TEMPLATE_EXTENSIONS = frozenset({".html", ".htm", ".jinja", ".jinja2", ".j2", ".twig"})
+
 # Directories never worth walking into. Vendored or generated, both of which
 # would distort size and finding counts alike.
 SKIP_DIRS = frozenset({
@@ -145,27 +153,55 @@ def finding_identity(finding: dict) -> tuple:
 _SEVERITY_RANK = {"high": 0, "medium": 1, "low": 2}
 
 
-def dedupe(findings: list[dict]) -> tuple[list[dict], int]:
-    """Collapse the same defect reported by two doctors, keeping the worst call.
+def dedupe(reports: list[dict]) -> tuple[list[dict], int]:
+    """Merge companion doctors' reports without double-charging one defect.
 
     Companion doctors overlap on purpose — django-code-doctor and
     python-code-doctor both flag a hardcoded `SECRET_KEY` at the same file and
     line, at different severities. Counting it twice charges the grade ~13
     weighted points for one defect instead of 10, and the recommended workflow
     runs both, so this is the normal case rather than an edge one.
+
+    Deduplication is strictly **across** reports, never within one. A single
+    detector can legitimately emit two findings that share file, line and type —
+    Django's template detector reports one `hardcoded_url_in_template` per link,
+    so a line with two links yields two findings that differ only in their
+    description. Collapsing those would understate both the count and the
+    penalty. So an identity's multiplicity in the merged set is the *maximum*
+    any one report gave it, not the sum: two-from-django plus one-from-python
+    stays two, and one-plus-one becomes one.
     """
-    best: dict[tuple, dict] = {}
     order: list[tuple] = []
-    for finding in findings:
-        identity = finding_identity(finding)
-        current = best.get(identity)
-        if current is None:
-            best[identity] = finding
-            order.append(identity)
-        elif (_SEVERITY_RANK.get(str(finding.get("severity")), 1)
-              < _SEVERITY_RANK.get(str(current.get("severity")), 1)):
-            best[identity] = finding
-    return [best[identity] for identity in order], len(findings) - len(best)
+    seen: set[tuple] = set()
+    per_identity: dict[tuple, list[dict]] = {}
+    total = 0
+
+    for report in reports:
+        grouped: dict[tuple, list[dict]] = {}
+        for finding in report["findings"]:
+            total += 1
+            identity = finding_identity(finding)
+            # `order` records first appearance once per identity — appending per
+            # occurrence would emit that identity's whole group again for each
+            # duplicate, multiplying rather than merging.
+            if identity not in seen:
+                seen.add(identity)
+                order.append(identity)
+            grouped.setdefault(identity, []).append(finding)
+        for identity, group in grouped.items():
+            kept = per_identity.get(identity, [])
+            if len(group) > len(kept):
+                per_identity[identity] = group
+            elif len(group) == len(kept):
+                # Same multiplicity from both: keep whichever call is harsher,
+                # so a medium and a high for one defect scores as a high.
+                worst = min(_SEVERITY_RANK.get(str(f.get("severity")), 1) for f in group)
+                current = min(_SEVERITY_RANK.get(str(f.get("severity")), 1) for f in kept)
+                if worst < current:
+                    per_identity[identity] = group
+
+    merged = [finding for identity in order for finding in per_identity[identity]]
+    return merged, total - len(merged)
 
 
 def load_findings(paths) -> tuple[list[dict], dict[str, str], set[str], list[dict], int]:
@@ -176,12 +212,21 @@ def load_findings(paths) -> tuple[list[dict], dict[str, str], set[str], list[dic
     from), and how many duplicates were collapsed.
     """
     reports: list[dict] = []
-    findings: list[dict] = []
     errors: dict[str, str] = {}
     for raw in paths:
         text = sys.stdin.read() if str(raw) == "-" else Path(raw).read_text(encoding="utf-8")
         if not text.strip():
-            warn(f"{raw} is empty — treated as no findings")
+            # A zero-byte file is what a doctor leaves behind when it fails
+            # *after* the shell created the redirect target. Dropping it would
+            # leave no report at all, and coverage resolution would then fall
+            # back to the doctor's profile and grade the whole rubric A+ off an
+            # artifact that contains nothing. Record it as an unknown-coverage
+            # report instead, so it refuses to grade rather than grading clean.
+            warn(f"{raw} is empty — no findings and no evidence of what was examined, so "
+                 "nothing from it can be graded. Did the doctor fail after the shell "
+                 "created the file?")
+            reports.append({"findings": [], "errors": {}, "ran": set(),
+                            "skipped": set(), "shape": SHAPE_PARTIAL})
             continue
         try:
             data = json.loads(text)
@@ -189,7 +234,6 @@ def load_findings(paths) -> tuple[list[dict], dict[str, str], set[str], list[dic
             raise SystemExit(f"error: {raw} is not valid JSON: {exc}") from exc
         report = normalize_findings(data)
         reports.append(report)
-        findings.extend(report["findings"])
         errors.update(report["errors"])
 
     # Skipped means skipped *everywhere*: a detector one report omitted and
@@ -198,8 +242,25 @@ def load_findings(paths) -> tuple[list[dict], dict[str, str], set[str], list[dic
     ran_anywhere = {name for report in reports for name in report["ran"]}
     skipped = {name for report in reports for name in report["skipped"]} - ran_anywhere
 
-    findings, duplicates = dedupe(findings)
+    findings, duplicates = dedupe(reports)
     return findings, errors, skipped, reports, duplicates
+
+
+def sizing_extensions(findings: list[dict], extra=()) -> frozenset:
+    """Which extensions the denominator should cover.
+
+    Code always, plus any template extension the findings themselves show was
+    analyzed. Deriving it from the findings keeps the invariant self-correcting:
+    lines enter the denominator exactly when the analysis reached them, so a
+    Django package with template findings is sized over its templates and a
+    Python package that happens to ship an HTML fixture is not.
+    """
+    used = {ext.lower() if ext.startswith(".") else f".{ext.lower()}" for ext in extra}
+    for finding in findings:
+        suffix = Path(str(finding.get("file", ""))).suffix.lower()
+        if suffix in TEMPLATE_EXTENSIONS:
+            used.add(suffix)
+    return frozenset(CODE_EXTENSIONS | used)
 
 
 def within(path: str, roots: list[Path], base: Path) -> bool:
@@ -369,7 +430,10 @@ def load_map(path) -> dict:
     # walks the same three files twice, so only the last package survives.
     by_docs: dict[str, str] = {}
     for package in packages:
-        resolved = str(Path(package["docs"]).as_posix()).rstrip("/")
+        # normpath so `src/a/docs` and `src/a/../a/docs` are recognized as one
+        # directory. Symlinked aliases still slip through — resolving those
+        # needs the repo root and a filesystem that already has the tree.
+        resolved = Path(os.path.normpath(package["docs"])).as_posix().rstrip("/")
         if resolved in by_docs:
             raise SystemExit(
                 f"error: {path} points {package['name']!r} and {by_docs[resolved]!r} at the same "

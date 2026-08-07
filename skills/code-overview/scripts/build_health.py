@@ -156,7 +156,9 @@ def render_category_rows(rows: list[dict]) -> str:
         if row["graded"]:
             width = max(1.5, row["score"])
             bar = f'<div class="bar"><i style="width:{width:.1f}%"></i></div>'
-            score = f'{row["score"]:.0f}'
+            # The stored one-decimal value, not a re-rounded integer: 92.6 is
+            # graded A- and must not be shown as "93", which reads as an A.
+            score = f'{row["score"]:.1f}'
             tip = (f'{counts["total"]} finding(s) · {row["density"]:.2f} weighted per KLOC '
                    f'· scores 50 at {row["half_life"]:.0f}')
         else:
@@ -257,7 +259,7 @@ def render_package_table(packages: list[dict], links: dict[str, str]) -> str:
             f'<td class="num">{"—" if score is None else f"{score:.1f}"}</td>'
             f'<td class="cgrade {grade_class(grade)}" style="color:var(--grade);'
             f'font-family:var(--mono);font-weight:600">{esc(grade)}</td>'
-            f'<td class="num">{package.get("findings_total", "—")}</td></tr>'
+            f'<td class="num">{"not generated" if package.get("generated") is False else package.get("findings_total", "—")}</td></tr>'
         )
     return ("<h2>Packages</h2>"
             '<div class="tbl-wrap"><table><thead><tr><th>Package</th><th>Language</th>'
@@ -384,9 +386,20 @@ def resolve_coverage(args, reports: list[dict]):
     if evidenced:
         # At least one report says what it ran. Believe it, and let the other
         # reports contribute findings without inflating what was examined.
-        return {rubric.DETECTOR_CATEGORIES[name]
-                for report in evidenced for name in report["ran"]
-                if name in rubric.DETECTOR_CATEGORIES}
+        ran = {rubric.DETECTOR_CATEGORIES[name]
+               for report in evidenced for name in report["ran"]
+               if name in rubric.DETECTOR_CATEGORIES}
+        # A rubric category usually has several detectors behind it. If any of
+        # them was skipped or crashed, the category was only *partly* measured —
+        # and a partial measurement can only ever miss findings, never invent
+        # them, so grading it would systematically flatter the code. Skipping
+        # exception_issues while running mutation_hazards leaves Correctness
+        # unmeasured, not clean.
+        absent = {rubric.DETECTOR_CATEGORIES[name]
+                  for report in evidenced
+                  for name in (report["skipped"] | set(report["errors"]))
+                  if name in rubric.DETECTOR_CATEGORIES}
+        return ran - absent
 
     if any(report["shape"] == common.SHAPE_PARTIAL for report in reports):
         warn("a findings file is a single detector's output, which says nothing about what "
@@ -413,7 +426,6 @@ def build(args, findings: list[dict], errors: dict[str, str], skipped: set[str],
     repo = Path(args.repo).resolve()
     relative_roots = scoring_roots(args, repo)
     roots = [repo / r for r in relative_roots]
-    size = measure(roots) if args.loc is None else {"files": args.files or 0, "loc": args.loc}
 
     # Keep only findings about the code this document is a claim about. The
     # doctors are run from the repo root so they can see manifests, tests and
@@ -436,6 +448,17 @@ def build(args, findings: list[dict], errors: dict[str, str], skipped: set[str],
         out_of_scope = len(findings) - len(kept)
         findings = kept
 
+    # Size over what was analyzed, which for a Django package includes its
+    # templates. Each override replaces only its own field, so `--files` alone
+    # and `--loc` alone both work; coupling them made one silently ignored and
+    # the other zero out the count it did not set.
+    extensions = common.sizing_extensions(findings, args.include_extension)
+    size = measure(roots, extensions)
+    if args.loc is not None:
+        size["loc"] = args.loc
+    if args.files is not None:
+        size["files"] = args.files
+
     covered = resolve_coverage(args, reports)
     scored = score_categories(findings, size["loc"], covered)
     packages = []
@@ -453,6 +476,7 @@ def build(args, findings: list[dict], errors: dict[str, str], skipped: set[str],
         "generated": args.date or dt.date.today().isoformat(),
         "commit": args.commit or git_sha(repo),
         "size": size,
+        "sized_extensions": sorted(extensions - common.CODE_EXTENSIONS),
         "score": scored["score"],
         "grade": scored["grade"],
         "categories": scored["categories"],
@@ -522,8 +546,22 @@ def collect_packages(repo: Path, map_path: str | None, out: Path) -> tuple[list[
         health = doc_path(repo, package, "health")
         meta = read_meta(health)
         if meta is None:
-            warn(f"no code-health metadata at {health} — {package['name']} is missing from "
-                 "the roll-up table (build its health page first)")
+            # Kept in the table rather than dropped. A package can legitimately
+            # have no health page — the documented "codemap only" answer for a
+            # language with no doctor — and a roll-up that silently omits it
+            # looks complete while a whole package is missing from it.
+            warn(f"no code-health metadata at {health} — {package['name']} is listed as "
+                 "not generated (build its health page if that is not deliberate)")
+            packages.append({
+                "package": package["name"],
+                "language": package.get("language", ""),
+                "grade": rubric.UNGRADED,
+                "score": None,
+                "size": {},
+                "findings_total": None,
+                "docs": package.get("docs", ""),
+                "generated": False,
+            })
             continue
         packages.append({
             "package": meta.get("package", package["name"]),
@@ -567,6 +605,10 @@ def main(argv=None) -> int:
     parser.add_argument("--files", type=int, help="override the measured file count")
     parser.add_argument("--commit", default="", help="commit sha for the metadata")
     parser.add_argument("--date", default="", help="generation date (default: today)")
+    parser.add_argument("--include-extension", action="append", default=[],
+                        help="also count files with this extension when sizing "
+                             "(template extensions are added automatically when the "
+                             "findings show they were analyzed)")
     parser.add_argument("--covers", action="append", default=[],
                         help="comma-separated rubric categories this analysis actually examined "
                              f"({', '.join(rubric.CATEGORY_KEYS)}). Use when the findings come "

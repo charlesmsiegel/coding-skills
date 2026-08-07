@@ -135,6 +135,13 @@ whole rubric.
 **Findings from two doctors are deduplicated** on `(file, line, type)`, keeping
 the higher severity — both security detectors flag the same hardcoded
 `SECRET_KEY`, and charging one defect twice inflates the penalty by a third.
+The merge is across reports only: one detector legitimately emits two findings on
+one line, so an identity's count is the maximum any report gave it, not the sum.
+
+**Do not pass `--skip`/`--skip-duplicates` casually.** A skipped detector
+ungrades its *whole* rubric category — skipping `exception_issues` ungrades
+Correctness — because a partly-measured category can only miss findings, never
+invent them. That is correct behaviour, but it shrinks what the grade covers.
 
 **The summary.** Write a short HTML fragment first — what this package is, why it
 is shaped this way, what you noticed reading it — and pass it as `--intro-file`.

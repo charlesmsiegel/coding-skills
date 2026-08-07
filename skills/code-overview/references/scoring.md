@@ -77,9 +77,20 @@ evidence, and are read accordingly:
 
 | Shape | What it is | Coverage it grants |
 |---|---|---|
-| full | `analyze_all.py`'s report — has `meta.analyzers_run` | exactly the categories whose detectors ran, minus any that were skipped or crashed |
+| full | `analyze_all.py`'s report — has `meta.analyzers_run` | the categories whose detectors ran, **minus every category any skipped or crashed detector belonged to** |
 | flat | a bare JSON list (`analyze_django.py`) | the `--doctor` profile, and only when no full report is present |
-| partial | one detector's `{"issues": [...]}` | **nothing** — one detector says what it found, never what else was looked at |
+| partial | one detector's `{"issues": [...]}`, or a zero-byte file | **nothing** — one detector says what it found, never what else was looked at |
+
+A rubric category usually has several detectors behind it, and the subtraction is
+deliberately all-or-nothing: skipping `exception_issues` ungrades **Correctness**
+even though `mutation_hazards` ran. A partly-measured category can only ever miss
+findings, never invent them, so grading it would systematically flatter the code —
+and "mostly measured" is not a thing the score can express.
+
+A zero-byte findings file is treated as `partial` rather than as no file at all.
+It is what a doctor leaves behind when it fails *after* the shell created the
+redirect target, and dropping it silently would leave no report, no contrary
+evidence, and an A+ built on an empty artifact.
 
 When any full report is present it is believed and the others add findings
 without inflating coverage. That is what makes the recommended Python+Django
@@ -132,6 +143,28 @@ The key is the **whole path**, not the basename: `src/a/models.py:3` and
 constantly. Two spellings of one path (absolute vs relative) simply fail to
 merge, which leaves a duplicate counted twice — the safe direction to be wrong
 in.
+
+Deduplication is strictly **across** reports, never within one. A single
+detector can legitimately emit two findings sharing file, line and type —
+Django's template detector reports one `hardcoded_url_in_template` per link, so
+a line with two links yields two findings differing only in description.
+An identity's multiplicity in the merged set is therefore the **maximum** any one
+report gave it, not the sum: two-from-Django plus one-from-Python stays two,
+and one-plus-one becomes one.
+
+## What the grade is divided by, part two: templates
+
+`CODE_EXTENSIONS` deliberately excludes markup, but Django's detectors report
+`missing_csrf_token` and `query_in_template` from `.html`. Dividing those by the
+Python lines alone makes a template-heavy package look far worse than it is.
+
+So the denominator's extension set is **derived from the findings**: a template
+extension is counted exactly when a finding points at a file with it. That keeps
+the invariant self-correcting — lines enter the denominator when the analysis
+reached them — so a Django package with template findings is sized over its
+templates while a Python package that merely ships an HTML fixture is not.
+`--include-extension` adds more by hand; `sized_extensions` in the metadata
+records what was counted beyond code.
 
 Run a Django app through **both** `django-code-doctor` and `python-code-doctor`
 and pass both findings files to `build_health.py` — that is what closes the

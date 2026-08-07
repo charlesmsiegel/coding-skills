@@ -148,6 +148,30 @@ def test_the_root_portal_omits_a_root_collapsed_package(run_script, repo):
     assert 'href="summary.html"' not in text, "and it must not link back to itself"
 
 
+def test_the_portal_does_not_call_a_partial_grade_an_upper_bound(run_script, repo):
+    """The portal is where readers land; its caveats must match health.html's."""
+    for module in range(4):
+        repo.write(f"src/app/m{module}.py", "\n".join(f"x{i}=1" for i in range(300)))
+    report = repo.path / "f.json"
+    report.write_text(json.dumps({
+        "meta": {"analyzer_errors": {"duplicates": "boom"},
+                 "analyzers_run": ["security"]},
+        "categories": {"security": {"issues": []}},
+    }))
+    repo.commit("init")
+    run_script(BUILD_HEALTH, "--out", repo.path / "src/app/docs/health.html",
+               "--findings", report, "--repo", repo.path, "--name", "app",
+               "--root-dir", "src/app", "--doctor", "python-code-doctor")
+    out = repo.path / "src/app/docs/summary.html"
+    run_script(BUILD_SUMMARY, "--out", out, "--repo", repo.path, "--name", "app")
+    text = out.read_text()
+    assert "did not complete" in text, "the portal has to carry the caveat at all"
+    assert "upper bound" not in text, (
+        "a dropped category is renormalized away, so the score is partial, not bounded above"
+    )
+    assert "partial" in text
+
+
 def test_prose_is_html_escaped_where_it_is_not_meant_to_be_html(run_script, graded):
     text = build(run_script, graded, "--highlight", "<img src=x onerror=alert(1)>").read_text()
     assert "<img src=x" not in text
