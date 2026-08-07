@@ -168,7 +168,12 @@ def test_kind_filter_narrows_rows_without_rewriting_the_headline(tmp_path):
     )
     payload = run(tmp_path, "--kind", "silent_cap")
     assert {row["kind"] for row in payload["candidates"]} == {"silent_cap"}
-    assert "0/empty" in payload["headline"], "the headline reports the tree, not the filter"
+    # Suppressing a more serious candidate because it was filtered out would be the
+    # worse failure, so the headline still covers the tree — but it has to say so,
+    # or it reads as describing rows that are not there.
+    assert "0/empty" in payload["headline"]
+    assert "--kind silent_cap" in payload["headline"]
+    assert "covers the whole tree" in payload["headline"]
 
 
 def test_a_clean_tree_is_reported_without_claiming_it_is_clean(tmp_path):
@@ -345,3 +350,21 @@ def test_json_quoted_sampling_keys_are_matched(tmp_path, setting):
 def test_the_shell_head_cap_the_guide_documents_is_detected(tmp_path, command):
     (tmp_path / "run.sh").write_text(command + "\n", encoding="utf-8")
     assert kinds(run(tmp_path), "silent_cap")
+
+
+# ---- fourth review round ------------------------------------------------------ #
+
+def test_a_json_quoted_flag_key_still_reads_as_default_off(tmp_path):
+    (tmp_path / "config.json").write_text('{"use_reranker": false}\n', encoding="utf-8")
+    assert kinds(run(tmp_path), "default_off_flag")
+
+
+@pytest.mark.parametrize("line", ["disable_reranker: true", "skip_adaptive_cutoff: true"])
+def test_a_negative_switch_defaulting_to_on_is_also_default_off(tmp_path, line):
+    (tmp_path / "config.yaml").write_text(line + "\n", encoding="utf-8")
+    assert kinds(run(tmp_path), "default_off_flag")
+
+
+def test_an_ordinary_true_setting_is_not_a_disabled_component(tmp_path):
+    (tmp_path / "config.yaml").write_text("verbose: true\nstrict_mode: true\n", encoding="utf-8")
+    assert kinds(run(tmp_path), "default_off_flag") == []

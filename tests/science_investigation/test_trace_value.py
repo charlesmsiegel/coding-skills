@@ -145,3 +145,10 @@ def test_a_leading_dot_literal_is_traced_as_a_number(tmp_path, needle):
     payload = run(needle, tmp_path)
     assert payload["candidates"]
     assert "appears nowhere" not in payload["headline"]
+
+
+def test_an_unsigned_needle_does_not_match_a_negative_literal(tmp_path):
+    """A tree holding both signs must not report two sites for one value."""
+    (tmp_path / "a.py").write_text("A = -0.7\n", encoding="utf-8")
+    assert run("0.7", tmp_path)["candidates"] == []
+    assert run("-0.7", tmp_path)["candidates"]

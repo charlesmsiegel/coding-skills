@@ -350,3 +350,26 @@ def test_a_semicolon_terminated_zero_return_is_flagged(tmp_path):
         encoding="utf-8",
     )
     assert kinds(run(tmp_path), "zero_default")
+
+
+# ---- fourth review round ------------------------------------------------------ #
+
+def test_a_threshold_written_with_the_literal_first_is_the_same_gate(tmp_path):
+    (tmp_path / "s.py").write_text("if 0.75 <= quality_score:\n    pass\n", encoding="utf-8")
+    rows = kinds(run(tmp_path), "threshold")
+    assert rows and "quality_score >= 0.75" in rows[0]["detail"], "normalized to metric-first"
+
+
+def test_the_same_comparison_is_not_reported_twice(tmp_path):
+    (tmp_path / "s.py").write_text("if quality_score >= 0.75:\n    pass\n", encoding="utf-8")
+    assert len(kinds(run(tmp_path), "threshold")) == 1
+
+
+@pytest.mark.parametrize("line,name", [
+    ("accuracy <- function(rows) mean(rows)", "accuracy"),
+    ("quality_score <- 0.8", "quality_score"),
+])
+def test_r_arrow_assignments_are_definitions(tmp_path, line, name):
+    """`.r` and `.R` are scanned, so `<-` has to be an assignment operator."""
+    (tmp_path / "m.R").write_text(line + "\n", encoding="utf-8")
+    assert any(row["detail"].startswith(name) for row in kinds(run(tmp_path), "metric_definition"))

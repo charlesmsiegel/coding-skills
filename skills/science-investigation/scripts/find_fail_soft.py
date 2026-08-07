@@ -86,12 +86,22 @@ _ARROW_EMPTY_RE = re.compile(r"^\s*(?:\{\s*\}|null|undefined|void\s+0)")
 _FLAG_NAME = r"[\w.]*(?:enable|enabled|use|using|with|allow|feature|flag|active|on)[\w]*"
 # An optional type annotation may sit between the name and the value:
 # `ENABLE_RERANKER: bool = False`, `const useReranker: boolean = false`.
-_ANNOTATED = r"\s*(?::\s*[A-Za-z_][\w.\[\]<>| ]*)?\s*[:=]\s*"
+# The optional `["']` carries JSON's `{"use_reranker": false}`, where the closing
+# key quote sits between the name and the delimiter.
+_ANNOTATED = r"[\"']?\s*(?::\s*[A-Za-z_][\w.\[\]<>| ]*)?\s*[:=]\s*"
 _DEFAULT_OFF_RE = re.compile(
     r"\b(" + _FLAG_NAME + r")" + _ANNOTATED + r"(?:false|0)\b"
     r"|\b(" + _FLAG_NAME + r")" + _ANNOTATED + r"[\"'](?:false|off|0|no)[\"']",
     re.IGNORECASE,
 )
+# `disable_reranker: true` is the same configuration written the other way round.
+_DISABLE_NAME = r"[\w.]*(?:disable|disabled|skip|off|bypass|ignore)[\w]*"
+_DISABLE_ON_RE = re.compile(
+    r"\b(" + _DISABLE_NAME + r")" + _ANNOTATED + r"(?:true|1)\b"
+    r"|\b(" + _DISABLE_NAME + r")" + _ANNOTATED + r"[\"'](?:true|on|1|yes)[\"']",
+    re.IGNORECASE,
+)
+DISABLE_TOKENS = frozenset({"disable", "disabled", "skip", "off", "bypass", "ignore"})
 # The name is confirmed by its *tokens*, not by a substring: `connection_timeout`
 # contains "on" and `user_id` contains "use", while `useReranker` and
 # `ENABLE_RERANKER` are genuine switches. Splitting first is what tells them apart.
@@ -99,9 +109,6 @@ _TOKEN_RE = re.compile(r"[A-Z]+(?![a-z])|[A-Z][a-z0-9]*|[a-z0-9]+")
 FLAG_TOKENS = frozenset({"enable", "enabled", "disable", "use", "using", "with",
                          "allow", "feature", "flag", "active", "on", "toggle"})
 
-
-def is_flag_name(name: str) -> bool:
-    return bool({t.lower() for t in _TOKEN_RE.findall(name)} & FLAG_TOKENS)
 
 _CAP_RE = re.compile(
     r"\[\s*:\s*\d{1,6}\s*\]"                             # rows[:100]
@@ -131,6 +138,10 @@ _MODEL_RE = re.compile(
 # A full date, a compact date, a four-digit provider snapshot (gpt-4-0613,
 # gpt-4-1106-preview), an explicit -v2, or an @-pinned tag.
 _PINNED_RE = re.compile(r"\d{4}-\d{2}-\d{2}|\d{6,8}|-\d{4}(?!\d)|-v\d+|@\d")
+
+
+def is_flag_name(name: str, tokens=FLAG_TOKENS) -> bool:
+    return bool({t.lower() for t in _TOKEN_RE.findall(name)} & tokens)
 
 
 def handler_body(lines: list, index: int, max_lines: int = 8) -> list:
@@ -230,6 +241,14 @@ def scan_line(line: str, display: str, lineno: int) -> list:
             "a component defaults to off here",
             CONFIRM["default_off_flag"], stripped,
         ))
+    else:
+        negated = _DISABLE_ON_RE.search(line)
+        if negated and is_flag_name(negated.group(1) or negated.group(2) or "", DISABLE_TOKENS):
+            out.append(candidate(
+                "default_off_flag", display, lineno,
+                "a component is disabled here by a negative switch defaulting to on",
+                CONFIRM["default_off_flag"], stripped,
+            ))
 
     if _CAP_RE.search(line):
         out.append(candidate(
@@ -334,7 +353,14 @@ def main() -> int:
     rows, files, skipped = scan(root)
     headline = headline_for(rows, files) + skipped_note(skipped)
     if args.kind:
-        rows = [r for r in rows if r["kind"] == args.kind]
+        # The headline still describes the whole tree — suppressing a more serious
+        # candidate because it was filtered out would be the worse failure — but it
+        # has to say so, or the headline and the rows below it appear to disagree.
+        shown = [r for r in rows if r["kind"] == args.kind]
+        if shown and headline_for(shown, files) != headline:
+            headline = ("[--kind " + args.kind + ": " + str(len(shown)) + " row(s) shown; this "
+                        "headline covers the whole tree] " + headline)
+        rows = shown
     rows.sort(key=lambda r: (KIND_ORDER.index(r["kind"]) if r["kind"] in KIND_ORDER else 99, r["file"], r["line"]))
 
     counts = {"files_scanned": files, "files_skipped_unread": len(skipped), "candidates_total": len(rows)}

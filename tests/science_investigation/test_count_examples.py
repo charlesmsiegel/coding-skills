@@ -105,11 +105,27 @@ def test_unparseable_rows_are_reported_rather_than_dropped(tmp_path):
     assert bad and "1 of 3" in bad[0]["detail"]
 
 
-def test_max_rows_truncation_is_announced(tmp_path):
+def test_a_truncated_read_still_reports_the_true_record_count(tmp_path):
+    """The cap applies to the field tally, never to N.
+
+    Counting a line is cheap and parsing it is not, so a capped run still knows
+    how many records exist. Reporting the cap as the dataset's size would be a
+    silent truncation committed by the tool whose whole job is deriving N.
+    """
     write_jsonl(tmp_path / "eval.jsonl", [{"gold": "a"} for _ in range(50)])
     payload = run(tmp_path, "--max-rows", "10")
-    assert payload["counts"]["records_total"] == 10
-    assert any("capped" in row["detail"] for row in kinds(payload, "dataset"))
+    assert payload["counts"]["records_total"] == 50
+    assert payload["counts"]["records_read"] == 10
+    assert any("--max-rows" in row["detail"] for row in kinds(payload, "dataset"))
+
+
+def test_a_truncated_read_never_claims_full_label_coverage(tmp_path):
+    """5 labeled rows followed by 15 unlabeled ones is not a fully-labeled set."""
+    rows = [{"gold": "g"} if i < 5 else {"q": "x"} for i in range(20)]
+    write_jsonl(tmp_path / "eval.jsonl", rows)
+    payload = run(tmp_path, "--max-rows", "5")
+    assert "fully-labeled" not in payload["headline"]
+    assert "read only in part" in payload["headline"]
 
 
 def test_no_datasets_says_so_instead_of_reporting_zero_examples(tmp_path):
@@ -211,3 +227,33 @@ def test_an_unreadable_jsonl_file_reports_a_parse_error_like_the_other_readers(t
     unopenable = tmp_path / "as_a_directory.jsonl"
     unopenable.mkdir()
     assert "parse_error" in counter.read_jsonl(unopenable, 100)
+
+
+# ---- fourth review round ------------------------------------------------------ #
+
+def test_a_non_object_jsonl_row_is_malformed_not_an_unlabeled_record(tmp_path):
+    (tmp_path / "eval.jsonl").write_text('{"gold":"a"}\n42\n', encoding="utf-8")
+    payload = run(tmp_path)
+    assert "1 of 2" in kinds(payload, "unparseable_rows")[0]["detail"]
+
+
+def test_a_populated_record_key_wins_over_an_earlier_empty_one(tmp_path):
+    """`{"data": [], "examples": [...]}` held real records under the second key."""
+    (tmp_path / "eval.json").write_text('{"data": [], "examples": [{"gold": "a"}]}', encoding="utf-8")
+    payload = run(tmp_path)
+    assert payload["counts"]["records_total"] == 1
+    assert not kinds(payload, "empty_dataset")
+
+
+def test_a_broken_config_file_is_not_reported_as_corrupted_measurement_input(tmp_path):
+    """Manufacturing a dataset finding out of a malformed settings.json is the
+    same error as manufacturing a metric out of `return 0`."""
+    (tmp_path / "settings.json").write_text("{bad json\n", encoding="utf-8")
+    payload = run(tmp_path)
+    assert not kinds(payload, "unparseable_dataset")
+    assert payload["counts"]["datasets_unparseable"] == 0
+
+
+def test_a_broken_file_that_looks_like_data_is_still_reported(tmp_path):
+    (tmp_path / "eval.json").write_text("{bad json\n", encoding="utf-8")
+    assert kinds(run(tmp_path), "unparseable_dataset")
