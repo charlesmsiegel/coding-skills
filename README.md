@@ -9,6 +9,16 @@ A repository of agentic skills to help with AI coding.
   (`references/`). `run_external_tools.py` also drives the real tools when they are
   installed — ruff, mypy, black, isort, bandit, flake8, plus pip-audit (dependency
   advisories) and coverage (code that never executes).
+- **[typescript-simplifier](skills/typescript-simplifier/)** — the same idea for
+  TypeScript, and fully standalone: it ships its own TS/TSX scanner (strings,
+  template literals, regex-vs-division, JSX text, bracket matching) so the
+  detectors run against a checkout with no `node_modules` and no build. Covers
+  the type system (`any`/`as`/`!`/`@ts-ignore` and a tsconfig strictness audit),
+  promise bugs, encapsulation leaks, import cycles and barrels, dependency
+  reconciliation, and the usual smell/design/duplication set.
+  `run_external_tools.py` drives `tsc`, ESLint, Biome, Prettier, madge, knip,
+  `npm audit` and coverage when the project already has them — the compiler
+  answers what a syntax scanner structurally cannot.
 - **[django-simplifier](skills/django-simplifier/)** — the Django-specific companion:
   N+1 queries, per-row writes, model definition problems, missing object-level
   authorization, insecure settings, queries hidden in templates, and abstractions that
@@ -79,7 +89,7 @@ python tools/validate_skills.py     # frontmatter, naming, description limit, ev
 ```
 
 `tools/validate_skills.py` is the single definition of a structurally valid skill:
-CI runs it over all nine on every pull request, and the release job runs it on the
+CI runs it over all ten on every pull request, and the release job runs it on the
 one skill it is about to package. It is stdlib-only, like the detectors, so it runs
 wherever the skills do. Its own rules are tested against deliberately-invalid skills
 in `tests/test_validate_skills.py` — a validator that cannot fail reads as coverage
