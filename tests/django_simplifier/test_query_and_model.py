@@ -6,8 +6,6 @@ the output, and the real N+1 goes out with it. So every new check here is
 paired with the correct form of the same construct, asserted silent.
 """
 
-import pytest
-
 from helpers import build_project, run_detector, smells
 
 MODELS = """\

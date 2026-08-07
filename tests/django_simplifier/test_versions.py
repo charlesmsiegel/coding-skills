@@ -174,10 +174,9 @@ def test_a_package_merely_containing_django_is_not_the_pin(detector, tmp_path):
     assert detector.detect_django_version(project)[0] == (6, 0)
 
 
-def test_an_unpinned_django_yields_no_version(detector, tmp_path):
-    project = build_project(tmp_path / "p", {"requirements.txt": "Django\ncelery\n"})
-    # Falls through to the installed environment, which may or may not have
-    # Django; either way the manifest itself must not claim a version.
+def test_an_unpinned_django_yields_no_version(detector):
+    # An unpinned `Django` says nothing about the version. Detection falls
+    # through to the installed environment; the manifest must not claim one.
     assert detector._from_requirements_text("Django\ncelery\n") is None
 
 
