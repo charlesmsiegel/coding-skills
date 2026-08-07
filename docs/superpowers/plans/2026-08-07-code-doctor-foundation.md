@@ -63,7 +63,7 @@ The remaining five families — git signals, the reference graph, duplication an
 
 **Interfaces:**
 - Consumes: nothing (first task)
-- Produces: `EXCLUDE_DIRS: frozenset[str]`, `NON_CODE_SUFFIXES: frozenset[str]`, `DOC_DIR_NAMES: frozenset[str]`, `is_probably_binary(path: Path) -> bool`, `walk_files(root: Path, *, source_only: bool) -> Iterator[Path]`, `configure_output() -> None`, `SEVERITY_ICONS: dict[str, str]`, `SEVERITY_RANK: dict[str, int]`
+- Produces: `EXCLUDE_DIRS: frozenset[str]`, `NON_CODE_SUFFIXES: frozenset[str]`, `DOC_DIR_NAMES: frozenset[str]`, `is_probably_binary(path: Path) -> bool`, `walk_paths(root: Path) -> Iterator[Path]` (metadata scope — binaries included, symlinks never followed), `walk_files(root: Path, *, source_only: bool) -> Iterator[Path]` (text scope), `configure_output() -> None`, `SEVERITY_ICONS: dict[str, str]`, `SEVERITY_RANK: dict[str, int]`
 
 - [ ] **Step 1: Create the test directory and write the failing test**
 
@@ -130,6 +130,31 @@ def test_documentation_directory_is_not_source(common, repo):
     repo.write("app.py", "print(2)\n")
     found = {p.name for p in common.walk_files(repo.path, source_only=True)}
     assert found == {"app.py"}
+
+
+def test_symlinks_are_never_followed(common, repo, tmp_path):
+    """A link out of the tree would otherwise let this skill read host data
+    and report a credential found there as committed to this repository."""
+    outside = tmp_path / "outside.txt"
+    outside.write_text("AWS_SECRET=hJ8s0Kd93LwmZq2XvRt7YbNc4PfGh6Aa\n")
+    repo.write("app.go", "package main\n")
+    (repo.path / "link.go").symlink_to(outside)
+    found = {p.name for p in common.walk_files(repo.path, source_only=True)}
+    assert found == {"app.go"}
+
+
+def test_bin_directory_is_scanned(common, repo):
+    """Ruby gems and shell CLIs keep executable source in bin/."""
+    repo.write("bin/console", "#!/usr/bin/env ruby\nputs 1\n")
+    found = {p.name for p in common.walk_files(repo.path, source_only=True)}
+    assert "console" in found
+
+
+def test_walk_paths_yields_binaries_for_metadata_checks(common, repo):
+    (repo.path / "blob.bin").write_bytes(b"\x00" * 32)
+    repo.write("app.go", "package main\n")
+    assert {p.name for p in common.walk_paths(repo.path)} == {"blob.bin", "app.go"}
+    assert {p.name for p in common.walk_files(repo.path, source_only=False)} == {"app.go"}
 ```
 
 - [ ] **Step 2: Run the test to verify it fails**
@@ -168,11 +193,16 @@ EXCLUDE_DIRS = frozenset({
     ".git", ".hg", ".svn",
     "node_modules", "bower_components", "vendor", "third_party",
     ".venv", "venv", "__pycache__", ".tox", ".nox", ".eggs", "site-packages",
-    "build", "dist", "out", "target", "bin", "obj",
+    "build", "dist", "out", "target", "obj",
     ".next", ".nuxt", ".svelte-kit", ".astro", ".angular",
     "coverage", ".nyc_output", ".turbo", ".cache", ".parcel-cache",
     ".mypy_cache", ".pytest_cache", ".ruff_cache", ".gradle", ".idea",
 })
+# `bin` is deliberately NOT excluded. Ruby gems, shell CLIs, and plenty of
+# other projects keep executable *source* there, and excluding it would hide
+# those entry points from even the secrets and merge-marker checks. The build
+# outputs that share the name (node_modules/.bin, target/) are already covered
+# by their parents.
 
 # The inverse of a language table. Enumerating what is NOT code means an
 # unknown extension is still treated as code, which is what keeps this skill
@@ -228,27 +258,47 @@ def is_source(rel_parts: tuple[str, ...], path: Path) -> bool:
     return not any(marker in name for marker in GENERATED_MARKERS)
 
 
-def walk_files(root: Path, *, source_only: bool) -> Iterator[Path]:
-    """Yield the files under ``root`` a detector should read.
+def walk_paths(root: Path) -> Iterator[Path]:
+    """Yield every non-excluded file path under ``root``, binaries included.
 
-    ``source_only=True`` restricts to files classified as source. Detectors
-    whose findings are real in any text file (secrets, merge markers) pass
-    False and take the wider set.
+    Metadata-only checks (file size, tracking state) need the binary paths that
+    ``walk_files`` filters out — a committed multi-gigabyte archive is exactly
+    the thing a hygiene check should see, and it is never going to be text.
+
+    **Symlinks are never followed.** A symlink passes ``is_file()`` and its
+    target would then be read, so a link pointing outside the tree would let
+    this skill inspect host data and report a credential found there as
+    committed to this repository. Git stores only the link target string, so
+    there is nothing of the target's content to review in any case.
     """
+    if root.is_symlink():
+        return
     if root.is_file():
         candidates = [root]
         rel_for = {root: (root.name,)}
     elif root.is_dir():
-        candidates = sorted(p for p in root.rglob("*") if p.is_file())
+        candidates = sorted(p for p in root.rglob("*")
+                            if p.is_file() and not p.is_symlink())
         rel_for = {p: p.relative_to(root).parts for p in candidates}
     else:
         return
 
     for path in candidates:
         parts = rel_for[path]
-        if not EXCLUDE_DIRS.isdisjoint(parts):
-            continue
-        if source_only and not is_source(parts, path):
+        if EXCLUDE_DIRS.isdisjoint(parts):
+            yield path
+
+
+def walk_files(root: Path, *, source_only: bool) -> Iterator[Path]:
+    """Yield the files under ``root`` a detector should *read as text*.
+
+    ``source_only=True`` restricts to files classified as source. Detectors
+    whose findings are real in any text file (secrets, merge markers) pass
+    False and take the wider set. Binaries are excluded from both.
+    """
+    for path in walk_paths(root):
+        if source_only and not is_source(path.relative_to(root).parts
+                                         if root.is_dir() else (path.name,), path):
             continue
         if is_probably_binary(path):
             continue
@@ -258,7 +308,7 @@ def walk_files(root: Path, *, source_only: bool) -> Iterator[Path]:
 - [ ] **Step 4: Run the tests to verify they pass**
 
 Run: `python -m pytest tests/code_doctor/test_common.py -v`
-Expected: 6 passed.
+Expected: 9 passed.
 
 - [ ] **Step 5: Commit**
 
@@ -461,7 +511,7 @@ class Reporter:
 - [ ] **Step 4: Run the tests to verify they pass**
 
 Run: `python -m pytest tests/code_doctor/test_common.py -v`
-Expected: 14 passed.
+Expected: 17 passed.
 
 - [ ] **Step 5: Commit**
 
@@ -615,7 +665,7 @@ def probe_history(repo: Path, *, min_commits: int = 20) -> HistoryDepth:
 - [ ] **Step 4: Run the tests to verify they pass**
 
 Run: `python -m pytest tests/code_doctor/test_common.py -v`
-Expected: 17 passed.
+Expected: 20 passed.
 
 - [ ] **Step 5: Commit**
 
@@ -783,6 +833,28 @@ def emit(findings: list[Finding], output_format: str, clean_message: str,
         _print_report(findings, clean_message, completeness)
 
 
+def coverage_gaps(unreadable: list[str], failed: list[str]) -> dict:
+    """Lost-file accounting, as a completeness record.
+
+    stderr is not enough. analyze_all.py ignores a subprocess's stderr when it
+    exits zero, so a detector that lost ten files to read errors would still
+    aggregate as "No problems found" — a silent coverage hole reported as a
+    clean repository, which is the exact failure this skill exists to avoid.
+    """
+    gaps = {}
+    if unreadable:
+        gaps["files_unreadable"] = (
+            f"{len(unreadable)} file(s) could not be read and were not analysed: "
+            + ", ".join(unreadable[:5]) + ("…" if len(unreadable) > 5 else "")
+        )
+    if failed:
+        gaps["files_detector_failed"] = (
+            f"{len(failed)} file(s) crashed the detector and are incomplete, not clean: "
+            + ", ".join(failed[:5]) + ("…" if len(failed) > 5 else "")
+        )
+    return gaps
+
+
 def run_file_detector(description: str, clean_message: str, analyze,
                       *, source_only: bool = True, argv: list[str] | None = None) -> None:
     """Standard main() for a detector that reasons about one file at a time.
@@ -794,26 +866,32 @@ def run_file_detector(description: str, clean_message: str, analyze,
     ignore = set(args.ignore.split(",")) if args.ignore else set()
 
     findings: list[Finding] = []
+    unreadable: list[str] = []
+    failed: list[str] = []
     for filepath in walk_files(Path(args.path), source_only=source_only):
         try:
             text = filepath.read_text(encoding="utf-8", errors="replace")
         except OSError as exc:
             warn_unreadable(filepath, exc)
+            unreadable.append(str(filepath))
             continue
         reporter = Reporter(filepath, ignore)
         try:
             analyze(filepath, text, reporter)
         except Exception as exc:  # a detector bug must not read as a clean file
             warn_detector_error(filepath, exc)
+            failed.append(str(filepath))
             continue
         findings.extend(reporter.findings)
-    emit(findings, args.format, clean_message)
+
+    gaps = coverage_gaps(unreadable, failed)
+    emit(findings, args.format, clean_message, completeness=gaps or None)
 ```
 
 - [ ] **Step 4: Run the tests to verify they pass**
 
 Run: `python -m pytest tests/code_doctor/test_common.py -v`
-Expected: 21 passed.
+Expected: 24 passed.
 
 - [ ] **Step 5: Commit**
 
@@ -931,10 +1009,31 @@ def test_merge_marker_in_yaml_is_still_reported(repo, run_script):
     assert "merge_conflict_marker" in types_in(result)
 
 
-def test_committed_env_file_is_a_finding(repo, run_script):
+def test_tracked_env_file_is_a_finding(repo, run_script):
     repo.write(".env", "API_KEY=abc123\n")
+    repo.commit("oops")
     result = run_script(SCRIPT, repo.path, "--format", "json")
     assert "committed_env_file" in types_in(result)
+
+
+def test_untracked_env_file_is_not_reported(repo, run_script):
+    """An untracked, gitignored .env is correct practice, not a leak.
+
+    Telling someone to rotate credentials and purge history over their local
+    .env is a false positive with a real cost.
+    """
+    repo.write(".gitignore", ".env\n")
+    repo.commit("ignore env")
+    repo.write(".env", "API_KEY=abc123\n")
+    result = run_script(SCRIPT, repo.path, "--format", "json")
+    assert "committed_env_file" not in types_in(result)
+
+
+def test_todo_in_a_non_source_text_file_is_inventoried(repo, run_script):
+    """The design scopes the TODO inventory to all text, not just source."""
+    repo.write("deployment.yaml", "replicas: 1  # TODO: raise before launch\n")
+    result = run_script(SCRIPT, repo.path, "--format", "json")
+    assert "todo_inventory" in types_in(result)
 
 
 def test_oversized_file_is_reported_once(repo, run_script):
@@ -979,12 +1078,14 @@ import re
 import subprocess
 from pathlib import Path
 
-from common import (Reporter, build_parser, configure_output, emit, git,
-                    is_git_repo, walk_files, warn_detector_error, warn_unreadable)
+from common import (Reporter, build_parser, configure_output, coverage_gaps,
+                    emit, git, is_git_repo, walk_files, walk_paths,
+                    warn_detector_error, warn_unreadable)
 
 MERGE_MARKERS = ("<<<<<<< ", "=======", ">>>>>>> ")
 MAX_FILE_LINES = 1000
 MAX_LINE_LENGTH = 300
+MAX_COMMITTED_BYTES = 10 * 1024 * 1024
 
 # The skill's one concession to language syntax, used only after string
 # literals have been blanked. Five tokens, and no detector branches on which
@@ -1021,6 +1122,29 @@ def comment_body(line: str) -> str | None:
     return None
 
 
+def git_dir_for(root: Path) -> Path:
+    """The directory to run git from.
+
+    `git -C <file>` fails, so scanning a single file directly — the advertised
+    `find_hygiene_issues.py conflicted.go` form — would otherwise report git as
+    unavailable and downgrade a genuine conflict to a candidate purely because
+    of how it was invoked.
+    """
+    return root if root.is_dir() else root.parent
+
+
+def _git_listing(root: Path, *args: str) -> tuple[list[str], Path] | None:
+    base = git_dir_for(root)
+    if not is_git_repo(base):
+        return None
+    try:
+        listing = git(base, "-c", "core.quotepath=false", *args)
+        toplevel = Path(git(base, "rev-parse", "--show-toplevel").strip())
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError):
+        return None
+    return listing.splitlines(), toplevel
+
+
 def unmerged_paths(root: Path) -> set[Path] | None:
     """Paths git reports as unmerged, or None when git cannot answer.
 
@@ -1028,19 +1152,31 @@ def unmerged_paths(root: Path) -> set[Path] | None:
     contains marker text on purpose. Without it the detector would report this
     repository's own test fixtures as defects.
     """
-    if not is_git_repo(root):
+    result = _git_listing(root, "ls-files", "-u", "--full-name")
+    if result is None:
         return None
-    try:
-        listing = git(root, "-c", "core.quotepath=false", "ls-files", "-u", "--full-name")
-    except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError):
-        return None
-    toplevel = Path(git(root, "rev-parse", "--show-toplevel").strip())
+    entries, toplevel = result
     paths = set()
-    for entry in listing.splitlines():
+    for entry in entries:
         _, _, rel = entry.partition("\t")
         if rel:
             paths.add((toplevel / rel.strip()).resolve())
     return paths
+
+
+def tracked_paths(root: Path) -> set[Path] | None:
+    """Paths git actually tracks, or None when git cannot answer.
+
+    An untracked or ignored `.env` on a developer's machine is correct
+    practice, not a leak. Asserting it is committed — and telling someone to
+    rotate credentials and purge history over it — is a false positive with a
+    real cost attached.
+    """
+    result = _git_listing(root, "ls-files", "--full-name")
+    if result is None:
+        return None
+    entries, toplevel = result
+    return {(toplevel / rel.strip()).resolve() for rel in entries if rel.strip()}
 
 
 def check_text_file(path: Path, text: str, report: Reporter,
@@ -1049,6 +1185,21 @@ def check_text_file(path: Path, text: str, report: Reporter,
     is_conflicted = unmerged is not None and path.resolve() in unmerged
 
     for number, line in enumerate(text.splitlines(), 1):
+        # The TODO inventory belongs here, not in the source pass: a TODO in
+        # deployment.yaml or settings.toml is debt exactly like one in a .go
+        # file, and the design's stated scope for it is all text.
+        body = comment_body(line)
+        if body is not None:
+            todo = _TODO.search(body)
+            if todo:
+                report.finding(
+                    number, "todo_inventory",
+                    f"{todo.group(1)}: {body[:80]}",
+                    "Convert it to a tracked issue or delete it. An undated TODO in the "
+                    "source is a decision nobody owns.",
+                    severity="low", snippet=line.strip()[:120],
+                )
+
         if not line.startswith(MERGE_MARKERS):
             continue
         if is_conflicted:
@@ -1072,13 +1223,44 @@ def check_text_file(path: Path, text: str, report: Reporter,
                 severity="high", snippet=line[:120],
             )
 
+def check_metadata(path: Path, report: Reporter, tracked: set[Path] | None) -> None:
+    """Checks that read the file's size and tracking state, never its bytes.
+
+    Runs over walk_paths, so binaries reach it — a committed multi-gigabyte
+    archive is precisely what this should catch, and it is never text.
+    """
     if path.name in SECRET_FILENAMES:
+        if tracked is None:
+            report.candidate(
+                1, "committed_env_file",
+                f"`{path.name}` is present and git could not be consulted",
+                also_caused_by=[
+                    "it is untracked or gitignored, which is the correct arrangement",
+                    "git is unavailable here, so tracking state is unknown",
+                ],
+                severity="high",
+            )
+        elif path.resolve() in tracked:
+            report.finding(
+                1, "committed_env_file",
+                f"`{path.name}` is tracked by git",
+                "Remove it from the index, add it to .gitignore, and rotate anything it "
+                "contained — git history keeps the old copy.",
+                severity="high",
+            )
+        # An untracked or ignored .env is correct practice. Say nothing.
+
+    try:
+        size = path.stat().st_size
+    except OSError:
+        return
+    if size > MAX_COMMITTED_BYTES and (tracked is None or path.resolve() in tracked):
         report.finding(
-            1, "committed_env_file",
-            f"`{path.name}` is committed to the repository",
-            "Remove it from the tree, add it to .gitignore, and rotate anything it "
-            "contained — git history keeps the old copy.",
-            severity="high",
+            1, "large_committed_binary",
+            f"{size // (1024 * 1024)} MB file tracked in git",
+            "Move it to release artifacts or an LFS/object store. Git stores every "
+            "version forever, so this cost is paid by every clone from now on.",
+            severity="medium",
         )
 
 
@@ -1104,20 +1286,12 @@ def check_source_file(path: Path, text: str, report: Reporter) -> None:
                 severity="low",
             )
 
+        # TODOs are inventoried in the text pass, which covers this file too.
         body = comment_body(line)
-        if body is None:
+        if body is None or _TODO.search(body):
             continue
 
-        todo = _TODO.search(body)
-        if todo:
-            report.finding(
-                number, "todo_inventory",
-                f"{todo.group(1)}: {body[:80]}",
-                "Convert it to a tracked issue or delete it. An undated TODO in the "
-                "source is a decision nobody owns.",
-                severity="low", snippet=line.strip()[:120],
-            )
-        elif _LOOKS_LIKE_CODE.search(body):
+        if _LOOKS_LIKE_CODE.search(body):
             report.candidate(
                 number, "commented_out_code",
                 "Commented-out line that looks like code",
@@ -1138,29 +1312,43 @@ def main() -> None:
     root = Path(args.path)
 
     findings = []
+    unreadable, failed = [], []
     unmerged = unmerged_paths(root)
+    tracked = tracked_paths(root)
+    text_files = set(walk_files(root, source_only=False))
     source_files = set(walk_files(root, source_only=True))
-    for filepath in walk_files(root, source_only=False):
-        try:
-            text = filepath.read_text(encoding="utf-8", errors="replace")
-        except OSError as exc:
-            warn_unreadable(filepath, exc)
-            continue
+
+    for filepath in walk_paths(root):
         report = Reporter(filepath, ignore)
         try:
-            check_text_file(filepath, text, report, unmerged)
-            if filepath in source_files:
-                check_source_file(filepath, text, report)
+            check_metadata(filepath, report, tracked)
+            if filepath in text_files:
+                try:
+                    text = filepath.read_text(encoding="utf-8", errors="replace")
+                except OSError as exc:
+                    warn_unreadable(filepath, exc)
+                    unreadable.append(str(filepath))
+                    findings.extend(report.findings)
+                    continue
+                check_text_file(filepath, text, report, unmerged)
+                if filepath in source_files:
+                    check_source_file(filepath, text, report)
         except Exception as exc:
             warn_detector_error(filepath, exc)
+            failed.append(str(filepath))
             continue
         findings.extend(report.findings)
 
-    completeness = {}
+    completeness = coverage_gaps(unreadable, failed)
     if unmerged is None:
         completeness["merge_state"] = (
             "git unavailable — conflict markers reported as candidates, "
             "since unmerged state could not be confirmed"
+        )
+    if tracked is None:
+        completeness["tracking_state"] = (
+            "git unavailable — tracking state unknown, so .env and large-file "
+            "findings are reported conservatively"
         )
     emit(findings, args.format, "No hygiene problems found",
          completeness=completeness or None)
@@ -1173,7 +1361,7 @@ if __name__ == "__main__":
 - [ ] **Step 4: Run the tests to verify they pass**
 
 Run: `python -m pytest tests/code_doctor/test_find_hygiene_issues.py -v`
-Expected: 10 passed.
+Expected: 13 passed.
 
 - [ ] **Step 5: Commit**
 
@@ -1217,12 +1405,33 @@ def records_of(result, smell_type):
     return [f for f in json.loads(result.stdout) if f["smell_type"] == smell_type]
 
 
-def test_private_key_block_is_a_finding(repo, run_script):
-    repo.write("deploy.sh", "#!/bin/sh\n-----BEGIN RSA PRIVATE KEY-----\nMIIEow==\n")
+def test_private_key_block_with_a_body_is_a_finding(repo, run_script):
+    repo.write("deploy.sh",
+               "#!/bin/sh\n-----BEGIN RSA PRIVATE KEY-----\n"
+               "MIIEowIBAAKCAQEAx7Vn9kQmPqLs3TfWuYcZgHjKdNbRt4VpXeAoCiMlSzUyBgHw\n"
+               "-----END RSA PRIVATE KEY-----\n")
     result = run_script(SCRIPT, repo.path, "--format", "json")
     record = records_of(result, "private_key_material")[0]
     assert record["kind"] == "finding"
     assert record["severity"] == "high"
+
+
+def test_bare_private_key_header_is_a_candidate(repo, run_script):
+    """Documentation examples and fixtures show the header with no key."""
+    repo.write("README.md", "Keys look like:\n\n-----BEGIN RSA PRIVATE KEY-----\n")
+    result = run_script(SCRIPT, repo.path, "--format", "json")
+    record = records_of(result, "private_key_material")[0]
+    assert record["kind"] == "candidate"
+    assert record["suggestion"] == ""
+
+
+def test_a_credential_is_never_both_a_finding_and_a_candidate(repo, run_script):
+    """A recognized token on a secret-shaped name must report once."""
+    repo.write("settings.py", 'API_TOKEN = "ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"\n')
+    result = run_script(SCRIPT, repo.path, "--format", "json")
+    assert len(json.loads(result.stdout)) == 1
+    assert records_of(result, "cloud_credential")
+    assert not records_of(result, "hardcoded_secret_assignment")
 
 
 def test_aws_access_key_is_a_finding(repo, run_script):
@@ -1281,6 +1490,8 @@ from pathlib import Path
 from common import Reporter, run_file_detector
 
 KEY_BLOCK = re.compile(r"-----BEGIN (?:RSA |EC |DSA |OPENSSH |PGP )?PRIVATE KEY-----")
+KEY_END = re.compile(r"-----END (?:RSA |EC |DSA |OPENSSH |PGP )?PRIVATE KEY-----")
+BASE64_LINE = re.compile(r"[A-Za-z0-9+/=]{32,}")
 
 CLOUD_CREDENTIALS = (
     (re.compile(r"\bAKIA[0-9A-Z]{16}\b"), "AWS access key ID"),
@@ -1311,18 +1522,49 @@ def shannon_entropy(value: str) -> float:
     return -sum((n / total) * math.log2(n / total) for n in counts.values())
 
 
+def has_key_payload(lines: list[str], start: int) -> bool:
+    """Whether a BEGIN line is followed by a plausible key body.
+
+    A bare `-----BEGIN RSA PRIVATE KEY-----` with nothing after it is what a
+    documentation example or a fixture looks like, and the wide walk reaches
+    both. Requiring an END marker or base64 body keeps rotate-and-purge advice
+    attached to something that is actually a key.
+    """
+    window = lines[start:start + 40]
+    if any(KEY_END.search(candidate) for candidate in window):
+        return True
+    return sum(1 for candidate in window if BASE64_LINE.fullmatch(candidate.strip())) >= 2
+
+
 def analyze(path: Path, text: str, report: Reporter) -> None:
-    for number, line in enumerate(text.splitlines(), 1):
+    lines = text.splitlines()
+    for index, line in enumerate(lines):
+        number = index + 1
         if KEY_BLOCK.search(line):
-            report.finding(
-                number, "private_key_material",
-                "Private key block committed to the repository",
-                "Remove the key, rotate it, and purge it from history. Anyone who has "
-                "ever cloned this repository has the old copy.",
-                severity="high",
-            )
+            if has_key_payload(lines, index + 1):
+                report.finding(
+                    number, "private_key_material",
+                    "Private key block committed to the repository",
+                    "Remove the key, rotate it, and purge it from history. Anyone who has "
+                    "ever cloned this repository has the old copy.",
+                    severity="high",
+                )
+            else:
+                report.candidate(
+                    number, "private_key_material",
+                    "Private-key header with no key body following it",
+                    also_caused_by=[
+                        "a documentation example showing the format",
+                        "a test fixture that only needs the header line",
+                        "a truncated or redacted paste",
+                    ],
+                    severity="high",
+                )
             continue
 
+        # One credential must not appear as both a finding and a candidate, so
+        # a recognized pattern ends this line's processing entirely.
+        matched_credential = False
         for pattern, label in CLOUD_CREDENTIALS:
             match = pattern.search(line)
             if match:
@@ -1333,7 +1575,10 @@ def analyze(path: Path, text: str, report: Reporter) -> None:
                     "manager. Revoke first — removing the line does not un-leak it.",
                     severity="high", snippet=match.group(0)[:12] + "…",
                 )
+                matched_credential = True
                 break
+        if matched_credential:
+            continue
 
         assignment = SECRET_NAME.search(line)
         if assignment and shannon_entropy(assignment.group(2)) >= MIN_ENTROPY_BITS:
@@ -1361,7 +1606,7 @@ if __name__ == "__main__":
 - [ ] **Step 4: Run the tests to verify they pass**
 
 Run: `python -m pytest tests/code_doctor/test_find_secrets.py -v`
-Expected: 5 passed.
+Expected: 7 passed.
 
 - [ ] **Step 5: Commit**
 
@@ -1424,6 +1669,15 @@ def test_bare_list_renders_a_markdown_table():
     out = run([FINDING])
     assert "| 🔴 high |" in out
     assert "merge_conflict_marker" in out
+
+
+def test_same_basename_in_two_directories_stays_distinguishable():
+    """An artifact whose locations are ambiguous cannot be worked from."""
+    front = dict(FINDING, file="frontend/index.js", line=12)
+    back = dict(FINDING, file="backend/index.js", line=44)
+    out = run([front, back])
+    assert "frontend/index.js:12" in out
+    assert "backend/index.js:44" in out
 
 
 def test_wrapped_shape_is_accepted():
@@ -1508,11 +1762,25 @@ def load(source: str | None) -> tuple[list[dict], dict]:
     return [], {}
 
 
-def location(record: dict) -> str:
-    return f"{Path(str(record.get('file', '?'))).name}:{record.get('line', '?')}"
+def location(record: dict, root: Path | None) -> str:
+    """A path the reader can act on.
+
+    Basename alone is not that: a repo with frontend/index.js and
+    backend/index.js renders both as `index.js:12`, and an artifact whose
+    locations are ambiguous cannot be worked from. Only the scan-root prefix
+    is stripped.
+    """
+    raw = Path(str(record.get("file", "?")))
+    shown = raw
+    if root is not None:
+        try:
+            shown = raw.resolve().relative_to(root.resolve())
+        except (ValueError, OSError):
+            shown = raw
+    return f"{shown.as_posix()}:{record.get('line', '?')}"
 
 
-def render_table(records: list[dict]) -> list[str]:
+def render_table(records: list[dict], root: Path | None) -> list[str]:
     lines = ["| Severity | Type | Location | Description |",
              "|---|---|---|---|"]
     for record in records:
@@ -1523,17 +1791,17 @@ def render_table(records: list[dict]) -> list[str]:
             description = description[:97] + "..."
         lines.append(
             f"| {icon} {severity} | {record.get('smell_type', '?')} | "
-            f"`{location(record)}` | {description} |"
+            f"`{location(record, root)}` | {description} |"
         )
     return lines
 
 
-def render_cards(records: list[dict]) -> list[str]:
+def render_cards(records: list[dict], root: Path | None) -> list[str]:
     lines = []
     for record in records:
         severity = record.get("severity", "medium")
         icon = SEVERITY_ICONS.get(severity, "")
-        lines.append(f"### {icon} {record.get('smell_type', '?')} — `{location(record)}`")
+        lines.append(f"### {icon} {record.get('smell_type', '?')} — `{location(record, root)}`")
         lines.append("")
         lines.append(record.get("description", ""))
         lines.append("")
@@ -1557,6 +1825,8 @@ def main() -> int:
     parser.add_argument("--format", choices=["list", "cards", "json"], default="list")
     parser.add_argument("--min-severity", choices=["high", "medium", "low"], default="low")
     parser.add_argument("--kind", choices=["finding", "candidate", "all"], default="all")
+    parser.add_argument("--root", type=Path, default=Path.cwd(),
+                        help="Scan root to make locations relative to (default: cwd)")
     args = parser.parse_args()
 
     try:
@@ -1588,12 +1858,12 @@ def main() -> int:
     if findings:
         out.append(f"## Findings ({len(findings)})")
         out.append("")
-        out += renderer(findings)
+        out += renderer(findings, args.root)
         out.append("")
     if candidates:
         out.append(f"## Candidates ({len(candidates)}) — unverified, check before acting")
         out.append("")
-        out += renderer(candidates)
+        out += renderer(candidates, args.root)
     if not findings and not candidates:
         out.append("No findings.")
 
@@ -1608,7 +1878,7 @@ if __name__ == "__main__":
 - [ ] **Step 4: Run the tests to verify they pass**
 
 Run: `python -m pytest tests/code_doctor/test_format_findings.py -v`
-Expected: 8 passed.
+Expected: 9 passed.
 
 - [ ] **Step 5: Commit**
 
@@ -1689,6 +1959,21 @@ def test_clean_repo_reports_clean(repo, run_script):
     repo.write("app.go", "package main\n\nfunc main() {}\n")
     result = run_script(SCRIPT, repo.path, "--format", "json")
     assert json.loads(result.stdout)["findings"] == []
+
+
+def test_detector_completeness_survives_the_merge(tmp_path, run_script):
+    """A detector's own warnings must not be dropped on the way to the report.
+
+    Outside a git repo, hygiene emits a merge_state note. If the aggregate
+    discards it, the report claims the category ran while silently losing the
+    caveat that makes its output legible.
+    """
+    plain = tmp_path / "plain"
+    plain.mkdir()
+    (plain / "app.go").write_text("package main\n<<<<<<< HEAD\nx := 1\n")
+    result = run_script(SCRIPT, plain, "--format", "json")
+    completeness = json.loads(result.stdout)["completeness"]
+    assert any("merge_state" in key for key in completeness)
 ```
 
 - [ ] **Step 2: Run the tests to verify they fail**
@@ -1728,23 +2013,33 @@ DETECTORS = {
 }
 
 
-def run_detector(script: str, path: Path, ignore: str) -> tuple[list[dict], str | None]:
-    """Returns (records, error). A failure is reported, never swallowed."""
+def run_detector(script: str, path: Path, ignore: str) -> tuple[list[dict], dict, str | None]:
+    """Returns (records, completeness, error). A failure is reported, never swallowed.
+
+    The detector's own completeness record comes back with its findings.
+    Dropping it would delete exactly the warnings that make a degraded run
+    legible — hygiene's merge_state note, and every history, resolution, and
+    test-classification warning the later plans add — while the aggregate went
+    on reporting the category as run.
+    """
     command = [sys.executable, str(SCRIPTS_DIR / script), str(path), "--format", "json"]
     if ignore:
         command += ["--ignore", ignore]
     try:
         result = subprocess.run(command, capture_output=True, text=True, timeout=600)
     except (subprocess.TimeoutExpired, OSError) as exc:
-        return [], f"{script}: did not complete ({exc})"
+        return [], {}, f"{script}: did not complete ({exc})"
     if result.returncode != 0:
-        return [], f"{script}: exited {result.returncode} ({result.stderr.strip()[-200:]})"
+        return [], {}, f"{script}: exited {result.returncode} ({result.stderr.strip()[-200:]})"
     try:
         payload = json.loads(result.stdout or "[]")
     except json.JSONDecodeError as exc:
-        return [], f"{script}: emitted invalid JSON ({exc})"
-    records = payload if isinstance(payload, list) else payload.get("findings", [])
-    return [r for r in records if isinstance(r, dict)], None
+        return [], {}, f"{script}: emitted invalid JSON ({exc})"
+    if isinstance(payload, list):
+        return [r for r in payload if isinstance(r, dict)], {}, None
+    records = payload.get("findings") or []
+    return ([r for r in records if isinstance(r, dict)],
+            payload.get("completeness") or {}, None)
 
 
 def main() -> int:
@@ -1770,17 +2065,21 @@ def main() -> int:
 
     records: list[dict] = []
     failures: list[str] = []
+    merged_notes: dict[str, str] = {}
     for category in selected:
-        found, error = run_detector(DETECTORS[category], Path(args.path), args.ignore)
+        found, notes, error = run_detector(DETECTORS[category], Path(args.path), args.ignore)
         if error:
             failures.append(error)
             continue
         records.extend(found)
+        for label, note in notes.items():
+            merged_notes[f"{category}.{label}"] = note
 
     completeness = {
         "categories_run": ", ".join(selected) or "none",
         "categories_skipped": ", ".join(sorted(set(DETECTORS) - set(selected))) or "none",
     }
+    completeness.update(merged_notes)
     if failures:
         completeness["detectors_failed"] = "; ".join(failures)
 
@@ -1796,7 +2095,7 @@ if __name__ == "__main__":
 - [ ] **Step 4: Run the tests to verify they pass**
 
 Run: `python -m pytest tests/code_doctor/test_analyze_all.py -v`
-Expected: 6 passed.
+Expected: 7 passed.
 
 - [ ] **Step 5: Commit**
 
@@ -1826,12 +2125,14 @@ record — a report that quietly lost a detector reads as a clean repository."
 
 - [ ] **Step 1: Write `SKILL.md`**
 
-Create `skills/code-doctor/SKILL.md`. The description must be ≤ 1024 characters and must defer to the language specialists rather than competing with them:
+Create `skills/code-doctor/SKILL.md`. The description must be ≤ 1024 characters, must defer to the language specialists rather than competing with them, and — critically — **must claim only what this plan actually ships.**
+
+This foundation ships hygiene and secrets. Dead-code leads, duplication, hotspots, and the toolchain runner arrive in plans 2–5. A description advertising them now would route users to a skill that delivers materially less than promised, and the description is the only thing a user sees before the skill is chosen. Each later plan widens this description as it lands its detectors.
 
 ```markdown
 ---
 name: code-doctor
-description: Review any codebase for quality problems and bugs, in any language — including ones with no dedicated tooling. Use when the user wants a repo reviewed, audited, triaged, or cleaned up and it is not primarily Python or TypeScript: Go, Rust, Ruby, Java, Kotlin, C#, PHP, Swift, Elixir, or a mixed/polyglot tree. Finds committed credentials, merge markers, dead code leads, duplication, oversized files, TODO debt, and the empirical bug hotspots only git history reveals — then runs the project's own toolchain for the language-specific half. Triggers on "review this repo", "what's wrong with this codebase", "clean this up", "audit this project", "find the risky parts". For Python use python-code-doctor, for TypeScript use typescript-code-doctor, for Django use django-code-doctor — this skill defers to them and says so. For architecture and understanding rather than defects, use code-visualization.
+description: Review any codebase for committed credentials, unresolved merge conflicts, oversized files, and TODO debt — in any language, including ones with no dedicated tooling. Use when the user wants a repo checked, audited, triaged, or cleaned up and it is not primarily Python or TypeScript: Go, Rust, Ruby, Java, Kotlin, C#, PHP, Swift, Elixir, or a mixed/polyglot tree. Needs no parser, no build, and no install — it reads text and git, so it works on a fresh clone. Separates defects it can prove from unverified leads, and never recommends a fix on heuristic evidence. Triggers on "review this repo", "what's wrong with this codebase", "any secrets committed", "audit this project". For Python use python-code-doctor, for TypeScript use typescript-code-doctor, for Django use django-code-doctor — this skill defers to them and says so. For architecture and understanding rather than defects, use code-visualization.
 ---
 
 # Code Doctor
@@ -2015,8 +2316,10 @@ Add to the skills list in `README.md`, after the `django-code-doctor` entry:
 - **[code-doctor](skills/code-doctor/)** — the language-agnostic member of the family,
   for repos the other three do not cover. No parsers, no comment-syntax tables, no
   framework knowledge: it finds committed credentials, merge markers, oversized files
-  and TODO debt from text alone, and gets its language-specific half by running the
-  project's own toolchain. Its distinguishing feature is the schema — a **finding**
+  and TODO debt from text and git alone, on a fresh clone with nothing installed.
+  (Duplication, dead-code leads, churn hotspots and the project-toolchain runner are
+  landing in follow-up plans; the skill's description tracks what it actually ships.)
+  Its distinguishing feature is the schema — a **finding**
   asserts a defect and carries a fix, a **candidate** reports a lead and carries the
   benign explanations instead, and the dataclass raises if a detector confuses them.
   Every detector whose evidence can be incomplete reports that incompleteness, so a
