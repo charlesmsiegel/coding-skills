@@ -35,10 +35,14 @@ from common import (
 # `.75` fell through to the identifier branch, where `\b` cannot match before a
 # dot — so the tool reported the value appears nowhere while the tree was full of it.
 _NUMERIC_RE = re.compile(r"^-?(?:\d+\.?\d*|\.\d+)(?:[eE][-+]?\d+)?$")
-_ASSIGN_RE = re.compile(r"(?<![=!<>+\-*/])=(?!=)")
-_COMPARE_RE = re.compile(r"(?:>=|<=|==|!=|>|<)")
+# `<-` is R's assignment, and must be recognized before the comparison test or
+# its `<` reads as a relational operator — which classified every R metric
+# definition as a comparison and headlined it "defined nowhere".
+_R_ASSIGN_RE = re.compile(r"<-")
+_ASSIGN_RE = re.compile(r"(?<![=!<>+\-*/])=(?!=)|<-")
+_COMPARE_RE = re.compile(r"(?:>=|<=|==|!=|>|<)(?!-)")
 # The needle is the thing being assigned: `quality_score = ...` / `quality_score: number =`
-_TARGET_RE = re.compile(r"^\s*(?::[^=\n]+?)?(?<![=!<>+\-*/])=(?!=)")
+_TARGET_RE = re.compile(r"^\s*(?::[^=\n]+?)?(?:(?<![=!<>+\-*/])=(?!=)|<-)")
 # ...or the thing being declared: `def quality_score(`, `const quality_score`
 _DECLARE_RE = re.compile(r"\b(?:def|function|func|fn|class|const|let|var)\s+$")
 
@@ -88,6 +92,8 @@ def classify(line: str, display: str, path: Path, span: tuple) -> str:
         return "config"
 
     before, after = line[:span[0]], line[span[1]:]
+    if _R_ASSIGN_RE.match(after.lstrip()[:2]) or _R_ASSIGN_RE.search(before[-3:]):
+        return "definition"
     if _COMPARE_RE.search(before[-4:]) or _COMPARE_RE.match(after.lstrip()[:2]):
         return "comparison"
     # The needle may be the value (`CUTOFF = 0.75`) or the name being defined

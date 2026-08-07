@@ -373,3 +373,47 @@ def test_r_arrow_assignments_are_definitions(tmp_path, line, name):
     """`.r` and `.R` are scanned, so `<-` has to be an assignment operator."""
     (tmp_path / "m.R").write_text(line + "\n", encoding="utf-8")
     assert any(row["detail"].startswith(name) for row in kinds(run(tmp_path), "metric_definition"))
+
+
+# ---- fifth review round ------------------------------------------------------- #
+
+def test_a_line_matching_two_definition_patterns_counts_once(tmp_path):
+    """`const accuracy = function accuracy(...)` matched both patterns, so the
+    headline's site count disagreed with the rows and with candidates_total."""
+    (tmp_path / "m.js").write_text(
+        "const accuracy = function accuracy(rows) { return 1; };\n", encoding="utf-8"
+    )
+    payload = run(tmp_path)
+    assert payload["counts"]["candidates_total"] == len(payload["candidates"])
+    assert len(kinds(payload, "no_consumer")) == 1
+
+
+def test_the_zero_default_headline_counts_the_definitions_it_printed(tmp_path):
+    """An indented config metric is a definition row but not a top-level name."""
+    (tmp_path / "s.py").write_text(
+        'CONFIG = {\n    "accuracy": 0.9,\n}\n\n'
+        'def load(cfg):\n    return cfg.get("accuracy", 0)\n',
+        encoding="utf-8",
+    )
+    payload = run(tmp_path)
+    assert kinds(payload, "zero_default")
+    assert "alongside 0 metric name(s)" not in payload["headline"]
+
+
+def test_dropping_nones_without_an_aggregate_is_not_a_composite(tmp_path):
+    """What makes it a composite is the averaging, not the list comprehension."""
+    (tmp_path / "util.py").write_text(
+        "def clean(values):\n    return [v for v in values if v is not None]\n", encoding="utf-8"
+    )
+    payload = run(tmp_path)
+    assert not kinds(payload, "renormalized_composite")
+    assert "No metric definitions" in payload["headline"]
+
+
+def test_kotlin_expression_bodied_functions_are_definitions(tmp_path):
+    """`.kt` is scanned, and Kotlin's keyword is `fun`, which was not in the list."""
+    (tmp_path / "M.kt").write_text(
+        "fun accuracy(rows: List<Int>): Double = rows.size.toDouble()\n", encoding="utf-8"
+    )
+    assert any(row["detail"].startswith("accuracy")
+               for row in kinds(run(tmp_path), "metric_definition"))

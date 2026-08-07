@@ -152,3 +152,12 @@ def test_an_unsigned_needle_does_not_match_a_negative_literal(tmp_path):
     (tmp_path / "a.py").write_text("A = -0.7\n", encoding="utf-8")
     assert run("0.7", tmp_path)["candidates"] == []
     assert run("-0.7", tmp_path)["candidates"]
+
+
+def test_an_r_arrow_assignment_is_a_definition_not_a_comparison(tmp_path):
+    """The `<` in `<-` read as a relational operator, so the tracer said an R
+    metric was compared against and defined nowhere."""
+    (tmp_path / "m.R").write_text("quality_score <- compute_score(rows)\n", encoding="utf-8")
+    payload = run("quality_score", tmp_path)
+    assert payload["counts"].get("definition") == 1
+    assert "defined nowhere" not in payload["headline"]

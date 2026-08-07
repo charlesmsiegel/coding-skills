@@ -33,6 +33,12 @@ from common import (
 
 DATA_SUFFIXES = frozenset({".jsonl", ".ndjson", ".json", ".csv", ".tsv"})
 
+# A .json array has to be decoded whole before any row can be counted, so
+# --max-rows cannot bound the read the way it does for JSONL and CSV. This bounds
+# it by size instead, and says so, rather than exhausting memory on a file the
+# caller asked to sample.
+MAX_JSON_BYTES = 200_000_000
+
 # Field names that carry ground truth. Deliberately excludes bare `answer` and
 # `output`: in an eval file those hold what the *system* produced, and counting
 # them as labels reports a fully-labeled set that has no labels at all. A
@@ -64,7 +70,8 @@ CONFIG_NAMES = frozenset({
 CONFIRM = {
     "partial_labels": "open the file and confirm the sparse field is the ground truth the metric reads",
     "no_label_field": "check whether ground truth lives elsewhere (a sidecar file, a DB) before concluding",
-    "small_n": "compare this n against the ship rule; a rule finer than the instrument is the finding",
+    "small_n": "compute the interval over the per-item deltas before concluding anything; whether this n "
+               "resolves the effect depends on their spread, not on n alone",
     "unparseable_rows": "read the failing rows; malformed rows dropped before scoring inflate every metric",
     "unparseable_dataset": "read the file; a corrupted eval set is not the same as an absent one, and a "
                            "pipeline that skips it silently reports metrics over whatever survived",
@@ -156,7 +163,13 @@ def records_from_json(payload):
                 return value
             if not value and empty is None:
                 empty = value
-        return empty
+        if empty is not None:
+            return empty
+        # `eval.json` holding one record directly (`{"input": ..., "expected": ...}`)
+        # is a dataset of one, not a config file. A recognized ground-truth field is
+        # the evidence; without one this stays None and ordinary config is unaffected.
+        if any(str(key).strip().lower() in LABEL_FIELDS for key in payload):
+            return [payload]
     return None
 
 
@@ -168,6 +181,10 @@ def read_json(path: Path, max_rows: int) -> dict:
     exactly like an absent one.
     """
     try:
+        size = path.stat().st_size
+        if size > MAX_JSON_BYTES:
+            return {"parse_error": "too large to decode whole (" + str(size) + " bytes); --max-rows "
+                                   "cannot bound a single JSON array — convert to JSONL to count it"}
         payload = json.loads(path.read_text(encoding="utf-8", errors="replace"))
     except json.JSONDecodeError as exc:
         return {"parse_error": "invalid JSON at line " + str(exc.lineno)}
@@ -189,7 +206,10 @@ def read_delimited(path: Path, max_rows: int) -> dict:
     rows, read, fields = 0, 0, {}
     try:
         with path.open("r", encoding="utf-8", errors="replace", newline="") as handle:
-            reader = csv.DictReader(handle, delimiter=delimiter)
+            # strict=True so an unterminated quoted field raises instead of
+            # swallowing the following lines into one record and reporting a
+            # confident, wrong N with bad_rows=0.
+            reader = csv.DictReader(handle, delimiter=delimiter, strict=True)
             for record in reader:
                 rows += 1
                 if read >= max_rows:
@@ -252,7 +272,7 @@ def analyze(root: Path, max_rows: int) -> tuple:
             unparseable.append(display)
             rows_out.append(candidate(
                 "unparseable_dataset", display, 1,
-                "looks like a dataset but does not parse (" + stats["parse_error"] + ") — it supplies "
+                "looks like a dataset but could not be read (" + stats["parse_error"] + ") — it supplies "
                 "no examples to anything, and nothing here says so",
                 CONFIRM["unparseable_dataset"],
             ))
@@ -304,7 +324,9 @@ def analyze(root: Path, max_rows: int) -> tuple:
         if 0 < rows < 30:
             rows_out.append(candidate(
                 "small_n", display, 1,
-                "n=" + str(rows) + " — small enough that most claimed effects will not resolve",
+                "n=" + str(rows) + " — small enough that resolvability is worth calculating rather than "
+                "assuming; low-variance paired deltas can resolve a small effect here, a noisy binary "
+                "metric cannot resolve a large one",
                 CONFIRM["small_n"],
             ))
         if stats.get("bad_rows"):

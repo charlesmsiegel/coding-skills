@@ -368,3 +368,46 @@ def test_a_negative_switch_defaulting_to_on_is_also_default_off(tmp_path, line):
 def test_an_ordinary_true_setting_is_not_a_disabled_component(tmp_path):
     (tmp_path / "config.yaml").write_text("verbose: true\nstrict_mode: true\n", encoding="utf-8")
     assert kinds(run(tmp_path), "default_off_flag") == []
+
+
+# ---- fifth review round ------------------------------------------------------- #
+
+def test_a_conditional_reraise_does_not_hide_the_zero_path(tmp_path):
+    """One class re-raised and every other failure scored is still fail-soft."""
+    (tmp_path / "s.py").write_text(
+        "def score(row):\n"
+        "    try:\n"
+        "        return judge(row)\n"
+        "    except Exception as exc:\n"
+        "        if isinstance(exc, FatalError):\n"
+        "            raise\n"
+        "        return 0.0\n",
+        encoding="utf-8",
+    )
+    rows = kinds(run(tmp_path), "error_becomes_zero")
+    assert rows and "another path re-raises" in rows[0]["detail"]
+
+
+def test_a_multiline_promise_catch_body_is_followed(tmp_path):
+    (tmp_path / "m.ts").write_text(
+        "const s = (r) => judge(r).catch(() => {\n  return 0;\n});\n", encoding="utf-8"
+    )
+    assert len(kinds(run(tmp_path), "error_becomes_zero")) == 1
+
+
+def test_a_multiline_promise_catch_that_rethrows_is_clean(tmp_path):
+    (tmp_path / "m.ts").write_text(
+        "const s = (r) => judge(r).catch((e) => {\n  throw e;\n});\n", encoding="utf-8"
+    )
+    assert run(tmp_path)["candidates"] == []
+
+
+def test_sampling_explicitly_switched_off_is_not_nondeterminism(tmp_path):
+    """`top_p: 1.0` is the neutral setting, and do_sample:false turns sampling off."""
+    (tmp_path / "gen.yaml").write_text("top_p: 1.0\ndo_sample: false\n", encoding="utf-8")
+    assert not kinds(run(tmp_path), "nondeterminism")
+
+
+def test_a_real_sampling_setting_is_still_flagged(tmp_path):
+    (tmp_path / "gen.yaml").write_text("top_p: 0.9\ntemperature: 0.7\n", encoding="utf-8")
+    assert kinds(run(tmp_path), "nondeterminism")

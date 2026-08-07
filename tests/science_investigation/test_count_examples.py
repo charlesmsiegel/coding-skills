@@ -257,3 +257,32 @@ def test_a_broken_config_file_is_not_reported_as_corrupted_measurement_input(tmp
 def test_a_broken_file_that_looks_like_data_is_still_reported(tmp_path):
     (tmp_path / "eval.json").write_text("{bad json\n", encoding="utf-8")
     assert kinds(run(tmp_path), "unparseable_dataset")
+
+
+# ---- fifth review round ------------------------------------------------------- #
+
+def test_small_n_asks_for_the_calculation_rather_than_asserting_the_conclusion(tmp_path):
+    """Whether n resolves an effect depends on the spread of the deltas, and the
+    scanner cannot see those — the same correction already made to the evals."""
+    write_jsonl(tmp_path / "eval.jsonl", [{"gold": "a"} for _ in range(12)])
+    row = kinds(run(tmp_path), "small_n")[0]
+    assert "will not resolve" not in row["detail"]
+    assert "calculating" in row["detail"] and "spread" in row["confirm"]
+
+
+def test_a_malformed_quoted_csv_field_is_surfaced(tmp_path):
+    """Permissive parsing absorbed following lines into one record and then
+    reported a confident, wrong N with bad_rows=0."""
+    (tmp_path / "eval.csv").write_text('id,label\n1,"unterminated\n2,no\n', encoding="utf-8")
+    payload = run(tmp_path)
+    assert kinds(payload, "unparseable_dataset")
+
+
+def test_a_single_record_object_is_a_one_row_dataset(tmp_path):
+    (tmp_path / "eval.json").write_text('{"input": "x", "expected": "y"}', encoding="utf-8")
+    assert run(tmp_path)["counts"]["records_total"] == 1
+
+
+def test_a_config_object_with_no_label_field_is_still_not_a_dataset(tmp_path):
+    (tmp_path / "eval.json").write_text('{"retries": 3, "region": "eu"}', encoding="utf-8")
+    assert run(tmp_path)["counts"]["datasets"] == 0
