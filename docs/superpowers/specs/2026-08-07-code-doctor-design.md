@@ -66,14 +66,54 @@ not merge anything yet.
 **architecture**. This is a hard line, and it decides what `code-doctor` may emit.
 
 **Invariant: the reference graph is an internal primitive, never a deliverable.**
-It exists only to produce findings that name a fix — a cycle is a bug class, an
-orphan file is dead code, a god module is a maintenance defect. `code-doctor`
-never emits a map, a diagram, a dependency picture, or a reading order. Every
-output is a finding with a location, a consequence, a concrete fix, and a reason
-it is worth doing.
+It exists only to produce findings and candidates — a cycle is a bug class, a
+zero-inbound file is a dead-code lead, a god module is a maintenance defect.
+`code-doctor` never emits a map, a diagram, a dependency picture, or a reading
+order.
 
 Where the two skills touch the same data (churn, complexity), they produce
 different artifacts and neither reads the other's.
+
+## Confidence discipline
+
+This skill buys language-independence by giving up parsing, which means most of
+its evidence is heuristic. The whole design is only trustworthy if it is honest
+about that, so this is an invariant rather than a style note.
+
+**Two output classes, and a detector must pick one.**
+
+- A **finding** asserts a defect. It carries a location, a consequence, a concrete
+  fix, and the reason it is worth doing. A detector may only emit findings for
+  claims its evidence actually supports — a merge-conflict marker, a committed
+  private key, an oversized file.
+- A **candidate** reports a lead requiring verification. It carries a location,
+  what was observed, **the specific ways a healthy codebase produces this same
+  observation**, and no fix. Dead functions, zero-inbound files, near-duplicates,
+  and decision density are candidates.
+
+Reporting a candidate as a finding is the failure mode that makes a tool like this
+useless — it recommends deleting live code — so the distinction is enforced in the
+findings schema, not left to prose.
+
+**Degrade audibly, never silently.** Every detector whose evidence can be
+incomplete reports the completeness of that evidence alongside its output:
+resolution rate for the reference graph, history depth for the git detectors,
+classifiability for tests. A sparse graph must read as under-resolution, never as
+"no coupling"; a shallow clone must read as unknown ownership, never as a bus
+factor of one; an unclassifiable directory must read as inconclusive, never as
+"no tests". Where completeness cannot be established, the detector suppresses the
+finding rather than qualifying it in a footnote.
+
+**Never assert a negative from an incomplete index.** "This is not referenced
+anywhere", "these files have no dependency between them", "this directory has no
+tests" are all claims a heuristic index cannot support on its own. Each is either
+downgraded to a candidate or gated on positive resolution for the specific files
+involved.
+
+This is the stance `typescript-code-doctor` already takes in *Verify before
+believing*, and that `code-visualization`'s `imports.py` takes with
+`ResolutionStats` — "a measured gap, not a silent one". `code-doctor` needs it
+more than either, because it knows less.
 
 ## Architecture: three layers
 
@@ -93,23 +133,51 @@ checks, and running them beats guessing.
 
 ### Foundation
 
-- **`common.py`** — extension-agnostic source walk (binary sniff, vendor and
-  build directory exclusion, `.gitignore` aware), severity icons, console,
-  one policy for unreadable files, git helper.
+- **`common.py`** — the source walk, severity icons, console, one policy for
+  unreadable files, git helpers (including the shallow-history probe below).
+
+  The walk is extension-agnostic in the direction that matters: an **unknown**
+  extension is treated as code, which is what keeps the skill language-blind. But
+  "not binary" is not "is source". A **denylist of known non-code text** —
+  `.md`, `.rst`, `.txt`, `.json`, `.yaml`, `.toml`, `.lock`, `.csv`, `.svg`,
+  minified bundles, and anything under a documentation root — keeps prose and
+  generated data out of the code-only detectors. A denylist is the inverse of a
+  language table: it enumerates what is *not* code, so it never needs to know
+  which languages exist.
+
+  Every detector additionally **declares its own scope**. Branch counting,
+  indentation nesting, duplication shingling, and declaration heuristics run only
+  over walk-classified source. Secrets, merge markers, and TODO inventory run over
+  all text, because those findings are real in a YAML file too.
 
 ### Git-derived signals (no language knowledge at all, highest unique value)
 
 - **`find_hotspots.py`** — the targeting engine: churn × complexity-proxy ×
   defect density. Effort follows change frequency, never line count.
-- **`find_change_coupling.py`** — files that repeatedly change in the same commit
-  but have no structural dependency between them. Hidden coupling, invisible to
-  static analysis in any language. Also flags files that change with everything.
+- **`find_change_coupling.py`** — files that repeatedly change in the same commit.
+  Co-change strength is the finding. The detector **does not claim the absence of
+  a structural dependency** unless `map_references.py` positively resolved
+  references for both files; with heuristic-only edges it cannot support that
+  claim, and a Go caller changing alongside the package it imports would otherwise
+  be mislabelled as hidden coupling when it is ordinary structural coupling. Where
+  resolution was positive for both ends, the finding is upgraded to "co-changes
+  with no resolved dependency" and says so. Also flags files that change with
+  everything.
 - **`find_ownership_risks.py`** — bus factor: single-author files, and files whose
   only author has stopped committing.
 
 Defect density is per-file density of commits whose messages match fix/bug/
 hotfix/revert. It is an empirical answer to "where do bugs live", as opposed to
 complexity's guess.
+
+**All four git-derived detectors probe history depth first**
+(`git rev-parse --is-shallow-repository`, plus the age of the oldest reachable
+commit against the requested window). A shallow CI checkout exposes only the most
+recent committer, which turns multi-author files into apparent single-author files
+and produces a confidently wrong ownership report. On truncated history these
+detectors skip or mark every finding incomplete; they never quietly compute over
+the fragment. `code-visualization/analyze_hotspots.py` already does this probe —
+same reasoning.
 
 ### Reference graph (heuristic, self-reporting)
 
@@ -129,40 +197,81 @@ complexity's guess.
   aliased packages, and vendored-vs-first-party are known misses and are named as
   such in the output and in `references/unknown-language-review.md`.
 
-- **`find_unreferenced.py`** — consumes the map. Two findings: **dead-function
-  candidates** (a distinctive identifier — length ≥ 4, not a common word —
-  occurring exactly once in the whole tree in declaration-shaped context) and
-  **orphan files** (nothing in the tree references them). Deliberately
-  conservative: recall is traded for precision, matching the repo's existing bias
+- **`find_unreferenced.py`** — consumes the map. Emits two **candidate** classes,
+  never fixes (see *Confidence discipline*): **dead-function candidates** (a
+  distinctive identifier — length ≥ 4, not a common word — occurring exactly once
+  in the whole tree in declaration-shaped context) and **zero-inbound files**.
+
+  Zero inbound edges is not orphanhood. Executable entry points (`main.go`,
+  `main.rs`, `cmd/*`), convention-loaded plugins, a library's public surface, and
+  CI configuration all legitimately have no internal referrer — and the graph
+  independently under-resolves package-style and aliased references, so the two
+  errors compound. The detector therefore **never recommends deleting or wiring in
+  a file**. It reports the candidate, names the reasons a live file lands in this
+  set, and prints the graph's resolution rate beside it. Known entry-point paths
+  and manifest-declared entry points are excluded outright.
+
+  Both classes trade recall hard for precision, matching the repo's existing bias
   of false negatives over false positives.
 
 - **`find_structure_issues.py`** — consumes the map. Import cycles, god modules
   (high fan-in *and* fan-out), and low directory cohesion (a directory whose files
-  never reference each other is not a module). Each emitted as a finding with a
-  fix, per the invariant above.
+  never reference each other is not a module).
+
+  Cycles are **findings**: a resolved cycle is positive evidence, and the graph's
+  misses can only hide cycles, not invent them. God modules and low cohesion are
+  **candidates** — both rest on edge counts, which under-resolution distorts
+  downward, so a quiet result means little. All three carry the resolution rate.
 
 ### Duplication
 
-- **`find_duplication.py`** — DRY. Strips comments, blanks string and number
-  literals, normalizes whitespace, then shingles N-line windows. Reports **exact**
-  duplicates and **near-duplicates via Jaccard similarity over shingle sets**.
-  Near-duplicate detection is the point: copy-paste-with-mutation is what actually
-  rots a codebase, and exact matching misses all of it.
+- **`find_duplication.py`** — DRY. Normalizes each line, then shingles N-line
+  windows. Reports **exact** duplicates and **near-duplicates via Jaccard
+  similarity over shingle sets**. Near-duplicate detection is the point:
+  copy-paste-with-mutation is what actually rots a codebase, and exact matching
+  misses all of it.
+
+  **Normalization order matters, and it is the one place this skill touches
+  comment syntax.** String and number literals are blanked *first*, then a minimal
+  universal comment-prefix set (`//`, `#`, `--`, `;`, `/* */`) is stripped from
+  what remains, then whitespace is collapsed. Blanking literals first is what stops
+  `url = "https://x"; do_unique_work()` from losing its trailing call to a `//`
+  that was never a comment. The residual ambiguity is real — `#` opens a Rust
+  attribute and a C preprocessor directive, not a comment — and it is **safe by
+  construction here**: a mis-normalized line simply fails to match its twin,
+  producing a missed duplicate rather than a false one. That is the stated bias.
+
+  This concession is scoped to normalization only. It is a five-token text fact,
+  not a language table, and no detector branches on which language a file is.
 
 ### Complexity
 
-- **`analyze_complexity.py`** — decision density over a near-universal branch-token
-  set (`if`/`else`/`for`/`while`/`case`/`catch`/`&&`/`||`/`?`), nesting depth by
-  indentation, file and function length via declaration-shaped segmentation, and an
-  arity proxy from commas between parens on declaration lines. The arity and
-  function-boundary findings are marked low-confidence; the nesting and length ones
-  are not.
+- **`analyze_complexity.py`** — decision density, nesting depth by indentation,
+  file and function length via declaration-shaped segmentation, and an arity proxy
+  from commas between parens on declaration lines.
+
+  The branch-token set is `if` / `else` / `for` / `while` / `case` / `catch` /
+  `&&` / `||`. **`?` is deliberately excluded**: in TypeScript it marks optional
+  properties, optional parameters, optional chaining, and conditional types, none
+  of which is a decision, and in Rust it is error propagation. Counting it would
+  report type-heavy files with no control flow as complex.
+
+  Decision density and the arity and function-boundary proxies are all marked
+  **heuristic** — they rest on declaration-shaped segmentation, not parsing. Only
+  nesting depth and raw length are reported as facts.
 
 ### Correctness and hygiene
 
 - **`find_hygiene_issues.py`** — merge conflict markers, TODO/FIXME/HACK/XXX
   inventory with git-blame age, commented-out code, oversized files and lines,
   committed `.env` files and large binaries, debug-print leftovers.
+
+  Commented-out code uses the same five-token comment-prefix set as
+  `find_duplication.py`, with literals blanked first, and is a **candidate**: a
+  commented line that looks like code may be a documentation example, and `#` may
+  be an attribute rather than a comment. Merge markers, oversized files, and
+  committed secrets or binaries are findings — none of them depends on comment
+  syntax.
 - **`find_secrets.py`** — key material (private key blocks, cloud credentials,
   JWTs) and high-entropy values assigned to names containing key/token/secret/
   password.
@@ -173,14 +282,45 @@ complexity's guess.
   filename conventions, assertion density, test files that assert nothing, and
   test:source ratio per directory.
 
+  **Filename conventions cannot see tests embedded in source files.** Rust's
+  `#[cfg(test)] mod tests` lives in the production `.rs` file; D, Zig, and Go
+  example functions have similar habits. A fully tested Rust directory would
+  otherwise report a zero test:source ratio — a confident claim of "no tests"
+  about code that is tested. So the detector first asks whether tests are
+  **classifiable** in this tree: filename-convention hits, an in-file test marker,
+  or a test target declared in the manifest or toolchain inventory. When none of
+  those resolve for a directory, it reports **"test classification inconclusive"**
+  and suppresses the ratio and mapping findings for it rather than reporting zero.
+
 ### The repo's own toolchain
 
 - **`find_project_checks.py`** — inventory what the repo already defines:
   `Makefile` targets, `justfile` recipes, `package.json` scripts,
-  `.pre-commit-config.yaml`, `tox.ini`, CI workflow steps.
-- **`run_project_checks.py`** — run the check-shaped ones in non-mutating mode and
-  normalize their output into this skill's findings shape. Never installs
-  anything; never runs a target it cannot identify as a check.
+  `.pre-commit-config.yaml`, `tox.ini`, CI workflow steps. Reports each with its
+  **literal command text**, so what would run is visible before anything runs.
+  This is the default entry point, and it executes nothing.
+
+- **`run_project_checks.py`** — runs selected checks and normalizes their output
+  into this skill's findings shape.
+
+  **A check-shaped name is not evidence of non-mutating behavior, so the name is
+  never sufficient to run it.** `"lint": "eslint . --fix"` is an ordinary thing to
+  find in a `package.json`, and an opaque `make check` recipe can regenerate
+  fixtures, write to a database, or call an external service. The script therefore:
+
+  1. **Never runs anything without explicit opt-in.** No target list, no run.
+  2. **Classifies each command by inspecting the command text**, not the target
+     name — a recognized read-only invocation of a known checker, versus anything
+     carrying a mutation flag (`--fix`, `--write`, `-i`, `format` without
+     `--check`), versus opaque (a recipe whose body it cannot read through, a shell
+     script, a nested `make`).
+  3. **Requires confirmation for anything not provably read-only**, surfacing the
+     literal command, via `AskUserQuestion` — the same stance the existing skills
+     take on installing tools and on `--fix`.
+  4. Never installs anything.
+
+  Opaque recipes are the common case, not the edge case, so "ask" is the expected
+  path rather than a rare fallback.
 
 ### Orchestration and output
 
