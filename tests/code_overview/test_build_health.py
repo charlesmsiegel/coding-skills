@@ -544,6 +544,160 @@ def test_the_root_keeps_repo_level_configuration_findings(run_script, repo):
     assert "legacy/old.py" not in files, "an unmapped directory is still out of scope"
 
 
+def test_a_zero_byte_report_grades_nothing(run_script, sized_repo, tmp_path):
+    """What a doctor leaves behind when it fails after the shell made the file."""
+    empty = tmp_path / "empty.json"
+    empty.write_text("")
+    out = sized_repo.path / "src/app/docs/health.html"
+    result = run_script(BUILD_HEALTH, "--out", out, "--findings", empty,
+                        "--repo", sized_repo.path, "--name", "app", "--root-dir", "src/app",
+                        "--doctor", "python-code-doctor")
+    meta = read_meta(out)
+    assert meta["score"] is None, "an empty artifact is not a clean run"
+    assert meta["grade"] == "—"
+    assert "empty" in result.stderr
+
+
+def test_skipping_one_detector_ungrades_its_whole_category(run_script, sized_repo):
+    """Correctness has many detectors; a partial measurement can only miss findings."""
+    report = sized_repo.path / "report.json"
+    report.write_text(json.dumps({
+        "meta": {"analyzers_run": ["mutation_hazards", "security"],
+                 "analyzers_skipped": ["exception_issues"]},
+        "categories": {"mutation_hazards": {"issues": []}, "security": {"issues": []},
+                       "exception_issues": {"issues": []}},
+    }), encoding="utf-8")
+    out = sized_repo.path / "src/app/docs/health.html"
+    run_script(BUILD_HEALTH, "--out", out, "--findings", report, "--repo", sized_repo.path,
+               "--name", "app", "--root-dir", "src/app", "--doctor", "python-code-doctor")
+    meta = read_meta(out)
+    assert "correctness" in meta["ungraded"], (
+        "exception_issues is a correctness detector; skipping it leaves the category "
+        "partly measured, and a partial measurement only ever misses findings"
+    )
+    assert "security" not in meta["ungraded"]
+
+
+def test_two_findings_on_one_line_from_one_report_both_count(run_script, sized_repo):
+    """Django's template detector emits one finding per link on a line."""
+    report = sized_repo.path / "one.json"
+    shared = {"file": "src/app/mod0.py", "line": 7, "smell_type": "hardcoded_url_in_template",
+              "severity": "medium"}
+    report.write_text(json.dumps([{**shared, "description": "link to /a"},
+                                  {**shared, "description": "link to /b"}]))
+    out = sized_repo.path / "src/app/docs/health.html"
+    run_script(BUILD_HEALTH, "--out", out, "--findings", report, "--repo", sized_repo.path,
+               "--name", "app", "--root-dir", "src/app", "--doctor", "django-code-doctor")
+    meta = read_meta(out)
+    assert meta["findings_total"] == 2, "deduplication is across reports, never within one"
+    assert meta["duplicates_merged"] == 0
+
+
+def test_cross_report_multiplicity_is_the_maximum_not_the_sum(run_script, sized_repo):
+    shared = {"file": "src/app/mod0.py", "line": 7, "smell_type": "hardcoded_url_in_template"}
+    a = sized_repo.path / "a.json"
+    a.write_text(json.dumps([{**shared, "severity": "medium", "description": "one"},
+                             {**shared, "severity": "medium", "description": "two"}]))
+    b = sized_repo.path / "b.json"
+    b.write_text(json.dumps([{**shared, "severity": "high", "description": "the same line"}]))
+    out = sized_repo.path / "src/app/docs/health.html"
+    run_script(BUILD_HEALTH, "--out", out, "--findings", a, "--findings", b,
+               "--repo", sized_repo.path, "--name", "app", "--root-dir", "src/app",
+               "--doctor", "django-code-doctor")
+    meta = read_meta(out)
+    assert meta["findings_total"] == 2, "two real defects, one of them also seen by the other doctor"
+    assert meta["duplicates_merged"] == 1
+
+
+def test_templates_are_sized_when_the_findings_reach_them(run_script, repo):
+    """A Django package's template findings must be divided by template lines too."""
+    for module in range(3):
+        repo.write(f"app/m{module}.py", "\n".join(f"x{i}=1" for i in range(200)))
+    for page in range(4):
+        repo.write(f"app/templates/p{page}.html", "\n".join(f"<p>{i}</p>" for i in range(500)))
+    repo.commit("init")
+
+    without = repo.path / "a.json"
+    without.write_text(json.dumps([{"file": "app/m0.py", "line": 3, "smell_type": "fat_model",
+                                    "severity": "high"}]))
+    with_templates = repo.path / "b.json"
+    with_templates.write_text(json.dumps([
+        {"file": "app/m0.py", "line": 3, "smell_type": "fat_model", "severity": "high"},
+        {"file": "app/templates/p0.html", "line": 2, "smell_type": "missing_csrf_token",
+         "severity": "high"},
+    ]))
+
+    plain = repo.path / "plain.html"
+    run_script(BUILD_HEALTH, "--out", plain, "--findings", without, "--repo", repo.path,
+               "--name", "app", "--root-dir", "app", "--doctor", "django-code-doctor")
+    templated = repo.path / "templated.html"
+    run_script(BUILD_HEALTH, "--out", templated, "--findings", with_templates, "--repo", repo.path,
+               "--name", "app", "--root-dir", "app", "--doctor", "django-code-doctor")
+
+    assert read_meta(plain)["sized_extensions"] == [], "no template findings, no template lines"
+    assert read_meta(templated)["sized_extensions"] == [".html"]
+    assert read_meta(templated)["size"]["loc"] > read_meta(plain)["size"]["loc"] * 2, (
+        "the templates the findings came from have to be in the denominator"
+    )
+
+
+def test_loc_and_files_overrides_are_independent(run_script, sized_repo):
+    measured = read_meta(build(run_script, sized_repo, []))
+    only_files = read_meta(build(run_script, sized_repo, [], "--files", "7"))
+    assert only_files["size"]["files"] == 7
+    assert only_files["size"]["loc"] == measured["size"]["loc"], "--files must not touch loc"
+
+    only_loc = read_meta(build(run_script, sized_repo, [], "--loc", "5000"))
+    assert only_loc["size"]["loc"] == 5000
+    assert only_loc["size"]["files"] == measured["size"]["files"], "--loc must not zero files"
+
+
+def test_category_scores_are_shown_at_grading_precision(run_script, sized_repo):
+    """A score of 92.6 graded A- must not be rendered as '93'."""
+    for count in range(0, 30):
+        out = build(run_script, sized_repo,
+                    [finding(category="naming_issues", severity="low", line=n)
+                     for n in range(count)])
+        text = out.read_text()
+        for row in read_meta(out)["categories"]:
+            if row["score"] is not None:
+                assert f'>{row["score"]:.1f}<' in text, (
+                    f'{row["key"]} stored {row["score"]} but the page does not show it'
+                )
+
+
+def test_a_package_with_no_health_page_stays_in_the_roll_up(run_script, repo):
+    """The documented "codemap only" answer must not vanish from the table."""
+    for module in range(3):
+        repo.write(f"src/api/m{module}.py", "\n".join(f"x{i}=1" for i in range(300)))
+        repo.write(f"src/svc/m{module}.go", "package main\n")
+    repo.write("docs/code-overview.json", json.dumps({
+        "schema": "code-overview/1",
+        "packages": [
+            {"name": "api", "roots": ["src/api"], "docs": "src/api/docs",
+             "language": "python", "doctor": "python-code-doctor"},
+            {"name": "svc", "roots": ["src/svc"], "docs": "src/svc/docs",
+             "language": "go", "doctor": ""},
+        ],
+    }))
+    repo.commit("init")
+    report = repo.path / "f.json"
+    report.write_text(json.dumps([finding(file="src/api/m0.py", category="security")]))
+    run_script(BUILD_HEALTH, "--out", repo.path / "src/api/docs/health.html",
+               "--findings", report, "--repo", repo.path, "--name", "api",
+               "--root-dir", "src/api", "--doctor", "python-code-doctor")
+
+    out = repo.path / "docs/health.html"
+    run_script(BUILD_HEALTH, "--root", "--out", out, "--map", repo.path / "docs/code-overview.json",
+               "--findings", report, "--repo", repo.path, "--name", "whole-repo",
+               "--doctor", "python-code-doctor")
+    rows = {row["package"]: row for row in read_meta(out)["packages"]}
+    assert set(rows) == {"api", "svc"}
+    assert rows["svc"]["generated"] is False
+    assert rows["svc"]["score"] is None
+    assert "not generated" in out.read_text()
+
+
 def test_malformed_findings_fail_loudly(run_script, sized_repo, tmp_path):
     broken = tmp_path / "broken.json"
     broken.write_text("{not json")

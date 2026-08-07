@@ -199,15 +199,30 @@ def build(args) -> str:
 
 
 def render_caveats(meta: dict) -> str:
+    """Caveats for the portal. Must say the same thing health.html says.
+
+    This page is where readers land, so a claim softened or overstated here
+    reaches more people than the one on the health page.
+    """
     parts = []
     if meta.get("ungraded"):
         listed = ", ".join(esc(rubric.CATEGORY_LABELS.get(k, k)) for k in meta["ungraded"])
         parts.append(f'<div class="callout warn">Ungraded: {listed}. Nothing measured those, '
                      "so the grade covers less than the full rubric.</div>")
+    if meta.get("analyzers_skipped"):
+        listed = ", ".join(f"<code>{esc(k)}</code>" for k in meta["analyzers_skipped"])
+        parts.append(f'<div class="callout warn">Detectors that were not run: {listed}. '
+                     "Their categories are ungraded rather than clean.</div>")
     if meta.get("analyzer_errors"):
         listed = ", ".join(f"<code>{esc(k)}</code>" for k in sorted(meta["analyzer_errors"]))
+        # Partial, not an upper bound — the category is dropped and the weights
+        # renormalized, so restoring it could move the score either way.
         parts.append(f'<div class="callout bad">Detectors that did not complete: {listed}. '
-                     "The grade is an upper bound.</div>")
+                     "Their categories were dropped, so this score is partial: the missing "
+                     "ones could have moved it either way.</div>")
+    if meta.get("findings_out_of_scope"):
+        parts.append(f'<div class="callout">{meta["findings_out_of_scope"]} finding(s) about '
+                     "code outside this unit are not counted here.</div>")
     return ("<h2>Caveats</h2>" + "".join(parts)) if parts else ""
 
 

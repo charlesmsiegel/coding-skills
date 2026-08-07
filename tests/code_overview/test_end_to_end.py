@@ -236,7 +236,12 @@ def test_rebuilding_the_root_before_the_packages_warns_and_recovers(run_script, 
                        "--map", map_path, "--findings", report, "--repo", repo.path,
                        "--name", "whole-repo")
     assert "billing" in early.stderr
-    assert read_meta(repo.path / "docs/health.html").get("packages") is None
+    # Listed as not-generated rather than dropped: a roll-up missing a whole
+    # package silently looks complete.
+    early_rows = read_meta(repo.path / "docs/health.html")["packages"]
+    assert [row["package"] for row in early_rows] == ["billing"]
+    assert early_rows[0]["score"] is None and early_rows[0]["generated"] is False
+    assert "not generated" in (repo.path / "docs/health.html").read_text()
 
     run_script(CO / "build_health.py", "--out", repo.path / "src/billing/docs/health.html",
                "--findings", report, "--repo", repo.path, "--name", "billing",
