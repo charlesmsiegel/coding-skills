@@ -49,6 +49,12 @@ LABEL_FIELDS = frozenset({
 # Where a JSON object hides its records.
 RECORD_KEYS = ("data", "examples", "rows", "records", "cases", "items", "tests",
                "samples", "results", "questions", "evals", "dataset")
+# Names and directories that make a file plausibly measurement data. A malformed
+# `settings.json` in a tree with no eval data is a broken config file, and
+# reporting it as corrupted measurement input manufactures a finding.
+DATASET_HINTS = ("eval", "test", "data", "dataset", "bench", "gold", "label", "annot",
+                 "sample", "record", "case", "example", "qa", "question", "golden",
+                 "fixture", "ground", "truth", "run", "result", "score")
 # JSON files that are configuration, not data, however they parse.
 CONFIG_NAMES = frozenset({
     "package.json", "package-lock.json", "tsconfig.json", "composer.json",
@@ -65,6 +71,11 @@ CONFIRM = {
     "empty_dataset": "check what writes this file; every metric reading it has n=0, which is not 0.0",
     "dataset": "confirm this file is what the metric actually reads at run time",
 }
+
+
+def looks_like_data(display: str) -> bool:
+    """Whether an unparseable file is plausibly a dataset rather than a config."""
+    return any(hint in display.lower() for hint in DATASET_HINTS)
 
 
 def is_populated(value) -> bool:
@@ -86,28 +97,36 @@ def tally(records, counts: dict) -> None:
 
 
 def read_jsonl(path: Path, max_rows: int) -> dict:
-    rows, bad, fields = 0, 0, {}
-    truncated = False
+    """Count every record; parse only the first `max_rows` of them.
+
+    Counting a line is cheap and parsing it is not, so the cap applies to the
+    tally rather than to the count. Reporting the cap as the dataset's size would
+    be a silent truncation inside the tool whose whole job is deriving N.
+    """
+    rows, read, bad, fields = 0, 0, 0, {}
     try:
         with path.open("r", encoding="utf-8", errors="replace") as handle:
             for line in handle:
                 if not line.strip():
                     continue
-                if rows >= max_rows:
-                    truncated = True
-                    break
                 rows += 1
+                if read >= max_rows:
+                    continue
+                read += 1
                 try:
                     record = json.loads(line)
                 except json.JSONDecodeError:
                     bad += 1
+                    continue
+                if not isinstance(record, dict):
+                    bad += 1          # a bare scalar or list is not a record
                     continue
                 tally([record], fields)
     except OSError as exc:
         # Same shape as the other readers: an unreadable eval set is reported, not
         # dropped into the "no datasets found" bucket.
         return {"parse_error": type(exc).__name__}
-    return {"rows": rows, "bad_rows": bad, "fields": fields, "truncated": truncated}
+    return {"rows": rows, "read": read, "bad_rows": bad, "fields": fields, "truncated": read < rows}
 
 
 def records_from_json(payload):
@@ -125,10 +144,19 @@ def records_from_json(payload):
     if isinstance(payload, list):
         return payload if not payload or any(isinstance(r, dict) for r in payload) else None
     if isinstance(payload, dict):
+        # A populated list wins over an earlier empty one: `{"data": [],
+        # "examples": [...]}` held real records under the second key, and taking
+        # the first match reported the file as an empty dataset.
+        empty = None
         for key in RECORD_KEYS:
             value = payload.get(key)
-            if isinstance(value, list) and (not value or any(isinstance(r, dict) for r in value)):
+            if not isinstance(value, list):
+                continue
+            if any(isinstance(r, dict) for r in value):
                 return value
+            if not value and empty is None:
+                empty = value
+        return empty
     return None
 
 
@@ -148,32 +176,31 @@ def read_json(path: Path, max_rows: int) -> dict:
     records = records_from_json(payload)
     if records is None:
         return {}
-    truncated = len(records) > max_rows
     fields: dict = {}
     kept = records[:max_rows]
     tally(kept, fields)
     bad = sum(1 for record in kept if not isinstance(record, dict))
-    return {"rows": len(kept), "bad_rows": bad, "fields": fields, "truncated": truncated}
+    return {"rows": len(records), "read": len(kept), "bad_rows": bad, "fields": fields,
+            "truncated": len(kept) < len(records)}
 
 
 def read_delimited(path: Path, max_rows: int) -> dict:
     delimiter = "\t" if path.suffix == ".tsv" else ","
-    rows, fields = 0, {}
-    truncated = False
+    rows, read, fields = 0, 0, {}
     try:
         with path.open("r", encoding="utf-8", errors="replace", newline="") as handle:
             reader = csv.DictReader(handle, delimiter=delimiter)
             for record in reader:
-                if rows >= max_rows:
-                    truncated = True
-                    break
                 rows += 1
+                if read >= max_rows:
+                    continue
+                read += 1
                 for key, value in record.items():
                     if key and isinstance(value, str) and value.strip():
                         fields[key] = fields.get(key, 0) + 1
     except (OSError, csv.Error, UnicodeError) as exc:
         return {"parse_error": type(exc).__name__}
-    return {"rows": rows, "bad_rows": 0, "fields": fields, "truncated": truncated}
+    return {"rows": rows, "read": read, "bad_rows": 0, "fields": fields, "truncated": read < rows}
 
 
 def read_dataset(path: Path, max_rows: int) -> dict:
@@ -220,6 +247,8 @@ def analyze(root: Path, max_rows: int) -> tuple:
         stats = read_dataset(path, max_rows)
         display = rel(path, root)
         if stats.get("parse_error"):
+            if not looks_like_data(display):
+                continue  # a broken config file is not corrupted measurement input
             unparseable.append(display)
             rows_out.append(candidate(
                 "unparseable_dataset", display, 1,
@@ -229,7 +258,7 @@ def analyze(root: Path, max_rows: int) -> tuple:
             ))
             continue
         if stats.get("rows") == 0 and "fields" in stats:
-            summaries.append({"file": display, "rows": 0, "labeled": 0, "labels": [],
+            summaries.append({"file": display, "rows": 0, "read": 0, "labeled": 0, "labels": [],
                               "label_fields": [], "truncated": False})
             rows_out.append(candidate(
                 "empty_dataset", display, 1,
@@ -241,24 +270,26 @@ def analyze(root: Path, max_rows: int) -> tuple:
         if not stats or not stats.get("rows"):
             continue
         rows = stats["rows"]
+        read = stats.get("read", rows)
         labels = label_coverage(stats["fields"])
         best = labels[0][1] if labels else 0
-        summaries.append({"file": display, "rows": rows, "labeled": best, "labels": labels,
+        summaries.append({"file": display, "rows": rows, "read": read, "labeled": best, "labels": labels,
                           "label_fields": [name for name, _ in labels], "truncated": stats["truncated"]})
 
         detail = str(rows) + " record(s)"
         if stats["truncated"]:
-            detail += " (read capped at --max-rows)"
+            detail += " (fields counted over the first " + str(read) + " only, --max-rows)"
         detail += "; fields: " + (describe(stats["fields"], rows) or "none")
         rows_out.append(candidate("dataset", display, 1, detail, CONFIRM["dataset"]))
 
         for name, count in labels:
-            if count >= rows:
+            if count >= read:
                 continue
-            pct = round(100.0 * count / rows, 1)
+            pct = round(100.0 * count / read, 1)
+            over = str(read) + " record(s)" + (" read of " + str(rows) if stats["truncated"] else "")
             rows_out.append(candidate(
                 "partial_labels", display, 1,
-                name + " populated on " + str(count) + " of " + str(rows) + " record(s) (" + str(pct)
+                name + " populated on " + str(count) + " of " + over + " (" + str(pct)
                 + "%) — a reference metric reading this field has n=" + str(count) + ", not " + str(rows),
                 CONFIRM["partial_labels"],
             ))
@@ -300,7 +331,7 @@ def headline_for(summaries: list, unparseable: list) -> str:
                 + ") — the measurement input exists and is empty, which is not the same as absent "
                 "and not the same as a score of 0.")
 
-    sparse = [(s, name, n) for s in summaries for name, n in s["labels"] if n < s["rows"]]
+    sparse = [(s, name, n) for s in summaries for name, n in s["labels"] if n < s["read"]]
     if sparse:
         worst_set, worst_field, worst_n = min(sparse, key=lambda t: t[2] / max(t[0]["rows"], 1))
         return (worst_set["file"] + ": " + str(worst_set["rows"]) + " record(s), " + worst_field
@@ -313,7 +344,16 @@ def headline_for(summaries: list, unparseable: list) -> str:
         return (str(len(summaries)) + " dataset(s), " + str(total) + " record(s), no recognized "
                 "ground-truth field in any of them: reference metrics have no inputs here.")
 
-    labeled = max(summaries, key=lambda s: s["labeled"])
+    # A truncated read cannot support a full-coverage claim: the rows past the cap
+    # were never looked at, and calling the prefix "fully labeled" is the silent
+    # truncation this skill exists to catch, committed by the tool that counts.
+    complete = [s for s in summaries if not s["truncated"]]
+    if not complete:
+        biggest = max(summaries, key=lambda s: s["read"])
+        return (str(len(summaries)) + " dataset(s), all read only in part (" + biggest["file"] + ": "
+                + str(biggest["read"]) + " of " + str(biggest["rows"]) + " records) — raise --max-rows "
+                "before quoting any coverage figure from this run.")
+    labeled = max(complete, key=lambda s: s["labeled"])
     return (str(len(summaries)) + " dataset(s); the largest fully-labeled set is " + labeled["file"]
             + " at n=" + str(labeled["labeled"]) + ". Check that n against the ship rule before "
             "trusting any comparison.")
@@ -349,6 +389,7 @@ def main() -> int:
         "datasets": len(summaries),
         "datasets_unparseable": len(unparseable),
         "records_total": sum(s["rows"] for s in summaries),
+        "records_read": sum(s["read"] for s in summaries),
         "records_labeled_max": max([s["labeled"] for s in summaries], default=0),
         "candidates_total": len(rows),
     }

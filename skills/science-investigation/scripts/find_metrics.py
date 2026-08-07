@@ -81,11 +81,14 @@ _ASSIGN_RE = re.compile(r"^\s*(?:(?:export|default|const|let|var|final|readonly|
                         r"public|private|protected|static)\s+)*"
                         + _NOT_A_TYPE + r"(?:[A-Za-z_][\w:<>,\[\]]*\s+)?"
                         r"(?:self\.|this\.)?([A-Za-z_][\w]*)\s*(?::[^=\n]+?)?"
-                        r"(?<![=!<>+\-*/])=(?!=)\s*(.+)$")
+                        r"(?:(?<![=!<>+\-*/])=(?!=)|<-)\s*(.+)$")  # `<-` is R's assignment
 # `"accuracy": 0.81` in JSON/dict, and `accuracy:` in YAML
 _KEY_RE = re.compile(r"^\s*[\"']?([A-Za-z_][\w]*)[\"']?\s*:\s*(.*)$")
-# `if score >= 0.75`, `while p < 0.05`
+# `if score >= 0.75`, `while p < 0.05`, and the mirrored `if 0.75 <= score`, which
+# is how a minimum bound is often written and gated exactly the same behaviour.
 _COMPARE_RE = re.compile(r"([A-Za-z_][\w.]*)\s*(>=|<=|==|>|<)\s*(" + _NUMBER + r")\b")
+_COMPARE_MIRRORED_RE = re.compile(r"(?<![\w.])(" + _NUMBER + r")\s*(>=|<=|==|>|<)\s*([A-Za-z_][\w.]*)")
+_MIRROR = {">=": "<=", "<=": ">=", ">": "<", "<": ">", "==": "=="}
 # `[v for v in parts.values() if v is not None]` / `.filter(v => v !== null)` —
 # the composite silently renormalizes over whichever components produced a value.
 _RENORMALIZE_RE = re.compile(
@@ -193,8 +196,17 @@ def scan_line(line: str, path_display: str, lineno: int, defined: dict) -> list:
 
     out = name_candidates(line, stripped, path_display, lineno, defined)
 
-    for left, op, number in _COMPARE_RE.findall(line):
+    comparisons = [(left, op, number) for left, op, number in _COMPARE_RE.findall(line)]
+    # Normalized so `0.75 <= score` reads as `score >= 0.75`: the same gate, and an
+    # auditor should not have to notice which way round the author wrote it.
+    comparisons += [(name, _MIRROR[op], number)
+                    for number, op, name in _COMPARE_MIRRORED_RE.findall(line)]
+    seen_comparisons = set()
+    for left, op, number in comparisons:
         leaf = left.split(".")[-1]
+        if (leaf, op, number) in seen_comparisons:
+            continue
+        seen_comparisons.add((leaf, op, number))
         if is_metric_name(leaf) or is_threshold_name(leaf):
             out.append(candidate(
                 "threshold", path_display, lineno,

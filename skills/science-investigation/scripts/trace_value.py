@@ -64,7 +64,11 @@ def build_pattern(needle: str, as_regex: bool) -> re.Pattern:
         # Reject every numeric continuation, not just a trailing digit: 0.7 is not
         # 0.75, not 0.7e3, and not 0.7_5. A tool that inflates its own site count
         # has no business auditing anyone else's.
-        return re.compile(r"(?<![\w.])" + re.escape(needle) + r"(?![\d_.]|[eE][-+]?\d)")
+        # An unsigned needle must not match `-0.7`: a tree holding both signs
+        # would otherwise report two sites for a value that appears once, and can
+        # reach the "defined independently" headline on the strength of it.
+        lead = r"(?<![\w.])" if needle.startswith("-") else r"(?<![\w.\-])"
+        return re.compile(lead + re.escape(needle) + r"(?![\d_.]|[eE][-+]?\d)")
     return re.compile(r"\b" + re.escape(needle) + r"\b")
 
 
