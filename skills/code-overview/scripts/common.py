@@ -111,7 +111,7 @@ def load_findings(paths) -> tuple[list[dict], dict[str, str]]:
         try:
             data = json.loads(text)
         except json.JSONDecodeError as exc:
-            raise SystemExit(f"error: {raw} is not valid JSON: {exc}")
+            raise SystemExit(f"error: {raw} is not valid JSON: {exc}") from exc
         part, part_errors = normalize_findings(data)
         findings.extend(part)
         errors.update(part_errors)
@@ -234,7 +234,7 @@ def load_map(path) -> dict:
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
     except json.JSONDecodeError as exc:
-        raise SystemExit(f"error: {path} is not valid JSON: {exc}")
+        raise SystemExit(f"error: {path} is not valid JSON: {exc}") from exc
     packages = data.get("packages")
     if not isinstance(packages, list):
         raise SystemExit(f"error: {path} has no `packages` list")
