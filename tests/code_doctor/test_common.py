@@ -169,6 +169,32 @@ def test_reporter_candidate_sets_kind(common):
     assert reporter.findings[0].suggestion == ""
 
 
+def test_finding_is_frozen(common):
+    """Frozen dataclass ensures schema enforcement holds across the object lifetime."""
+    import dataclasses
+    candidate = common.Finding(file="a.go", line=1, smell_type="x", description="d",
+                               kind="candidate", also_caused_by=["it is an entry point"])
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        candidate.suggestion = "delete it"
+
+
+def test_blank_reasons_are_rejected(common):
+    """also_caused_by requires at least one non-blank entry."""
+    with pytest.raises(common.SchemaError, match="also_caused_by"):
+        common.Finding(file="a.go", line=1, smell_type="x", description="d",
+                       kind="candidate", also_caused_by=[""])
+
+
+def test_asdict_round_trips_through_finding(common):
+    """asdict() on a frozen Finding can reconstruct the original."""
+    from dataclasses import asdict
+    original = common.Finding(file="a.go", line=42, smell_type="x",
+                              description="d", suggestion="fix it")
+    reconstructed = common.Finding(**asdict(original))
+    assert original == reconstructed
+    assert original.line == reconstructed.line
+
+
 def test_probe_history_reports_not_a_repo(common, tmp_path):
     plain = tmp_path / "plain"
     plain.mkdir()

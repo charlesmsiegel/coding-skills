@@ -161,7 +161,7 @@ class SchemaError(ValueError):
 VALID_KINDS = frozenset({"finding", "candidate"})
 
 
-@dataclass
+@dataclass(frozen=True)
 class Finding:
     """One output record, in one of two kinds.
 
@@ -175,6 +175,9 @@ class Finding:
 
     The constructor enforces the difference. Prose in a reference file does not
     survive contact with a detector author in a hurry; a raised exception does.
+
+    Frozen to ensure the schema enforcement holds across the lifetime of the
+    object, not just at construction time.
     """
 
     file: str
@@ -210,7 +213,7 @@ class Finding:
                     f"{self.smell_type}: a candidate must not carry a suggestion — it is an "
                     "unverified lead, and a fix on unverified evidence is how live code gets deleted"
                 )
-            if not self.also_caused_by:
+            if not self.also_caused_by or not any(s.strip() for s in self.also_caused_by):
                 raise SchemaError(
                     f"{self.smell_type}: a candidate must name the ways a healthy codebase produces "
                     "this observation in also_caused_by, so the reader can rule them out"
