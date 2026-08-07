@@ -76,6 +76,31 @@ def test_bin_directory_is_scanned(common, repo):
     assert "console" in found
 
 
+def test_missing_root_raises_rather_than_reporting_clean(common, tmp_path):
+    """A typo in an audit path must not produce an authoritative empty report."""
+    with pytest.raises(common.ScanPathError):
+        list(common.walk_files(tmp_path / "nope", source_only=True))
+
+
+def test_excluded_directories_are_not_descended_into(common, repo, monkeypatch):
+    """Pruning during traversal, not filtering after enumeration."""
+    repo.write("node_modules/pkg/deep/nested/index.js", "module.exports = 1\n")
+    repo.write("src/app.js", "export const a = 1\n")
+    seen = []
+    real_walk = common.os.walk
+
+    def spy(top, **kwargs):
+        for dirpath, dirnames, filenames in real_walk(top, **kwargs):
+            seen.append(dirpath)
+            yield dirpath, dirnames, filenames
+
+    monkeypatch.setattr(common.os, "walk", spy)
+    list(common.walk_files(repo.path, source_only=True))
+    assert not any("node_modules" in d for d in seen), (
+        "walked into an excluded tree instead of pruning it"
+    )
+
+
 def test_walk_paths_yields_binaries_for_metadata_checks(common, repo):
     (repo.path / "blob.bin").write_bytes(b"\x00" * 32)
     repo.write("app.go", "package main\n")
