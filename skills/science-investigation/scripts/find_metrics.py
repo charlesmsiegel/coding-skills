@@ -30,7 +30,7 @@ from pathlib import Path
 
 from common import (
     CODE_SUFFIXES, CONFIG_SUFFIXES, add_common_args, candidate, configure_output,
-    emit, envelope, iter_files, read_source, rel, skipped_note,
+    emit, envelope, is_config, iter_files, mask_strings, read_source, rel, skipped_note,
 )
 
 # Tokens that make an identifier a measure on their own.
@@ -68,6 +68,7 @@ _DEF_RE = re.compile(
     r"\b(?:def|function|func|fun|fn|sub)\s+(?:\([^)]*\)\s*)?([A-Za-z_][\w]*)\s*\("
     r"|\bdef\s+([A-Za-z_][\w]*[?!]?)\s*$"                  # Ruby: def accuracy
     r"|\bdef\s+([A-Za-z_][\w]*[?!]?)\s+[A-Za-z_]"          # Ruby: def accuracy rows
+    r"|\bAS\s+[\"'`]?([A-Za-z_][\w]*)[\"'`]?\s*(?:,|$|\bFROM\b)"   # SQL: AVG(x) AS accuracy
     r"|^\s*(?:(?:public|private|protected|static|final|virtual|override|async|export)\s+)*"
     r"(?:[A-Za-z_][\w:<>,\[\] ]*?[\w>\]])\s+([A-Za-z_][\w]*)\s*\([^;]*\)\s*(?:const\s*)?\{"
 )
@@ -85,7 +86,7 @@ _ASSIGN_RE = re.compile(r"^\s*(?:(?:export|default|const|let|var|final|readonly|
                         r"(?:self\.|this\.)?([A-Za-z_][\w]*)\s*(?::[^=\n]+?)?"
                         r"(?:(?<![=!<>+\-*/])=(?!=)|<-)\s*(.+)$")  # `<-` is R's assignment
 # `"accuracy": 0.81` in JSON/dict, and `accuracy:` in YAML
-_KEY_RE = re.compile(r"^\s*[\"']?([A-Za-z_][\w]*)[\"']?\s*:\s*(.*)$")
+_KEY_RE = re.compile(r"^\s*[\"']?([A-Za-z_][\w-]*)[\"']?\s*:\s*(.*)$")
 # `if score >= 0.75`, `while p < 0.05`, and the mirrored `if 0.75 <= score`, which
 # is how a minimum bound is often written and gated exactly the same behaviour.
 # The literal must end atomically: a trailing `\b` let `0.8f` backtrack to `0.`
@@ -189,6 +190,16 @@ def named_on(line: str, stripped: str) -> list:
     return deduped
 
 
+def comparable(line: str, is_config_file: bool) -> str:
+    """The part of a line a comparison may legitimately be read from.
+
+    Message text is masked in source files: `message = "quality_score > 0.8"` gates
+    nothing, and reporting it as a threshold invents a decision site. Config files
+    are left alone, because there the quoted text *is* the value.
+    """
+    return line if is_config_file else mask_strings(line)
+
+
 def name_candidates(line: str, stripped: str, path_display: str, lineno: int, defined: dict) -> list:
     """Candidates from the names a line defines, recording module-level metrics."""
     out = []
@@ -219,7 +230,8 @@ def name_candidates(line: str, stripped: str, path_display: str, lineno: int, de
     return out
 
 
-def scan_line(line: str, path_display: str, lineno: int, defined: dict, window: str = "") -> list:
+def scan_line(line: str, path_display: str, lineno: int, defined: dict, window: str = "",
+              is_config_file: bool = False) -> list:
     """Candidates from one line. `defined` accumulates metric name -> first site."""
     stripped = line.strip()
     if not stripped or stripped.startswith(("#", "//", "*", "<!--")):
@@ -227,11 +239,12 @@ def scan_line(line: str, path_display: str, lineno: int, defined: dict, window: 
 
     out = name_candidates(line, stripped, path_display, lineno, defined)
 
-    comparisons = [(left, op, number) for left, op, number in _COMPARE_RE.findall(line)]
+    scannable = comparable(line, is_config_file)
+    comparisons = [(left, op, number) for left, op, number in _COMPARE_RE.findall(scannable)]
     # Normalized so `0.75 <= score` reads as `score >= 0.75`: the same gate, and an
     # auditor should not have to notice which way round the author wrote it.
     comparisons += [(name, _MIRROR[op], number)
-                    for number, op, name in _COMPARE_MIRRORED_RE.findall(line)]
+                    for number, op, name in _COMPARE_MIRRORED_RE.findall(scannable)]
     seen_comparisons = set()
     for left, op, number in comparisons:
         leaf = left.split(".")[-1]
@@ -293,7 +306,7 @@ def scan(root: Path) -> tuple:
             # A few lines of context, because the aggregate that makes a dropped-None
             # list a composite usually sits on the next line, not this one.
             window = "\n".join(lines[max(0, lineno - 2):lineno + 3])
-            found += scan_line(line, display, lineno, defined, window)
+            found += scan_line(line, display, lineno, defined, window, is_config(path))
     return found, defined, corpus, skipped
 
 

@@ -456,3 +456,28 @@ def test_a_zero_default_naming_nothing_measurable_is_still_dropped(tmp_path):
         'def opts(settings):\n    return settings.get("retries", 0)\n', encoding="utf-8"
     )
     assert run(tmp_path)["candidates"] == []
+
+
+# ---- seventh review round ----------------------------------------------------- #
+
+def test_a_sql_metric_alias_is_a_definition(tmp_path):
+    (tmp_path / "m.sql").write_text("SELECT AVG(correct) AS accuracy FROM evals;\n", encoding="utf-8")
+    assert any(row["detail"].startswith("accuracy")
+               for row in kinds(run(tmp_path), "metric_definition"))
+
+
+def test_a_hyphenated_config_key_is_a_metric_definition(tmp_path):
+    (tmp_path / "c.yaml").write_text("quality-score: 0.8\n", encoding="utf-8")
+    assert kinds(run(tmp_path), "metric_definition")
+
+
+def test_a_comparison_inside_a_message_is_not_a_threshold(tmp_path):
+    """`message = "quality_score > 0.8"` gates nothing."""
+    (tmp_path / "s.py").write_text('message = "quality_score > 0.8"\n', encoding="utf-8")
+    assert not kinds(run(tmp_path), "threshold")
+
+
+def test_a_comparison_in_a_config_value_is_still_read(tmp_path):
+    """Config quotes hold the value itself, so they are not masked."""
+    (tmp_path / "c.yaml").write_text('rule: "quality_score > 0.8"\n', encoding="utf-8")
+    assert kinds(run(tmp_path), "threshold")

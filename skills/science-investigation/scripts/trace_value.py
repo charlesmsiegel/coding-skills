@@ -29,6 +29,7 @@ from pathlib import Path
 from common import (
     CODE_SUFFIXES, CONFIG_SUFFIXES, DOC_SUFFIXES, add_common_args, candidate,
     configure_output, emit, envelope, is_config, iter_files, read_source, rel, skipped_note,
+    split_comment,
 )
 
 # Leading-dot and exponent forms count as numbers here too. Without this, tracing
@@ -47,6 +48,8 @@ _TARGET_RE = re.compile(r"^\s*(?::[^=\n]+?)?(?:(?<![=!<>+\-*/])=(?!=)|<-)")
 _DECLARE_RE = re.compile(r"\b(?:def|function|func|fun|fn|sub|class|const|let|var)\s+$")
 
 CONFIRM = {
+    "comment":
+        "a commented-out site: confirm whether the live value moved on without it",
     "definition": "confirm this is the source of truth, and that the other sites read it rather than repeat it",
     "comparison": "confirm what decision this gates and that it means the same thing as the other sites",
     "config": "confirm which run actually loads this config; a stale config reads as an active threshold",
@@ -83,6 +86,10 @@ def classify(line: str, display: str, path: Path, span: tuple, numeric: bool = T
     absolute path carries the checkout's own directory names, and a repo cloned
     under ~/tests/ would otherwise report every site as a test.
     """
+    code, comment = split_comment(line)
+    if span[0] >= len(code):
+        return "comment"     # `# QUALITY_THRESHOLD = 0.7` is not a source of truth
+
     lowered = display.lower()
     if re.search(r"(?:^|[/_.-])(?:tests?|spec|specs|__tests__)(?:[/_.-]|$)", lowered):
         return "test"
@@ -92,8 +99,10 @@ def classify(line: str, display: str, path: Path, span: tuple, numeric: bool = T
         return "config"
 
     before, after = line[:span[0]], line[span[1]:]
-    if _R_ASSIGN_RE.match(after.lstrip()[:2]) or _R_ASSIGN_RE.search(before[-3:]):
-        return "definition"
+    if _R_ASSIGN_RE.match(after.lstrip()[:2]):
+        return "definition"          # `quality_score <- ...`: the needle is the target
+    if _R_ASSIGN_RE.search(before[-3:]) and not numeric:
+        return "other"               # `reported <- quality_score`: the needle is read
     if _COMPARE_RE.search(before[-4:]) or _COMPARE_RE.match(after.lstrip()[:2]):
         return "comparison"
     # The needle may be the value (`CUTOFF = 0.75`) or the name being defined
@@ -153,6 +162,12 @@ def headline_for(needle: str, rows: list) -> str:
         return ("'" + needle + "' is defined independently in " + str(len(definitions)) + " place(s) ("
                 + where + "): changing one will not move the others, and they may already disagree.")
 
+    if not definitions and kinds.get("comparison") and kinds.get("config"):
+        configs = sorted({r["file"] for r in rows if r["kind"] == "config"})
+        return ("'" + needle + "' is configured in " + ", ".join(configs[:3]) + " but written as a "
+                "literal in " + str(kinds["comparison"]) + " comparison(s) — confirm the code reads the "
+                "config rather than repeating the number.")
+
     if not definitions and kinds.get("comparison"):
         return ("'" + needle + "' is compared against in " + str(kinds["comparison"]) + " place(s) and "
                 "defined nowhere — a literal repeated at the point of use has no single meaning to change.")
@@ -204,7 +219,7 @@ def main() -> int:
         return 2
 
     rows, skipped = scan(root, pattern, bool(_NUMERIC_RE.match(args.needle)) and not args.regex)
-    order = ["definition", "comparison", "config", "doc", "test", "other"]
+    order = ["definition", "comparison", "config", "doc", "test", "comment", "other"]
     rows.sort(key=lambda r: (order.index(r["kind"]) if r["kind"] in order else 99, r["file"], r["line"]))
     counts = {"needle": args.needle, "sites": len(rows), "files": len({r["file"] for r in rows}),
               "files_skipped_unread": len(skipped)}
