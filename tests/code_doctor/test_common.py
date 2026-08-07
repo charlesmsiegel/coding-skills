@@ -106,3 +106,64 @@ def test_walk_paths_yields_binaries_for_metadata_checks(common, repo):
     repo.write("app.go", "package main\n")
     assert {p.name for p in common.walk_paths(repo.path)} == {"blob.bin", "app.go"}
     assert {p.name for p in common.walk_files(repo.path, source_only=False)} == {"app.go"}
+
+
+def test_finding_requires_a_suggestion(common):
+    """A finding asserts a defect, so it must say what to do about it."""
+    with pytest.raises(common.SchemaError, match="suggestion"):
+        common.Finding(file="a.go", line=1, smell_type="x",
+                       description="d", suggestion="")
+
+
+def test_finding_may_not_carry_benign_explanations(common):
+    """also_caused_by is the candidate's honesty field; on a finding it is a lie."""
+    with pytest.raises(common.SchemaError, match="also_caused_by"):
+        common.Finding(file="a.go", line=1, smell_type="x", description="d",
+                       suggestion="fix it", also_caused_by=["something benign"])
+
+
+def test_candidate_requires_benign_explanations(common):
+    """A candidate must name the ways a healthy codebase produces this."""
+    with pytest.raises(common.SchemaError, match="also_caused_by"):
+        common.Finding(file="a.go", line=1, smell_type="x", description="d",
+                       kind="candidate", also_caused_by=[])
+
+
+def test_candidate_may_not_carry_a_fix(common):
+    """The whole point: an unverified lead must not recommend an edit."""
+    with pytest.raises(common.SchemaError, match="suggestion"):
+        common.Finding(file="a.go", line=1, smell_type="x", description="d",
+                       kind="candidate", suggestion="delete it",
+                       also_caused_by=["it is an entry point"])
+
+
+def test_valid_finding_and_candidate_construct(common):
+    finding = common.Finding(file="a.go", line=1, smell_type="x",
+                             description="d", suggestion="fix it")
+    candidate = common.Finding(file="a.go", line=2, smell_type="y",
+                               description="d", kind="candidate",
+                               also_caused_by=["it is an entry point"])
+    assert finding.kind == "finding"
+    assert candidate.suggestion == ""
+
+
+def test_unknown_kind_is_rejected(common):
+    with pytest.raises(common.SchemaError, match="kind"):
+        common.Finding(file="a.go", line=1, smell_type="x", description="d",
+                       suggestion="fix", kind="probably")
+
+
+def test_reporter_honours_ignore(common):
+    from pathlib import Path
+    reporter = common.Reporter(Path("a.go"), {"skipme"})
+    reporter.finding(1, "skipme", "d", "fix it")
+    reporter.finding(2, "keepme", "d", "fix it")
+    assert [f.smell_type for f in reporter.findings] == ["keepme"]
+
+
+def test_reporter_candidate_sets_kind(common):
+    from pathlib import Path
+    reporter = common.Reporter(Path("a.go"), set())
+    reporter.candidate(1, "lead", "d", ["it may be loaded by convention"])
+    assert reporter.findings[0].kind == "candidate"
+    assert reporter.findings[0].suggestion == ""

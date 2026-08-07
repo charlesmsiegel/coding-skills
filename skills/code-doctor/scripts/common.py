@@ -11,6 +11,7 @@ a formality.
 import contextlib
 import os
 import sys
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterator
 
@@ -145,3 +146,102 @@ def walk_files(root: Path, *, source_only: bool) -> Iterator[Path]:
         if is_probably_binary(path):
             continue
         yield path
+
+
+# --------------------------------------------------------------------------- #
+# The confidence discipline, as a type
+# --------------------------------------------------------------------------- #
+
+class SchemaError(ValueError):
+    """A detector tried to emit a record its evidence does not support."""
+
+
+VALID_KINDS = frozenset({"finding", "candidate"})
+
+
+@dataclass
+class Finding:
+    """One output record, in one of two kinds.
+
+    A **finding** asserts a defect. It carries a concrete fix, because a claim
+    you cannot act on is not worth making.
+
+    A **candidate** reports a lead that needs verification. It carries the
+    specific ways a healthy codebase produces the same observation, and it
+    carries no fix — recommending an edit on heuristic evidence is how a tool
+    like this talks someone into deleting live code.
+
+    The constructor enforces the difference. Prose in a reference file does not
+    survive contact with a detector author in a hurry; a raised exception does.
+    """
+
+    file: str
+    line: int
+    smell_type: str
+    description: str
+    suggestion: str = ""
+    also_caused_by: list[str] = field(default_factory=list)
+    severity: str = "medium"
+    kind: str = "finding"
+    code_snippet: str = ""
+    related_lines: list[int] = field(default_factory=list)
+
+    def __post_init__(self) -> None:
+        if self.kind not in VALID_KINDS:
+            raise SchemaError(
+                f"{self.smell_type}: kind must be one of {sorted(VALID_KINDS)}, got {self.kind!r}"
+            )
+        if self.kind == "finding":
+            if not self.suggestion.strip():
+                raise SchemaError(
+                    f"{self.smell_type}: a finding asserts a defect and must carry a suggestion; "
+                    "if you cannot name the fix, emit a candidate instead"
+                )
+            if self.also_caused_by:
+                raise SchemaError(
+                    f"{self.smell_type}: also_caused_by belongs to candidates; a finding that has "
+                    "benign explanations is a candidate"
+                )
+        else:
+            if self.suggestion.strip():
+                raise SchemaError(
+                    f"{self.smell_type}: a candidate must not carry a suggestion — it is an "
+                    "unverified lead, and a fix on unverified evidence is how live code gets deleted"
+                )
+            if not self.also_caused_by:
+                raise SchemaError(
+                    f"{self.smell_type}: a candidate must name the ways a healthy codebase produces "
+                    "this observation in also_caused_by, so the reader can rule them out"
+                )
+
+
+class Reporter:
+    """Collects records for one file, honouring the detector's --ignore set."""
+
+    def __init__(self, path: Path, ignore: set[str]):
+        self.path = path
+        self.ignore = ignore
+        self.findings: list[Finding] = []
+
+    def finding(self, line: int, smell_type: str, description: str, suggestion: str,
+                severity: str = "medium", snippet: str = "",
+                related: list[int] | None = None) -> None:
+        self._add(Finding(
+            file=str(self.path), line=line, smell_type=smell_type,
+            description=description, suggestion=suggestion, severity=severity,
+            kind="finding", code_snippet=snippet, related_lines=related or [],
+        ))
+
+    def candidate(self, line: int, smell_type: str, description: str,
+                  also_caused_by: list[str], severity: str = "low",
+                  snippet: str = "", related: list[int] | None = None) -> None:
+        self._add(Finding(
+            file=str(self.path), line=line, smell_type=smell_type,
+            description=description, also_caused_by=also_caused_by,
+            severity=severity, kind="candidate", code_snippet=snippet,
+            related_lines=related or [],
+        ))
+
+    def _add(self, record: Finding) -> None:
+        if record.smell_type not in self.ignore:
+            self.findings.append(record)
