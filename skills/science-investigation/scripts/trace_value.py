@@ -28,7 +28,7 @@ from pathlib import Path
 
 from common import (
     CODE_SUFFIXES, CONFIG_SUFFIXES, DOC_SUFFIXES, add_common_args, candidate,
-    configure_output, emit, envelope, iter_files, read_lines, rel,
+    configure_output, emit, envelope, iter_files, read_source, rel, skipped_note,
 )
 
 _NUMERIC_RE = re.compile(r"^-?\d+(?:\.\d+)?$")
@@ -58,7 +58,10 @@ def build_pattern(needle: str, as_regex: bool) -> re.Pattern:
     if as_regex:
         return re.compile(needle)
     if _NUMERIC_RE.match(needle):
-        return re.compile(r"(?<![\w.])" + re.escape(needle) + r"(?![\d])")
+        # Reject every numeric continuation, not just a trailing digit: 0.7 is not
+        # 0.75, not 0.7e3, and not 0.7_5. A tool that inflates its own site count
+        # has no business auditing anyone else's.
+        return re.compile(r"(?<![\w.])" + re.escape(needle) + r"(?![\d_.]|[eE][-+]?\d)")
     return re.compile(r"\b" + re.escape(needle) + r"\b")
 
 
@@ -91,17 +94,29 @@ def classify(line: str, display: str, suffix: str, span: tuple) -> str:
     return "other"
 
 
-def scan(root: Path, pattern: re.Pattern) -> list:
-    rows = []
+def scan(root: Path, pattern: re.Pattern) -> tuple:
+    """(rows, files skipped unread).
+
+    Every occurrence on a line is classified, not just the first — `score > 0.7 and
+    backup > 0.7` is two consumers, and minified config puts many on one line. Rows
+    are then one per (line, role): repeating an identical row for each occurrence
+    would pad the list an auditor has to read without adding a place to look.
+    """
+    rows, skipped, seen = [], [], set()
     for path in iter_files(root, CODE_SUFFIXES | CONFIG_SUFFIXES | DOC_SUFFIXES):
         display = rel(path, root)
-        for lineno, line in enumerate(read_lines(path), 1):
-            match = pattern.search(line)
-            if not match:
-                continue
-            kind = classify(line, display, path.suffix, match.span())
-            rows.append(candidate(kind, display, lineno, kind + " site", CONFIRM[kind], line.strip()))
-    return rows
+        lines, reason = read_source(path)
+        if reason:
+            skipped.append((display, reason))
+            continue
+        for lineno, line in enumerate(lines, 1):
+            for match in pattern.finditer(line):
+                kind = classify(line, display, path.suffix, match.span())
+                if (display, lineno, kind) in seen:
+                    continue
+                seen.add((display, lineno, kind))
+                rows.append(candidate(kind, display, lineno, kind + " site", CONFIRM[kind], line.strip()))
+    return rows, skipped
 
 
 def headline_for(needle: str, rows: list) -> str:
@@ -147,6 +162,7 @@ CAVEAT = (
     "A textual match. It cannot see a value assembled at run time, read from an environment variable, "
     "stored in a database, or scaled on the way in (0.7 written as 70 elsewhere is invisible). "
     "Classification is heuristic — a multi-line expression or an unusual layout can land in 'other'. "
+    "A site is one (line, role) pair, so a line using the value twice the same way counts once. "
     "A numeric needle deliberately does not match inside a longer number, so search 0.75 separately."
 )
 
@@ -170,16 +186,17 @@ def main() -> int:
         print("error: bad regular expression: " + str(exc), file=sys.stderr)
         return 2
 
-    rows = scan(root, pattern)
+    rows, skipped = scan(root, pattern)
     order = ["definition", "comparison", "config", "doc", "test", "other"]
     rows.sort(key=lambda r: (order.index(r["kind"]) if r["kind"] in order else 99, r["file"], r["line"]))
-    counts = {"needle": args.needle, "sites": len(rows), "files": len({r["file"] for r in rows})}
+    counts = {"needle": args.needle, "sites": len(rows), "files": len({r["file"] for r in rows}),
+              "files_skipped_unread": len(skipped)}
     for kind in order:
         found = sum(1 for r in rows if r["kind"] == kind)
         if found:
             counts[kind] = found
-    emit(envelope("trace_value", root, headline_for(args.needle, rows), CAVEAT, counts, rows[:args.limit]),
-         args.format)
+    headline = headline_for(args.needle, rows) + skipped_note(skipped)
+    emit(envelope("trace_value", root, headline, CAVEAT, counts, rows[:args.limit]), args.format)
     return 0
 
 

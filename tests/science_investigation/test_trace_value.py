@@ -11,6 +11,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
+
 SCRIPT = Path(__file__).resolve().parents[2] / "skills" / "science-investigation" / "scripts" / "trace_value.py"
 
 
@@ -97,3 +99,31 @@ def test_every_row_is_a_candidate_with_a_confirm_step(tmp_path):
     for row in run("0.6", tmp_path)["candidates"]:
         assert row["status"] == "candidate"
         assert row["confirm"].strip()
+
+
+# ---- review fixes ------------------------------------------------------------ #
+
+@pytest.mark.parametrize("line", ["x = 0.7e3", "x = 0.7_5", "x = 0.75"])
+def test_no_numeric_continuation_is_ever_a_match(tmp_path, line):
+    """0.7 is not 0.75, not 0.7e3, not 0.7_5 — an inflated count is the whole failure."""
+    (tmp_path / "a.py").write_text(line + "\n", encoding="utf-8")
+    assert run("0.7", tmp_path)["candidates"] == []
+
+
+def test_two_roles_on_one_line_are_both_counted(tmp_path):
+    (tmp_path / "a.py").write_text("CUTOFF = 0.7 if mean > 0.7 else 1\n", encoding="utf-8")
+    counts = run("0.7", tmp_path)["counts"]
+    assert counts["definition"] == 1 and counts["comparison"] == 1
+
+
+def test_a_repeated_literal_in_one_role_is_one_site(tmp_path):
+    """A site is a (line, role) pair: two identical rows give an auditor one place to look."""
+    (tmp_path / "a.py").write_text("if score > 0.7 and backup > 0.7:\n    pass\n", encoding="utf-8")
+    assert run("0.7", tmp_path)["counts"]["sites"] == 1
+
+
+def test_a_file_too_large_to_read_is_reported_as_unread(tmp_path):
+    (tmp_path / "huge.py").write_text("# padding 0.7\n" * 200_000, encoding="utf-8")
+    payload = run("0.7", tmp_path)
+    assert payload["counts"]["files_skipped_unread"] == 1
+    assert "NOT read" in payload["headline"]

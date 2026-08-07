@@ -37,6 +37,11 @@ CODE_SUFFIXES = frozenset({
 CONFIG_SUFFIXES = frozenset({".yaml", ".yml", ".json", ".toml", ".ini", ".cfg", ".env"})
 DOC_SUFFIXES = frozenset({".md", ".rst", ".txt"})
 
+# `.env` and `.env.production` have suffix "" and ".production" respectively, so a
+# suffix test never sees them — and thresholds, model ids, and feature flags live
+# in them constantly. Matched by name instead.
+CONFIG_NAME_PREFIXES = (".env",)
+
 # A file big enough to be data rather than source. Reading it as source produces
 # thousands of candidates from one artifact, which buries everything else.
 MAX_SOURCE_BYTES = 2_000_000
@@ -60,32 +65,50 @@ def add_common_args(parser, root_help="directory or file to scan (default: .)"):
     return parser
 
 
+def wanted(path: Path, suffixes) -> bool:
+    if path.suffix in suffixes:
+        return True
+    return CONFIG_SUFFIXES <= suffixes and path.name.startswith(CONFIG_NAME_PREFIXES)
+
+
 def iter_files(root: Path, suffixes) -> list:
     """Every file under `root` with one of `suffixes`, sorted, vendored trees skipped."""
     root = Path(root)
     if root.is_file():
-        return [root] if root.suffix in suffixes else []
+        return [root] if wanted(root, suffixes) else []
     found = []
     for path in root.rglob("*"):
-        if not path.is_file() or path.suffix not in suffixes:
+        if not path.is_file() or not wanted(path, suffixes):
             continue
         if EXCLUDE_DIRS.isdisjoint(path.relative_to(root).parts):
             found.append(path)
     return sorted(found)
 
 
-def read_lines(path: Path) -> list:
-    """The file's lines, or [] if it cannot be read as text.
+def read_source(path: Path) -> tuple:
+    """(lines, skip_reason). A skipped file is never silently reported as clean.
 
-    Unreadable is not the same as clean, so the caller is told: an unreadable file
-    is counted as skipped and reported in `counts`, never silently dropped.
+    Returning the reason rather than a bare [] is the point: a 3 MB generated
+    scoring module read as zero lines would otherwise show up inside
+    `files_scanned` and produce a "no candidates found" headline over code nobody
+    looked at — which is the exact silent-cap failure this skill audits for.
     """
     try:
-        if path.stat().st_size > MAX_SOURCE_BYTES:
-            return []
-        return path.read_text(encoding="utf-8", errors="replace").splitlines()
-    except OSError:
-        return []
+        size = path.stat().st_size
+        if size > MAX_SOURCE_BYTES:
+            return [], "larger than " + str(MAX_SOURCE_BYTES // 1_000_000) + "MB (" + str(size) + " bytes)"
+        return path.read_text(encoding="utf-8", errors="replace").splitlines(), None
+    except OSError as exc:
+        return [], "unreadable (" + type(exc).__name__ + ")"
+
+
+def skipped_note(skipped: list) -> str:
+    """A sentence naming the files no scan actually looked at, or ''."""
+    if not skipped:
+        return ""
+    shown = ", ".join(name + " — " + reason for name, reason in skipped[:3])
+    return (" " + str(len(skipped)) + " file(s) were NOT read (" + shown
+            + "), so this result does not cover them.")
 
 
 def rel(path: Path, root: Path) -> str:

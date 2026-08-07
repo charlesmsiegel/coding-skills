@@ -131,3 +131,36 @@ def test_vendored_trees_are_skipped(tmp_path, directory):
     vendored.mkdir()
     write_jsonl(vendored / "eval.jsonl", [{"gold": "a"} for _ in range(9)])
     assert run(tmp_path)["counts"]["datasets"] == 0
+
+
+# ---- review fixes ------------------------------------------------------------ #
+
+def test_every_label_field_keeps_its_own_coverage(tmp_path):
+    """A full `expected` must not hide a sparse `human_rating`: two fields, two n's."""
+    rows = [{"expected": "gold"} for _ in range(100)]
+    for row in rows[:5]:
+        row["human_rating"] = 4
+    write_jsonl(tmp_path / "eval.jsonl", rows)
+
+    payload = run(tmp_path)
+    partial = kinds(payload, "partial_labels")
+    assert [row["detail"].split(" ")[0] for row in partial] == ["human_rating"]
+    assert "n=5, not 100" in partial[0]["detail"]
+    assert "human_rating" in payload["headline"] and "5" in payload["headline"]
+
+
+def test_a_corrupted_dataset_is_not_reported_as_an_absent_one(tmp_path):
+    (tmp_path / "eval.json").write_text('{"cases": [{"gold": "a"},\n', encoding="utf-8")
+    payload = run(tmp_path)
+    assert kinds(payload, "unparseable_dataset")
+    assert payload["counts"]["datasets_unparseable"] == 1
+    assert "do not parse" in payload["headline"]
+    assert "No JSON/JSONL/CSV datasets found" not in payload["headline"]
+
+
+def test_json_that_is_simply_not_a_dataset_stays_silent(tmp_path):
+    """Only a *parse failure* is surfaced; a well-formed config is not a corruption."""
+    (tmp_path / "settings.json").write_text('{"retries": 3, "region": "eu"}', encoding="utf-8")
+    payload = run(tmp_path)
+    assert payload["candidates"] == []
+    assert payload["counts"]["datasets_unparseable"] == 0

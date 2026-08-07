@@ -190,3 +190,55 @@ def test_a_missing_path_exits_two(tmp_path):
         capture_output=True, text=True, timeout=60,
     )
     assert result.returncode == 2
+
+
+# ---- review fixes ------------------------------------------------------------ #
+
+def test_exported_typescript_metrics_are_found(tmp_path):
+    """`export const` is the ordinary shape of a TS metrics module."""
+    (tmp_path / "metrics.ts").write_text(
+        "export const qualityScore = (rows) => rows.length;\n"
+        "export default function recallAt10(rows) { return 1; }\n",
+        encoding="utf-8",
+    )
+    found = {row["detail"].split(" ")[0] for row in kinds(run(tmp_path), "metric_definition")}
+    assert "qualityScore" in found and "recallAt10" in found
+
+
+def test_two_dead_definitions_of_one_name_do_not_clear_each_other(tmp_path):
+    """Excluding only the first definition made the second look like a consumer."""
+    (tmp_path / "a.py").write_text("def quality_score(r):\n    return 1\n", encoding="utf-8")
+    (tmp_path / "b.py").write_text("def quality_score(r):\n    return 2\n", encoding="utf-8")
+    rows = kinds(run(tmp_path), "no_consumer")
+    assert sorted(row["file"] for row in rows) == ["a.py", "b.py"]
+
+
+def test_pytest_entry_points_are_not_dead_measurement(tmp_path):
+    """pytest calls these by collection, so 'referenced nowhere' says nothing."""
+    (tmp_path / "test_scoring.py").write_text(
+        "def test_precision_is_computed():\n"
+        "    assert True\n"
+        "\n"
+        "def test_baseline_matches():\n"
+        "    assert True\n",
+        encoding="utf-8",
+    )
+    payload = run(tmp_path)
+    assert not kinds(payload, "no_consumer")
+    assert "dead measurement" not in payload["headline"]
+
+
+def test_dot_env_files_are_scanned(tmp_path):
+    """`Path('.env').suffix` is '', so a suffix test never sees it."""
+    (tmp_path / ".env").write_text("QUALITY_THRESHOLD=0.75\n", encoding="utf-8")
+    assert run(tmp_path)["counts"]["files_scanned"] == 1
+
+
+def test_an_unread_file_is_reported_as_unread_not_as_scanned(tmp_path):
+    big = tmp_path / "huge_metrics.py"
+    big.write_text("accuracy = 0.5\n" + ("# padding\n" * 200_000), encoding="utf-8")
+    assert big.stat().st_size > 2_000_000
+    payload = run(tmp_path)
+    assert payload["counts"]["files_skipped_unread"] == 1
+    assert payload["counts"]["files_scanned"] == 0
+    assert "NOT read" in payload["headline"], "a file nobody read must not read as clean"
