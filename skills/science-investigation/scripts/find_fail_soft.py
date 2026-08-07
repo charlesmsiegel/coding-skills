@@ -84,7 +84,7 @@ _ARROW_EMPTY_RE = re.compile(r"^\s*(?:\{\s*\}|null|undefined|void\s+0)")
 # The flag word may open the name (`enable_reranker`) or sit inside it
 # (`rag.use_reranker`), so the prefix is optional. `on` alone matches half the
 # words in English, which is what _ENABLE_TOKEN_RE below exists to filter back out.
-_FLAG_NAME = r"[\w.]*(?:enable|enabled|use|using|with|allow|feature|flag|active|on)[\w]*"
+_FLAG_NAME = r"[\w.-]*(?:enable|enabled|use|using|with|allow|feature|flag|active|on)[\w-]*"
 # An optional type annotation may sit between the name and the value:
 # `ENABLE_RERANKER: bool = False`, `const useReranker: boolean = false`.
 # The optional `["']` carries JSON's `{"use_reranker": false}`, where the closing
@@ -96,7 +96,7 @@ _DEFAULT_OFF_RE = re.compile(
     re.IGNORECASE,
 )
 # `disable_reranker: true` is the same configuration written the other way round.
-_DISABLE_NAME = r"[\w.]*(?:disable|disabled|skip|off|bypass|ignore)[\w]*"
+_DISABLE_NAME = r"[\w.-]*(?:disable|disabled|skip|off|bypass|ignore)[\w-]*"
 _DISABLE_ON_RE = re.compile(
     r"\b(" + _DISABLE_NAME + r")" + _ANNOTATED + r"(?:true|1)\b"
     r"|\b(" + _DISABLE_NAME + r")" + _ANNOTATED + r"[\"'](?:true|on|1|yes)[\"']",
@@ -235,7 +235,18 @@ def scan_promise_catches(line: str, display: str, lineno: int) -> list:
     return []
 
 
+# An off switch silences the sampling settings around it only when it is the
+# file's *only* answer. A file holding both `do_sample: false` and
+# `do_sample: true` describes several generation configs, and a textual scan
+# cannot tell which block a given `temperature:` belongs to — so it reports them
+# and lets the reader decide, rather than going quiet on the strength of the
+# first switch it saw.
 _SAMPLING_OFF_RE = re.compile(r"\bdo_sample[\"']?\s*[=:]\s*false", re.IGNORECASE)
+_SAMPLING_ON_RE = re.compile(r"\bdo_sample[\"']?\s*[=:]\s*true", re.IGNORECASE)
+
+
+def sampling_disabled(text: str) -> bool:
+    return bool(_SAMPLING_OFF_RE.search(text)) and not _SAMPLING_ON_RE.search(text)
 
 
 def scan_line(line: str, display: str, lineno: int, sampling_off: bool = False) -> list:
@@ -303,7 +314,7 @@ def scan(root: Path) -> tuple:
             continue
         read += 1
         rows += scan_handlers(lines, display)
-        sampling_off = bool(_SAMPLING_OFF_RE.search("\n".join(lines)))
+        sampling_off = sampling_disabled("\n".join(lines))
         for lineno, line in enumerate(lines, 1):
             rows += scan_line(line, display, lineno, sampling_off)
     return rows, read, skipped

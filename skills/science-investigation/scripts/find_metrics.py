@@ -66,6 +66,8 @@ _NUMBER = r"-?(?:\d+\.?\d*|\.\d+)(?:[eE][-+]?\d+)?"
 # a call, and treating every call as a definition would bury the real ones.
 _DEF_RE = re.compile(
     r"\b(?:def|function|func|fun|fn|sub)\s+(?:\([^)]*\)\s*)?([A-Za-z_][\w]*)\s*\("
+    r"|\bdef\s+([A-Za-z_][\w]*[?!]?)\s*$"                  # Ruby: def accuracy
+    r"|\bdef\s+([A-Za-z_][\w]*[?!]?)\s+[A-Za-z_]"          # Ruby: def accuracy rows
     r"|^\s*(?:(?:public|private|protected|static|final|virtual|override|async|export)\s+)*"
     r"(?:[A-Za-z_][\w:<>,\[\] ]*?[\w>\]])\s+([A-Za-z_][\w]*)\s*\([^;]*\)\s*(?:const\s*)?\{"
 )
@@ -86,8 +88,17 @@ _ASSIGN_RE = re.compile(r"^\s*(?:(?:export|default|const|let|var|final|readonly|
 _KEY_RE = re.compile(r"^\s*[\"']?([A-Za-z_][\w]*)[\"']?\s*:\s*(.*)$")
 # `if score >= 0.75`, `while p < 0.05`, and the mirrored `if 0.75 <= score`, which
 # is how a minimum bound is often written and gated exactly the same behaviour.
-_COMPARE_RE = re.compile(r"([A-Za-z_][\w.]*)\s*(>=|<=|==|>|<)\s*(" + _NUMBER + r")\b")
-_COMPARE_MIRRORED_RE = re.compile(r"(?<![\w.])(" + _NUMBER + r")\s*(>=|<=|==|>|<)\s*([A-Za-z_][\w.]*)")
+# The literal must end atomically: a trailing `\b` let `0.8f` backtrack to `0.`
+# and report a threshold that is not in the source. A C-family suffix is consumed
+# but kept out of the capture, so the auditor sees 0.8.
+_LITERAL_END = r"[fFdDlLuU]?(?![\w.])"
+# `accuracy(rows) >= 0.8` gates exactly as `accuracy >= 0.8` does; without the
+# optional call the decision site was inventoried nowhere.
+_CALL = r"(?:\([^()]*\))?"
+_COMPARE_RE = re.compile(r"([A-Za-z_][\w.]*)" + _CALL + r"\s*(>=|<=|==|>|<)\s*("
+                         + _NUMBER + r")" + _LITERAL_END)
+_COMPARE_MIRRORED_RE = re.compile(r"(?<![\w.])(" + _NUMBER + r")" + _LITERAL_END
+                                  + r"\s*(>=|<=|==|>|<)\s*([A-Za-z_][\w.]*)")
 _MIRROR = {">=": "<=", "<=": ">=", ">": "<", "<": ">", "==": "=="}
 # `[v for v in parts.values() if v is not None]` / `.filter(v => v !== null)` —
 # the composite silently renormalizes over whichever components produced a value.
@@ -158,7 +169,7 @@ def named_on(line: str, stripped: str) -> list:
     names = []
     definition = _DEF_RE.search(line)
     if definition:
-        names.append((definition.group(1) or definition.group(2), ""))
+        names.append((next(g for g in definition.groups() if g), ""))
     assignment = _ASSIGN_RE.match(line)
     if assignment:
         names.append((assignment.group(1), assignment.group(2)))
@@ -330,10 +341,22 @@ MEASURE_KINDS = ("metric_definition", "threshold", "composite_weight")
 SCOPED_KINDS = ("zero_default",)
 
 
+def names_a_measure(text: str) -> bool:
+    return any(is_metric_name(word) for word in re.findall(r"[A-Za-z_][\w]*", text))
+
+
 def scope_zero_defaults(rows: list) -> list:
-    """Drop context-free rows from files with no measurement content at all."""
+    """Drop context-free rows from files with no measurement content at all.
+
+    A row survives if its own line names a measure, even when nothing else in that
+    file does: `result.get("accuracy", 0)` in a dashboard module is exactly where
+    "not measured" turns into a zero, and file-local scoping alone hid it.
+    """
     measured = {r["file"] for r in rows if r["kind"] in MEASURE_KINDS}
-    return [r for r in rows if r["kind"] not in SCOPED_KINDS or r["file"] in measured]
+    return [r for r in rows
+            if r["kind"] not in SCOPED_KINDS
+            or r["file"] in measured
+            or names_a_measure(r.get("evidence", ""))]
 
 
 def dedupe(rows: list, limit: int) -> list:

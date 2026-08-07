@@ -417,3 +417,42 @@ def test_kotlin_expression_bodied_functions_are_definitions(tmp_path):
     )
     assert any(row["detail"].startswith("accuracy")
                for row in kinds(run(tmp_path), "metric_definition"))
+
+
+# ---- sixth review round ------------------------------------------------------- #
+
+def test_a_c_family_suffixed_literal_reports_its_real_value(tmp_path):
+    """`0.8f` backtracked to `0.` — a threshold value that is not in the source."""
+    (tmp_path / "m.cpp").write_text("if (quality_score >= 0.8f) { }\n", encoding="utf-8")
+    rows = kinds(run(tmp_path), "threshold")
+    assert rows and "quality_score >= 0.8 " in rows[0]["detail"]
+
+
+def test_a_gate_on_a_metric_call_is_a_threshold(tmp_path):
+    (tmp_path / "s.py").write_text("if accuracy(rows) >= 0.8:\n    pass\n", encoding="utf-8")
+    rows = kinds(run(tmp_path), "threshold")
+    assert rows and "accuracy >= 0.8" in rows[0]["detail"]
+
+
+def test_ruby_methods_without_parentheses_are_definitions(tmp_path):
+    (tmp_path / "m.rb").write_text("def accuracy rows\n  1\nend\n", encoding="utf-8")
+    assert any(row["detail"].startswith("accuracy")
+               for row in kinds(run(tmp_path), "metric_definition"))
+
+
+def test_a_zero_default_naming_a_metric_survives_in_a_file_that_defines_none(tmp_path):
+    """`result.get("accuracy", 0)` in a dashboard is exactly where 'not measured'
+    turns into a zero; file-local scoping alone hid it."""
+    (tmp_path / "metric.py").write_text("def accuracy(rows):\n    return 1\n", encoding="utf-8")
+    (tmp_path / "dashboard.py").write_text(
+        'def show(result):\n    return result.get("accuracy", 0)\n', encoding="utf-8"
+    )
+    rows = kinds(run(tmp_path), "zero_default")
+    assert [row["file"] for row in rows] == ["dashboard.py"]
+
+
+def test_a_zero_default_naming_nothing_measurable_is_still_dropped(tmp_path):
+    (tmp_path / "util.py").write_text(
+        'def opts(settings):\n    return settings.get("retries", 0)\n', encoding="utf-8"
+    )
+    assert run(tmp_path)["candidates"] == []

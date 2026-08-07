@@ -44,7 +44,7 @@ _COMPARE_RE = re.compile(r"(?:>=|<=|==|!=|>|<)(?!-)")
 # The needle is the thing being assigned: `quality_score = ...` / `quality_score: number =`
 _TARGET_RE = re.compile(r"^\s*(?::[^=\n]+?)?(?:(?<![=!<>+\-*/])=(?!=)|<-)")
 # ...or the thing being declared: `def quality_score(`, `const quality_score`
-_DECLARE_RE = re.compile(r"\b(?:def|function|func|fn|class|const|let|var)\s+$")
+_DECLARE_RE = re.compile(r"\b(?:def|function|func|fun|fn|sub|class|const|let|var)\s+$")
 
 CONFIRM = {
     "definition": "confirm this is the source of truth, and that the other sites read it rather than repeat it",
@@ -76,7 +76,7 @@ def build_pattern(needle: str, as_regex: bool) -> re.Pattern:
     return re.compile(r"\b" + re.escape(needle) + r"\b")
 
 
-def classify(line: str, display: str, path: Path, span: tuple) -> str:
+def classify(line: str, display: str, path: Path, span: tuple, numeric: bool = True) -> str:
     """Which kind of site this is.
 
     Deliberately classifies on the path *relative to the scanned root*: an
@@ -98,7 +98,11 @@ def classify(line: str, display: str, path: Path, span: tuple) -> str:
         return "comparison"
     # The needle may be the value (`CUTOFF = 0.75`) or the name being defined
     # (`quality_score = compute()`, `def quality_score(`, `quality_score:`).
-    if _ASSIGN_RE.search(before) and not before.rstrip().endswith(","):
+    # An assignment *before* the match only makes this a definition when the needle
+    # is a literal being assigned. For a name, sitting on the right-hand side means
+    # it is being read — `reported = quality_score` is a consumer, and counting it
+    # as a second definition produced a false "defined independently" headline.
+    if numeric and _ASSIGN_RE.search(before) and not before.rstrip().endswith(","):
         return "definition"
     if _TARGET_RE.match(after) or _DECLARE_RE.search(before):
         return "definition"
@@ -107,7 +111,7 @@ def classify(line: str, display: str, path: Path, span: tuple) -> str:
     return "other"
 
 
-def scan(root: Path, pattern: re.Pattern) -> tuple:
+def scan(root: Path, pattern: re.Pattern, numeric: bool = True) -> tuple:
     """(rows, files skipped unread).
 
     Every occurrence on a line is classified, not just the first — `score > 0.7 and
@@ -124,7 +128,7 @@ def scan(root: Path, pattern: re.Pattern) -> tuple:
             continue
         for lineno, line in enumerate(lines, 1):
             for match in pattern.finditer(line):
-                kind = classify(line, display, path, match.span())
+                kind = classify(line, display, path, match.span(), numeric)
                 if (display, lineno, kind) in seen:
                     continue
                 seen.add((display, lineno, kind))
@@ -199,7 +203,7 @@ def main() -> int:
         print("error: bad regular expression: " + str(exc), file=sys.stderr)
         return 2
 
-    rows, skipped = scan(root, pattern)
+    rows, skipped = scan(root, pattern, bool(_NUMERIC_RE.match(args.needle)) and not args.regex)
     order = ["definition", "comparison", "config", "doc", "test", "other"]
     rows.sort(key=lambda r: (order.index(r["kind"]) if r["kind"] in order else 99, r["file"], r["line"]))
     counts = {"needle": args.needle, "sites": len(rows), "files": len({r["file"] for r in rows}),

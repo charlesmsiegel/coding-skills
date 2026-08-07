@@ -286,3 +286,40 @@ def test_a_single_record_object_is_a_one_row_dataset(tmp_path):
 def test_a_config_object_with_no_label_field_is_still_not_a_dataset(tmp_path):
     (tmp_path / "eval.json").write_text('{"retries": 3, "region": "eu"}', encoding="utf-8")
     assert run(tmp_path)["counts"]["datasets"] == 0
+
+
+# ---- sixth review round ------------------------------------------------------- #
+
+def test_a_capped_read_cannot_conclude_the_dataset_is_unlabeled(tmp_path):
+    """An unlabeled first row says nothing about the labeled rows past the cap."""
+    (tmp_path / "eval.jsonl").write_text('{"q":"x"}\n{"gold":"g"}\n', encoding="utf-8")
+    headline = run(tmp_path, "--max-rows", "1")["headline"]
+    assert "no recognized ground-truth field in any of them" not in headline
+    assert "--max-rows" in headline
+
+
+def test_a_csv_row_with_more_fields_than_the_header_is_malformed(tmp_path):
+    (tmp_path / "eval.csv").write_text("expected,input\na,b,extra\n", encoding="utf-8")
+    assert kinds(run(tmp_path), "unparseable_rows")
+
+
+def test_a_csv_written_with_a_byte_order_mark_still_has_its_label(tmp_path):
+    """A BOM survives into the first field name as `\\ufeffexpected`."""
+    (tmp_path / "eval.csv").write_text("expected,input\na,b\n", encoding="utf-8-sig")
+    payload = run(tmp_path)
+    assert not kinds(payload, "no_label_field")
+
+
+def test_metadata_json_is_not_measurement_data(tmp_path):
+    """`metadata` contains the hint `data`; tokens must not match by substring."""
+    (tmp_path / "metadata.json").write_text("{bad\n", encoding="utf-8")
+    payload = run(tmp_path)
+    assert not kinds(payload, "unparseable_dataset")
+
+
+def test_an_unreadable_dataset_outranks_a_reassuring_conclusion(tmp_path):
+    (tmp_path / "eval.json").write_text('{"input":"x","expected":"y"}', encoding="utf-8")
+    (tmp_path / "test-cases.json").write_text("{bad json\n", encoding="utf-8")
+    headline = run(tmp_path)["headline"]
+    assert "could not be read" in headline and "test-cases.json" in headline
+    assert "fully-labeled" not in headline
