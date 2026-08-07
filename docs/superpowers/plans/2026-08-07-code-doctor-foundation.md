@@ -63,7 +63,7 @@ The remaining five families — git signals, the reference graph, duplication an
 
 **Interfaces:**
 - Consumes: nothing (first task)
-- Produces: `EXCLUDE_DIRS: frozenset[str]`, `NON_CODE_SUFFIXES: frozenset[str]`, `DOC_DIR_NAMES: frozenset[str]`, `is_probably_binary(path: Path) -> bool`, `walk_paths(root: Path) -> Iterator[Path]` (metadata scope — binaries included, symlinks never followed), `walk_files(root: Path, *, source_only: bool) -> Iterator[Path]` (text scope), `configure_output() -> None`, `SEVERITY_ICONS: dict[str, str]`, `SEVERITY_RANK: dict[str, int]`
+- Produces: `EXCLUDE_DIRS: frozenset[str]`, `NON_CODE_SUFFIXES: frozenset[str]`, `DOC_DIR_NAMES: frozenset[str]`, `is_probably_binary(path: Path) -> bool`, `ScanPathError`, `walk_paths(root: Path) -> Iterator[Path]` (metadata scope — binaries included, symlinks never followed, excluded directories pruned during traversal, raises `ScanPathError` on a missing root), `walk_files(root: Path, *, source_only: bool) -> Iterator[Path]` (text scope), `configure_output() -> None`, `SEVERITY_ICONS: dict[str, str]`, `SEVERITY_RANK: dict[str, int]`
 
 - [ ] **Step 1: Create the test directory and write the failing test**
 
@@ -150,6 +150,31 @@ def test_bin_directory_is_scanned(common, repo):
     assert "console" in found
 
 
+def test_missing_root_raises_rather_than_reporting_clean(common, tmp_path):
+    """A typo in an audit path must not produce an authoritative empty report."""
+    with pytest.raises(common.ScanPathError):
+        list(common.walk_files(tmp_path / "nope", source_only=True))
+
+
+def test_excluded_directories_are_not_descended_into(common, repo, monkeypatch):
+    """Pruning during traversal, not filtering after enumeration."""
+    repo.write("node_modules/pkg/deep/nested/index.js", "module.exports = 1\n")
+    repo.write("src/app.js", "export const a = 1\n")
+    seen = []
+    real_walk = common.os.walk
+
+    def spy(top, **kwargs):
+        for dirpath, dirnames, filenames in real_walk(top, **kwargs):
+            seen.append(dirpath)
+            yield dirpath, dirnames, filenames
+
+    monkeypatch.setattr(common.os, "walk", spy)
+    list(common.walk_files(repo.path, source_only=True))
+    assert not any("node_modules" in d for d in seen), (
+        "walked into an excluded tree instead of pruning it"
+    )
+
+
 def test_walk_paths_yields_binaries_for_metadata_checks(common, repo):
     (repo.path / "blob.bin").write_bytes(b"\x00" * 32)
     repo.write("app.go", "package main\n")
@@ -178,6 +203,7 @@ a formality.
 """
 
 import contextlib
+import os
 import subprocess
 import sys
 import time
@@ -225,6 +251,14 @@ DOC_DIR_NAMES = frozenset({"docs", "doc", "documentation", "examples", "example"
 GENERATED_MARKERS = (".min.js", ".min.css", ".bundle.js", "_pb2.py", ".g.dart", ".generated.")
 
 _BINARY_SNIFF_BYTES = 8192
+
+
+class ScanPathError(ValueError):
+    """The path handed to a detector does not exist.
+
+    Ending the iterator instead would let a typo in an audit path produce an
+    authoritative-looking "No problems found" over nothing at all.
+    """
 
 
 def configure_output() -> None:
@@ -275,19 +309,23 @@ def walk_paths(root: Path) -> Iterator[Path]:
     if root.is_symlink():
         return
     if root.is_file():
-        candidates = [root]
-        rel_for = {root: (root.name,)}
-    elif root.is_dir():
-        candidates = sorted(p for p in root.rglob("*")
-                            if p.is_file() and not p.is_symlink())
-        rel_for = {p: p.relative_to(root).parts for p in candidates}
-    else:
+        yield root
         return
+    if not root.is_dir():
+        raise ScanPathError(f"{root}: no such file or directory")
 
-    for path in candidates:
-        parts = rel_for[path]
-        if EXCLUDE_DIRS.isdisjoint(parts):
-            yield path
+    # os.walk with in-place dirnames pruning, NOT rglob-then-filter: rglob
+    # descends into node_modules, vendor and target in full and stats every
+    # file inside before anything is discarded. On a real project that tree
+    # dwarfs the source and dominates both wall-clock and memory.
+    for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
+        dirnames[:] = sorted(d for d in dirnames
+                             if d not in EXCLUDE_DIRS
+                             and not Path(dirpath, d).is_symlink())
+        for name in sorted(filenames):
+            path = Path(dirpath, name)
+            if not path.is_symlink() and path.is_file():
+                yield path
 
 
 def walk_files(root: Path, *, source_only: bool) -> Iterator[Path]:
@@ -309,7 +347,7 @@ def walk_files(root: Path, *, source_only: bool) -> Iterator[Path]:
 - [ ] **Step 4: Run the tests to verify they pass**
 
 Run: `python -m pytest tests/code_doctor/test_common.py -v`
-Expected: 9 passed.
+Expected: 11 passed.
 
 - [ ] **Step 5: Commit**
 
@@ -512,7 +550,7 @@ class Reporter:
 - [ ] **Step 4: Run the tests to verify they pass**
 
 Run: `python -m pytest tests/code_doctor/test_common.py -v`
-Expected: 17 passed.
+Expected: 19 passed.
 
 - [ ] **Step 5: Commit**
 
@@ -652,7 +690,11 @@ def probe_history(repo: Path, *, min_commits: int = 20) -> HistoryDepth:
 
     oldest_days = None
     try:
-        stamp = git(repo, "log", "--reverse", "--format=%ct", "--max-count=1").strip()
+        # `git log --reverse --max-count=1` does NOT give the oldest commit:
+        # --max-count limits the selection first, then --reverse reverses what
+        # was selected, so it returns HEAD. Ask for the root commit directly.
+        root = git(repo, "rev-list", "--max-parents=0", "HEAD").split()
+        stamp = git(repo, "log", "-1", "--format=%ct", root[-1]).strip() if root else ""
         if stamp:
             oldest_days = int((time.time() - int(stamp)) / 86400)
     except Exception:
@@ -664,7 +706,7 @@ def probe_history(repo: Path, *, min_commits: int = 20) -> HistoryDepth:
 - [ ] **Step 4: Run the tests to verify they pass**
 
 Run: `python -m pytest tests/code_doctor/test_common.py -v`
-Expected: 20 passed.
+Expected: 22 passed.
 
 - [ ] **Step 5: Commit**
 
@@ -765,6 +807,12 @@ def warn_detector_error(filepath: Path, exc: Exception) -> None:
     )
 
 
+def fail_on_bad_path(exc: ScanPathError) -> int:
+    """Turn a missing scan root into a loud, nonzero exit at the CLI boundary."""
+    print(f"error: {exc}", file=sys.stderr)
+    return 2
+
+
 def build_parser(description: str) -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=description)
     parser.add_argument("path", nargs="?", default=".", help="File or directory")
@@ -855,10 +903,11 @@ def coverage_gaps(unreadable: list[str], failed: list[str]) -> dict:
 
 
 def run_file_detector(description: str, clean_message: str, analyze,
-                      *, source_only: bool = True, argv: list[str] | None = None) -> None:
+                      *, source_only: bool = True, argv: list[str] | None = None) -> int:
     """Standard main() for a detector that reasons about one file at a time.
 
-    ``analyze`` is called as ``analyze(path, text, reporter)``.
+    ``analyze`` is called as ``analyze(path, text, reporter)``. Returns the
+    process exit code.
     """
     configure_output()
     args = build_parser(description).parse_args(argv)
@@ -867,7 +916,11 @@ def run_file_detector(description: str, clean_message: str, analyze,
     findings: list[Finding] = []
     unreadable: list[str] = []
     failed: list[str] = []
-    for filepath in walk_files(Path(args.path), source_only=source_only):
+    try:
+        walked = list(walk_files(Path(args.path), source_only=source_only))
+    except ScanPathError as exc:
+        return fail_on_bad_path(exc)
+    for filepath in walked:
         try:
             text = filepath.read_text(encoding="utf-8", errors="replace")
         except OSError as exc:
@@ -885,12 +938,13 @@ def run_file_detector(description: str, clean_message: str, analyze,
 
     gaps = coverage_gaps(unreadable, failed)
     emit(findings, args.format, clean_message, completeness=gaps or None)
+    return 0
 ```
 
 - [ ] **Step 4: Run the tests to verify they pass**
 
 Run: `python -m pytest tests/code_doctor/test_common.py -v`
-Expected: 24 passed.
+Expected: 26 passed.
 
 - [ ] **Step 5: Commit**
 
@@ -1075,11 +1129,13 @@ dead code rather than a documentation example needs a reading brain.
 
 import re
 import subprocess
+import sys
 from pathlib import Path
 
-from common import (Reporter, build_parser, configure_output, coverage_gaps,
-                    emit, git, is_git_repo, walk_files, walk_paths,
-                    warn_detector_error, warn_unreadable)
+from common import (Reporter, ScanPathError, build_parser, configure_output,
+                    coverage_gaps, emit, fail_on_bad_path, git, is_git_repo,
+                    tracked_paths, walk_files, walk_paths, warn_detector_error,
+                    warn_unreadable)
 
 MERGE_MARKERS = ("<<<<<<< ", "=======", ">>>>>>> ")
 MAX_FILE_LINES = 1000
@@ -1098,7 +1154,11 @@ _TODO = re.compile(r"\b(TODO|FIXME|HACK|XXX)\b")
 # opener, or contains an assignment or a call.
 _LOOKS_LIKE_CODE = re.compile(r"[;{}]\s*$|\)\s*[;{]?\s*$|=[^=]|\w+\s*\(")
 
-SECRET_FILENAMES = frozenset({".env", ".env.local", ".env.production", ".npmrc", ".pypirc"})
+# Filenames whose whole purpose is to hold secrets. `.npmrc` and `.pypirc`
+# are deliberately absent: both routinely hold nothing but registry, index,
+# and proxy settings, so a name-only rule would call ordinary committed
+# config a credential leak. find_secrets.py inspects their contents instead.
+SECRET_FILENAMES = frozenset({".env", ".env.local", ".env.production"})
 
 
 def blank_literals(line: str) -> str:
@@ -1108,7 +1168,7 @@ def blank_literals(line: str) -> str:
     `url = "https://x"; work()` from losing its trailing call to a `//` that
     was never a comment.
     """
-    return _STRING_LITERAL.sub(lambda m: m.group(1) + " " * (len(m.group(0)) - 2) + m.group(1), line)
+    return _STRING_LITERAL.sub(lambda m: m.group(1) + " " * (len(m.group(0)) - 2) + m.group(1), line)
 
 
 def comment_body(line: str) -> str | None:
@@ -1253,10 +1313,23 @@ def check_metadata(path: Path, report: Reporter, tracked: set[Path] | None) -> N
         size = path.stat().st_size
     except OSError:
         return
-    if size > MAX_COMMITTED_BYTES and (tracked is None or path.resolve() in tracked):
+    if size <= MAX_COMMITTED_BYTES:
+        return
+    megabytes = size // (1024 * 1024)
+    if tracked is None:
+        report.candidate(
+            1, "large_committed_binary",
+            f"{megabytes} MB file present, and git could not be consulted",
+            also_caused_by=[
+                "it is untracked or gitignored — a local build artifact costs no clone time",
+                "git is unavailable here, so tracking state is unknown",
+            ],
+            severity="medium",
+        )
+    elif path.resolve() in tracked:
         report.finding(
             1, "large_committed_binary",
-            f"{size // (1024 * 1024)} MB file tracked in git",
+            f"{megabytes} MB file tracked in git",
             "Move it to release artifacts or an LFS/object store. Git stores every "
             "version forever, so this cost is paid by every clone from now on.",
             severity="medium",
@@ -1304,7 +1377,7 @@ def check_source_file(path: Path, text: str, report: Reporter) -> None:
             )
 
 
-def main() -> None:
+def main() -> int:
     configure_output()
     args = build_parser(__doc__).parse_args()
     ignore = set(args.ignore.split(",")) if args.ignore else set()
@@ -1312,12 +1385,16 @@ def main() -> None:
 
     findings = []
     unreadable, failed = [], []
+    try:
+        text_files = set(walk_files(root, source_only=False))
+        source_files = set(walk_files(root, source_only=True))
+        all_paths = list(walk_paths(root))
+    except ScanPathError as exc:
+        return fail_on_bad_path(exc)
     unmerged = unmerged_paths(root)
     tracked = tracked_paths(root)
-    text_files = set(walk_files(root, source_only=False))
-    source_files = set(walk_files(root, source_only=True))
 
-    for filepath in walk_paths(root):
+    for filepath in all_paths:
         report = Reporter(filepath, ignore)
         try:
             check_metadata(filepath, report, tracked)
@@ -1351,10 +1428,11 @@ def main() -> None:
         )
     emit(findings, args.format, "No hygiene problems found",
          completeness=completeness or None)
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
 ```
 
 - [ ] **Step 4: Run the tests to verify they pass**
@@ -1434,7 +1512,40 @@ def test_a_credential_is_never_both_a_finding_and_a_candidate(repo, run_script):
 
 
 def test_aws_access_key_is_a_finding(repo, run_script):
-    repo.write("config.yaml", "aws_key: AKIAIOSFODNN7EXAMPLE\n")
+    repo.write("config.yaml", "aws_key: AKIA2E0RSCHEMAQ7VXBN\n")
+    repo.commit("oops")
+    result = run_script(SCRIPT, repo.path, "--format", "json")
+    assert records_of(result, "cloud_credential")
+
+
+def test_documented_example_key_is_not_reported(repo, run_script):
+    """AKIAIOSFODNN7EXAMPLE is AWS's own published placeholder.
+
+    The wide walk deliberately reaches documentation, so a repo that quotes
+    the vendor's example must not get revoke-and-purge advice for it.
+    """
+    repo.write("README.md", "For example:\n\n    aws_key: AKIAIOSFODNN7EXAMPLE\n")
+    repo.commit("docs")
+    result = run_script(SCRIPT, repo.path, "--format", "json")
+    assert not records_of(result, "cloud_credential")
+
+
+def test_untracked_credential_is_a_candidate(repo, run_script):
+    """A gitignored local token was never pushed; do not demand rotation."""
+    repo.write(".gitignore", "local.yaml\n")
+    repo.commit("ignore")
+    repo.write("local.yaml", "aws_key: AKIA2E0RSCHEMAQ7VXBN\n")
+    result = run_script(SCRIPT, repo.path, "--format", "json")
+    record = records_of(result, "cloud_credential")[0]
+    assert record["kind"] == "candidate"
+
+
+def test_jwt_is_detected(repo, run_script):
+    token = ("eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9."
+             "eyJzdWIiOiIxMjM0NTY3ODkwIiwibmFtZSI6IkEifQ."
+             "SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJVAdQssw5c")
+    repo.write("config.yaml", f"auth: {token}\n")
+    repo.commit("oops")
     result = run_script(SCRIPT, repo.path, "--format", "json")
     assert records_of(result, "cloud_credential")
 
@@ -1456,7 +1567,8 @@ def test_low_entropy_placeholder_is_not_reported(repo, run_script):
 
 def test_secret_in_a_lockfile_is_still_found(repo, run_script):
     """Secrets take the wide walk — a lockfile is not source but can leak."""
-    repo.write("Cargo.lock", "token = AKIAIOSFODNN7EXAMPLE\n")
+    repo.write("Cargo.lock", "token = AKIA2E0RSCHEMAQ7VXBN\n")
+    repo.commit("oops")
     result = run_script(SCRIPT, repo.path, "--format", "json")
     assert records_of(result, "cloud_credential")
 ```
@@ -1484,9 +1596,12 @@ does not have.
 
 import math
 import re
+import sys
 from pathlib import Path
 
-from common import Reporter, run_file_detector
+from common import (Reporter, ScanPathError, build_parser, configure_output,
+                    coverage_gaps, emit, fail_on_bad_path, tracked_paths,
+                    walk_files, warn_detector_error, warn_unreadable)
 
 KEY_BLOCK = re.compile(r"-----BEGIN (?:RSA |EC |DSA |OPENSSH |PGP )?PRIVATE KEY-----")
 KEY_END = re.compile(r"-----END (?:RSA |EC |DSA |OPENSSH |PGP )?PRIVATE KEY-----")
@@ -1499,7 +1614,17 @@ CLOUD_CREDENTIALS = (
     (re.compile(r"\bgithub_pat_[A-Za-z0-9_]{22,}\b"), "GitHub fine-grained token"),
     (re.compile(r"\bxox[baprs]-[A-Za-z0-9-]{10,}\b"), "Slack token"),
     (re.compile(r"\bsk-[A-Za-z0-9]{32,}\b"), "API secret key"),
+    (re.compile(r"\beyJ[A-Za-z0-9_-]{10,}\.eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b"), "JWT"),
 )
+
+# Values every vendor publishes in its own documentation. They are not
+# credentials, and the wide walk deliberately reaches the docs and fixtures
+# that quote them.
+DOCUMENTED_EXAMPLES = frozenset({
+    "AKIAIOSFODNN7EXAMPLE",
+    "ASIAIOSFODNN7EXAMPLE",
+    "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+})
 
 SECRET_NAME = re.compile(
     r"\b(\w*(?:secret|passwd|password|token|apikey|api_key|access_key|private_key)\w*)\b"
@@ -1535,17 +1660,28 @@ def has_key_payload(lines: list[str], start: int) -> bool:
     return sum(1 for candidate in window if BASE64_LINE.fullmatch(candidate.strip())) >= 2
 
 
-def analyze(path: Path, text: str, report: Reporter) -> None:
+def analyze(path: Path, text: str, report: Reporter,
+            tracked_here: bool | None = None) -> None:
     lines = text.splitlines()
     for index, line in enumerate(lines):
         number = index + 1
         if KEY_BLOCK.search(line):
-            if has_key_payload(lines, index + 1):
+            if has_key_payload(lines, index + 1) and tracked_here is not False:
                 report.finding(
                     number, "private_key_material",
                     "Private key block committed to the repository",
                     "Remove the key, rotate it, and purge it from history. Anyone who has "
                     "ever cloned this repository has the old copy.",
+                    severity="high",
+                )
+            elif has_key_payload(lines, index + 1):
+                report.candidate(
+                    number, "private_key_material",
+                    "Private key block in a file git does not track",
+                    also_caused_by=[
+                        "it is gitignored local key material that was never pushed",
+                        "it is a scratch file outside the repository's history",
+                    ],
                     severity="high",
                 )
             else:
@@ -1566,7 +1702,22 @@ def analyze(path: Path, text: str, report: Reporter) -> None:
         matched_credential = False
         for pattern, label in CLOUD_CREDENTIALS:
             match = pattern.search(line)
-            if match:
+            if not match:
+                continue
+            matched_credential = True
+            if match.group(0) in DOCUMENTED_EXAMPLES:
+                break  # the vendor's own published placeholder
+            if tracked_here is False:
+                report.candidate(
+                    number, "cloud_credential",
+                    f"{label} in a file git does not track",
+                    also_caused_by=[
+                        "it is gitignored local configuration that was never pushed",
+                        "it is a scratch file outside the repository's history",
+                    ],
+                    severity="high", snippet=match.group(0)[:12] + "…",
+                )
+            else:
                 report.finding(
                     number, "cloud_credential",
                     f"{label} committed to the repository",
@@ -1574,8 +1725,7 @@ def analyze(path: Path, text: str, report: Reporter) -> None:
                     "manager. Revoke first — removing the line does not un-leak it.",
                     severity="high", snippet=match.group(0)[:12] + "…",
                 )
-                matched_credential = True
-                break
+            break
         if matched_credential:
             continue
 
@@ -1593,19 +1743,58 @@ def analyze(path: Path, text: str, report: Reporter) -> None:
             )
 
 
+def main() -> int:
+    configure_output()
+    args = build_parser(__doc__).parse_args()
+    ignore = set(args.ignore.split(",")) if args.ignore else set()
+    root = Path(args.path)
+
+    # Tracking state separates a committed leak from a developer's gitignored
+    # local config. Without it every finding would carry revoke-and-purge
+    # advice for files that were never pushed anywhere.
+    tracked = tracked_paths(root)
+
+    findings, unreadable, failed = [], [], []
+    try:
+        walked = list(walk_files(root, source_only=False))
+    except ScanPathError as exc:
+        return fail_on_bad_path(exc)
+    for filepath in walked:
+        try:
+            text = filepath.read_text(encoding="utf-8", errors="replace")
+        except OSError as exc:
+            warn_unreadable(filepath, exc)
+            unreadable.append(str(filepath))
+            continue
+        report = Reporter(filepath, ignore)
+        tracked_here = None if tracked is None else (filepath.resolve() in tracked)
+        try:
+            analyze(filepath, text, report, tracked_here)
+        except Exception as exc:
+            warn_detector_error(filepath, exc)
+            failed.append(str(filepath))
+            continue
+        findings.extend(report.findings)
+
+    completeness = coverage_gaps(unreadable, failed)
+    if tracked is None:
+        completeness["tracking_state"] = (
+            "git unavailable — tracking state unknown, so credentials are reported "
+            "as committed only where that cannot be ruled out"
+        )
+    emit(findings, args.format, "No committed credentials found",
+         completeness=completeness or None)
+    return 0
+
+
 if __name__ == "__main__":
-    run_file_detector(
-        "Credentials committed to the repository",
-        "No committed credentials found",
-        analyze,
-        source_only=False,
-    )
+    sys.exit(main())
 ```
 
 - [ ] **Step 4: Run the tests to verify they pass**
 
 Run: `python -m pytest tests/code_doctor/test_find_secrets.py -v`
-Expected: 7 passed.
+Expected: 11 passed.
 
 - [ ] **Step 5: Commit**
 
@@ -1711,6 +1900,12 @@ def test_json_passthrough_round_trips():
     assert json.loads(out)[0]["smell_type"] == "merge_conflict_marker"
 
 
+def test_json_output_keeps_completeness():
+    out = run({"completeness": {"history": "shallow clone"}, "findings": [FINDING]},
+              "--format", "json")
+    assert json.loads(out)["completeness"] == {"history": "shallow clone"}
+
+
 def test_cards_include_the_fix_and_the_benign_reasons():
     out = run([FINDING, CANDIDATE], "--format", "cards")
     assert "Resolve it" in out
@@ -1792,6 +1987,11 @@ def render_table(records: list[dict], root: Path | None) -> list[str]:
             f"| {icon} {severity} | {record.get('smell_type', '?')} | "
             f"`{location(record, root)}` | {description} |"
         )
+        # A candidate without its benign explanations is indistinguishable from
+        # a defect, which is the one thing the two-class schema exists to
+        # prevent. They travel with the row even in the compact renderer.
+        for reason in record.get("also_caused_by", []):
+            lines.append(f"| | | | ↳ also caused by: {reason} |")
     return lines
 
 
@@ -1841,7 +2041,13 @@ def main() -> int:
         records = [r for r in records if r.get("kind", "finding") == args.kind]
 
     if args.format == "json":
-        print(json.dumps(records, indent=2))
+        # Keep the wrapped shape when the input had one: a downstream consumer
+        # that loses the shallow-history or failed-detector note treats a
+        # degraded result as a complete one.
+        if completeness:
+            print(json.dumps({"completeness": completeness, "findings": records}, indent=2))
+        else:
+            print(json.dumps(records, indent=2))
         return 0
 
     findings = [r for r in records if r.get("kind", "finding") == "finding"]
@@ -1877,7 +2083,7 @@ if __name__ == "__main__":
 - [ ] **Step 4: Run the tests to verify they pass**
 
 Run: `python -m pytest tests/code_doctor/test_format_findings.py -v`
-Expected: 9 passed.
+Expected: 10 passed.
 
 - [ ] **Step 5: Commit**
 
@@ -2062,15 +2268,24 @@ def main() -> int:
 
     selected = [c for c in DETECTORS if c not in skip and (not only or c in only)]
 
-    records: list[dict] = []
+    findings: list[Finding] = []
     failures: list[str] = []
     merged_notes: dict[str, str] = {}
+    rejected: dict[str, list[str]] = {}
     for category in selected:
         found, notes, error = run_detector(DETECTORS[category], Path(args.path), args.ignore)
         if error:
             failures.append(error)
             continue
-        records.extend(found)
+        # Reconstruct here, while the category is still known. Finding's
+        # __post_init__ re-validates, so one malformed record from a buggy
+        # detector fails that category instead of aborting the whole report
+        # and discarding every other category's valid results.
+        for record in found:
+            try:
+                findings.append(Finding(**record))
+            except (TypeError, ValueError) as exc:
+                rejected.setdefault(category, []).append(str(exc))
         for label, note in notes.items():
             merged_notes[f"{category}.{label}"] = note
 
@@ -2081,8 +2296,12 @@ def main() -> int:
     completeness.update(merged_notes)
     if failures:
         completeness["detectors_failed"] = "; ".join(failures)
+    for category, errors in rejected.items():
+        completeness[f"{category}.records_rejected"] = (
+            f"{len(errors)} record(s) did not satisfy the findings schema and were "
+            f"dropped: {errors[0]}"
+        )
 
-    findings = [Finding(**record) for record in records]
     emit(findings, args.format, "No problems found", completeness=completeness)
     return 0
 
