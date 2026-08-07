@@ -17,6 +17,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+import rubric
+
 ASSETS = Path(__file__).resolve().parent.parent / "assets"
 
 MAP_SCHEMA = "code-overview/1"
@@ -133,7 +135,7 @@ def normalize_findings(data) -> dict:
     for finding in findings:
         finding.setdefault("severity", "medium")
     return {"findings": findings, "errors": errors, "ran": ran,
-            "skipped": skipped, "shape": shape}
+            "skipped": skipped, "shape": shape, "empty_artifact": False}
 
 
 def finding_identity(finding: dict) -> tuple:
@@ -227,16 +229,17 @@ def load_reports(paths) -> tuple[list[dict], dict[str, str], set[str]]:
             raise SystemExit(f"error: cannot read findings file {raw}: {exc}") from exc
         if not text.strip():
             # A zero-byte file is what a doctor leaves behind when it fails
-            # *after* the shell created the redirect target. Dropping it would
-            # leave no report at all, and coverage resolution would then fall
-            # back to the doctor's profile and grade the whole rubric A+ off an
-            # artifact that contains nothing. Record it as an unknown-coverage
-            # report instead, so it refuses to grade rather than grading clean.
+            # *after* the shell created the redirect target. It is flagged
+            # rather than dropped, and flagged distinctly from a bare list: an
+            # empty artifact is positive evidence that a run *failed*, and the
+            # gap it leaves cannot be attributed to any category, because
+            # nothing in the file says which doctor was meant to write it.
             warn(f"{raw} is empty — no findings and no evidence of what was examined, so "
                  "nothing from it can be graded. Did the doctor fail after the shell "
                  "created the file?")
             reports.append({"findings": [], "errors": {}, "ran": set(),
-                            "skipped": set(), "shape": SHAPE_PARTIAL})
+                            "skipped": set(), "shape": SHAPE_PARTIAL,
+                            "empty_artifact": True})
             continue
         try:
             data = json.loads(text)
@@ -254,16 +257,28 @@ def load_reports(paths) -> tuple[list[dict], dict[str, str], set[str]]:
     return reports, errors, skipped
 
 
-def sizing_extensions(findings: list[dict], extra=()) -> frozenset:
+def sizing_extensions(findings: list[dict], extra=(), doctor: str = "") -> frozenset:
     """Which extensions the denominator should cover.
 
-    Code always, plus any template extension the findings themselves show was
-    analyzed. Deriving it from the findings keeps the invariant self-correcting:
-    lines enter the denominator exactly when the analysis reached them, so a
-    Django package with template findings is sized over its templates and a
-    Python package that happens to ship an HTML fixture is not.
+    Code always, plus templates when the analysis reached them. Two signals say
+    it did, and both are needed:
+
+    - **The doctor parses markup.** `django-code-doctor` reads templates on
+      every run, so its template lines are in the denominator whether or not
+      any of them was faulty. Findings alone would leave a package of clean
+      templates sized over its Python only — and then a single new template
+      finding would drop every template line into the divisor and *raise* the
+      grade, which is precisely backwards.
+    - **A finding points at one.** This still catches the case the doctor
+      profile cannot know about: an unrecognized `--doctor`, or a tool passed
+      through `--covers`.
+
+    A Python package that merely ships an HTML fixture is covered by neither,
+    so it is sized over its code alone, as it should be.
     """
     used = {ext.lower() if ext.startswith(".") else f".{ext.lower()}" for ext in extra}
+    if doctor in rubric.DOCTORS_ANALYZING_TEMPLATES:
+        used |= set(TEMPLATE_EXTENSIONS)
     for finding in findings:
         suffix = Path(str(finding.get("file", ""))).suffix.lower()
         if suffix in TEMPLATE_EXTENSIONS:

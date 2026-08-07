@@ -166,7 +166,9 @@ manifest and missing tests, alongside real findings it can no longer see.
 
 Running `build_health.py --root` before the package health pages exist is not an
 error — it warns per missing package and leaves them out of the table. Re-run it
-after.
+after. Do re-run it: the root denominator is narrowed to packages that have a
+graded health page, so a first pass with none of them built measures every
+doctored package instead, which is the looser answer.
 
 ## Generating the atlases
 

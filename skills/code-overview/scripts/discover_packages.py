@@ -30,7 +30,7 @@ import sys
 from collections import Counter
 from pathlib import Path
 
-from common import MAP_SCHEMA, SKIP_DIRS, iter_code_files, measure, warn
+from common import CODE_EXTENSIONS, MAP_SCHEMA, SKIP_DIRS, iter_code_files, measure, warn
 
 # Extension → language, for deciding which doctor fits a candidate.
 LANGUAGE_BY_EXT = {
@@ -356,9 +356,24 @@ def discover(repo: Path, excluded: set[str], min_files: int) -> dict:
             continue
         add([child], child.name, f"top-level source directory ({child.name})", "directory")
 
+    # --- final fallback: the repository itself.
+    # Every rule above proposes a *directory*, so a repo whose code sits
+    # directly at the root — a handful of standalone scripts, no manifest, no
+    # importable package — produced no candidate, nothing too_small, nothing
+    # unassigned and no question: a proposal with nothing in it and no way to
+    # ask about it. Only when nothing else was found, so this never overlaps.
+    loose = root_level_sources(repo)
+    if not candidates and loose["files"]:
+        add([repo], repo.name or "repository",
+            f"{loose['files']} source file(s) directly in the repository root", "repo-root")
+
     total = measure([repo])
     covered = {root for entry in candidates for root in entry["roots"]}
     unassigned = unassigned_dirs(repo, excluded, covered, min_files)
+    # Loose root files beside real candidates belong to no directory, so
+    # unassigned_dirs cannot see them. Named here so they can be assigned.
+    if candidates and loose["files"] and "." not in covered:
+        unassigned.append({"path": ".", "size": loose, "note": "files directly in the repo root"})
     return {
         "schema": MAP_SCHEMA,
         "repo": str(repo),
@@ -369,6 +384,24 @@ def discover(repo: Path, excluded: set[str], min_files: int) -> dict:
         "unassigned": unassigned,
         "questions": build_questions(candidates, too_small, unassigned, total),
     }
+
+
+def root_level_sources(repo: Path) -> dict:
+    """Size of the source files sitting directly in the repo root.
+
+    Not a walk: only the top level, because these are exactly the files no
+    directory-shaped candidate can ever claim.
+    """
+    files = [child for child in sorted(repo.iterdir())
+             if child.is_file() and child.suffix in CODE_EXTENSIONS]
+    loc = 0
+    for path in files:
+        try:
+            text = path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        loc += sum(1 for line in text.splitlines() if line.strip())
+    return {"files": len(files), "loc": loc}
 
 
 def unassigned_dirs(repo: Path, excluded: set[str], covered: set[str], min_files: int) -> list[dict]:

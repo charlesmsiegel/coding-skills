@@ -627,8 +627,13 @@ def test_cross_report_multiplicity_is_the_maximum_not_the_sum(run_script, sized_
     assert meta["duplicates_merged"] == 1
 
 
-def test_templates_are_sized_when_the_findings_reach_them(run_script, repo):
-    """A Django package's template findings must be divided by template lines too."""
+def test_a_template_reading_doctor_sizes_templates_either_way(run_script, repo):
+    """Django reads templates on every run, so its template lines are always the divisor.
+
+    Sizing off findings alone made the denominator jump the moment a template
+    finding appeared — which *raised* the grade. A rule under which discovering
+    a bug improves the score is the wrong shape, so the doctor decides.
+    """
     for module in range(3):
         repo.write(f"app/m{module}.py", "\n".join(f"x{i}=1" for i in range(200)))
     for page in range(4):
@@ -647,16 +652,39 @@ def test_templates_are_sized_when_the_findings_reach_them(run_script, repo):
 
     plain = repo.path / "plain.html"
     run_script(BUILD_HEALTH, "--out", plain, "--findings", without, "--repo", repo.path,
-               "--name", "app", "--root-dir", "app", "--doctor", "django-code-doctor")
+               "--name", "app", "--root-dir", "app", "--doctor", "django-code-doctor",
+               "--covers", "correctness,security,tests,complexity,design,hygiene")
     templated = repo.path / "templated.html"
     run_script(BUILD_HEALTH, "--out", templated, "--findings", with_templates, "--repo", repo.path,
-               "--name", "app", "--root-dir", "app", "--doctor", "django-code-doctor")
+               "--name", "app", "--root-dir", "app", "--doctor", "django-code-doctor",
+               "--covers", "correctness,security,tests,complexity,design,hygiene")
 
-    assert read_meta(plain)["sized_extensions"] == [], "no template findings, no template lines"
-    assert read_meta(templated)["sized_extensions"] == [".html"]
-    assert read_meta(templated)["size"]["loc"] > read_meta(plain)["size"]["loc"] * 2, (
-        "the templates the findings came from have to be in the denominator"
+    assert ".html" in read_meta(plain)["sized_extensions"], (
+        "clean templates were still analyzed, so they are still in the denominator"
     )
+    assert read_meta(plain)["size"]["loc"] == read_meta(templated)["size"]["loc"], (
+        "adding a template finding must not change what the grade is divided by"
+    )
+    assert read_meta(templated)["score"] < read_meta(plain)["score"], (
+        "and with the divisor fixed, one more finding can only lower the grade"
+    )
+
+
+def test_a_code_only_doctor_leaves_stray_markup_out_of_the_divisor(run_script, repo):
+    """A Python package that merely ships an HTML fixture is sized over its code."""
+    for module in range(3):
+        repo.write(f"app/m{module}.py", "\n".join(f"x{i}=1" for i in range(200)))
+    repo.write("app/fixture.html", "\n".join(f"<p>{i}</p>" for i in range(2000)))
+    repo.commit("init")
+    out = repo.path / "h.html"
+    report = repo.path / "f.json"
+    report.write_text(json.dumps(full_report(
+        [finding(file="app/m0.py", category="security", severity="high", line=3)])))
+    run_script(BUILD_HEALTH, "--out", out, "--findings", report, "--repo", repo.path,
+               "--name", "app", "--root-dir", "app", "--doctor", "python-code-doctor")
+    meta = read_meta(out)
+    assert meta["sized_extensions"] == []
+    assert meta["size"]["loc"] < 1000, "the 2000-line fixture is not code this doctor read"
 
 
 def test_loc_and_files_overrides_are_independent(run_script, sized_repo):
@@ -826,3 +854,83 @@ def test_a_missing_findings_file_fails_cleanly(run_script, sized_repo, tmp_path)
                         "--name", "app", expect_rc=1)
     assert "cannot read findings file" in result.stderr
     assert "Traceback" not in result.stderr
+
+
+def test_a_crashed_companion_ungrades_everything(run_script, sized_repo, tmp_path):
+    """A doctor that died leaves a zero-byte file beside a full, clean report.
+
+    The Python report really did run; the point is that Django is what sees
+    N+1 queries, missing CSRF and insecure settings, so the categories the
+    Python report "covered" were half-measured — and nothing in either file
+    says which half. Grading them produced an A+ built on a crash.
+    """
+    good = tmp_path / "py.json"
+    good.write_text(json.dumps(full_report([])))
+    crashed = tmp_path / "django.json"
+    crashed.write_text("")
+    out = sized_repo.path / "h.html"
+    result = run_script(BUILD_HEALTH, "--out", out, "--findings", good, "--findings", crashed,
+                        "--repo", sized_repo.path, "--name", "app", "--root-dir", "src/app",
+                        "--doctor", "python-code-doctor")
+    meta = read_meta(out)
+    assert meta["score"] is None, "a crashed companion must not leave an A+ standing"
+    assert len(meta["ungraded"]) == 7, "every category, since the gap cannot be attributed"
+    assert "a doctor failed" in result.stderr
+    assert "--covers" in result.stderr
+
+
+def test_naming_the_coverage_overrides_a_crashed_companion(run_script, sized_repo, tmp_path):
+    """--covers is the documented way to say what the surviving reports examined."""
+    good = tmp_path / "py.json"
+    good.write_text(json.dumps(full_report([])))
+    crashed = tmp_path / "django.json"
+    crashed.write_text("")
+    out = sized_repo.path / "h.html"
+    run_script(BUILD_HEALTH, "--out", out, "--findings", good, "--findings", crashed,
+               "--repo", sized_repo.path, "--name", "app", "--root-dir", "src/app",
+               "--doctor", "python-code-doctor", "--covers", "correctness,security")
+    meta = read_meta(out)
+    assert meta["score"] is not None
+    assert set(meta["ungraded"]) == {"tests", "complexity", "design", "duplication", "hygiene"}
+
+
+def test_a_null_line_does_not_abort_the_page(run_script, sized_repo):
+    """`--covers` invites tools this skill has never seen; their fields vary."""
+    out = build(run_script, sized_repo,
+                [finding(line=3, severity="high"), finding(line=None, severity="high")])
+    meta = read_meta(out)
+    assert meta["findings_total"] == 2
+    assert {item["line"] for item in meta["top_findings"]} == {0, 3}
+
+
+def test_the_root_grade_excludes_packages_whose_report_never_arrived(run_script, repo):
+    """A doctor named in the map is an intention; a graded page is the evidence."""
+    for module in range(2):
+        repo.write(f"src/api/m{module}.py", "\n".join(f"x{i} = {i}" for i in range(300)))
+    for module in range(10):
+        repo.write(f"web/c{module}.ts", "\n".join(f"const b{i} = {i};" for i in range(600)))
+    repo.write("docs/code-overview.json", json.dumps({
+        "schema": "code-overview/1",
+        "packages": [
+            {"name": "api", "roots": ["src/api"], "docs": "src/api/docs",
+             "language": "python", "doctor": "python-code-doctor"},
+            {"name": "web", "roots": ["web"], "docs": "web/docs",
+             "language": "typescript", "doctor": "typescript-code-doctor"},
+        ],
+    }))
+    repo.commit("init")
+    report = repo.path / "f.json"
+    report.write_text(json.dumps(full_report(
+        [finding(file="src/api/m0.py", category="security", severity="high", line=3)])))
+    # Only the Python package's health page is ever built.
+    run_script(BUILD_HEALTH, "--out", repo.path / "src/api/docs/health.html",
+               "--findings", report, "--repo", repo.path, "--name", "api",
+               "--root-dir", "src/api", "--doctor", "python-code-doctor")
+    out = repo.path / "docs/health.html"
+    result = run_script(BUILD_HEALTH, "--root", "--out", out,
+                        "--map", repo.path / "docs/code-overview.json", "--findings", report,
+                        "--repo", repo.path, "--name", "whole", "--doctor", "python-code-doctor")
+    meta = read_meta(out)
+    assert meta["roots"] == ["src/api"], "web was never analyzed, so it is not measured"
+    assert meta["size"]["loc"] < 1000, "6000 unexamined TypeScript lines stay out"
+    assert "no graded health page" in result.stderr

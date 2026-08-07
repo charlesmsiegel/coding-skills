@@ -112,6 +112,15 @@ doctor leaves behind when it fails *after* the shell created the redirect target
 and dropping it silently would leave no report, no contrary evidence, and an A+
 built on an empty artifact.
 
+**An empty artifact ungrades everything, even beside a full report.** A failed
+run is evidence of a gap, and it outranks the evidence next to it. In the
+recommended Python+Django merge, a Django crash leaves the Python report full and
+clean — and Django is what sees N+1 queries, missing CSRF tokens and insecure
+settings, so the categories Python "covered" were in fact half-measured. Nothing
+in the files says which doctor was meant to write the empty one, so the gap
+cannot be subtracted from particular categories. Re-run the failed doctor, or use
+`--covers` to say what the surviving reports examined.
+
 When any full report is present it is believed and the others add findings
 without inflating coverage. That is what makes the recommended Python+Django
 merge behave: if the Python report skipped duplicates, the Django list beside it
@@ -178,13 +187,24 @@ and one-plus-one becomes one.
 `missing_csrf_token` and `query_in_template` from `.html`. Dividing those by the
 Python lines alone makes a template-heavy package look far worse than it is.
 
-So the denominator's extension set is **derived from the findings**: a template
-extension is counted exactly when a finding points at a file with it. That keeps
-the invariant self-correcting — lines enter the denominator when the analysis
-reached them — so a Django package with template findings is sized over its
-templates while a Python package that merely ships an HTML fixture is not.
-`--include-extension` adds more by hand; `sized_extensions` in the metadata
-records what was counted beyond code.
+So the denominator's extension set is derived from **what the analysis reached**,
+which two signals report:
+
+- **The doctor parses markup.** `rubric.DOCTORS_ANALYZING_TEMPLATES` names them —
+  `django-code-doctor` reads templates on every run, so its template lines are in
+  the denominator whether or not any of them was faulty.
+- **A finding points at one.** This still catches what a doctor profile cannot
+  know: an unrecognized `--doctor`, or a third-party tool declared via `--covers`.
+
+The first signal is not redundant. Deriving template sizing from findings alone
+leaves a package of *clean* templates measured over its Python lines only — and
+then the first template finding anyone adds drops thousands of lines into the
+divisor and **raises** the grade. A rule under which discovering a bug improves
+the score is the wrong shape, whatever it does to any individual number.
+
+A Python package that merely ships an HTML fixture matches neither signal and is
+sized over its code alone, as it should be. `--include-extension` adds more by
+hand; `sized_extensions` in the metadata records what was counted beyond code.
 
 Run a Django app through **both** `django-code-doctor` and `python-code-doctor`
 and pass both findings files to `build_health.py` — that is what closes the
@@ -211,6 +231,17 @@ Two mechanisms keep them aligned:
   findings; measuring the whole checkout anyway would improve the repo's grade in
   direct proportion to how much code was excluded from analysis.
 
+  That union is narrowed twice more, on the same principle. A package with **no
+  doctor** contributes no findings, so its lines are out. And a package whose
+  **health page is missing or ungraded** was not actually analyzed — a doctor
+  named in the map is an intention, not a result. A TypeScript package whose
+  report never arrived, or arrived empty from a failed run, is pure dilution:
+  6000 unexamined lines beside 600 examined ones turned a high-severity secret
+  from a failing security score into an overall A. Both exclusions are warned
+  about, and both packages stay in the table as ungraded. This is why the rebuild
+  order runs `--root` *after* the package pages exist; run before them, there is
+  nothing to narrow by, so it falls back to every doctored package and says so.
+
   One exception, in `--root` mode only: findings about files sitting **directly
   in the repo root** — `tsconfig.json`, the root manifest, a settings file — are
   kept. They describe the whole tree rather than any package, and the repo grade
@@ -225,7 +256,15 @@ Four steps, first hit wins:
    `python-code-doctor` and `typescript-code-doctor` stamp on every finding.
 2. The finding's type token against `SMELL_TYPE_CATEGORIES`, the explicit table
    for `django-code-doctor`, which emits a flat list with no category field.
-3. Substring keywords against the type token, then against the detector name.
+3. `TYPE_KEYWORDS` against the type token, then against the detector name.
+   Keywords match at **word boundaries** — the start of the token or just after a
+   non-alphanumeric character — not anywhere in it. Plain substring matching put
+   `latest_dependency` under Tests because `test` sits inside `latest`, swapping
+   an 8%-weight category for a 15% one *and* reporting the match as successful,
+   so the unmapped-type caveat never fired. Boundary matching still lets a
+   keyword cover a family by prefix: `complex` reaches `complexity`, `auth`
+   reaches `authentication`, `deprecat` reaches both `deprecated` and
+   `deprecation`.
 4. Fallback to hygiene — **and the type is recorded in `unmapped_types`**, shown
    in a callout on the page.
 

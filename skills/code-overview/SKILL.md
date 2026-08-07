@@ -141,6 +141,13 @@ and **`django-code-doctor` run alone needs `--covers`**:
 The recommended Python+Django merge needs no flag either, since the Python report
 carries the evidence. `--assume-full-coverage` credits the whole rubric.
 
+**A zero-byte findings file ungrades everything, even beside a full report.** It
+means a doctor *failed*, not that it found nothing, and no file says which one —
+so the gap cannot be charged to particular categories. If Django crashes during
+the merge, the clean Python report alone would otherwise grade A+ on categories
+Django was supposed to help measure. Re-run the failed doctor; if you cannot,
+`--covers` declares what the surviving reports examined.
+
 **Findings from two doctors are deduplicated** on `(file, line, type)`, keeping
 the higher severity — both security detectors flag the same hardcoded
 `SECRET_KEY`, and charging one defect twice inflates the penalty by a third.
@@ -182,11 +189,14 @@ Same three documents, one scope up.
   unassigned contributes no findings, so it must not pad the denominator either.
   Findings about files directly in the repo root (`tsconfig.json`, the root
   manifest) are kept here even though they sit in no package; they describe the
-  whole tree. Packages with **no doctor are left out of the repo grade's size** —
-  their lines would dilute findings they cannot contribute — while still
-  appearing in the table as ungraded. It reads each package's `health.html` for
-  the grade table, so build those first; a package with no health page stays in
-  the table marked *not generated* rather than vanishing from it.
+  whole tree. Packages with **no doctor**, and packages with **no graded health
+  page**, are left out of the repo grade's size — their lines would dilute
+  findings they cannot contribute — while still appearing in the table as
+  ungraded. A doctor named in the map is an intention; only a graded health page
+  proves the code was examined, so **build the package pages first and re-run
+  `--root` after them.** Run before they exist, it falls back to every doctored
+  package and says so. A package with no health page stays in the table marked
+  *not generated* rather than vanishing from it.
 - **Summary**: `build_summary.py --root --map docs/code-overview.json`.
 
 ## 5. Navigation, last

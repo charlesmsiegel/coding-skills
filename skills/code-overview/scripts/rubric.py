@@ -181,8 +181,12 @@ SMELL_TYPE_CATEGORIES = {
     smell: category for category, smells in SMELL_TYPES.items() for smell in smells
 }
 
-# Last resort before the fallback. Matched as substrings against the finding's
-# type token, most specific first — `test` would otherwise swallow `latest`.
+# Last resort before the fallback. Matched against the finding's type token at
+# word boundaries — see `keyword_matches`. Ordering is by specificity within a
+# category, but ordering alone cannot keep keywords apart: `test` sits before
+# `dependency`, so a plain substring match sent `latest_dependency` to Tests
+# and reported it as a successful match, hiding the mistake from the
+# unmapped-type caveat while swapping a 15%-weight category for an 8% one.
 TYPE_KEYWORDS: tuple[tuple[str, str], ...] = (
     ("n_plus_one", "correctness"), ("race", "correctness"), ("leak", "correctness"),
     ("unawaited", "correctness"), ("await", "correctness"), ("mutation", "correctness"),
@@ -224,6 +228,14 @@ DOCTOR_COVERAGE = {
     "django-code-doctor": {"correctness", "security", "tests", "complexity", "design", "hygiene"},
 }
 
+# Doctors that parse markup as well as code. Their template lines belong in the
+# denominator whenever they run, not only when a template happened to produce a
+# finding: sizing off findings alone leaves a package full of *clean* templates
+# measured over its Python lines only, and then the first template finding
+# added drops thousands of lines into the divisor and *improves* the grade.
+# A discontinuity that rewards finding a bug is the wrong shape entirely.
+DOCTORS_ANALYZING_TEMPLATES = frozenset({"django-code-doctor"})
+
 
 def finding_type(finding: dict) -> str:
     """The type token, under whichever key the emitting detector used."""
@@ -232,6 +244,27 @@ def finding_type(finding: dict) -> str:
         if value:
             return str(value)
     return "issue"
+
+
+def keyword_matches(needle: str, token: str) -> bool:
+    """Does `needle` begin a word inside `token`?
+
+    Finding types are snake_case, so a word begins at the start of the string
+    or after a non-alphanumeric character. Matching there rather than anywhere
+    keeps `test` out of `latest_dependency`, `greatest_hits` and `protest_*`
+    while still letting a keyword cover a whole family by prefix — `complex`
+    reaches `complexity`, `auth` reaches `authentication`, `deprecat` reaches
+    both `deprecated` and `deprecation`. Keywords that are themselves
+    multi-word (`n_plus_one`, `too_many`) match as written.
+    """
+    start = 0
+    while True:
+        index = token.find(needle, start)
+        if index < 0:
+            return False
+        if index == 0 or not token[index - 1].isalnum():
+            return True
+        start = index + 1
 
 
 def categorize(finding: dict) -> tuple[str, bool]:
@@ -251,14 +284,14 @@ def categorize(finding: dict) -> tuple[str, bool]:
 
     lowered = token.lower()
     for needle, category in TYPE_KEYWORDS:
-        if needle in lowered:
+        if keyword_matches(needle, lowered):
             return category, True
 
     # A detector category we do not know, but which names itself usefully.
     if detector:
         lowered_detector = str(detector).lower()
         for needle, category in TYPE_KEYWORDS:
-            if needle in lowered_detector:
+            if keyword_matches(needle, lowered_detector):
                 return category, True
 
     return FALLBACK_CATEGORY, False
