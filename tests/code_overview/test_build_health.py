@@ -39,11 +39,14 @@ def sized_repo(repo):
 
 
 def build(run_script, repo, findings, *args, out="src/app/docs/health.html", **kwargs):
+    """Build a package health page. A doctor is named by default — without one
+    nothing is graded, which is its own test below rather than the baseline."""
     report = repo.path / "findings.json"
     report.write_text(json.dumps(findings), encoding="utf-8")
     target = repo.path / out
     run_script(BUILD_HEALTH, "--out", target, "--findings", report,
-               "--repo", repo.path, "--name", "app", "--root-dir", "src/app", *args)
+               "--repo", repo.path, "--name", "app", "--root-dir", "src/app",
+               "--doctor", "python-code-doctor", *args)
     return target
 
 
@@ -179,8 +182,9 @@ def test_the_root_document_rolls_up_every_package(run_script, repo):
     reports = {}
     for package, count in (("alpha", 30), ("beta", 1)):
         report = repo.path / f"{package}.json"
-        report.write_text(json.dumps(
-            [finding(category="security", severity="high") for _ in range(count)]))
+        report.write_text(json.dumps([
+            finding(category="security", severity="high", file=f"src/{package}/m0.py")
+            for _ in range(count)]))
         reports[package] = report
         run_script(BUILD_HEALTH, "--out", repo.path / f"src/{package}/docs/health.html",
                    "--findings", report, "--repo", repo.path, "--name", package,
@@ -212,8 +216,9 @@ def test_the_root_table_survives_a_package_with_no_health_page(run_script, repo)
     report.write_text("[]")
     out = repo.path / "docs/health.html"
     result = run_script(BUILD_HEALTH, "--root", "--out", out,
-                        "--map", repo.path / "docs/code-overview.json",
-                        "--findings", report, "--repo", repo.path, "--name", "whole-repo")
+                        "--map", repo.path / "docs/code-overview.json", "--findings", report,
+                        "--repo", repo.path, "--name", "whole-repo",
+                        "--doctor", "python-code-doctor")
     assert out.is_file(), "a missing package page is a warning, not a failure"
     assert "alpha" in result.stderr
 
@@ -223,9 +228,168 @@ def test_an_empty_findings_file_is_not_a_crash(run_script, sized_repo, tmp_path)
     empty.write_text("")
     out = sized_repo.path / "src/app/docs/health.html"
     result = run_script(BUILD_HEALTH, "--out", out, "--findings", empty,
-                        "--repo", sized_repo.path, "--name", "app", "--root-dir", "src/app")
+                        "--repo", sized_repo.path, "--name", "app", "--root-dir", "src/app",
+                        "--doctor", "python-code-doctor")
     assert "empty" in result.stderr
     assert read_meta(out)["findings_total"] == 0
+
+
+def test_no_recognized_doctor_grades_nothing(run_script, sized_repo):
+    """The one output this must never produce is an A+ for an unread language."""
+    report = sized_repo.path / "findings.json"
+    report.write_text("[]")
+    out = sized_repo.path / "src/app/docs/health.html"
+    result = run_script(BUILD_HEALTH, "--out", out, "--findings", report,
+                        "--repo", sized_repo.path, "--name", "app", "--root-dir", "src/app",
+                        "--language", "go")
+    meta = read_meta(out)
+    assert meta["score"] is None
+    assert meta["grade"] == "—"
+    assert set(meta["ungraded"]) == {row["key"] for row in meta["categories"]}
+    assert "no coverage profile" in result.stderr
+    assert "--assume-full-coverage" in result.stderr, "the warning has to name the override"
+
+
+def test_assume_full_coverage_is_the_deliberate_override(run_script, sized_repo):
+    report = sized_repo.path / "findings.json"
+    report.write_text("[]")
+    out = sized_repo.path / "src/app/docs/health.html"
+    run_script(BUILD_HEALTH, "--out", out, "--findings", report, "--repo", sized_repo.path,
+               "--name", "app", "--root-dir", "src/app", "--assume-full-coverage")
+    meta = read_meta(out)
+    assert meta["grade"] == "A+"
+    assert meta["ungraded"] == []
+
+
+def test_a_skipped_analyzer_is_ungraded_not_clean(run_script, sized_repo):
+    """--skip-duplicates is documented by the doctors, so this report is normal."""
+    report = sized_repo.path / "report.json"
+    report.write_text(json.dumps({
+        "meta": {"analyzers_skipped": ["duplicates"], "analyzer_errors": {}},
+        "categories": {"security": {"issues": [finding(severity="high")]}},
+    }), encoding="utf-8")
+    out = sized_repo.path / "src/app/docs/health.html"
+    run_script(BUILD_HEALTH, "--out", out, "--findings", report, "--repo", sized_repo.path,
+               "--name", "app", "--root-dir", "src/app", "--doctor", "python-code-doctor")
+    meta = read_meta(out)
+    assert meta["analyzers_skipped"] == ["duplicates"]
+    assert "duplication" in meta["ungraded"]
+    assert "Detectors that were not run" in out.read_text()
+
+
+def test_an_analyzer_missing_from_analyzers_run_counts_as_skipped(run_script, sized_repo):
+    report = sized_repo.path / "report.json"
+    report.write_text(json.dumps({
+        "meta": {"analyzers_run": ["security"]},
+        "categories": {"security": {"issues": []}, "duplicates": {"issues": []}},
+    }), encoding="utf-8")
+    out = sized_repo.path / "src/app/docs/health.html"
+    run_script(BUILD_HEALTH, "--out", out, "--findings", report, "--repo", sized_repo.path,
+               "--name", "app", "--root-dir", "src/app", "--doctor", "python-code-doctor")
+    assert "duplication" in read_meta(out)["ungraded"]
+
+
+def test_findings_outside_the_package_are_dropped_and_counted(run_script, sized_repo):
+    """The doctor runs from the repo root, so its report covers the whole tree."""
+    out = build(run_script, sized_repo, [
+        finding(file="src/app/mod0.py", category="security", severity="high"),
+        finding(file="src/other/thing.py", category="security", severity="high"),
+        finding(file=str(sized_repo.path / "src/app/mod1.py"), category="security"),
+    ])
+    meta = read_meta(out)
+    assert meta["findings_total"] == 2, "an absolute path inside the package still counts"
+    assert meta["findings_out_of_scope"] == 1
+    text = out.read_text()
+    assert "src/other/thing.py" not in text
+    assert "1 finding(s) in the report were about code outside" in text, (
+        "a dropped finding has to be visible on the page, not only in the metadata"
+    )
+
+
+def test_scope_can_be_named_separately_from_the_measured_roots(run_script, sized_repo):
+    out = build(run_script, sized_repo,
+                [finding(file="src/app/mod0.py"), finding(file="src/other/x.py")],
+                "--scope", "src")
+    assert read_meta(out)["findings_out_of_scope"] == 0
+
+
+def test_the_root_grade_is_sized_over_the_mapped_packages_only(run_script, repo):
+    """Unassigned code must not pad the denominator it contributes no findings to."""
+    for module in range(3):
+        repo.write(f"src/app/m{module}.py", "\n".join(f"x{i}=1" for i in range(300)))
+    for module in range(20):
+        repo.write(f"legacy/old{module}.py", "\n".join(f"y{i}=1" for i in range(300)))
+    repo.write("docs/code-overview.json", json.dumps({
+        "schema": "code-overview/1",
+        "packages": [{"name": "app", "roots": ["src/app"], "docs": "src/app/docs",
+                      "language": "python", "doctor": "python-code-doctor"}],
+    }))
+    repo.commit("init")
+    report = repo.path / "f.json"
+    report.write_text(json.dumps(
+        [finding(file="src/app/m0.py", category="security", severity="high")] * 5))
+    out = repo.path / "docs/health.html"
+    run_script(BUILD_HEALTH, "--root", "--out", out, "--map", repo.path / "docs/code-overview.json",
+               "--findings", report, "--repo", repo.path, "--name", "whole-repo",
+               "--doctor", "python-code-doctor")
+    meta = read_meta(out)
+    assert meta["roots"] == ["src/app"]
+    whole_repo_loc = 23 * 300
+    assert meta["size"]["loc"] < whole_repo_loc / 2, (
+        "the unmapped legacy/ tree would otherwise dilute the density it never contributed to"
+    )
+
+
+def test_the_by_type_table_agrees_with_the_category_scores(run_script, sized_repo):
+    """`bare_except` comes from code_smells → Complexity, and re-deriving it from
+    the type token alone would land it in Hygiene."""
+    out = build(run_script, sized_repo,
+                [finding(category="code_smells", smell_type="bare_except", severity="high")])
+    text = out.read_text()
+    table = text.split("Findings by type", 1)[1]
+    assert "bare_except" in table
+    row = table.split("bare_except", 1)[1][:300]
+    assert "Complexity" in row
+    assert "Dependencies" not in row
+    complexity = next(r for r in read_meta(out)["categories"] if r["key"] == "complexity")
+    assert complexity["findings"]["total"] == 1
+
+
+def test_a_root_collapsed_package_is_not_listed_as_its_own(run_script, repo):
+    repo.write("m.py", "x = 1\n")
+    repo.write("docs/code-overview.json", json.dumps({
+        "schema": "code-overview/1",
+        "packages": [{"name": "whole", "roots": ["."], "docs": "docs"}],
+    }))
+    repo.commit("init")
+    report = repo.path / "f.json"
+    report.write_text("[]")
+    out = repo.path / "docs/health.html"
+    run_script(BUILD_HEALTH, "--root", "--out", out, "--map", repo.path / "docs/code-overview.json",
+               "--findings", report, "--repo", repo.path, "--name", "whole-repo",
+               "--doctor", "python-code-doctor")
+    assert read_meta(out).get("packages") is None, (
+        "the package's documents are the repo's; a table row would link this page to itself"
+    )
+
+
+def test_duplicate_package_names_are_rejected(run_script, repo):
+    repo.write("m.py", "x = 1\n")
+    repo.write("docs/code-overview.json", json.dumps({
+        "schema": "code-overview/1",
+        "packages": [
+            {"name": "api", "roots": ["services/a"], "docs": "services/a/docs"},
+            {"name": "api", "roots": ["services/b"], "docs": "services/b/docs"},
+        ],
+    }))
+    repo.commit("init")
+    report = repo.path / "f.json"
+    report.write_text("[]")
+    result = run_script(BUILD_HEALTH, "--root", "--out", repo.path / "docs/health.html",
+                        "--map", repo.path / "docs/code-overview.json", "--findings", report,
+                        "--repo", repo.path, "--name", "whole-repo", expect_rc=1)
+    assert "two packages named 'api'" in result.stderr
+    assert "unique" in result.stderr
 
 
 def test_malformed_findings_fail_loudly(run_script, sized_repo, tmp_path):

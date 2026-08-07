@@ -54,6 +54,13 @@ Ask about anything else the proposal cannot see: **a unit that spans folders**
 (a service plus the shared types only it uses; a Django app plus its templates
 directory) is one package with several `roots`, and only the user knows that.
 
+Two of its questions decide what a grade can mean, so do not skip them:
+`mixed-languages` (only the dominant language's doctor runs, while the other
+language's lines still swell the size the grade is divided by) and `no-doctor`
+(below). **Package names must be unique** — they are both the identity used to
+link the documents and the label a reader clicks — so if two manifests yield the
+same name, rename one when you write the map.
+
 Then write the confirmed map to `docs/code-overview.json` — the shape is in
 `references/doc-layout.md`. Everything downstream reads it.
 
@@ -61,7 +68,35 @@ Then write the confirmed map to `docs/code-overview.json` — the shape is in
 that appeared or vanished since. Re-litigating a settled package structure wastes
 the user's time and churns the documents.
 
-## 2. Per package
+## 2. Run the doctors once, from the repo root
+
+**Not once per package directory.** This is the step that is easy to get wrong
+and expensive to get wrong, because the failure is silent:
+
+```bash
+python "$DOCTOR/scripts/analyze_all.py" <repo> --format json > $WORK/findings.json
+```
+
+Pointed at `src/billing` instead, a doctor cannot see the repo's `pyproject.toml`
+or its top-level `tests/`, so it reports a missing dependency manifest and "no
+test files were found" — two fabricated findings, one of them high severity in
+the Tests category — about a project that has both. `django-code-doctor` is worse:
+its whole-project class graph is built from settings and `INSTALLED_APPS`, so an
+app directory alone yields a fraction of the real findings, and a package that
+isn't recognized as Django at all yields *none*, which grades as an A+.
+
+`analyze_django.py` for `django-code-doctor`. Run every doctor the map needs —
+one per language present — and keep each report; they all get passed along
+below. Do not pass `--skip`/`--skip-duplicates` unless you mean it: a skipped
+detector leaves its rubric category ungraded (which is correct, and lowers what
+the grade covers).
+
+**A Django project deserves both doctors.** `django-code-doctor` has no general
+duplication or dead-code detector, so on its own those categories come back
+ungraded. Run `python-code-doctor` over the repo too, pass both JSON files, and
+use `--doctor python-code-doctor` so the union is credited with full coverage.
+
+## 3. Per package
 
 For each package in the map, with `ROOTS` its roots and `DOCS` its docs dir:
 
@@ -72,30 +107,25 @@ package's inventory tab ends up describing its own documentation. Scale judgment
 tabs to size: a 400-line package may warrant the automated tabs only, and
 code-visualization's own proportion rule covers this.
 
-**The findings.**
-
-```bash
-python "$DOCTOR/scripts/analyze_all.py" <root> --format json > $WORK/<pkg>.json
-```
-
-`analyze_django.py` for `django-code-doctor`. For a multi-root package, run the
-doctor once per root and pass every file to `--findings`.
-
-**A Django app deserves both doctors.** `django-code-doctor` has no general
-duplication or dead-code detector, so on its own those categories come back
-ungraded. Run `python-code-doctor` over the same roots too, pass both JSON files,
-and use `--doctor python-code-doctor` so the union is credited with full
-coverage.
-
-**The grade.**
+**The grade.** The repo-wide findings are partitioned by path, so each package's
+page carries only findings about its own code:
 
 ```bash
 python "$SKILL/scripts/build_health.py" --out <DOCS>/health.html --repo <repo> \
-  --findings $WORK/<pkg>.json --name <pkg> --root-dir <root> \
+  --findings $WORK/findings.json --name <pkg> --root-dir <root> \
   --language python --doctor python-code-doctor
 ```
 
-Repeat `--root-dir` for each root. It prints the grade to stderr.
+`--scope` defaults to the `--root-dir` values, so a multi-root package
+(repeat `--root-dir`) keeps exactly its own findings. The count dropped as
+out-of-scope is printed to stderr and recorded in the metadata — it should
+roughly account for the rest of the repo, and if it accounts for *everything*
+the paths don't line up.
+
+**`--doctor` is not optional.** It is how the page knows which rubric categories
+the findings could have covered. Name a doctor with no coverage profile — or
+none at all — and every category comes back ungraded rather than scoring an
+unread language A+. `--assume-full-coverage` is the deliberate override.
 
 **The summary.** Write a short HTML fragment first — what this package is, why it
 is shaped this way, what you noticed reading it — and pass it as `--intro-file`.
@@ -112,21 +142,23 @@ python "$SKILL/scripts/build_summary.py" --out <DOCS>/summary.html --repo <repo>
 It reads the grade back out of `health.html` rather than being told it, so the
 two documents cannot disagree.
 
-## 3. The repo level
+## 4. The repo level
 
 Same three documents, one scope up.
 
 - **Atlas**: a genuine repo-wide `code-visualization` run into `docs/codemap.html`.
   Cross-package coupling and cycles only exist at this scope, so this is not a
   collation of the package atlases.
-- **Health**: `build_health.py --root --map docs/code-overview.json`, passing
-  **every** package's findings file plus any repo-wide-only run. The root grade is
-  recomputed from the union over total LOC — the same measurement as a package
-  grade, and comparable to one, rather than an average of averages. It reads each
-  package's `health.html` for the grade table, so build those first.
+- **Health**: `build_health.py --root --map docs/code-overview.json`, passing every
+  doctor's findings file. The root grade is recomputed from the union rather than
+  averaged from package grades, so it is the same measurement as a package grade
+  and comparable to one. With `--map` and no explicit `--root-dir`, it is sized
+  over the union of the mapped packages' roots — code the user chose to leave
+  unassigned contributes no findings, so it must not pad the denominator either.
+  It reads each package's `health.html` for the grade table, so build those first.
 - **Summary**: `build_summary.py --root --map docs/code-overview.json`.
 
-## 4. Navigation, last
+## 5. Navigation, last
 
 ```bash
 python "$SKILL/scripts/inject_nav.py" --map docs/code-overview.json --repo <repo>
@@ -144,18 +176,20 @@ what it names.
 Doctors ship for Python, Django, and TypeScript. For anything else — Go, Rust,
 plain JS, Java, a mixed package — **ask the user** which they want:
 
-- **Codemap plus an ungraded health page.** Build `health.html` from
-  language-agnostic signals only and let the rubric mark every category ungraded.
-  The package appears in the roll-up as ungraded rather than dragging the
-  average down with a fabricated F.
+- **Codemap plus an ungraded health page.** Build `health.html` with `--doctor`
+  naming whatever produced the findings (or nothing at all): with no coverage
+  profile, every category comes back ungraded and the score is null. The package
+  appears in the roll-up as ungraded rather than dragging the average down with a
+  fabricated F — or, worse, floating it with a fabricated A+.
 - **Codemap only.** No `health.html`; the nav drops the link and the summary says
   why.
 - **The closest doctor anyway.** Sometimes right for a JS package with no
   TypeScript. Record it in the metadata via `--doctor` and say so on the page.
 
 What is never acceptable is a grade computed from a doctor that could not read
-the language. An empty findings list from a doctor that parsed nothing is an
-A+, and that is a lie.
+the language. An empty findings list from a doctor that parsed nothing would be
+an A+, and that is a lie — which is why an unrecognized `--doctor` grades
+nothing at all rather than everything.
 
 ## Quality bar
 
@@ -164,8 +198,13 @@ A+, and that is a lie.
   score A- and still be architecturally wrong — which is exactly why
   `summary.html` links the code map beside it.
 - **Ungraded is not zero and not a hundred.** A category nothing measured is
-  dropped from the mean and named on the page. Same for a detector that crashed:
-  its zero count means *unknown*, not *clean*.
+  dropped from the mean and named on the page. Same for a detector that crashed,
+  one that was skipped, and one that never ran: their zero counts mean *unknown*,
+  not *clean*.
+- **Findings and the lines they are divided by must cover the same code.** That
+  is what `--scope` and the root's map-derived sizing are for. Grading a package
+  over findings from elsewhere, or over lines nothing analyzed, produces a number
+  that looks like the others and means something different.
 - **Every document is generated, never hand-edited.** Fix the input and re-run.
 - **No dangling links.** `inject_nav.py --check` exits 0 or the set is not done.
 - **Say what was skipped.** Packages you did not build, a doctor that was

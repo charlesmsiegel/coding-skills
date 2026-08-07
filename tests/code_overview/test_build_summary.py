@@ -129,6 +129,25 @@ def test_the_root_portal_lists_every_package(run_script, graded):
     assert "the whole repository" in text
 
 
+def test_the_root_portal_omits_a_root_collapsed_package(run_script, repo):
+    """Single-package repo: the package's documents *are* the repo's."""
+    repo.write("m.py", "x = 1\n")
+    repo.write("docs/code-overview.json", json.dumps({
+        "schema": "code-overview/1",
+        "packages": [{"name": "whole", "roots": ["."], "docs": "docs",
+                      "language": "python", "doctor": "python-code-doctor"}],
+    }))
+    repo.commit("init")
+    out = repo.path / "docs/summary.html"
+    run_script(BUILD_SUMMARY, "--root", "--out", out, "--repo", repo.path,
+               "--name", "whole-repo", "--map", repo.path / "docs/code-overview.json")
+    text = out.read_text()
+    assert "<h2>Packages</h2>" not in text, (
+        "advertising a package document set that is this very page misleads the reader"
+    )
+    assert 'href="summary.html"' not in text, "and it must not link back to itself"
+
+
 def test_prose_is_html_escaped_where_it_is_not_meant_to_be_html(run_script, graded):
     text = build(run_script, graded, "--highlight", "<img src=x onerror=alert(1)>").read_text()
     assert "<img src=x" not in text

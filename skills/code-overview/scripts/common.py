@@ -65,24 +65,29 @@ def warn(message: str) -> None:
 # findings
 # --------------------------------------------------------------------------
 
-def normalize_findings(data) -> tuple[list[dict], dict[str, str]]:
-    """Flatten any doctor's JSON into (findings, analyzer_errors).
+def normalize_findings(data) -> tuple[list[dict], dict[str, str], set[str]]:
+    """Flatten any doctor's JSON into (findings, analyzer_errors, analyzers_skipped).
 
     Three shapes in the wild: analyze_all.py's report (`categories` mapping),
     a single detector's `{"issues": [...]}`, and django-code-doctor's flat list.
-    `analyzer_errors` matters as much as the findings — a category that crashed
-    reports zero, and zero from a crashed detector means *unknown*, not *clean*.
+
+    The two non-finding values matter as much as the findings, for the same
+    reason: an analyzer that crashed and an analyzer that was never run both
+    report zero, and zero from an analyzer that did not look means *unknown*,
+    not *clean*. `--skip-duplicates` is advertised by the doctors as the way to
+    skip the slowest detector, so a report missing a whole category is a normal
+    thing to be handed, not a corrupt one.
     """
     findings: list[dict] = []
     errors: dict[str, str] = {}
+    skipped: set[str] = set()
 
     if isinstance(data, list):
         findings = [item for item in data if isinstance(item, dict)]
     elif isinstance(data, dict):
-        errors = {
-            str(k): str(v)
-            for k, v in (data.get("meta", {}).get("analyzer_errors") or {}).items()
-        }
+        meta = data.get("meta", {}) if isinstance(data.get("meta"), dict) else {}
+        errors = {str(k): str(v) for k, v in (meta.get("analyzer_errors") or {}).items()}
+        skipped = {str(name) for name in (meta.get("analyzers_skipped") or [])}
         categories = data.get("categories")
         if isinstance(categories, dict):
             for name, payload in categories.items():
@@ -91,18 +96,30 @@ def normalize_findings(data) -> tuple[list[dict], dict[str, str]]:
                     if isinstance(issue, dict):
                         issue.setdefault("category", name)
                         findings.append(issue)
+            # An analyzer the report names as run-or-skipped but never lists is
+            # also absent. `analyzers_run` is the authoritative list.
+            ran = meta.get("analyzers_run")
+            if isinstance(ran, list) and ran:
+                skipped |= {name for name in categories if name not in set(ran)}
         elif isinstance(data.get("issues"), list):
             findings = [item for item in data["issues"] if isinstance(item, dict)]
 
     for finding in findings:
         finding.setdefault("severity", "medium")
-    return findings, errors
+    return findings, errors, skipped
 
 
-def load_findings(paths) -> tuple[list[dict], dict[str, str]]:
-    """Read and merge several findings files. `-` reads stdin."""
+def load_findings(paths) -> tuple[list[dict], dict[str, str], set[str]]:
+    """Read and merge several findings files. `-` reads stdin.
+
+    Skipped analyzers intersect rather than union across files: running the
+    Python doctor with `--skip-duplicates` and the Django doctor beside it
+    leaves duplication covered by neither, but a category one report skipped and
+    another covered is covered.
+    """
     findings: list[dict] = []
     errors: dict[str, str] = {}
+    skipped: set[str] | None = None
     for raw in paths:
         text = sys.stdin.read() if str(raw) == "-" else Path(raw).read_text(encoding="utf-8")
         if not text.strip():
@@ -112,10 +129,35 @@ def load_findings(paths) -> tuple[list[dict], dict[str, str]]:
             data = json.loads(text)
         except json.JSONDecodeError as exc:
             raise SystemExit(f"error: {raw} is not valid JSON: {exc}") from exc
-        part, part_errors = normalize_findings(data)
+        part, part_errors, part_skipped = normalize_findings(data)
         findings.extend(part)
         errors.update(part_errors)
-    return findings, errors
+        skipped = part_skipped if skipped is None else (skipped & part_skipped)
+    return findings, errors, skipped or set()
+
+
+def within(path: str, roots: list[Path], base: Path) -> bool:
+    """Is `path` inside any of `roots`? Used to partition repo-wide findings.
+
+    A relative path is resolved against `base`, not the working directory: the
+    doctors echo back whatever path they were invoked with, so a findings file
+    can hold either form, and resolving a repo-relative path against wherever
+    this script happens to be running would put every finding out of scope.
+    """
+    if not path:
+        return False
+    try:
+        candidate = Path(path)
+        resolved = (candidate if candidate.is_absolute() else Path(base) / candidate).resolve()
+    except (OSError, ValueError):
+        return False
+    for root in roots:
+        try:
+            resolved.relative_to(Path(root).resolve())
+            return True
+        except ValueError:
+            continue
+    return False
 
 
 # --------------------------------------------------------------------------
@@ -238,11 +280,40 @@ def load_map(path) -> dict:
     packages = data.get("packages")
     if not isinstance(packages, list):
         raise SystemExit(f"error: {path} has no `packages` list")
+    seen: set[str] = set()
     for package in packages:
         if not package.get("name") or not package.get("roots"):
             raise SystemExit(f"error: {path} has a package with no name or no roots: {package!r}")
+        # The name is both the identity used to match packages across scripts and
+        # the label a reader clicks in the nav. Two packages called `api` — easy
+        # to get from two manifests — would silently lose every link between
+        # them and could point a grade row at the wrong package, so this is
+        # rejected rather than worked around.
+        if package["name"] in seen:
+            raise SystemExit(
+                f"error: {path} has two packages named {package['name']!r} — names are the "
+                "identity used to link documents together and the label a reader sees, so "
+                "they have to be unique; rename one (e.g. to its path)"
+            )
+        seen.add(package["name"])
         package.setdefault("docs", str(Path(package["roots"][0]) / "docs"))
     return data
+
+
+def is_root_collapsed(repo: Path, package: dict) -> bool:
+    """Does this package's document set *are* the repo's?
+
+    True for the documented single-package map (`roots: ["."]`, `docs: "docs"`).
+    There is no package layer in that case, so every place that renders a
+    package list has to leave it out or the portal claims a second document set
+    that does not exist and links rows back to themselves.
+    """
+    return (Path(repo) / package.get("docs", "")).resolve() == (Path(repo) / "docs").resolve()
+
+
+def listed_packages(repo: Path, packages: list[dict]) -> list[dict]:
+    """Packages that genuinely have their own document set."""
+    return [p for p in packages if not is_root_collapsed(repo, p)]
 
 
 def save_map(path, data: dict) -> None:

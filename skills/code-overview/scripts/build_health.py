@@ -34,11 +34,15 @@ import sys
 from pathlib import Path
 
 import rubric
-from common import (HEALTH_SCHEMA, doc_path, esc, git_sha, json_block, load_findings,
-                    load_map, measure, read_asset, read_meta, rel_href, render, warn)
+from common import (HEALTH_SCHEMA, doc_path, esc, git_sha, json_block, listed_packages,
+                    load_findings, load_map, measure, read_asset, read_meta, rel_href,
+                    render, warn, within)
 
 SEVERITY_ORDER = ("high", "medium", "low")
 SEVERITY_ICONS = {"high": "🔴", "medium": "🟡", "low": "🟢"}
+
+# Distinct from an empty set, which means "this analysis covered nothing".
+GRADE_EVERYTHING = object()
 
 
 def grade_class(grade: str) -> str:
@@ -47,17 +51,20 @@ def grade_class(grade: str) -> str:
     return "g-" + grade[0].lower()
 
 
-def score_categories(findings: list[dict], loc: int, covered: set[str] | None) -> dict:
+def score_categories(findings: list[dict], loc: int, covered) -> dict:
     """Bucket findings by rubric category and score each one.
 
-    `covered` names the categories the doctor is actually capable of reporting.
-    A category outside it comes back ungraded — a doctor that has no duplication
-    detector must not hand out a free 100 for duplication.
+    `covered` names the categories this analysis was capable of reporting;
+    `GRADE_EVERYTHING` means all of them. A category outside it comes back
+    ungraded — a doctor with no duplication detector must not hand out a free
+    100 for duplication, and neither must a detector that was skipped, crashed,
+    or never ran at all.
     """
     buckets: dict[str, list[dict]] = {key: [] for key in rubric.CATEGORY_KEYS}
     unmapped: set[str] = set()
     for finding in findings:
         category, matched = rubric.categorize(finding)
+        finding["_rubric_category"] = category
         buckets[category].append(finding)
         if not matched:
             unmapped.add(rubric.finding_type(finding))
@@ -71,7 +78,7 @@ def score_categories(findings: list[dict], loc: int, covered: set[str] | None) -
         weighted = sum(rubric.severity_weight(f.get("severity", "medium")) for f in bucket)
         density = rubric.density(weighted, loc)
 
-        graded = covered is None or key in covered
+        graded = covered is GRADE_EVERYTHING or key in covered
         score = rubric.score_from_density(density, half_life) if graded else None
         scores[key] = score
         rows.append({
@@ -193,15 +200,27 @@ def render_top_findings(items: list[dict]) -> str:
 
 
 def render_by_type(findings: list[dict], limit: int = 25) -> str:
+    """Counts per finding type, carrying the category each was actually scored under.
+
+    The category has to come from the finding, not be re-derived from the type
+    token: `bare_except` arrives from the `code_smells` detector and is scored
+    under Complexity, but the token alone matches no rubric keyword and would
+    re-derive as Hygiene — so a rebuilt category would make this table
+    contradict the scores directly above it.
+    """
     counts: dict[str, int] = {}
+    categories: dict[str, str] = {}
     for finding in findings:
-        counts[rubric.finding_type(finding)] = counts.get(rubric.finding_type(finding), 0) + 1
+        name = rubric.finding_type(finding)
+        counts[name] = counts.get(name, 0) + 1
+        categories.setdefault(
+            name, finding.get("_rubric_category") or rubric.categorize(finding)[0])
     if not counts:
         return ""
     ordered = sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))[:limit]
     rows = "".join(
-        f'<tr><td><code>{esc(name)}</code></td>'
-        f'<td>{esc(rubric.CATEGORY_LABELS.get(rubric.categorize({"type": name})[0], ""))}</td>'
+        f'<tr><td><code class="ftype">{esc(name)}</code></td>'
+        f'<td class="cat">{esc(rubric.CATEGORY_LABELS.get(categories[name], ""))}</td>'
         f'<td class="num">{count}</td></tr>'
         for name, count in ordered
     )
@@ -241,14 +260,25 @@ def render_package_table(packages: list[dict], links: dict[str, str]) -> str:
             + "".join(rows) + "</tbody></table></div>")
 
 
-def render_caveats(errors: dict[str, str], unmapped: list[str], ungraded: list[str],
-                   notes: list[str]) -> str:
+def render_caveats(errors: dict[str, str], skipped: set[str], unmapped: list[str],
+                   ungraded: list[str], notes: list[str], out_of_scope: int,
+                   roots: list[str]) -> str:
     parts = []
+    if out_of_scope:
+        listed = ", ".join(f"<code>{esc(r)}</code>" for r in roots)
+        parts.append(f'<div class="callout">{out_of_scope} finding(s) in the report were about '
+                     f"code outside {listed} and are not counted here. That keeps the findings "
+                     "and the lines they are divided by describing the same code; if some of "
+                     "that code should be graded, add it to the package map.</div>")
     if errors:
         listed = ", ".join(f"<code>{esc(k)}</code>" for k in sorted(errors))
         parts.append('<div class="callout bad"><strong>Detectors that did not complete:</strong> '
                      f"{listed}. A zero count in those categories means <em>unknown</em>, "
                      "not clean — the grade is an upper bound.</div>")
+    if skipped:
+        listed = ", ".join(f"<code>{esc(k)}</code>" for k in sorted(skipped))
+        parts.append('<div class="callout warn"><strong>Detectors that were not run:</strong> '
+                     f"{listed}. Their rubric categories are ungraded rather than clean.</div>")
     if ungraded:
         listed = ", ".join(esc(rubric.CATEGORY_LABELS.get(k, k)) for k in ungraded)
         parts.append('<div class="callout warn"><strong>Ungraded categories:</strong> '
@@ -283,20 +313,67 @@ def headline_badges(meta: dict) -> str:
 # main
 # --------------------------------------------------------------------------
 
-def build(args, findings: list[dict], errors: dict[str, str]) -> tuple[str, dict]:
+def scoring_roots(args, repo: Path) -> list[str]:
+    """The code the grade is a claim about — repo-relative.
+
+    Findings and the LOC they are divided by have to cover the same code. At the
+    root that is the union of the mapped packages, not the whole checkout: when
+    the user deliberately leaves a directory unassigned, measuring `.` puts its
+    lines in the denominator while none of its findings are in the numerator,
+    which quietly improves the repo's grade in proportion to how much code was
+    left out.
+    """
+    if args.root_dir:
+        return list(args.root_dir)
+    if args.root and args.map:
+        roots = [root for package in load_map(args.map).get("packages", [])
+                 for root in package.get("roots", [])]
+        if roots and "." not in roots:
+            return sorted(set(roots))
+    return ["."]
+
+
+def resolve_coverage(args, errors: dict[str, str], skipped: set[str]):
+    """Which rubric categories this analysis is entitled to grade."""
+    if args.assume_full_coverage:
+        return GRADE_EVERYTHING
+
+    covered = rubric.DOCTOR_COVERAGE.get(args.doctor)
+    if covered is None:
+        # No known doctor produced these findings, so nothing here can be
+        # claimed as measured. An empty findings list from a doctor that could
+        # not read the language would otherwise render as an A+, which is the
+        # one output this skill must never produce.
+        warn(f"no coverage profile for doctor {args.doctor!r} — every category is ungraded. "
+             "Pass --assume-full-coverage if the findings really do cover the whole rubric, "
+             "or add the doctor to rubric.DOCTOR_COVERAGE.")
+        return set()
+
+    # An analyzer that crashed, was skipped, or never ran reported nothing, and
+    # nothing is not a clean bill of health.
+    absent = set(errors) | set(skipped)
+    return set(covered) - {rubric.DETECTOR_CATEGORIES[name]
+                           for name in absent if name in rubric.DETECTOR_CATEGORIES}
+
+
+def build(args, findings: list[dict], errors: dict[str, str], skipped: set[str]) -> tuple[str, dict]:
     repo = Path(args.repo).resolve()
-    roots = [repo / r for r in (args.root_dir or ["."])]
+    relative_roots = scoring_roots(args, repo)
+    roots = [repo / r for r in relative_roots]
     size = measure(roots) if args.loc is None else {"files": args.files or 0, "loc": args.loc}
 
-    covered = None if args.assume_full_coverage else rubric.DOCTOR_COVERAGE.get(args.doctor)
-    if args.doctor and covered is None and not args.assume_full_coverage:
-        warn(f"unknown doctor {args.doctor!r} — every category is being graded; pass "
-             "--assume-full-coverage to silence this, or add the doctor to rubric.DOCTOR_COVERAGE")
-    # A detector that crashed reported nothing; that category cannot be graded.
-    if errors and covered is not None:
-        covered = set(covered) - {rubric.DETECTOR_CATEGORIES[name]
-                                  for name in errors if name in rubric.DETECTOR_CATEGORIES}
+    # Keep only findings about the code this document is a claim about. The
+    # doctors are run from the repo root so they can see manifests, tests and
+    # settings; without that context they invent findings (a package with no
+    # manifest of its own reports a missing one) and miss real ones.
+    scope = [repo / s for s in (args.scope or relative_roots)]
+    out_of_scope = 0
+    if scope and [Path(s).resolve() for s in scope] != [repo]:
+        kept = [f for f in findings if within(str(f.get("file", "")), scope, repo)]
+        out_of_scope = len(findings) - len(kept)
+        findings = kept
 
+    covered = resolve_coverage(args, errors, skipped)
     scored = score_categories(findings, size["loc"], covered)
     packages = []
     links: dict[str, str] = {}
@@ -307,7 +384,7 @@ def build(args, findings: list[dict], errors: dict[str, str]) -> tuple[str, dict
         "schema": HEALTH_SCHEMA,
         "scope": "repository" if args.root else "package",
         "package": args.name,
-        "roots": args.root_dir or ["."],
+        "roots": relative_roots,
         "language": args.language,
         "doctor": args.doctor,
         "generated": args.date or dt.date.today().isoformat(),
@@ -319,6 +396,8 @@ def build(args, findings: list[dict], errors: dict[str, str]) -> tuple[str, dict
         "ungraded": scored["ungraded"],
         "unmapped_types": scored["unmapped_types"],
         "analyzer_errors": errors,
+        "analyzers_skipped": sorted(skipped),
+        "findings_out_of_scope": out_of_scope,
         "findings_total": len(findings),
         "findings_by_severity": {sev: sum(1 for f in findings if f.get("severity") == sev)
                                  for sev in SEVERITY_ORDER},
@@ -332,8 +411,8 @@ def build(args, findings: list[dict], errors: dict[str, str]) -> tuple[str, dict
         "GRADE_CLASS": grade_class(scored["grade"]),
         "SCORE": "—" if scored["score"] is None else f'{scored["score"]:.1f}',
         "SUBJECT": esc(args.name),
-        "SUBJECT_DETAIL": esc(", ".join(args.root_dir)
-                              or ("the whole repository" if args.root else ".")),
+        "SUBJECT_DETAIL": esc("the whole repository" if relative_roots == ["."]
+                              else ", ".join(relative_roots)),
         "HEADLINE_BADGES": headline_badges(meta),
         "UNGRADED_NOTE": ('<div class="callout warn">Nothing in this analysis could be graded — '
                           "the grade shown is a placeholder.</div>"
@@ -343,7 +422,8 @@ def build(args, findings: list[dict], errors: dict[str, str]) -> tuple[str, dict
         "FINDINGS_SUMMARY": render_findings_summary(findings),
         "TOP_FINDINGS": render_top_findings(meta["top_findings"]),
         "BY_TYPE": render_by_type(findings),
-        "CAVEATS": render_caveats(errors, scored["unmapped_types"], scored["ungraded"], args.note),
+        "CAVEATS": render_caveats(errors, skipped, scored["unmapped_types"],
+                                  scored["ungraded"], args.note, out_of_scope, relative_roots),
         "META_JSON": json_block(meta),
     })
 
@@ -373,7 +453,7 @@ def collect_packages(repo: Path, map_path: str | None, out: Path) -> tuple[list[
         return [], {}
     data = load_map(map_path)
     packages, links = [], {}
-    for package in data.get("packages", []):
+    for package in listed_packages(repo, data.get("packages", [])):
         health = doc_path(repo, package, "health")
         meta = read_meta(health)
         if meta is None:
@@ -400,7 +480,14 @@ def main(argv=None) -> int:
                         help="doctor JSON file; repeat to merge, '-' for stdin")
     parser.add_argument("--name", default="", help="package name (or repo name with --root)")
     parser.add_argument("--root-dir", action="append", default=[],
-                        help="package root, repo-relative; repeat for a multi-root package")
+                        help="package root, repo-relative; repeat for a multi-root package. "
+                             "With --root and --map, defaults to the union of the mapped "
+                             "packages' roots so findings and LOC cover the same code")
+    parser.add_argument("--scope", action="append", default=[],
+                        help="keep only findings under this repo-relative path (default: the "
+                             "root dirs). Lets the doctor run from the repo root — where it can "
+                             "see manifests, tests and settings — while this document stays "
+                             "about one package")
     parser.add_argument("--repo", default=".", help="repository root (default: .)")
     parser.add_argument("--language", default="")
     parser.add_argument("--doctor", default="", help="which doctor produced the findings")
@@ -416,7 +503,9 @@ def main(argv=None) -> int:
     parser.add_argument("--commit", default="", help="commit sha for the metadata")
     parser.add_argument("--date", default="", help="generation date (default: today)")
     parser.add_argument("--assume-full-coverage", action="store_true",
-                        help="grade every category even for a doctor with known blind spots")
+                        help="grade every category regardless of which doctor produced the "
+                             "findings; without it, an unrecognized --doctor leaves everything "
+                             "ungraded rather than scoring an unread language A+")
     args = parser.parse_args(argv)
 
     if not args.findings:
@@ -424,13 +513,15 @@ def main(argv=None) -> int:
     if not args.name:
         args.name = Path(args.repo).resolve().name if args.root else "package"
 
-    findings, errors = load_findings(args.findings)
-    page, meta = build(args, findings, errors)
+    findings, errors, skipped = load_findings(args.findings)
+    page, meta = build(args, findings, errors, skipped)
 
     out = Path(args.out)
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(page, encoding="utf-8")
-    print(f"{out}: {meta['grade']} ({meta['score']}) — {meta['findings_total']} finding(s)",
+    print(f"{out}: {meta['grade']} ({meta['score']}) — {meta['findings_total']} finding(s)"
+          + (f", {meta['findings_out_of_scope']} outside {', '.join(meta['roots'])}"
+             if meta["findings_out_of_scope"] else ""),
           file=sys.stderr)
     return 0
 

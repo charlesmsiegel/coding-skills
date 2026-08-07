@@ -70,18 +70,28 @@ categories are dropped and the remaining weights renormalized.
 
 ## Ungraded is not zero, and not a hundred
 
-A category comes back ungraded in three situations:
+A category comes back ungraded in five situations:
 
 1. **No detector covers it for this doctor.** `rubric.DOCTOR_COVERAGE` records
    this. `django-code-doctor` has no general duplication or dead-code detector,
    so duplication is ungraded for a Django app reviewed by it alone — it must
    not collect a free 100.
-2. **A detector crashed.** The doctors report those under
+2. **No known doctor produced the findings at all.** An unrecognized (or empty)
+   `--doctor` means *nothing* can be claimed as measured, so every category is
+   ungraded and the overall score is null. This is the case that matters most:
+   a doctor pointed at a language it cannot parse returns an empty findings
+   list, and an empty findings list graded as coverage is an A+. Pass
+   `--assume-full-coverage` to override deliberately.
+3. **A detector crashed.** The doctors report those under
    `meta.analyzer_errors`, and a zero count from a crashed detector means
    *unknown*. `build_health.py` drops the affected rubric category.
-3. **The artifact it needs is absent** — no coverage file, no manifest.
+4. **A detector was skipped or never ran.** `meta.analyzers_skipped`, plus any
+   category absent from `meta.analyzers_run`. `--skip-duplicates` is advertised
+   by the doctors as the way to skip the slowest detector, so being handed a
+   report missing a whole category is normal, not a corruption.
+5. **The artifact it needs is absent** — no coverage file, no manifest.
 
-All three land in `ungraded` in the metadata and in a callout on the page. The
+All five land in `ungraded` in the metadata and in a callout on the page. The
 only dishonest options are the two obvious ones: scoring 0 punishes a repo for
 a missing coverage artifact; scoring 100 rewards it for one.
 
@@ -89,6 +99,26 @@ Run a Django app through **both** `django-code-doctor` and `python-code-doctor`
 and pass both findings files to `build_health.py` — that is what closes the
 coverage gap. Pass `--doctor python-code-doctor` in that case, since the union
 covers every category.
+
+## What the grade is divided by
+
+Density is findings per KLOC, so the findings and the lines have to describe the
+same code or the number is meaningless in a way that is invisible on the page.
+Two mechanisms keep them aligned:
+
+- **`--scope`** (defaulting to `--root-dir`) drops findings about files outside
+  the package. The doctors are run from the repo root so they can see manifests,
+  tests and settings — without that context they *invent* findings, reporting a
+  missing manifest and "no test files found" for a package that has neither of
+  its own but sits in a project that has both. Running them where they can see
+  everything and partitioning by path afterwards is the only way to get both
+  correct findings and per-package numbers. The dropped count is recorded as
+  `findings_out_of_scope`.
+- **Root sizing from the map.** With `--root --map` and no explicit `--root-dir`,
+  the denominator is the union of the mapped packages' roots. When the user
+  answers the `unassigned` question with "leave it out", that code contributes no
+  findings; measuring the whole checkout anyway would improve the repo's grade in
+  direct proportion to how much code was excluded from analysis.
 
 ## Mapping a finding to a category
 

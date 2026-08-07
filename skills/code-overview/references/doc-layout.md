@@ -46,7 +46,14 @@ read by every later script:
 `roots` is a list because a unit is not always a directory: a Django app and its
 templates, a service and the shared types only it uses. Every path is
 repo-relative. `doctor` empty means no doctor ships for that language — the
-health page is built ungraded, or skipped, according to what the user chose.
+health page is then built with every category ungraded, or skipped entirely,
+according to what the user chose.
+
+**`name` must be unique across the map.** It is both the identity the scripts
+match packages by and the label a reader clicks in the nav, so two packages
+called `api` — easy to get from two manifests — would lose every link between
+them and could point a grade row at the wrong package. `load_map` rejects
+duplicates rather than guessing; rename one, usually to its path.
 
 `discover_packages.py` emits a superset of this shape: the same `packages` list
 plus `too_small`, `unassigned`, and `questions`. Strip those three when saving
@@ -98,7 +105,9 @@ Every `health.html` carries its numbers in machine-readable form:
 | `ungraded[]` | category keys that were not measured |
 | `unmapped_types[]` | finding types the rubric has no home for |
 | `analyzer_errors` | detector → error, from the doctor's own report |
-| `findings_total`, `findings_by_severity` | counts |
+| `analyzers_skipped[]` | detectors the doctor was told not to run, or that never ran |
+| `findings_out_of_scope` | findings dropped as being about code outside this unit |
+| `findings_total`, `findings_by_severity` | counts, after scoping |
 | `top_findings[]` | the worst N, with repo-relative paths |
 | `packages[]` | root scope only: one row per package, with its grade |
 
@@ -123,10 +132,18 @@ array is the whole table.
 The scripts read each other's output, so order matters:
 
 1. `discover_packages.py` → confirm with the user → save `docs/code-overview.json`
-2. per package: atlas → doctor findings → `build_health.py` → `build_summary.py`
-3. root: atlas → `build_health.py --root --map …` (reads every package
+2. **the doctors, once each, from the repo root** — not per package directory
+3. per package: atlas → `build_health.py` (partitions the repo-wide findings by
+   path) → `build_summary.py`
+4. root: atlas → `build_health.py --root --map …` (reads every package
    `health.html`) → `build_summary.py --root --map …`
-4. `inject_nav.py` (needs every document to exist, so it can skip what does not)
+5. `inject_nav.py` (needs every document to exist, so it can skip what does not)
+
+Step 2 is the one worth stating twice. A doctor pointed at a package directory
+loses the project context several of its detectors depend on — the dependency
+manifest, the test tree, Django's settings and app registry — and the result is
+not a smaller report but a *wrong* one: fabricated findings about a missing
+manifest and missing tests, alongside real findings it can no longer see.
 
 Running `build_health.py --root` before the package health pages exist is not an
 error — it warns per missing package and leaves them out of the table. Re-run it

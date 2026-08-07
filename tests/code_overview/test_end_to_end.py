@@ -41,10 +41,17 @@ def handle(items=[]):
 
 @pytest.fixture
 def monorepo(repo):
+    # A manifest and a shared test tree at the root, owned by no single package —
+    # exactly the context a doctor loses when it is pointed at one package dir.
+    repo.write("pyproject.toml", '[project]\nname = "platform"\ndependencies = ["requests"]\n')
     for package in PACKAGES:
         repo.write(f"src/{package}/__init__.py", "")
         repo.write(f"src/{package}/core.py", SOURCE)
         repo.write(f"src/{package}/util.py", "\n".join(f"x{i} = {i}" for i in range(200)))
+        repo.write(f"tests/test_{package}.py",
+                   f"from src.{package} import core, util\n\n\n"
+                   f"def test_handle():\n    assert core.handle([1]) == 1\n"
+                   f"    assert util is not None\n")
     repo.commit("init")
     return repo
 
@@ -77,17 +84,15 @@ def test_the_documented_pipeline_produces_a_navigable_set(run_script, monorepo, 
     map_path.parent.mkdir(parents=True, exist_ok=True)
     map_path.write_text(json.dumps({"schema": "code-overview/1", "packages": chosen}))
 
-    # 2. per package: atlas (stubbed), doctor, health, summary
-    reports = []
+    # 2. the doctor, ONCE, from the repo root — so it can see the manifest and
+    #    the shared tests/ tree that no single package owns.
+    report = tmp_path / "findings.json"
+    report.write_text(run_script(DOCTOR / "analyze_all.py", repo.path, "--format", "json").stdout)
+
+    # 3. per package: atlas (stubbed), health scoped to its roots, summary
     for package in chosen:
         docs = package["docs"]
         stub_atlas(repo, docs, f"{package['name']} — Codebase Atlas")
-        report = tmp_path / f"{package['name']}.json"
-        findings = run_script(DOCTOR / "analyze_all.py",
-                              repo.path / package["roots"][0], "--format", "json").stdout
-        report.write_text(findings)
-        reports.append(report)
-
         run_script(CO / "build_health.py", "--out", repo.path / docs / "health.html",
                    "--findings", report, "--repo", repo.path, "--name", package["name"],
                    "--root-dir", package["roots"][0], "--language", package["language"],
@@ -95,18 +100,15 @@ def test_the_documented_pipeline_produces_a_navigable_set(run_script, monorepo, 
         run_script(CO / "build_summary.py", "--out", repo.path / docs / "summary.html",
                    "--repo", repo.path, "--name", package["name"])
 
-    # 3. repo level
+    # 4. repo level
     stub_atlas(repo, "docs", "whole-repo — Codebase Atlas")
-    root_health_args = []
-    for report in reports:
-        root_health_args += ["--findings", report]
     run_script(CO / "build_health.py", "--root", "--out", repo.path / "docs/health.html",
                "--map", map_path, "--repo", repo.path, "--name", "whole-repo",
-               "--doctor", "python-code-doctor", *root_health_args)
+               "--doctor", "python-code-doctor", "--findings", report)
     run_script(CO / "build_summary.py", "--root", "--out", repo.path / "docs/summary.html",
                "--repo", repo.path, "--name", "whole-repo", "--map", map_path)
 
-    # 4. navigation, and the gate
+    # 5. navigation, and the gate
     run_script(CO / "inject_nav.py", "--map", map_path, "--repo", repo.path)
     check = run_script(CO / "inject_nav.py", "--map", map_path, "--repo", repo.path, "--check")
     assert "BROKEN LINK" not in check.stderr
@@ -153,6 +155,56 @@ def test_the_documented_pipeline_produces_a_navigable_set(run_script, monorepo, 
     assert root["grade"] not in {"A+", "A", "A-"}
     assert any(row["key"] == "security" and row["findings"]["total"] > 0
                for row in root["categories"])
+
+
+def test_repo_context_findings_beat_package_scoped_ones(run_script, monorepo, tmp_path):
+    """Why SKILL.md runs the doctors from the repo root, pinned as a test.
+
+    A doctor pointed at one package cannot see the root manifest or the shared
+    tests/ tree, so it fabricates findings about both. The failure is silent —
+    a plausible report, wrong in the Tests category, which carries 15% of the
+    grade — so it is worth an explicit regression test rather than a comment.
+    """
+    repo = monorepo
+    fabricated = {"no_tests_in_repo", "untested_module", "no_dependency_manifest"}
+
+    def types(*args):
+        findings = json.loads(run_script(DOCTOR / "analyze_all.py", *args,
+                                         "--format", "json").stdout)
+        return {issue.get("issue_type") or issue.get("smell_type") or issue.get("type")
+                for payload in findings["categories"].values()
+                for issue in payload["issues"]}
+
+    scoped = types(repo.path / "src/billing")
+    whole = types(repo.path)
+
+    assert scoped & fabricated, (
+        "the fixture has to actually reproduce the problem, or this test proves nothing"
+    )
+    assert not (whole & fabricated), (
+        "run from the root, the doctor sees pyproject.toml and tests/ and stops "
+        "inventing findings about their absence"
+    )
+
+
+def test_a_package_page_carries_only_its_own_findings(run_script, monorepo, tmp_path):
+    repo = monorepo
+    report = tmp_path / "findings.json"
+    report.write_text(run_script(DOCTOR / "analyze_all.py", repo.path, "--format", "json").stdout)
+    out = repo.path / "src/billing/docs/health.html"
+    run_script(CO / "build_health.py", "--out", out, "--findings", report, "--repo", repo.path,
+               "--name", "billing", "--root-dir", "src/billing", "--doctor", "python-code-doctor")
+
+    meta = read_meta(out)
+    assert meta["findings_out_of_scope"] > 0, "the shipping package's findings were in the report"
+    for item in meta["top_findings"]:
+        assert item["file"].startswith("src/billing/"), item["file"]
+    # Every *location* on the page is inside the package. Descriptions may still
+    # name another package — a duplicate block spanning the two is attributed to
+    # this one and says where its twin is, which is the point of the finding.
+    locations = re.findall(r'<code class="floc">([^<]+)</code>', out.read_text())
+    assert locations
+    assert all(loc.startswith("src/billing/") for loc in locations), locations
 
 
 def test_rebuilding_the_root_before_the_packages_warns_and_recovers(run_script, monorepo,
