@@ -286,3 +286,37 @@ def test_workspace_members_honour_exclusions(run_script, repo):
     assert "legacy-app" not in found, (
         "a workspace glob must not re-add a tree the caller excluded"
     )
+
+
+def test_a_repo_of_loose_scripts_still_gets_a_candidate(run_script, repo):
+    """Every other rule proposes a directory, so root-level code fell through.
+
+    Three standalone scripts with no manifest produced no candidate, nothing
+    too_small, nothing unassigned and no question — a proposal with nothing in
+    it and no way to ask about it.
+    """
+    for name in ("tool", "helper", "run"):
+        repo.write(f"{name}.py", "\n".join(f"x{i} = {i}" for i in range(120)))
+    repo.commit("init")
+    proposal = propose(run_script, repo)
+    assert len(proposal["packages"]) == 1
+    package = proposal["packages"][0]
+    assert package["roots"] == ["."]
+    assert package["doctor"] == "python-code-doctor"
+
+
+def test_loose_root_files_beside_real_packages_are_reported(run_script, repo):
+    """They belong to no directory, so the unassigned scan could not see them."""
+    for module in range(4):
+        repo.write(f"src/api/m{module}.py", "\n".join(f"x{i} = {i}" for i in range(200)))
+    repo.write("src/api/__init__.py", "")
+    repo.write("manage_stuff.py", "\n".join(f"y{i} = {i}" for i in range(90)))
+    repo.commit("init")
+    proposal = propose(run_script, repo)
+    assert "api" in names(proposal), "the real package is still found"
+    loose = [entry for entry in proposal["unassigned"] if entry["path"] == "."]
+    assert loose, "the root-level script has to be visible somewhere"
+    assert loose[0]["size"]["files"] == 1
+    assert not any(p["roots"] == ["."] for p in proposal["packages"]), (
+        "and it must not become a whole-repo package overlapping the real one"
+    )

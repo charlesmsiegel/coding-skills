@@ -121,12 +121,27 @@ def relativize(value: str, repo: Path) -> str:
     return str(value).replace(prefix, "").replace(str(repo), ".")
 
 
+def line_number(finding: dict) -> int:
+    """A finding's line as something sortable.
+
+    `.get("line", 0)` is not enough: a producer that emits `"line": null` for a
+    file-level finding returns None, and one None beside one int aborts the
+    whole page with a TypeError deep in `sorted`. `--covers` exists precisely so
+    tools this skill has never seen can be graded, so their fields cannot be
+    assumed well-typed.
+    """
+    try:
+        return int(finding.get("line") or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
 def top_findings(findings: list[dict], limit: int, repo: Path) -> list[dict]:
     ranked = sorted(
         findings,
         key=lambda f: (SEVERITY_ORDER.index(f.get("severity", "medium"))
                        if f.get("severity") in SEVERITY_ORDER else 1,
-                       str(f.get("file", "")), f.get("line", 0)),
+                       str(f.get("file", "")), line_number(f)),
     )
     out = []
     for finding in ranked[:limit]:
@@ -136,7 +151,7 @@ def top_findings(findings: list[dict], limit: int, repo: Path) -> list[dict]:
             "type": rubric.finding_type(finding),
             "category": category,
             "file": relativize(finding.get("file", ""), repo),
-            "line": finding.get("line", 0),
+            "line": line_number(finding),
             "description": relativize(str(finding.get("description", "")), repo)[:400],
             "suggestion": relativize(
                 str(finding.get("suggestion") or finding.get("after") or ""), repo)[:300],
@@ -331,7 +346,7 @@ def headline_badges(meta: dict) -> str:
 # main
 # --------------------------------------------------------------------------
 
-def scoring_roots(args, repo: Path) -> list[str]:
+def scoring_roots(args, repo: Path, rolled_up: list[dict] | None = None) -> list[str]:
     """The code the grade is a claim about — repo-relative.
 
     Findings and the LOC they are divided by have to cover the same code. At the
@@ -340,6 +355,13 @@ def scoring_roots(args, repo: Path) -> list[str]:
     lines in the denominator while none of its findings are in the numerator,
     which quietly improves the repo's grade in proportion to how much code was
     left out.
+
+    A package earns its place in the denominator by having been *analyzed*, and
+    the only proof of that is its own graded health page. Naming a doctor in the
+    map is an intention, not a result: a TypeScript package whose report never
+    arrived, or arrived empty from a failed run, has a doctor in the map and no
+    findings anywhere, so its lines are pure dilution. `rolled_up` carries the
+    package rows already read back from those health pages.
     """
     if args.root_dir:
         return list(args.root_dir)
@@ -350,11 +372,28 @@ def scoring_roots(args, repo: Path) -> list[str]:
         # Python density — far enough that an empty Python report could grade
         # A+ over the combined total.
         analyzed = [p for p in packages if p.get("doctor")]
-        skipped = [p["name"] for p in packages if not p.get("doctor")]
-        if skipped and analyzed:
+        doctorless = [p["name"] for p in packages if not p.get("doctor")]
+        if doctorless and analyzed:
             warn("packages with no doctor are excluded from the repo grade's size: "
-                 f"{', '.join(skipped)}. Their lines would dilute findings they cannot "
+                 f"{', '.join(doctorless)}. Their lines would dilute findings they cannot "
                  "contribute to; they still appear in the package table as ungraded.")
+
+        # Now narrow further to those whose health page exists and is graded.
+        # Before the package pages have been built there is nothing to narrow
+        # by — that is the documented "run --root again afterwards" case — so
+        # fall back to the doctored set rather than measuring nothing.
+        if rolled_up:
+            graded = {row["package"] for row in rolled_up if row.get("score") is not None}
+            evidenced = [p for p in analyzed if p["name"] in graded]
+            ungraded = [p["name"] for p in analyzed if p["name"] not in graded]
+            if evidenced and ungraded:
+                warn("packages with no graded health page are excluded from the repo "
+                     f"grade's size: {', '.join(sorted(ungraded))}. A doctor named in the "
+                     "map is an intention; only a graded health page is evidence the code "
+                     "was examined, and unexamined lines dilute every finding beside them.")
+            if evidenced:
+                analyzed = evidenced
+
         roots = [root for package in (analyzed or packages)
                  for root in package.get("roots", [])]
         if roots and "." not in roots:
@@ -392,6 +431,22 @@ def resolve_coverage(args, reports: list[dict]):
         if unknown:
             raise SystemExit(f"error: --covers names unknown categories: {', '.join(sorted(unknown))}")
         return named
+
+    # A failed run is evidence of a *gap*, and it outranks the evidence beside
+    # it. In the recommended Python+Django merge, a Django crash that leaves a
+    # zero-byte file still leaves the Python report full and clean, and every
+    # Python-profile category — which is all of them — would grade A+. But
+    # Django is what sees N+1 queries, missing CSRF tokens and insecure
+    # settings, so the categories Python "covered" were in fact half-measured.
+    # Nothing in the files says which doctor was supposed to write the empty
+    # one, so the gap cannot be subtracted from particular categories: the only
+    # honest answer is to grade none of them until someone says what ran.
+    if any(report.get("empty_artifact") for report in reports):
+        warn("a findings file is empty, which means a doctor failed rather than found "
+             "nothing — and nothing says which categories it was meant to cover, so none "
+             "are graded. Re-run the failed doctor, or pass --covers a,b,c to declare what "
+             "the surviving reports examined.")
+        return set()
 
     evidenced = [report for report in reports if report["shape"] == common.SHAPE_FULL]
     if evidenced:
@@ -433,7 +488,13 @@ def resolve_coverage(args, reports: list[dict]):
 def build(args, reports: list[dict], errors: dict[str, str],
           skipped: set[str]) -> tuple[str, dict]:
     repo = Path(args.repo).resolve()
-    relative_roots = scoring_roots(args, repo)
+    # Read the package roll-up first: at the root, which packages have a graded
+    # health page decides which roots may enter the denominator.
+    packages: list[dict] = []
+    links: dict[str, str] = {}
+    if args.root:
+        packages, links = collect_packages(repo, args.map, Path(args.out))
+    relative_roots = scoring_roots(args, repo, packages)
     roots = [repo / r for r in relative_roots]
 
     # A root that vanished between runs measures zero lines, and a clean report
@@ -478,7 +539,7 @@ def build(args, reports: list[dict], errors: dict[str, str],
     # templates. Each override replaces only its own field, so `--files` alone
     # and `--loc` alone both work; coupling them made one silently ignored and
     # the other zero out the count it did not set.
-    extensions = common.sizing_extensions(findings, args.include_extension)
+    extensions = common.sizing_extensions(findings, args.include_extension, args.doctor)
     size = measure(roots, extensions)
     if args.loc is not None:
         size["loc"] = args.loc
@@ -487,10 +548,6 @@ def build(args, reports: list[dict], errors: dict[str, str],
 
     covered = resolve_coverage(args, reports)
     scored = score_categories(findings, size["loc"], covered)
-    packages = []
-    links: dict[str, str] = {}
-    if args.root:
-        packages, links = collect_packages(repo, args.map, Path(args.out))
 
     meta = {
         "schema": HEALTH_SCHEMA,

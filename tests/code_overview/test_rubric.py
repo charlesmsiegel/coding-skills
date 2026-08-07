@@ -142,3 +142,32 @@ def test_no_smell_type_is_mapped_to_two_categories(rubric):
         for smell in smells:
             assert smell not in seen, f"{smell} is in both {seen.get(smell)} and {category}"
             seen[smell] = category
+
+
+def test_keywords_match_at_word_boundaries_only(rubric):
+    """`test` inside `latest` sent dependency findings to a 15%-weight category.
+
+    Worse than the miscategorization: the match reported as *successful*, so the
+    unmapped-type caveat never fired and nothing on the page hinted at it.
+    """
+    assert rubric.categorize({"type": "latest_dependency"}) == ("hygiene", True)
+    assert rubric.categorize({"type": "outdated_dependency"}) == ("hygiene", True)
+    # No keyword legitimately applies to these, so they must surface as gaps
+    # rather than being quietly filed under Tests.
+    for token in ("greatest_hits", "protest_handler", "contested_lock"):
+        category, matched = rubric.categorize({"type": token})
+        assert matched is False, f"{token} has no real keyword and must be reported unmapped"
+        assert category == rubric.FALLBACK_CATEGORY
+
+
+def test_keyword_prefixes_still_cover_their_family(rubric):
+    """Boundary matching must not cost the deliberate prefix keywords."""
+    expected = {
+        "test_smells": "tests", "no_tests_in_repo": "tests",
+        "complexity_high": "complexity", "too_many_arguments": "complexity",
+        "long_function": "complexity", "authentication_missing": "security",
+        "deprecated_call": "hygiene", "deprecation_warning": "hygiene",
+        "n_plus_one_query": "correctness", "mutation_hazard": "correctness",
+    }
+    for token, category in expected.items():
+        assert rubric.categorize({"type": token}) == (category, True), token
