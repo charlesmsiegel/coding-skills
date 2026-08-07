@@ -273,8 +273,15 @@ def collect(ctx):
                 "that it is a template method pattern you are fighting.",
                 "medium"))
 
-        # A viewset or detail view that never scopes its queryset to the caller.
+        # A view that never scopes its queryset to the caller.
+        #
+        # DRF viewsets are deliberately left to find_drf_issues: it reports the
+        # same gap as unscoped_viewset_queryset, knows about permission classes
+        # and DEFAULT_PERMISSION_CLASSES, and gives advice specific to DRF. Two
+        # findings for one problem is how a report starts getting skimmed.
         is_viewset = bool(set(info.bases) & VIEWSET_BASES) or ctx.derives_from(name, VIEWSET_BASES)
+        if is_viewset:
+            continue
         has_queryset_attr = "queryset" in info.assignments
         get_queryset = info.methods.get("get_queryset")
 
@@ -305,7 +312,7 @@ def collect(ctx):
                                       for k in ("permission_classes", "permission_required",
                                                 "raise_exception"))
             decorated = bool(set(info.decorators) & AUTH_DECORATORS)
-            if not has_permission_attr and not decorated and not is_viewset:
+            if not has_permission_attr and not decorated:
                 findings.append(finding(
                     info.file, info.line, "unauthenticated_mutation",
                     "`" + name + "` handles " + ", ".join(sorted(mutating)) + " and mixes in no "

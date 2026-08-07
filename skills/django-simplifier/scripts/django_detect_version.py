@@ -14,6 +14,7 @@ because a version-conditional finding built on a guess is worse than no
 finding at all.
 """
 
+import argparse
 import re
 import sys
 import tomllib
@@ -182,11 +183,18 @@ def detect_django_version(root):
 
 
 def main():
-    root = sys.argv[1] if len(sys.argv) > 1 else "."
-    version, source = detect_django_version(root)
+    parser = argparse.ArgumentParser(
+        prog="django_detect_version",
+        description="Report which Django version a project pins, and where the pin was read from")
+    parser.add_argument("path", nargs="?", default=".", help="Project root")
+    args = parser.parse_args()
+
+    version, source = detect_django_version(args.path)
+    # "unknown" is an answer, not a failure — the caller's job is to notice the
+    # word, and a non-zero exit would make an ordinary outcome look like a crash.
     if version is None:
-        print("Django version: unknown — " + source)
-        return 1
+        print("Django version: unknown - " + source)
+        return 0
     print("Django version: " + str(version[0]) + "." + str(version[1]) + "  (from " + source + ")")
     return 0
 

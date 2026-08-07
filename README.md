@@ -19,11 +19,18 @@ A repository of agentic skills to help with AI coding.
   `run_external_tools.py` drives `tsc`, ESLint, Biome, Prettier, madge, knip,
   `npm audit` and coverage when the project already has them — the compiler
   answers what a syntax scanner structurally cannot.
-- **[django-simplifier](skills/django-simplifier/)** — the Django-specific companion:
-  N+1 queries, per-row writes, model definition problems, missing object-level
-  authorization, insecure settings, queries hidden in templates, and abstractions that
-  never earned their keep. Detectors share one whole-project class graph and stay
-  silent outside Django projects.
+- **[django-simplifier](skills/django-simplifier/)** — the Django-specific companion,
+  and the one that also writes and upgrades. Fifteen detectors: N+1 queries and
+  per-row writes, model and migration problems, missing object-level authorization
+  (in views, DRF viewsets, and the admin alike), insecure settings, work hidden in
+  templates, form and admin traps, async and transaction-boundary bugs,
+  Django-shaped test smells, and abstractions that never earned their keep. It is
+  **version-aware across Django 4, 5, and 6** — a declarative change table plus
+  version detection from the project's manifests lets it derive severity from the
+  target and drive a 4→5→6 upgrade. `references/django-idioms.md` is prescriptive,
+  for writing new Django rather than reviewing old. Detectors share one
+  whole-project class graph, parse each file once, and stay silent outside Django
+  projects.
 - **[theory-building](skills/theory-building/)** — governs code being written *now*:
   state the theory, reuse before inventing, abstract over repetition, treat tests as a
   floor. Guides only, no scripts.
