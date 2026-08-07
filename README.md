@@ -57,6 +57,16 @@ mechanical.
 - **[fix-pr](skills/fix-pr/)** — work through review feedback.
   `fetch_pr_feedback.py` pulls inline threads with their resolved state, which
   `gh pr view` cannot show. Complying with a wrong suggestion counts as a failure.
+- **[science-investigation](skills/science-investigation/)** — audits whether a system's
+  numbers can be believed: is the right thing measured, on enough real data, with sound
+  statistics, and does the reported score mean what the dashboard claims. A system can be
+  fully tested and still have measurement that means nothing, and that gap is invisible to
+  every other skill here. Sharpest on LLM systems (judge confound, prompt and
+  model-version drift, silent fail-soft, contamination, RAG's two failure surfaces).
+  Four stdlib scripts enumerate metrics and thresholds, count labeled examples, find
+  default-off flags and swallowed errors, and trace one threshold across the tree — each
+  emitting a headline, a caveat, and rows explicitly marked as candidates to confirm by
+  reading. It reports; it does not fix.
 - **[update-docs](skills/update-docs/)** — build or refresh a project's own
   documentation skill. `check_doc_staleness.py` checks citations against the tree and
   infers missing coverage from churn.
@@ -96,7 +106,7 @@ python tools/validate_skills.py     # frontmatter, naming, description limit, ev
 ```
 
 `tools/validate_skills.py` is the single definition of a structurally valid skill:
-CI runs it over all ten on every pull request, and the release job runs it on the
+CI runs it over all eleven on every pull request, and the release job runs it on the
 one skill it is about to package. It is stdlib-only, like the detectors, so it runs
 wherever the skills do. Its own rules are tested against deliberately-invalid skills
 in `tests/test_validate_skills.py` — a validator that cannot fail reads as coverage

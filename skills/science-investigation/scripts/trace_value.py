@@ -1,0 +1,187 @@
+#!/usr/bin/env python3
+"""Trace one threshold or one metric name across the whole tree.
+
+Two questions this answers that a plain grep does not:
+
+  - **Does this threshold have one meaning?** `0.7` written as a constant in one
+    file and as a literal in three comparisons elsewhere is four independent
+    values that look like one. Changing the constant moves nothing.
+  - **Does this name mean one thing?** `quality_score` defined under `evaluation/`
+    and again under `experiments/` is the two-systems-one-name trap: two
+    measurement systems, different populations, one word, and someone will cite
+    the wrong one to settle a question only the other could answer.
+
+Hits are classified as definitions, comparisons, config, docs, and tests, because
+the mix is the finding: many comparisons and no definition means the value is
+repeated at the point of use.
+
+Usage:
+  python trace_value.py 0.7 .
+  python trace_value.py quality_score . --format json
+  python trace_value.py 'p9[59]' . --regex
+"""
+
+import re
+import sys
+import argparse
+from pathlib import Path
+
+from common import (
+    CODE_SUFFIXES, CONFIG_SUFFIXES, DOC_SUFFIXES, add_common_args, candidate,
+    configure_output, emit, envelope, iter_files, read_lines, rel,
+)
+
+_NUMERIC_RE = re.compile(r"^-?\d+(?:\.\d+)?$")
+_ASSIGN_RE = re.compile(r"(?<![=!<>+\-*/])=(?!=)")
+_COMPARE_RE = re.compile(r"(?:>=|<=|==|!=|>|<)")
+# The needle is the thing being assigned: `quality_score = ...` / `quality_score: number =`
+_TARGET_RE = re.compile(r"^\s*(?::[^=\n]+?)?(?<![=!<>+\-*/])=(?!=)")
+# ...or the thing being declared: `def quality_score(`, `const quality_score`
+_DECLARE_RE = re.compile(r"\b(?:def|function|func|fn|class|const|let|var)\s+$")
+
+CONFIRM = {
+    "definition": "confirm this is the source of truth, and that the other sites read it rather than repeat it",
+    "comparison": "confirm what decision this gates and that it means the same thing as the other sites",
+    "config": "confirm which run actually loads this config; a stale config reads as an active threshold",
+    "doc": "confirm the documented value still matches the code — docs drift silently",
+    "test": "a test pinning the value is good; confirm it pins the meaning too, not just the number",
+    "other": "read the line and decide which of the above it is",
+}
+
+
+def build_pattern(needle: str, as_regex: bool) -> re.Pattern:
+    """Match the value, and only the value.
+
+    A numeric needle must not match inside a longer number — searching `0.7` and
+    hitting `0.75` is exactly the kind of wrong count this skill exists to catch.
+    """
+    if as_regex:
+        return re.compile(needle)
+    if _NUMERIC_RE.match(needle):
+        return re.compile(r"(?<![\w.])" + re.escape(needle) + r"(?![\d])")
+    return re.compile(r"\b" + re.escape(needle) + r"\b")
+
+
+def classify(line: str, display: str, suffix: str, span: tuple) -> str:
+    """Which kind of site this is.
+
+    Deliberately classifies on the path *relative to the scanned root*: an
+    absolute path carries the checkout's own directory names, and a repo cloned
+    under ~/tests/ would otherwise report every site as a test.
+    """
+    lowered = display.lower()
+    if re.search(r"(?:^|[/_.-])(?:tests?|spec|specs|__tests__)(?:[/_.-]|$)", lowered):
+        return "test"
+    if suffix in DOC_SUFFIXES:
+        return "doc"
+    if suffix in CONFIG_SUFFIXES:
+        return "config"
+
+    before, after = line[:span[0]], line[span[1]:]
+    if _COMPARE_RE.search(before[-4:]) or _COMPARE_RE.match(after.lstrip()[:2]):
+        return "comparison"
+    # The needle may be the value (`CUTOFF = 0.75`) or the name being defined
+    # (`quality_score = compute()`, `def quality_score(`, `quality_score:`).
+    if _ASSIGN_RE.search(before) and not before.rstrip().endswith(","):
+        return "definition"
+    if _TARGET_RE.match(after) or _DECLARE_RE.search(before):
+        return "definition"
+    if not before.strip(" \t\"'-") and after.lstrip().startswith(":"):
+        return "definition"
+    return "other"
+
+
+def scan(root: Path, pattern: re.Pattern) -> list:
+    rows = []
+    for path in iter_files(root, CODE_SUFFIXES | CONFIG_SUFFIXES | DOC_SUFFIXES):
+        display = rel(path, root)
+        for lineno, line in enumerate(read_lines(path), 1):
+            match = pattern.search(line)
+            if not match:
+                continue
+            kind = classify(line, display, path.suffix, match.span())
+            rows.append(candidate(kind, display, lineno, kind + " site", CONFIRM[kind], line.strip()))
+    return rows
+
+
+def headline_for(needle: str, rows: list) -> str:
+    if not rows:
+        return ("'" + needle + "' appears nowhere under this path. If a report cites it, the number "
+                "is produced somewhere this scan cannot see — find that before trusting it.")
+
+    kinds = {}
+    for row in rows:
+        kinds[row["kind"]] = kinds.get(row["kind"], 0) + 1
+    files = sorted({r["file"] for r in rows})
+    definitions = [r for r in rows if r["kind"] == "definition"]
+    mix = ", ".join(str(n) + " " + kind for kind, n in sorted(kinds.items(), key=lambda pair: -pair[1]))
+
+    if len(definitions) > 1:
+        where = ", ".join(sorted({r["file"] + ":" + str(r["line"]) for r in definitions})[:4])
+        return ("'" + needle + "' is defined independently in " + str(len(definitions)) + " place(s) ("
+                + where + "): changing one will not move the others, and they may already disagree.")
+
+    if not definitions and kinds.get("comparison"):
+        return ("'" + needle + "' is compared against in " + str(kinds["comparison"]) + " place(s) and "
+                "defined nowhere — a literal repeated at the point of use has no single meaning to change.")
+
+    elsewhere = [r for r in rows if r["kind"] == "comparison" and r["file"] != definitions[0]["file"]] \
+        if definitions else []
+    if elsewhere:
+        return ("'" + needle + "' is defined once (" + definitions[0]["file"] + ":" + str(definitions[0]["line"])
+                + ") but written as a literal in " + str(len(elsewhere)) + " comparison(s) in other files ("
+                + ", ".join(sorted({r["file"] for r in elsewhere})[:3])
+                + ") — changing the definition will not move them.")
+
+    roots = sorted({f.split("/")[0] for f in files if "/" in f})
+    if len(roots) > 1:
+        return ("'" + needle + "' spans " + str(len(roots)) + " top-level directories (" + ", ".join(roots[:4])
+                + ") across " + str(len(rows)) + " site(s) — confirm it means the same thing in each; "
+                "one name spanning two measurement systems is its own finding.")
+
+    return ("'" + needle + "': " + str(len(rows)) + " site(s) in " + str(len(files)) + " file(s) (" + mix
+            + "). Confirm every consumer means the same thing by it.")
+
+
+CAVEAT = (
+    "A textual match. It cannot see a value assembled at run time, read from an environment variable, "
+    "stored in a database, or scaled on the way in (0.7 written as 70 elsewhere is invisible). "
+    "Classification is heuristic — a multi-line expression or an unusual layout can land in 'other'. "
+    "A numeric needle deliberately does not match inside a longer number, so search 0.75 separately."
+)
+
+
+def main() -> int:
+    configure_output()
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("needle", help="the threshold, literal, or metric name to trace")
+    add_common_args(parser)
+    parser.add_argument("--regex", action="store_true", help="treat the needle as a regular expression")
+    args = parser.parse_args()
+
+    root = Path(args.root)
+    if not root.exists():
+        print("error: no such path: " + str(root), file=sys.stderr)
+        return 2
+
+    try:
+        pattern = build_pattern(args.needle, args.regex)
+    except re.error as exc:
+        print("error: bad regular expression: " + str(exc), file=sys.stderr)
+        return 2
+
+    rows = scan(root, pattern)
+    order = ["definition", "comparison", "config", "doc", "test", "other"]
+    rows.sort(key=lambda r: (order.index(r["kind"]) if r["kind"] in order else 99, r["file"], r["line"]))
+    counts = {"needle": args.needle, "sites": len(rows), "files": len({r["file"] for r in rows})}
+    for kind in order:
+        found = sum(1 for r in rows if r["kind"] == kind)
+        if found:
+            counts[kind] = found
+    emit(envelope("trace_value", root, headline_for(args.needle, rows), CAVEAT, counts, rows[:args.limit]),
+         args.format)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

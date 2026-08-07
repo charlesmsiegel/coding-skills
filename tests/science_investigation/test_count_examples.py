@@ -1,0 +1,133 @@
+"""Tests for science-investigation's example counter.
+
+This script exists so an auditor never quotes "n=30" from memory, which means its
+counts have to be right and its notion of "labeled" has to be conservative. The
+sharpest test here is the one pinning that a bare `answer` column is NOT ground
+truth: in an eval file that holds what the system produced, and counting it as a
+label turns an unlabeled dataset into a fully-labeled one.
+"""
+
+import json
+import subprocess
+import sys
+from pathlib import Path
+
+import pytest
+
+SCRIPT = Path(__file__).resolve().parents[2] / "skills" / "science-investigation" / "scripts" / "count_examples.py"
+
+
+def run(root, *args) -> dict:
+    result = subprocess.run(
+        [sys.executable, str(SCRIPT), str(root), "--format", "json", *args],
+        capture_output=True, text=True, timeout=120,
+    )
+    assert result.returncode == 0, result.stderr[-600:]
+    return json.loads(result.stdout)
+
+
+def write_jsonl(path: Path, rows: list) -> None:
+    path.write_text("".join(json.dumps(r) + "\n" for r in rows), encoding="utf-8")
+
+
+def kinds(payload, kind) -> list:
+    return [row for row in payload["candidates"] if row["kind"] == kind]
+
+
+def test_partial_labels_report_the_real_n(tmp_path):
+    rows = [{"id": i, "question": "q", "answer": "a"} for i in range(412)]
+    for row in rows[:3]:
+        row["expected_answer"] = "gold"
+    write_jsonl(tmp_path / "eval.jsonl", rows)
+
+    payload = run(tmp_path)
+    partial = kinds(payload, "partial_labels")
+    assert partial, "3 labeled of 412 is the finding this script exists for"
+    assert "n=3, not 412" in partial[0]["detail"]
+    assert "412" in payload["headline"] and "3" in payload["headline"]
+
+
+def test_a_bare_answer_column_is_not_treated_as_ground_truth(tmp_path):
+    """`answer` holds the system's output; counting it as a label hides the gap."""
+    write_jsonl(tmp_path / "eval.jsonl", [{"id": i, "answer": "a"} for i in range(50)])
+    payload = run(tmp_path)
+    assert kinds(payload, "no_label_field")
+    assert not kinds(payload, "partial_labels")
+
+
+def test_an_empty_string_is_not_a_populated_field(tmp_path):
+    write_jsonl(tmp_path / "eval.jsonl", [{"label": "yes"}, {"label": ""}, {"label": None}])
+    payload = run(tmp_path)
+    assert "1 of 3" in kinds(payload, "partial_labels")[0]["detail"]
+
+
+def test_zero_and_false_are_real_values(tmp_path):
+    """A label of 0 (or False) is a label; treating it as missing undercounts n."""
+    write_jsonl(tmp_path / "eval.jsonl", [{"label": 0}, {"label": False}, {"label": 1}])
+    payload = run(tmp_path)
+    assert not kinds(payload, "partial_labels"), "all three rows are labeled"
+
+
+def test_csv_columns_are_counted(tmp_path):
+    (tmp_path / "rows.csv").write_text("id,label\n1,yes\n2,\n3,no\n", encoding="utf-8")
+    payload = run(tmp_path)
+    assert "2 of 3" in kinds(payload, "partial_labels")[0]["detail"]
+
+
+def test_records_nested_under_a_json_key_are_found(tmp_path):
+    (tmp_path / "cases.json").write_text(
+        json.dumps({"version": 2, "cases": [{"gold": "a"}, {"gold": "b"}]}), encoding="utf-8"
+    )
+    payload = run(tmp_path)
+    assert payload["counts"]["records_total"] == 2
+
+
+def test_configuration_json_is_not_counted_as_a_dataset(tmp_path):
+    (tmp_path / "package.json").write_text(json.dumps({"name": "x", "version": "1.0"}), encoding="utf-8")
+    (tmp_path / "tsconfig.json").write_text(json.dumps({"compilerOptions": {"strict": True}}), encoding="utf-8")
+    payload = run(tmp_path)
+    assert payload["counts"]["datasets"] == 0
+
+
+def test_a_small_dataset_is_flagged_against_the_ship_rule(tmp_path):
+    write_jsonl(tmp_path / "eval.jsonl", [{"gold": "a"} for _ in range(12)])
+    payload = run(tmp_path)
+    assert kinds(payload, "small_n")
+
+
+def test_unparseable_rows_are_reported_rather_than_dropped(tmp_path):
+    (tmp_path / "eval.jsonl").write_text(
+        json.dumps({"gold": "a"}) + "\n" + "{not json\n" + json.dumps({"gold": "b"}) + "\n",
+        encoding="utf-8",
+    )
+    payload = run(tmp_path)
+    bad = kinds(payload, "unparseable_rows")
+    assert bad and "1 of 3" in bad[0]["detail"]
+
+
+def test_max_rows_truncation_is_announced(tmp_path):
+    write_jsonl(tmp_path / "eval.jsonl", [{"gold": "a"} for _ in range(50)])
+    payload = run(tmp_path, "--max-rows", "10")
+    assert payload["counts"]["records_total"] == 10
+    assert any("capped" in row["detail"] for row in kinds(payload, "dataset"))
+
+
+def test_no_datasets_says_so_instead_of_reporting_zero_examples(tmp_path):
+    (tmp_path / "s.py").write_text("x = 1\n", encoding="utf-8")
+    payload = run(tmp_path)
+    assert payload["counts"]["datasets"] == 0
+    assert "No JSON/JSONL/CSV datasets" in payload["headline"]
+
+
+def test_a_single_file_can_be_counted_directly(tmp_path):
+    write_jsonl(tmp_path / "eval.jsonl", [{"gold": "a"} for _ in range(5)])
+    payload = run(tmp_path / "eval.jsonl")
+    assert payload["counts"]["records_total"] == 5
+
+
+@pytest.mark.parametrize("directory", ["node_modules", ".venv", "__pycache__"])
+def test_vendored_trees_are_skipped(tmp_path, directory):
+    vendored = tmp_path / directory
+    vendored.mkdir()
+    write_jsonl(vendored / "eval.jsonl", [{"gold": "a"} for _ in range(9)])
+    assert run(tmp_path)["counts"]["datasets"] == 0

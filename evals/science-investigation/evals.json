@@ -1,0 +1,35 @@
+{
+  "skill_name": "science-investigation",
+  "evals": [
+    {
+      "id": 1,
+      "prompt": "Audit our eval. It reports eight metrics and we gate releases on the composite being above 0.75.",
+      "expected_output": "Runs the enumeration scripts first (find_metrics.py, count_examples.py, find_fail_soft.py) rather than grepping from memory, and treats their rows as candidates to confirm by reading, never as findings. Builds the metric x inputs x consumer x N inventory, and counts the labeled examples rather than assuming the eval set is labeled — reporting N beside every aggregate, and null (not 0.0) for anything never measured. Reads the composite's definition for renormalization over surviving components, and asks where the weights came from. Traces the 0.75 gate to the code that consumes it. Names what is structurally unmeasurable with the current data instead of leaving silence to read as success. Ranks findings by likelihood x blast radius on the decisions the numbers drive, cites file:line it actually opened, states what it did not audit, and does not fix anything.",
+      "files": []
+    },
+    {
+      "id": 2,
+      "prompt": "Our LLM-as-judge quality score went from 0.71 to 0.79 after last week's prompt work. Can I put that in the launch doc?",
+      "expected_output": "Loads references/llm-measurement.md before answering. Names the judge confound first: the score is joint over the system under test and the judge, so a judge-prompt or judge-model change is indistinguishable from a product improvement in the headline, and asks whether the judge's own reliability (human agreement, self-consistency) is measured at all. Checks whether the judge prompt, system prompt, and model id are pinned and recorded per run, and whether git history shows the instrument changing inside the comparison window — a change that only ever moves scores up gets extra scrutiny. Checks non-determinism (temperature, single run vs repeats, seeds) and asks whether 8 points exceeds the run-to-run noise floor, and what n the score was computed over. Does not simply validate or simply reject the number: says precisely what the 0.71 -> 0.79 can and cannot support, and what would have to be true to put it in the doc.",
+      "files": []
+    },
+    {
+      "id": 3,
+      "prompt": "Can you check the metrics in src/utils/? Just glance at it, and give me a report I can send to the team.",
+      "expected_output": "If the subtree has no real measurement content, says so in one line and stops rather than manufacturing a report — a padded audit trains the reader to skim the next one. If there is measurement content, does not 'just glance': confirms every script row by opening the file, because a candidate reported as a finding is the failure mode this skill exists to prevent, and an unconfirmed report is worse than none when it is about to be sent to a team. Every count in the report is re-derived from a script in this session rather than recalled. Says explicitly what was not audited. Flags the one-line answer honestly instead of padding to look thorough.",
+      "files": []
+    },
+    {
+      "id": 4,
+      "prompt": "We ran the new retrieval strategy against the old one on our 30-question eval set and it won by 3 points. Ship it?",
+      "expected_output": "Leads with sample size against effect size: 30 examples cannot resolve a 3-point difference, and a bootstrap over 30 deltas has an interval wider than the effect being argued about. Asks whether the comparison is paired (same questions across arms), whether the resampling is seeded, and how many metric x arm comparisons were run without correction. For RAG specifically, separates retrieval quality from generation quality — a single end-to-end score hides which half moved — and distinguishes faithfulness from correctness. Checks whether errors, timeouts, or empty retrievals scored as zeros, and whether the eval set could be contaminated. Does not refuse to answer or hedge into uselessness: states what the result does support, what it would take to resolve 3 points, and that the decision is the owner's. Does not fix or re-run anything.",
+      "files": []
+    },
+    {
+      "id": 5,
+      "prompt": "The scoring pipeline looks fine to me — it's fully tested, 94% coverage, and CI is green. Is there anything to audit here?",
+      "expected_output": "States the core principle plainly and without moralizing: a system can be fully tested, ship daily, and still have measurement that means nothing, because tests check that the code does what its author intended and never that the metric measures what the dashboard claims. Gives concrete examples of what coverage cannot see — a metric with no labeled inputs, an error path scoring 0.0, a composite renormalizing over survivors, an unpinned judge model, a cap in the eval loop. Then actually runs the audit rather than arguing about it, and reports what it finds, including crediting good practice (null for unmeasurable, recorded errors, pinned versions, seeded resampling, published negative results) where it exists.",
+      "files": []
+    }
+  ]
+}
