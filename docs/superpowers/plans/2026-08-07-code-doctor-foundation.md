@@ -180,6 +180,7 @@ a formality.
 import contextlib
 import subprocess
 import sys
+import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Iterator
@@ -535,7 +536,7 @@ prevents is a tool recommending that someone delete live code."
 
 **Interfaces:**
 - Consumes: nothing new
-- Produces: `git(repo: Path, *args: str) -> str`, `is_git_repo(repo: Path) -> bool`, `HistoryDepth` dataclass with fields `is_repo: bool`, `is_shallow: bool`, `commit_count: int`, `oldest_commit_days: int | None`, and property `usable: bool`; `probe_history(repo: Path, *, min_commits: int = 20) -> HistoryDepth`
+- Produces: `git(repo: Path, *args: str) -> str`, `is_git_repo(repo: Path) -> bool`, `HistoryDepth` dataclass with fields `is_repo: bool`, `is_shallow: bool`, `commit_count: int`, `oldest_commit_days: int | None`, `min_commits: int = 20`, and property `usable: bool`; `probe_history(repo: Path, *, min_commits: int = 20) -> HistoryDepth`
 
 - [ ] **Step 1: Write the failing test**
 
@@ -616,12 +617,11 @@ class HistoryDepth:
     is_shallow: bool
     commit_count: int
     oldest_commit_days: int | None
+    min_commits: int = 20
 
     @property
     def usable(self) -> bool:
-        return self.is_repo and not self.is_shallow and self.commit_count >= self._min
-
-    _min: int = 20
+        return self.is_repo and not self.is_shallow and self.commit_count >= self.min_commits
 
     def explain(self) -> str:
         if not self.is_repo:
@@ -629,7 +629,7 @@ class HistoryDepth:
         if self.is_shallow:
             return ("shallow clone — history-derived findings skipped; "
                     "re-run with `git fetch --unshallow` for ownership and churn")
-        if self.commit_count < self._min:
+        if self.commit_count < self.min_commits:
             return (f"only {self.commit_count} commit(s) of history — too few to support "
                     "churn or ownership claims; findings skipped")
         return f"{self.commit_count} commits of history"
@@ -638,7 +638,7 @@ class HistoryDepth:
 def probe_history(repo: Path, *, min_commits: int = 20) -> HistoryDepth:
     """Establish what may be claimed from this repository's history."""
     if not is_git_repo(repo):
-        return HistoryDepth(False, False, 0, None, _min=min_commits)
+        return HistoryDepth(False, False, 0, None, min_commits=min_commits)
 
     try:
         shallow = git(repo, "rev-parse", "--is-shallow-repository").strip() == "true"
@@ -654,12 +654,11 @@ def probe_history(repo: Path, *, min_commits: int = 20) -> HistoryDepth:
     try:
         stamp = git(repo, "log", "--reverse", "--format=%ct", "--max-count=1").strip()
         if stamp:
-            import time
             oldest_days = int((time.time() - int(stamp)) / 86400)
     except Exception:
         oldest_days = None
 
-    return HistoryDepth(True, shallow, count, oldest_days, _min=min_commits)
+    return HistoryDepth(True, shallow, count, oldest_days, min_commits=min_commits)
 ```
 
 - [ ] **Step 4: Run the tests to verify they pass**
@@ -2383,4 +2382,9 @@ Each later plan appends its detectors to `DETECTORS` in `analyze_all.py` and its
 
 **Type consistency.** `Reporter.finding(...)` and `Reporter.candidate(...)` are used consistently across Tasks 5 and 6 with the signatures defined in Task 2. `emit(findings, format, clean_message, completeness=None)` is defined in Task 4 and called with that signature in Tasks 5, 6, and 8. `walk_files(root, *, source_only)` is defined in Task 1 and called with the keyword in Tasks 4, 5, and 8. `Finding(**record)` in Task 8 round-trips the `asdict()` output from Task 4 — the field set matches exactly, and the `__post_init__` validation re-runs on reconstruction, which is deliberate: a detector that emits a malformed record fails the merge loudly.
 
-One note for the implementer: `HistoryDepth` in Task 3 uses a `_min` dataclass field with a default, declared after `oldest_commit_days`. Because it has a default and all preceding fields do not, this is valid. It is passed as a keyword in `probe_history`.
+**Pre-flight corrections (applied before execution).** A scan of the plan against its own Global Constraints found one real conflict and one style problem, both in Task 3:
+
+- `probe_history` had `import time` inside the function body. Verified empirically against `python-code-doctor/scripts/find_local_imports.py`, which reports it — and the CI ratchet requires that detector to stay silent on every skill's `scripts/`. The import is hoisted to the module top.
+- `HistoryDepth` declared a `_min` field *after* a `@property`. Valid Python, but needlessly clever. It is now a normal trailing field named `min_commits`, passed by keyword from `probe_history`.
+
+No other conflict was found: `find_exception_issues`, `find_global_state`, `find_resource_leaks`, and `find_security_issues` all report zero on the plan's Task 3 code as written.
