@@ -362,6 +362,86 @@ data out of the code-only detectors without ever enumerating languages."
 
 ---
 
+### Task 1b: Make the skill directory structurally valid
+
+**Discovered during execution.** `tools/validate_skills.py` runs over every directory under `skills/` on every pull request, and CI fails the build when one lacks a `SKILL.md` or a paired `evals/<skill>/evals.json`. Task 1 created `skills/code-doctor/scripts/`, so CI went red immediately and would have stayed red through Tasks 2–8 while `SKILL.md` waited in Task 9. A branch that is red for eight consecutive tasks has no working signal, which is worse than the sequencing was convenient.
+
+This task creates the minimum that validates. Task 9 replaces both files with the real content — this is scaffolding, and it is marked as such in the file itself so nobody mistakes the stub for the deliverable.
+
+**Files:**
+- Create: `skills/code-doctor/SKILL.md`
+- Create: `evals/code-doctor/evals.json`
+
+**Interfaces:**
+- Consumes: nothing
+- Produces: a structurally valid skill directory; `python tools/validate_skills.py` exits clean
+
+- [ ] **Step 1: Verify the failure first**
+
+Run: `python tools/validate_skills.py`
+Expected: `error: code-doctor: no SKILL.md`
+
+- [ ] **Step 2: Write the stub SKILL.md**
+
+The description must be ≤ 1024 characters and describe only what the skill can do *today* (Task 1 only ships a file walk, so it can do nothing useful yet). Do not copy Task 9's description forward — advertising unshipped detectors is the defect Task 9 exists to avoid.
+
+```markdown
+---
+name: code-doctor
+description: Under construction — not yet ready for use. This skill will review any codebase for quality problems and bugs without a parser or language tables, but its detectors are still being built. Do not invoke it yet. For Python use python-code-doctor, for TypeScript use typescript-code-doctor, for Django use django-code-doctor.
+---
+
+# Code Doctor (under construction)
+
+**This skill is incomplete and should not be invoked.** It is being built task by
+task; see `docs/superpowers/plans/2026-08-07-code-doctor-foundation.md`.
+
+Its finished form is a language-agnostic reviewer that measures code quality and
+bugs — no parsers, no comment-syntax tables, no framework knowledge — separating
+defects it can prove from unverified leads it cannot. Until the detectors land,
+use `python-code-doctor`, `typescript-code-doctor`, or `django-code-doctor`.
+
+Task 9 of the plan replaces this file with the real router.
+```
+
+- [ ] **Step 3: Write the stub evals**
+
+The validator requires `skill_name`, and a non-empty `evals` list whose every case has `id`, `prompt`, and `expected_output`. Task 9 replaces this with the five real cases.
+
+```json
+{
+  "skill_name": "code-doctor",
+  "evals": [
+    {
+      "id": "under-construction-defers",
+      "prompt": "Review this Go repo for problems.",
+      "expected_output": "Recognizes code-doctor is incomplete and not yet usable, and says so rather than pretending to review. Does not fabricate findings. Replaced in Task 9 by the real eval set."
+    }
+  ]
+}
+```
+
+- [ ] **Step 4: Verify**
+
+```bash
+python tools/validate_skills.py     # must exit clean, no "code-doctor" error
+python -m pytest tests/ -q          # the standalone-install test sees the new skill
+python -m ruff check .
+```
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add skills/code-doctor/SKILL.md evals/code-doctor/evals.json
+git commit -m "code-doctor: structural stub so CI validates during the build
+
+tools/validate_skills.py checks every directory under skills/ on every PR, so
+creating scripts/ without a SKILL.md turns the branch red until Task 9. The
+stub says plainly that the skill is not ready; Task 9 replaces both files."
+```
+
+---
+
 ### Task 2: The finding/candidate schema, enforced in the dataclass
 
 **Files:**
@@ -2331,7 +2411,8 @@ record — a report that quietly lost a detector reads as a clean repository."
 ### Task 9: `SKILL.md`, the two references, evals, and repo integration
 
 **Files:**
-- Create: `skills/code-doctor/SKILL.md`
+- Replace: `skills/code-doctor/SKILL.md` (overwrite Task 1b's under-construction stub in full)
+- Replace: `evals/code-doctor/evals.json` (overwrite Task 1b's single placeholder case)
 - Create: `skills/code-doctor/references/critical-review-guide.md`
 - Create: `skills/code-doctor/references/unknown-language-review.md`
 - Create: `evals/code-doctor/evals.json`
