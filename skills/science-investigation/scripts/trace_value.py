@@ -28,7 +28,7 @@ from pathlib import Path
 
 from common import (
     CODE_SUFFIXES, CONFIG_SUFFIXES, DOC_SUFFIXES, add_common_args, candidate,
-    configure_output, emit, envelope, iter_files, read_source, rel, skipped_note,
+    configure_output, emit, envelope, is_config, iter_files, read_source, rel, skipped_note,
 )
 
 _NUMERIC_RE = re.compile(r"^-?\d+(?:\.\d+)?$")
@@ -65,7 +65,7 @@ def build_pattern(needle: str, as_regex: bool) -> re.Pattern:
     return re.compile(r"\b" + re.escape(needle) + r"\b")
 
 
-def classify(line: str, display: str, suffix: str, span: tuple) -> str:
+def classify(line: str, display: str, path: Path, span: tuple) -> str:
     """Which kind of site this is.
 
     Deliberately classifies on the path *relative to the scanned root*: an
@@ -75,9 +75,9 @@ def classify(line: str, display: str, suffix: str, span: tuple) -> str:
     lowered = display.lower()
     if re.search(r"(?:^|[/_.-])(?:tests?|spec|specs|__tests__)(?:[/_.-]|$)", lowered):
         return "test"
-    if suffix in DOC_SUFFIXES:
+    if path.suffix in DOC_SUFFIXES:
         return "doc"
-    if suffix in CONFIG_SUFFIXES:
+    if is_config(path):
         return "config"
 
     before, after = line[:span[0]], line[span[1]:]
@@ -111,7 +111,7 @@ def scan(root: Path, pattern: re.Pattern) -> tuple:
             continue
         for lineno, line in enumerate(lines, 1):
             for match in pattern.finditer(line):
-                kind = classify(line, display, path.suffix, match.span())
+                kind = classify(line, display, path, match.span())
                 if (display, lineno, kind) in seen:
                     continue
                 seen.add((display, lineno, kind))

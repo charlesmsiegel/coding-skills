@@ -127,3 +127,12 @@ def test_a_file_too_large_to_read_is_reported_as_unread(tmp_path):
     payload = run("0.7", tmp_path)
     assert payload["counts"]["files_skipped_unread"] == 1
     assert "NOT read" in payload["headline"]
+
+
+def test_dot_env_sites_are_classified_as_config_not_as_code_definitions(tmp_path):
+    """The walk and the classifier must agree on what a config file is."""
+    (tmp_path / ".env").write_text("QUALITY_THRESHOLD=0.75\n", encoding="utf-8")
+    (tmp_path / ".env.production").write_text("QUALITY_THRESHOLD=0.75\n", encoding="utf-8")
+    counts = run("0.75", tmp_path)["counts"]
+    assert counts["config"] == 2
+    assert "definition" not in counts

@@ -62,6 +62,7 @@ CONFIRM = {
     "unparseable_rows": "read the failing rows; malformed rows dropped before scoring inflate every metric",
     "unparseable_dataset": "read the file; a corrupted eval set is not the same as an absent one, and a "
                            "pipeline that skips it silently reports metrics over whatever survived",
+    "empty_dataset": "check what writes this file; every metric reading it has n=0, which is not 0.0",
     "dataset": "confirm this file is what the metric actually reads at run time",
 }
 
@@ -108,13 +109,18 @@ def read_jsonl(path: Path, max_rows: int) -> dict:
 
 
 def records_from_json(payload):
-    """The record list inside a parsed .json file, or None if it holds no dataset."""
+    """The record list inside a parsed .json file, or None if it holds no dataset.
+
+    An *empty* list is a dataset with zero rows, not a non-dataset: `[]` in
+    eval.json says the measurement input exists and has n=0, which is a different
+    fact from "there is no eval set" and a much more actionable one.
+    """
     if isinstance(payload, list):
-        return payload if payload and isinstance(payload[0], dict) else None
+        return payload if all(isinstance(r, dict) for r in payload[:1]) else None
     if isinstance(payload, dict):
         for key in RECORD_KEYS:
             value = payload.get(key)
-            if isinstance(value, list) and value and isinstance(value[0], dict):
+            if isinstance(value, list) and all(isinstance(r, dict) for r in value[:1]):
                 return value
     return None
 
@@ -213,6 +219,16 @@ def analyze(root: Path, max_rows: int) -> tuple:
                 CONFIRM["unparseable_dataset"],
             ))
             continue
+        if stats.get("rows") == 0 and "fields" in stats:
+            summaries.append({"file": display, "rows": 0, "labeled": 0, "labels": [],
+                              "label_fields": [], "truncated": False})
+            rows_out.append(candidate(
+                "empty_dataset", display, 1,
+                "parses as a dataset and holds zero records — every metric reading it has n=0, "
+                "which must be reported as 'not measured' rather than as a score",
+                CONFIRM["empty_dataset"],
+            ))
+            continue
         if not stats or not stats.get("rows"):
             continue
         rows = stats["rows"]
@@ -269,6 +285,12 @@ def headline_for(summaries: list, unparseable: list) -> str:
         return ("No JSON/JSONL/CSV datasets found under this path. If metrics are reported anyway, "
                 "find what they read — measurement with no stored examples cannot be re-derived.")
 
+    empty = [s for s in summaries if s["rows"] == 0]
+    if empty and len(empty) == len(summaries):
+        return (str(len(empty)) + " dataset(s) parse but hold zero records (" + empty[0]["file"]
+                + ") — the measurement input exists and is empty, which is not the same as absent "
+                "and not the same as a score of 0.")
+
     sparse = [(s, name, n) for s in summaries for name, n in s["labels"] if n < s["rows"]]
     if sparse:
         worst_set, worst_field, worst_n = min(sparse, key=lambda t: t[2] / max(t[0]["rows"], 1))
@@ -311,8 +333,8 @@ def main() -> int:
         return 2
 
     rows, summaries, unparseable = analyze(root, args.max_rows)
-    order = ["unparseable_dataset", "partial_labels", "no_label_field", "small_n",
-             "unparseable_rows", "dataset"]
+    order = ["unparseable_dataset", "empty_dataset", "partial_labels", "no_label_field",
+             "small_n", "unparseable_rows", "dataset"]
     rows.sort(key=lambda r: (order.index(r["kind"]) if r["kind"] in order else 99, r["file"]))
     counts = {
         "datasets": len(summaries),

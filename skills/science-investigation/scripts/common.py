@@ -32,7 +32,8 @@ EXCLUDE_DIRS = frozenset({
 # Where measurement code lives, across the languages this has to work in.
 CODE_SUFFIXES = frozenset({
     ".py", ".ipynb", ".ts", ".tsx", ".js", ".jsx", ".go", ".java", ".kt", ".rb",
-    ".rs", ".scala", ".r", ".R", ".sql", ".sh",
+    ".rs", ".scala", ".r", ".R", ".sql", ".sh", ".c", ".h", ".cc", ".cpp", ".cxx",
+    ".hpp", ".cs", ".m", ".swift", ".php",
 })
 CONFIG_SUFFIXES = frozenset({".yaml", ".yml", ".json", ".toml", ".ini", ".cfg", ".env"})
 DOC_SUFFIXES = frozenset({".md", ".rst", ".txt"})
@@ -41,6 +42,18 @@ DOC_SUFFIXES = frozenset({".md", ".rst", ".txt"})
 # suffix test never sees them — and thresholds, model ids, and feature flags live
 # in them constantly. Matched by name instead.
 CONFIG_NAME_PREFIXES = (".env",)
+
+
+def is_config(path) -> bool:
+    """Config by suffix or by name.
+
+    One predicate, used by both the file walk and the site classifier: when only
+    the walk knew about `.env`, a threshold in one was scanned and then reported
+    as a code definition.
+    """
+    path = Path(path)
+    return path.suffix in CONFIG_SUFFIXES or path.name.startswith(CONFIG_NAME_PREFIXES)
+
 
 # A file big enough to be data rather than source. Reading it as source produces
 # thousands of candidates from one artifact, which buries everything else.
@@ -68,7 +81,7 @@ def add_common_args(parser, root_help="directory or file to scan (default: .)"):
 def wanted(path: Path, suffixes) -> bool:
     if path.suffix in suffixes:
         return True
-    return CONFIG_SUFFIXES <= suffixes and path.name.startswith(CONFIG_NAME_PREFIXES)
+    return CONFIG_SUFFIXES <= suffixes and is_config(path)
 
 
 def iter_files(root: Path, suffixes) -> list:

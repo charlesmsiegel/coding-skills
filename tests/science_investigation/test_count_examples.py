@@ -164,3 +164,24 @@ def test_json_that_is_simply_not_a_dataset_stays_silent(tmp_path):
     payload = run(tmp_path)
     assert payload["candidates"] == []
     assert payload["counts"]["datasets_unparseable"] == 0
+
+
+# ---- second review round ------------------------------------------------------ #
+
+def test_an_empty_dataset_is_reported_as_n_zero_not_as_no_dataset(tmp_path):
+    """`[]` says the input exists and is empty — a different fact from absent."""
+    (tmp_path / "eval.json").write_text("[]", encoding="utf-8")
+    payload = run(tmp_path)
+    assert kinds(payload, "empty_dataset")
+    assert "zero records" in payload["headline"]
+    assert "No JSON/JSONL/CSV datasets" not in payload["headline"]
+
+
+def test_an_empty_record_list_under_a_named_key_is_also_a_dataset(tmp_path):
+    (tmp_path / "cases.json").write_text('{"cases": []}', encoding="utf-8")
+    assert kinds(run(tmp_path), "empty_dataset")
+
+
+def test_a_json_list_of_scalars_is_still_not_a_dataset(tmp_path):
+    (tmp_path / "allow.json").write_text('["a", "b", "c"]', encoding="utf-8")
+    assert run(tmp_path)["counts"]["datasets"] == 0

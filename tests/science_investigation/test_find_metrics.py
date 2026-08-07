@@ -242,3 +242,71 @@ def test_an_unread_file_is_reported_as_unread_not_as_scanned(tmp_path):
     assert payload["counts"]["files_skipped_unread"] == 1
     assert payload["counts"]["files_scanned"] == 0
     assert "NOT read" in payload["headline"], "a file nobody read must not read as clean"
+
+
+# ---- second review round ------------------------------------------------------ #
+
+def test_go_receiver_and_c_family_methods_are_found(tmp_path):
+    (tmp_path / "runner.go").write_text(
+        "package main\n"
+        "func (r *Runner) Accuracy(rows []int) float64 { return 1 }\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "metrics.cpp").write_text("double accuracy(int n) { return 1.0; }\n", encoding="utf-8")
+    found = {row["detail"].split(" ")[0] for row in kinds(run(tmp_path), "metric_definition")}
+    assert found == {"Accuracy", "accuracy"}
+
+
+def test_c_family_files_are_scanned_at_all(tmp_path):
+    (tmp_path / "Metrics.cs").write_text("// nothing\n", encoding="utf-8")
+    assert run(tmp_path)["counts"]["files_scanned"] == 1
+
+
+@pytest.mark.parametrize("line,literal", [
+    ("if quality_score > .75:", ".75"),
+    ("if pvalue < 1e-3:", "1e-3"),
+])
+def test_leading_dot_and_exponent_thresholds_are_found(tmp_path, line, literal):
+    """`pvalue < 1e-3` is the single most common threshold in a stats codebase."""
+    (tmp_path / "s.py").write_text(line + "\n    pass\n", encoding="utf-8")
+    assert any(literal in row["detail"] for row in kinds(run(tmp_path), "threshold"))
+
+
+def test_the_headline_never_contradicts_the_rows_it_printed(tmp_path):
+    """An indented config key is a definition; the headline used to deny it."""
+    (tmp_path / "c.yaml").write_text("metrics:\n  accuracy: 0.90\n", encoding="utf-8")
+    payload = run(tmp_path)
+    assert kinds(payload, "metric_definition")
+    assert "No metric definitions found" not in payload["headline"]
+
+
+def test_thresholds_without_a_metric_definition_are_still_headlined(tmp_path):
+    (tmp_path / "s.py").write_text("if quality_score >= 0.8:\n    pass\n", encoding="utf-8")
+    payload = run(tmp_path)
+    assert "threshold site(s)" in payload["headline"]
+
+
+def test_zero_defaults_in_a_tree_with_no_measurement_are_not_reported(tmp_path):
+    """`return 0` in a CLI is not a measurement site; reporting it manufactures one."""
+    (tmp_path / "util.py").write_text(
+        "def main():\n"
+        "    return 0\n"
+        "\n"
+        "def opts(settings):\n"
+        "    return settings.get('retries', 0)\n",
+        encoding="utf-8",
+    )
+    payload = run(tmp_path)
+    assert not kinds(payload, "zero_default")
+    assert "No metric definitions found" in payload["headline"]
+
+
+def test_a_zero_default_beside_a_metric_is_still_reported(tmp_path):
+    (tmp_path / "score.py").write_text(
+        "def accuracy(rows):\n"
+        "    if not rows:\n"
+        "        return 0.0\n"
+        "    return sum(rows) / len(rows)\n",
+        encoding="utf-8",
+    )
+    assert kinds(run(tmp_path), "zero_default")

@@ -109,9 +109,13 @@ _NONDET_RE = re.compile(
     r"|\bdo_sample\s*[=:]\s*true",
     re.IGNORECASE,
 )
+# Quoted in code, bare in config: `model="gpt-4o"`, `MODEL=gpt-4`, `model: gpt-4`.
+# Requiring quotes meant the .env and YAML forms were scanned and never reported.
 _MODEL_RE = re.compile(
-    r"[\"']((?:gpt|claude|gemini|llama|mistral|mixtral|command|titan|sonnet|opus|haiku|o[134]|text-embedding)"
-    r"[A-Za-z0-9._-]*)[\"']"
+    r"(?:[\"']|[=:]\s*)"
+    r"((?:gpt|claude|gemini|llama|mistral|mixtral|command|titan|sonnet|opus|haiku|o[134]|text-embedding)"
+    r"[A-Za-z0-9._-]*)"
+    r"(?=[\"']|\s|,|$)"
 )
 # A full date, a compact date, a four-digit provider snapshot (gpt-4-0613,
 # gpt-4-1106-preview), an explicit -v2, or an @-pinned tag.

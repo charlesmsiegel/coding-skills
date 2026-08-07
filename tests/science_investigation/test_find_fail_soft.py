@@ -270,3 +270,20 @@ def test_a_file_too_large_to_read_is_reported_as_unread(tmp_path):
     payload = run(tmp_path)
     assert payload["counts"]["files_skipped_unread"] == 1
     assert "NOT read" in payload["headline"]
+
+
+# ---- second review round ------------------------------------------------------ #
+
+@pytest.mark.parametrize("name,body", [
+    (".env", "MODEL=gpt-4\n"),
+    ("config.yaml", "model: gpt-4\n"),
+    ("call.py", 'client.complete(model="gpt-4")\n'),
+])
+def test_unpinned_models_are_caught_quoted_or_bare(tmp_path, name, body):
+    (tmp_path / name).write_text(body, encoding="utf-8")
+    assert kinds(run(tmp_path), "unpinned_model")
+
+
+def test_a_pinned_model_stays_unflagged_in_config_too(tmp_path):
+    (tmp_path / "config.yaml").write_text("model: gpt-4o-2024-08-06\n", encoding="utf-8")
+    assert not kinds(run(tmp_path), "unpinned_model")
