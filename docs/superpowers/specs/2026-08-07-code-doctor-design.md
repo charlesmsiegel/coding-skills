@@ -303,9 +303,13 @@ same reasoning.
   of which is a decision, and in Rust it is error propagation. Counting it would
   report type-heavy files with no control flow as complex.
 
-  Decision density and the arity and function-boundary proxies are all marked
-  **heuristic** — they rest on declaration-shaped segmentation, not parsing. Only
-  nesting depth and raw length are reported as facts.
+  Decision density, nesting depth, and the arity and function-boundary proxies
+  are all marked **heuristic**. Indentation is not scope: in brace-delimited and
+  expression-heavy languages it routinely aligns argument lists, fluent call
+  chains, array literals, and formatter-wrapped expressions that introduce no
+  nested control flow at all, so an indentation-derived depth overstates
+  complexity in ordinary well-formatted code. Only raw length — lines in a file,
+  characters in a line — is reported as fact, because only that is one.
 
 ### Correctness and hygiene
 
