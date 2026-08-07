@@ -1,7 +1,9 @@
 # Django security review
 
-`find_django_security.py` reads settings and `mark_safe` calls, and
-`find_view_issues.py` flags the ownership gap. Everything below needs a reader.
+`find_django_security.py` reads settings, `mark_safe` calls, and template
+escaping; `find_view_issues.py` flags the ownership gap, CSRF exemptions, and
+open redirects; `find_drf_issues.py` covers the API surface and
+`find_admin_issues.py` the admin. Everything below needs a reader.
 
 Run Django's own checker first — it knows about deployment settings this skill
 does not: `python manage.py check --deploy`.
@@ -127,6 +129,14 @@ Django is a more likely route in than anything above.
 python -m pip install pip-audit && pip-audit -r requirements.txt
 ```
 
-Check the Django version against the supported-release list. A project on an
-end-of-life Django receives no security fixes at all, which subsumes every other
-finding in this file.
+Check the Django version against the supported-release list — `find_version_issues.py`
+does this and reports `django_end_of_life`. **As of August 2026 every Django 4
+release is end of life**, as are 5.0 and 5.1. A project on one receives no
+security fixes at all, which subsumes every other finding in this file. See
+`django-upgrade-runbook.md`.
+
+Django 6.0 added first-class Content-Security-Policy support (`SECURE_CSP`,
+`ContentSecurityPolicyMiddleware`). A CSP is the control that turns a surviving
+XSS into a blocked script rather than a compromise — worth adopting on any
+project already on 6.0, starting with `SECURE_CSP_REPORT_ONLY` to find what
+breaks.

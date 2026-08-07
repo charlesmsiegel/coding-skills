@@ -16,6 +16,10 @@ be written inline once", delete it.
 | Middleware with a trivial `__call__` | Runs on every request to do nearly nothing | A decorator on the views that need it |
 | Service class that only wraps CRUD | Forwards to the ORM, adds no rule | Call the ORM; or a model method |
 | `post_save` signal doing 2 lines | Invisible behavior on every save | Put it in `save()` or an explicit method |
+| `AppConfig.ready()` doing work | Runs on every management command, including the migrate that creates the table it reads | Import the signal handlers and return |
+| Context processor that queries | A query on every rendered request, including the ones that never read it | `SimpleLazyObject`, or fetch it in the views that need it |
+| Custom filter named like a builtin | Load order decides which one a template gets | Delete it, or rename it so the shadowing is deliberate |
+| Generic view overriding 5+ hooks | The control flow now lives in Django's source | Write the function |
 
 ## Managers and QuerySets — the one worth understanding
 

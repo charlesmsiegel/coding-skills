@@ -71,9 +71,20 @@ def test_other_users_order_is_404(self):
   or `refresh_from_db()` when you want the row rather than the copy. (On Django
   before 3.2 the objects really were shared across tests and mutation did leak;
   that version is long unsupported, so do not carry the old workaround forward.)
+- **`transaction.on_commit` callbacks never fire under `TestCase`.** The wrapping
+  transaction rolls back, so the callback is discarded — and the test passes
+  without exercising the thing it was written for. Use
+  `captureOnCommitCallbacks(execute=True)` to run them inside the wrapped
+  transaction, or `TransactionTestCase` when the commit itself is under test.
+  This is the same trap as the bullet above, one layer out, and it is why
+  `enqueue_without_on_commit` bugs survive a green suite.
+- **`self.client.login()` runs the real authentication backend**, password
+  hashing included, on every test that calls it. `force_login()` skips it and is
+  usually the single largest win available in a slow Django suite. Use `login()`
+  only when the login flow is what the test is about.
 - **Migrations run once for the test database.** A model-field change is a schema
-  change, and no test in this file protects you from it — see the migrations rule in
-  SKILL.md.
+  change, and no test in this file protects you from it — see
+  `django-migrations.md`, and `makemigrations --check` in CI.
 
 ## Where the net is not worth building
 

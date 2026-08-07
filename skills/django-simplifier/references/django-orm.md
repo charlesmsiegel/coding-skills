@@ -93,7 +93,8 @@ passes every test and shows up as inventory that doesn't add up.
 still holds the old number. `refresh_from_db()` if you need it.
 
 For anything that must be atomic across multiple statements, `F()` is not enough —
-use `select_for_update()` inside a transaction.
+use `select_for_update()` inside a transaction. `django-async-and-tasks.md`
+covers what else belongs inside that block, and what must not.
 
 ## When raw SQL is the right answer
 

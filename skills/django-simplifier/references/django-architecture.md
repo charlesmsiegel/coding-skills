@@ -136,3 +136,16 @@ Use it for genuinely cross-cutting concerns: authentication, request IDs,
 transactions, locale. Everything else — anything that applies to a subset of views
 — should be a decorator or a mixin on those views, where the cost is paid only
 where the benefit is.
+
+One piece of middleware is worth adopting deliberately: `LoginRequiredMiddleware`
+(Django 5.1+) flips authentication from opt-in to opt-out across the whole site,
+with `@login_not_required` for the exceptions. Forgetting to opt an endpoint out
+is a broken page; forgetting to opt one in, under the old default, is a leak.
+
+## Where the rest of this lives
+
+This file covers where logic goes. The neighbouring decisions have their own
+guides: `django-idioms.md` for what to write when the code does not exist yet,
+`django-forms-and-admin.md` and `django-drf.md` for those layers,
+`django-async-and-tasks.md` for transaction and task boundaries, and
+`django-migrations.md` for anything that changes the schema.
