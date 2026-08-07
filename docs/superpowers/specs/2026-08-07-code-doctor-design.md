@@ -136,14 +136,25 @@ checks, and running them beats guessing.
 - **`common.py`** — the source walk, severity icons, console, one policy for
   unreadable files, git helpers (including the shallow-history probe below).
 
-  The walk is extension-agnostic in the direction that matters: an **unknown**
-  extension is treated as code, which is what keeps the skill language-blind. But
-  "not binary" is not "is source". A **denylist of known non-code text** —
-  `.md`, `.rst`, `.txt`, `.json`, `.yaml`, `.toml`, `.lock`, `.csv`, `.svg`,
-  minified bundles, and anything under a documentation root — keeps prose and
-  generated data out of the code-only detectors. A denylist is the inverse of a
-  language table: it enumerates what is *not* code, so it never needs to know
-  which languages exist.
+  The walk applies **three** filters, and all three are load-bearing:
+
+  1. **Directory exclusion**, carried over from the existing skills: `.git`,
+     `node_modules`, `vendor`, `third_party`, `.venv`, `build`, `dist`, `target`,
+     framework build roots, and the tool caches — plus `.gitignore` awareness.
+     This is the one that matters most for cost: vendored and generated code has
+     ordinary source extensions, so an extension filter never touches it, and on
+     a large project it would both dominate runtime and fill the report with
+     defects in code the user does not own.
+  2. **A denylist of known non-code text** — `.md`, `.rst`, `.txt`, `.json`,
+     `.yaml`, `.toml`, `.lock`, `.csv`, `.svg`, minified bundles, and anything
+     under a documentation root — keeping prose and generated data out of the
+     code-only detectors.
+  3. **A binary sniff**, so a NUL-bearing blob is never read as text.
+
+  Filter 2 is a denylist rather than a language table on purpose: it enumerates
+  what is *not* code, so an **unknown** extension is still treated as code, which
+  is what keeps the skill language-blind. A table of known languages would
+  silently skip the next one.
 
   Every detector additionally **declares its own scope**. Branch counting,
   indentation nesting, duplication shingling, and declaration heuristics run only
@@ -152,17 +163,28 @@ checks, and running them beats guessing.
 
 ### Git-derived signals (no language knowledge at all, highest unique value)
 
-- **`find_hotspots.py`** — the targeting engine: churn × complexity-proxy ×
-  defect density. Effort follows change frequency, never line count.
+- **`find_hotspots.py`** — the targeting engine, scored
+  **`churn × complexity-proxy × (1 + defect signal)`**. The `1 +` is not
+  cosmetic: a plain product zeroes any file whose commit messages happen not to
+  match fix/bug keywords, which would drop a hot, complex, fast-moving file to the
+  bottom of the list alongside dormant clean ones. Teams that fix defects inside
+  feature commits are the common case, not the exception, so defect history
+  boosts the ranking rather than gating it. Effort follows change frequency, never
+  line count.
+
 - **`find_change_coupling.py`** — files that repeatedly change in the same commit.
-  Co-change strength is the finding. The detector **does not claim the absence of
-  a structural dependency** unless `map_references.py` positively resolved
-  references for both files; with heuristic-only edges it cannot support that
-  claim, and a Go caller changing alongside the package it imports would otherwise
-  be mislabelled as hidden coupling when it is ordinary structural coupling. Where
-  resolution was positive for both ends, the finding is upgraded to "co-changes
-  with no resolved dependency" and says so. Also flags files that change with
-  everything.
+  Co-change strength is a **candidate**, not a finding: a source file and its
+  test, a manifest and its lockfile, a schema and its migration, and a component
+  and its snapshot all co-change constantly and healthily, so the observation
+  alone establishes no defect and names no fix. The `also_caused_by` list carries
+  exactly those healthy forms.
+
+  The detector additionally **does not claim the absence of a structural
+  dependency** unless `map_references.py` positively resolved references for both
+  files; with heuristic-only edges it cannot support that claim, and a Go caller
+  changing alongside the package it imports would otherwise be mislabelled as
+  hidden coupling when it is ordinary structural coupling. Also flags files that
+  change with everything.
 - **`find_ownership_risks.py`** — bus factor: single-author files, and files whose
   only author has stopped committing.
 
@@ -202,14 +224,23 @@ same reasoning.
   distinctive identifier — length ≥ 4, not a common word — occurring exactly once
   in the whole tree in declaration-shaped context) and **zero-inbound files**.
 
-  Zero inbound edges is not orphanhood. Executable entry points (`main.go`,
-  `main.rs`, `cmd/*`), convention-loaded plugins, a library's public surface, and
-  CI configuration all legitimately have no internal referrer — and the graph
-  independently under-resolves package-style and aliased references, so the two
-  errors compound. The detector therefore **never recommends deleting or wiring in
-  a file**. It reports the candidate, names the reasons a live file lands in this
-  set, and prints the graph's resolution rate beside it. Known entry-point paths
-  and manifest-declared entry points are excluded outright.
+  Zero inbound edges is not orphanhood. Executable entry points, convention-loaded
+  plugins, a library's public surface, and CI configuration all legitimately have
+  no internal referrer — and the graph independently under-resolves package-style
+  and aliased references, so the two errors compound. The detector therefore
+  **never recommends deleting or wiring in a file**. It reports the candidate,
+  names the reasons a live file lands in this set, and prints the graph's
+  resolution rate beside it.
+
+  **Entry points are excluded on manifest evidence only, never on a filename
+  convention.** A `go.mod`, `Cargo.toml`, `package.json`, `pyproject.toml`, or
+  build config that *declares* a binary, an entry, or a script is evidence this
+  repo supplied about itself. A baked-in list of `main.go` / `main.rs` / `cmd/*`
+  would be per-language knowledge — the thing this layer does not carry — and a
+  partial one at that, silently mishandling Ruby `bin/*`, Zig `src/main.zig`, and
+  JVM main classes while appearing to handle entry points in general. Where no
+  manifest declares entry points, nothing is excluded and every zero-inbound file
+  is simply reported as the candidate it is.
 
   Both classes trade recall hard for precision, matching the repo's existing bias
   of false negatives over false positives.
@@ -218,10 +249,16 @@ same reasoning.
   (high fan-in *and* fan-out), and low directory cohesion (a directory whose files
   never reference each other is not a module).
 
-  Cycles are **findings**: a resolved cycle is positive evidence, and the graph's
-  misses can only hide cycles, not invent them. God modules and low cohesion are
-  **candidates** — both rest on edge counts, which under-resolution distorts
-  downward, so a quiet result means little. All three carry the resolution rate.
+  **All three are candidates.** An earlier draft of this spec called cycles
+  findings, on the reasoning that the graph's misses can only hide a cycle rather
+  than invent one. That reasoning is wrong: a token match is evidence that a
+  filename appeared in another file, not that it appeared *as a reference*. Two
+  modules naming each other in header comments, docstrings, or a changelog produce
+  both edges and a cycle that does not exist. Resolution rate measures whether
+  tokens matched files, never whether the match was semantic — so nothing built on
+  these edges can assert a defect. God modules and low cohesion rest on edge
+  counts, which under-resolution distorts downward besides. All three carry the
+  resolution rate.
 
 ### Duplication
 
@@ -233,16 +270,26 @@ same reasoning.
 
   **Normalization order matters, and it is the one place this skill touches
   comment syntax.** String and number literals are blanked *first*, then a minimal
-  universal comment-prefix set (`//`, `#`, `--`, `;`, `/* */`) is stripped from
-  what remains, then whitespace is collapsed. Blanking literals first is what stops
+  universal comment-prefix set (`//`, `#`, `--`, `;`, `/* */`) is handled, then
+  whitespace is collapsed. Blanking literals first is what stops
   `url = "https://x"; do_unique_work()` from losing its trailing call to a `//`
-  that was never a comment. The residual ambiguity is real — `#` opens a Rust
-  attribute and a C preprocessor directive, not a comment — and it is **safe by
-  construction here**: a mis-normalized line simply fails to match its twin,
-  producing a missed duplicate rather than a false one. That is the stated bias.
+  that was never a comment.
+
+  **Ambiguous lines are retained, not stripped.** An earlier draft argued the
+  ambiguity was safe because a mis-normalized line would merely fail to match its
+  twin. That is only half true, and the wrong half: stripping is a *deleting*
+  operation, so removing two blocks' distinct Rust attributes or C preprocessor
+  directives makes their residues **more** alike, manufacturing a near-duplicate
+  that does not exist. The error runs in both directions. So a line whose prefix
+  is ambiguous in context — `#` at the start of a line, `;` anywhere — is kept
+  verbatim in the shingle rather than being cut. Only unambiguous whole-line
+  comments are dropped. Both directions are tested: a fixture pair that must not
+  match, and a fixture pair that must.
 
   This concession is scoped to normalization only. It is a five-token text fact,
   not a language table, and no detector branches on which language a file is.
+  Duplication output is a **candidate** regardless — the same shape is not the
+  same decision.
 
 ### Complexity
 
@@ -269,9 +316,20 @@ same reasoning.
   Commented-out code uses the same five-token comment-prefix set as
   `find_duplication.py`, with literals blanked first, and is a **candidate**: a
   commented line that looks like code may be a documentation example, and `#` may
-  be an attribute rather than a comment. Merge markers, oversized files, and
-  committed secrets or binaries are findings — none of them depends on comment
-  syntax.
+  be an attribute rather than a comment.
+
+  **Merge markers are gated on repository state.** The marker text is positive
+  textual evidence, but this detector scans all text — and a documentation
+  example, a snapshot, or a fixture that exists precisely to test conflict
+  handling will legitimately contain `<<<<<<<` / `=======` / `>>>>>>>`. (This
+  repo's own test suite writes such fixtures.) Where git is available, a marker
+  in a path git reports as **unmerged** (`git ls-files -u`, `git diff --check`) is
+  a **finding** at high severity; a marker anywhere else — or anywhere at all when
+  git is unavailable — is a **candidate** naming documentation, snapshots, and
+  conflict-handling fixtures as the benign forms.
+
+  Oversized files and lines, and committed `.env` files, remain findings: none of
+  them depends on comment syntax or on repository state.
 - **`find_secrets.py`** — key material (private key blocks, cloud credentials,
   JWTs) and high-entropy values assigned to names containing key/token/secret/
   password.
@@ -291,6 +349,14 @@ same reasoning.
   or a test target declared in the manifest or toolchain inventory. When none of
   those resolve for a directory, it reports **"test classification inconclusive"**
   and suppresses the ratio and mapping findings for it rather than reporting zero.
+
+  **"Asserts nothing" is a candidate, never a finding.** Assertion density is
+  counted over a generic marker set, and a test that verifies plenty can match
+  none of it: a Go test delegating to a helper that calls `t.Fatal`, a custom
+  matcher or DSL, an expected-exception test, a snapshot test, a table-driven
+  harness, or a property-based generator. Establishing that a test verifies
+  nothing needs framework knowledge this layer does not have, so the record names
+  those forms in `also_caused_by` and stops there.
 
 ### The repo's own toolchain
 
@@ -314,19 +380,33 @@ same reasoning.
      carrying a mutation flag (`--fix`, `--write`, `-i`, `format` without
      `--check`), versus opaque (a recipe whose body it cannot read through, a shell
      script, a nested `make`).
-  3. **Requires confirmation for anything not provably read-only**, surfacing the
-     literal command, via `AskUserQuestion` — the same stance the existing skills
-     take on installing tools and on `--fix`.
+  3. **Escalates anything not provably read-only to the agent, via a two-stage
+     protocol.** A Python subprocess cannot call `AskUserQuestion` — that is an
+     agent tool, and a script that claims to use it would either crash or, worse,
+     skip the safeguard and run the command. So the script instead **exits without
+     running**, emitting a structured `confirmation_required` payload: each
+     command's literal text, its classification, and a digest of that text. The
+     *agent* puts the question to the user, and reruns with
+     `--confirm <digest>[,<digest>…]`. A digest that does not match the command
+     found on rerun is refused, so a confirmation cannot be replayed against
+     changed content. Read-only-classified commands run without this round trip.
   4. Never installs anything.
 
-  Opaque recipes are the common case, not the edge case, so "ask" is the expected
-  path rather than a rare fallback.
+  Opaque recipes are the common case, not the edge case, so the confirmation
+  round trip is the expected path rather than a rare fallback. `SKILL.md`
+  documents both stages, since the agent is half the protocol.
 
 ### Orchestration and output
 
 - **`analyze_all.py`** — unified report, `--skip cat1,cat2`.
-- **`analyze_diff.py`** — the diff lens, file-level detectors against changed files
-  only. Git-based, so it is already language-agnostic.
+- **`analyze_diff.py`** — the diff lens. Runs the file-level detectors against the
+  changed files and then, **by default, keeps only findings anchored to
+  added or modified lines** — matching both specialist `analyze_diff.py`
+  implementations. Changed *files* is the wrong scope: a one-line edit to a large
+  legacy file would otherwise report every pre-existing hygiene and complexity hit
+  as though the change introduced it, which is how a review tool trains people to
+  ignore it. Findings anchored elsewhere are baseline-gated. Git-based, so already
+  language-agnostic.
 - **`format_findings.py`** — list / cards / JSON artifact renderer. This file is
   where a future python+typescript merge would start.
 
