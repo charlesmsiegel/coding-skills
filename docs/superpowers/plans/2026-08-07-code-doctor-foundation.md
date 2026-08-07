@@ -63,7 +63,7 @@ The remaining five families — git signals, the reference graph, duplication an
 
 **Interfaces:**
 - Consumes: nothing (first task)
-- Produces: `EXCLUDE_DIRS: frozenset[str]`, `NON_CODE_SUFFIXES: frozenset[str]`, `DOC_DIR_NAMES: frozenset[str]`, `is_probably_binary(path: Path) -> bool`, `ScanPathError`, `walk_paths(root: Path) -> Iterator[Path]` (metadata scope — binaries included, symlinks never followed, excluded directories pruned during traversal, raises `ScanPathError` on a missing root), `walk_files(root: Path, *, source_only: bool) -> Iterator[Path]` (text scope), `configure_output() -> None`, `SEVERITY_ICONS: dict[str, str]`, `SEVERITY_RANK: dict[str, int]`
+- Produces: `EXCLUDE_DIRS: frozenset[str]`, `NON_CODE_SUFFIXES: frozenset[str]`, `NON_CODE_BASENAMES: frozenset[str]`, `DOC_DIR_NAMES: frozenset[str]`, `is_probably_binary(path: Path) -> bool`, `ScanPathError`, `walk_paths(root: Path) -> Iterator[Path]` (metadata scope — binaries included, symlinks never followed, excluded directories pruned during traversal, raises `ScanPathError` on a missing root), `walk_files(root: Path, *, source_only: bool) -> Iterator[Path]` (text scope), `configure_output() -> None`, `SEVERITY_ICONS: dict[str, str]`, `SEVERITY_RANK: dict[str, int]`
 
 - [ ] **Step 1: Create the test directory and write the failing test**
 
@@ -246,6 +246,16 @@ NON_CODE_SUFFIXES = frozenset({
 # under docs/ is an example, not the product.
 DOC_DIR_NAMES = frozenset({"docs", "doc", "documentation", "examples", "example", "samples"})
 
+# Conventionally extensionless prose and metadata. `Path.suffix` is empty for
+# these, so the unknown-extension-is-code rule would otherwise feed a README
+# through the complexity and duplication detectors — the exact prose-derived
+# metrics the denylist exists to prevent. Compared case-insensitively.
+NON_CODE_BASENAMES = frozenset({
+    "readme", "license", "licence", "copying", "notice", "authors",
+    "contributors", "changelog", "changes", "history", "news", "todo",
+    "install", "manifest", "codeowners", "maintainers", "version",
+})
+
 # Minified or generated bundles: real code, but nobody reviews them and their
 # line lengths would dominate every size metric.
 GENERATED_MARKERS = (".min.js", ".min.css", ".bundle.js", "_pb2.py", ".g.dart", ".generated.")
@@ -290,6 +300,8 @@ def is_source(rel_parts: tuple[str, ...], path: Path) -> bool:
     if path.suffix.lower() in NON_CODE_SUFFIXES:
         return False
     name = path.name.lower()
+    if not path.suffix and name.split(".")[0] in NON_CODE_BASENAMES:
+        return False
     return not any(marker in name for marker in GENERATED_MARKERS)
 
 
@@ -654,7 +666,7 @@ prevents is a tool recommending that someone delete live code."
 
 **Interfaces:**
 - Consumes: nothing new
-- Produces: `git(repo: Path, *args: str) -> str`, `is_git_repo(repo: Path) -> bool`, `HistoryDepth` dataclass with fields `is_repo: bool`, `is_shallow: bool`, `commit_count: int`, `oldest_commit_days: int | None`, `min_commits: int = 20`, and property `usable: bool`; `probe_history(repo: Path, *, min_commits: int = 20) -> HistoryDepth`
+- Produces: `git(repo: Path, *args: str) -> str`, `is_git_repo(repo: Path) -> bool`, `HistoryDepth` dataclass with fields `is_repo: bool`, `is_shallow: bool`, `commit_count: int`, `oldest_commit_days: int | None`, `min_commits: int = 20`, `window_days: int | None = None`, and property `usable: bool`; `probe_history(repo: Path, *, min_commits: int = 20) -> HistoryDepth`, `git_dir_for(root) -> Path`, `unmerged_paths(root) -> set[Path] | None`, `tracked_paths(root) -> set[Path] | None`
 
 - [ ] **Step 1: Write the failing test**
 
@@ -736,10 +748,21 @@ class HistoryDepth:
     commit_count: int
     oldest_commit_days: int | None
     min_commits: int = 20
+    window_days: int | None = None
 
     @property
     def usable(self) -> bool:
-        return self.is_repo and not self.is_shallow and self.commit_count >= self.min_commits
+        if not (self.is_repo and not self.is_shallow
+                and self.commit_count >= self.min_commits):
+            return False
+        # 20 commits spanning three weeks cannot answer a question about the
+        # last year. A history rewrite or a truncated migration produces
+        # exactly that shape, and it is not shallow by git's definition.
+        if self.window_days is not None:
+            if self.oldest_commit_days is None:
+                return False
+            return self.oldest_commit_days >= self.window_days
+        return True
 
     def explain(self) -> str:
         if not self.is_repo:
@@ -750,18 +773,31 @@ class HistoryDepth:
         if self.commit_count < self.min_commits:
             return (f"only {self.commit_count} commit(s) of history — too few to support "
                     "churn or ownership claims; findings skipped")
+        if self.window_days is not None and not self.usable:
+            return (f"history reaches back {self.oldest_commit_days} day(s), short of the "
+                    f"{self.window_days}-day window asked for; findings skipped")
         return f"{self.commit_count} commits of history"
 
 
-def probe_history(repo: Path, *, min_commits: int = 20) -> HistoryDepth:
-    """Establish what may be claimed from this repository's history."""
+def probe_history(repo: Path, *, min_commits: int = 20,
+                  window_days: int | None = None) -> HistoryDepth:
+    """Establish what may be claimed from this repository's history.
+
+    ``window_days`` is the span a caller intends to reason over; history that
+    does not reach back that far cannot answer, even when it is deep enough
+    by commit count.
+    """
     if not is_git_repo(repo):
-        return HistoryDepth(False, False, 0, None, min_commits=min_commits)
+        return HistoryDepth(False, False, 0, None, min_commits=min_commits,
+                            window_days=window_days)
 
     try:
         shallow = git(repo, "rev-parse", "--is-shallow-repository").strip() == "true"
     except Exception:
-        shallow = False
+        # Failing to DETERMINE shallowness is not evidence of depth. A probe
+        # whose job is "a wrong answer is worse than no answer" must fail
+        # toward unusable, so an unanswerable query counts as shallow.
+        shallow = True
 
     try:
         count = int(git(repo, "rev-list", "--count", "HEAD").strip() or 0)
@@ -780,8 +816,71 @@ def probe_history(repo: Path, *, min_commits: int = 20) -> HistoryDepth:
     except Exception:
         oldest_days = None
 
-    return HistoryDepth(True, shallow, count, oldest_days, min_commits=min_commits)
+    return HistoryDepth(True, shallow, count, oldest_days, min_commits=min_commits,
+                        window_days=window_days)
+
+
+def git_dir_for(root: Path) -> Path:
+    """The directory to run git from.
+
+    `git -C <file>` fails, so scanning a single file directly — the advertised
+    `find_hygiene_issues.py conflicted.go` form — would otherwise report git as
+    unavailable and downgrade a genuine conflict to a candidate purely because
+    of how it was invoked.
+    """
+    return root if root.is_dir() else root.parent
+
+
+def _git_listing(root: Path, *args: str) -> tuple[list[str], Path] | None:
+    base = git_dir_for(root)
+    if not is_git_repo(base):
+        return None
+    try:
+        listing = git(base, "-c", "core.quotepath=false", *args)
+        toplevel = Path(git(base, "rev-parse", "--show-toplevel").strip())
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError):
+        return None
+    return listing.splitlines(), toplevel
+
+
+def unmerged_paths(root: Path) -> set[Path] | None:
+    """Paths git reports as unmerged, or None when git cannot answer.
+
+    This is what separates a real unresolved conflict from a fixture that
+    contains marker text on purpose. Without it the detector would report this
+    repository's own test fixtures as defects.
+    """
+    result = _git_listing(root, "ls-files", "-u", "--full-name")
+    if result is None:
+        return None
+    entries, toplevel = result
+    paths = set()
+    for entry in entries:
+        _, _, rel = entry.partition("\t")
+        if rel:
+            paths.add((toplevel / rel.strip()).resolve())
+    return paths
+
+
+def tracked_paths(root: Path) -> set[Path] | None:
+    """Paths git actually tracks, or None when git cannot answer.
+
+    An untracked or ignored `.env` on a developer's machine is correct
+    practice, not a leak. Asserting it is committed — and telling someone to
+    rotate credentials and purge history over it — is a false positive with a
+    real cost attached.
+    """
+    result = _git_listing(root, "ls-files", "--full-name")
+    if result is None:
+        return None
+    entries, toplevel = result
+    return {(toplevel / rel.strip()).resolve() for rel in entries if rel.strip()}
 ```
+
+These four live in `common.py`, not in a detector, because **two** detectors need
+them: `find_hygiene_issues.py` gates conflict markers on unmerged state, and
+`find_secrets.py` gates credential findings on tracking state. Defining them in
+one detector and importing from `common` in the other is an `ImportError`.
 
 - [ ] **Step 4: Run the tests to verify they pass**
 
@@ -1208,14 +1307,13 @@ dead code rather than a documentation example needs a reading brain.
 """
 
 import re
-import subprocess
 import sys
 from pathlib import Path
 
 from common import (Reporter, ScanPathError, build_parser, configure_output,
-                    coverage_gaps, emit, fail_on_bad_path, git, is_git_repo,
-                    tracked_paths, walk_files, walk_paths, warn_detector_error,
-                    warn_unreadable)
+                    coverage_gaps, emit, fail_on_bad_path, is_probably_binary,
+                    tracked_paths, unmerged_paths, walk_files, walk_paths,
+                    warn_detector_error, warn_unreadable)
 
 MERGE_MARKERS = ("<<<<<<< ", "=======", ">>>>>>> ")
 MAX_FILE_LINES = 1000
@@ -1227,6 +1325,11 @@ MAX_COMMITTED_BYTES = 10 * 1024 * 1024
 # language a file is. A mis-classified line loses a candidate, never invents
 # a finding.
 LINE_COMMENT_PREFIXES = ("//", "#", "--", ";")
+# `//` and `--` begin a comment in every language that uses them. `#` and `;`
+# do not: `#` opens a C preprocessor directive and a Rust attribute, `;` is an
+# instruction separator in assembly. A hit on those two supports a candidate,
+# never a finding.
+UNAMBIGUOUS_PREFIXES = ("//", "--")
 
 _STRING_LITERAL = re.compile(r"""(["'`])(?:\\.|(?!\1).)*\1""")
 _TODO = re.compile(r"\b(TODO|FIXME|HACK|XXX)\b")
@@ -1251,6 +1354,16 @@ def blank_literals(line: str) -> str:
     return _STRING_LITERAL.sub(lambda m: m.group(1) + " " * (len(m.group(0)) - 2) + m.group(1), line)
 
 
+def unambiguous_comment(line: str) -> bool:
+    """Whether this line's comment marker is one no language repurposes."""
+    blanked = blank_literals(line)
+    positions = [(blanked.find(pfx), pfx) for pfx in LINE_COMMENT_PREFIXES]
+    hits = [(index, pfx) for index, pfx in positions if index != -1]
+    if not hits:
+        return False
+    return min(hits)[1] in UNAMBIGUOUS_PREFIXES
+
+
 def comment_body(line: str) -> str | None:
     """The text after a line-comment prefix, or None if there is no comment."""
     blanked = blank_literals(line)
@@ -1259,63 +1372,6 @@ def comment_body(line: str) -> str | None:
         if index != -1:
             return line[index + len(prefix):].strip()
     return None
-
-
-def git_dir_for(root: Path) -> Path:
-    """The directory to run git from.
-
-    `git -C <file>` fails, so scanning a single file directly — the advertised
-    `find_hygiene_issues.py conflicted.go` form — would otherwise report git as
-    unavailable and downgrade a genuine conflict to a candidate purely because
-    of how it was invoked.
-    """
-    return root if root.is_dir() else root.parent
-
-
-def _git_listing(root: Path, *args: str) -> tuple[list[str], Path] | None:
-    base = git_dir_for(root)
-    if not is_git_repo(base):
-        return None
-    try:
-        listing = git(base, "-c", "core.quotepath=false", *args)
-        toplevel = Path(git(base, "rev-parse", "--show-toplevel").strip())
-    except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError):
-        return None
-    return listing.splitlines(), toplevel
-
-
-def unmerged_paths(root: Path) -> set[Path] | None:
-    """Paths git reports as unmerged, or None when git cannot answer.
-
-    This is what separates a real unresolved conflict from a fixture that
-    contains marker text on purpose. Without it the detector would report this
-    repository's own test fixtures as defects.
-    """
-    result = _git_listing(root, "ls-files", "-u", "--full-name")
-    if result is None:
-        return None
-    entries, toplevel = result
-    paths = set()
-    for entry in entries:
-        _, _, rel = entry.partition("\t")
-        if rel:
-            paths.add((toplevel / rel.strip()).resolve())
-    return paths
-
-
-def tracked_paths(root: Path) -> set[Path] | None:
-    """Paths git actually tracks, or None when git cannot answer.
-
-    An untracked or ignored `.env` on a developer's machine is correct
-    practice, not a leak. Asserting it is committed — and telling someone to
-    rotate credentials and purge history over it — is a false positive with a
-    real cost attached.
-    """
-    result = _git_listing(root, "ls-files", "--full-name")
-    if result is None:
-        return None
-    entries, toplevel = result
-    return {(toplevel / rel.strip()).resolve() for rel in entries if rel.strip()}
 
 
 def check_text_file(path: Path, text: str, report: Reporter,
@@ -1330,12 +1386,25 @@ def check_text_file(path: Path, text: str, report: Reporter,
         body = comment_body(line)
         if body is not None:
             todo = _TODO.search(body)
-            if todo:
+            if todo and unambiguous_comment(line):
                 report.finding(
                     number, "todo_inventory",
                     f"{todo.group(1)}: {body[:80]}",
                     "Convert it to a tracked issue or delete it. An undated TODO in the "
                     "source is a decision nobody owns.",
+                    severity="low", snippet=line.strip()[:120],
+                )
+            elif todo:
+                # `#` and `;` are syntax, not comments, in several languages —
+                # C's `#define TODO 1` is not debt someone forgot to file.
+                report.candidate(
+                    number, "todo_inventory",
+                    f"{todo.group(1)} on a line whose comment prefix is ambiguous",
+                    also_caused_by=[
+                        "a C preprocessor directive or Rust attribute, where `#` is syntax",
+                        "an assembly or ini line, where `;` is not a comment",
+                        "a literal string that happens to contain the word",
+                    ],
                     severity="low", snippet=line.strip()[:120],
                 )
 
@@ -1395,6 +1464,8 @@ def check_metadata(path: Path, report: Reporter, tracked: set[Path] | None) -> N
         return
     if size <= MAX_COMMITTED_BYTES:
         return
+    if not is_probably_binary(path):
+        return  # a large SQL dump or dataset is a different conversation
     megabytes = size // (1024 * 1024)
     if tracked is None:
         report.candidate(
@@ -1567,6 +1638,7 @@ def test_private_key_block_with_a_body_is_a_finding(repo, run_script):
                "#!/bin/sh\n-----BEGIN RSA PRIVATE KEY-----\n"
                "MIIEowIBAAKCAQEAx7Vn9kQmPqLs3TfWuYcZgHjKdNbRt4VpXeAoCiMlSzUyBgHw\n"
                "-----END RSA PRIVATE KEY-----\n")
+    repo.commit("oops")  # the detector maps untracked to candidate, so commit it
     result = run_script(SCRIPT, repo.path, "--format", "json")
     record = records_of(result, "private_key_material")[0]
     assert record["kind"] == "finding"
@@ -1683,8 +1755,12 @@ from common import (Reporter, ScanPathError, build_parser, configure_output,
                     coverage_gaps, emit, fail_on_bad_path, tracked_paths,
                     walk_files, warn_detector_error, warn_unreadable)
 
-KEY_BLOCK = re.compile(r"-----BEGIN (?:RSA |EC |DSA |OPENSSH |PGP )?PRIVATE KEY-----")
-KEY_END = re.compile(r"-----END (?:RSA |EC |DSA |OPENSSH |PGP )?PRIVATE KEY-----")
+# OpenPGP armor is "PGP PRIVATE KEY BLOCK", not "PGP PRIVATE KEY" — the
+# shorter form matches nothing a real key ever writes.
+KEY_BLOCK = re.compile(r"-----BEGIN (?:RSA |EC |DSA |OPENSSH )?PRIVATE KEY-----"
+                      r"|-----BEGIN PGP PRIVATE KEY BLOCK-----")
+KEY_END = re.compile(r"-----END (?:RSA |EC |DSA |OPENSSH )?PRIVATE KEY-----"
+                    r"|-----END PGP PRIVATE KEY BLOCK-----")
 BASE64_LINE = re.compile(r"[A-Za-z0-9+/=]{32,}")
 
 CLOUD_CREDENTIALS = (
@@ -2322,6 +2398,8 @@ def run_detector(script: str, path: Path, ignore: str) -> tuple[list[dict], dict
         return [], {}, f"{script}: emitted invalid JSON ({exc})"
     if isinstance(payload, list):
         return [r for r in payload if isinstance(r, dict)], {}, None
+    if not isinstance(payload, dict):
+        return [], {}, f"{script}: emitted {type(payload).__name__}, expected a list or object"
     records = payload.get("findings") or []
     return ([r for r in records if isinstance(r, dict)],
             payload.get("completeness") or {}, None)
