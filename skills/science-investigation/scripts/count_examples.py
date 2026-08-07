@@ -60,6 +60,8 @@ CONFIRM = {
     "no_label_field": "check whether ground truth lives elsewhere (a sidecar file, a DB) before concluding",
     "small_n": "compare this n against the ship rule; a rule finer than the instrument is the finding",
     "unparseable_rows": "read the failing rows; malformed rows dropped before scoring inflate every metric",
+    "unparseable_dataset": "read the file; a corrupted eval set is not the same as an absent one, and a "
+                           "pipeline that skips it silently reports metrics over whatever survived",
     "dataset": "confirm this file is what the metric actually reads at run time",
 }
 
@@ -118,10 +120,18 @@ def records_from_json(payload):
 
 
 def read_json(path: Path, max_rows: int) -> dict:
+    """Parsed records, {} if the file is simply not a dataset, or a parse error.
+
+    The three outcomes are kept distinct on purpose. Collapsing "this JSON is
+    corrupt" into "this is not a dataset" is what makes a broken eval set look
+    exactly like an absent one.
+    """
     try:
         payload = json.loads(path.read_text(encoding="utf-8", errors="replace"))
-    except (OSError, json.JSONDecodeError, ValueError):
-        return {}
+    except json.JSONDecodeError as exc:
+        return {"parse_error": "invalid JSON at line " + str(exc.lineno)}
+    except (OSError, ValueError) as exc:
+        return {"parse_error": type(exc).__name__}
     records = records_from_json(payload)
     if records is None:
         return {}
@@ -146,8 +156,8 @@ def read_delimited(path: Path, max_rows: int) -> dict:
                 for key, value in record.items():
                     if key and isinstance(value, str) and value.strip():
                         fields[key] = fields.get(key, 0) + 1
-    except (OSError, csv.Error, UnicodeError):
-        return {}
+    except (OSError, csv.Error, UnicodeError) as exc:
+        return {"parse_error": type(exc).__name__}
     return {"rows": rows, "bad_rows": 0, "fields": fields, "truncated": truncated}
 
 
@@ -173,7 +183,12 @@ def data_files(root: Path) -> list:
 
 
 def label_coverage(fields: dict) -> list:
-    """[(field, populated_count)] for the recognized ground-truth fields, richest first."""
+    """[(field, populated_count)] for every recognized ground-truth field, richest first.
+
+    Every field, not the fullest one: a file with `expected` on 100/100 and
+    `human_rating` on 5/100 has two different n's, and a metric reading the second
+    has n=5. Reporting only the maximum is how the sparse field disappears.
+    """
     hits = [(name, n) for name, n in fields.items() if name.strip().lower() in LABEL_FIELDS]
     return sorted(hits, key=lambda pair: -pair[1])
 
@@ -184,17 +199,26 @@ def describe(fields: dict, rows: int, top: int = 6) -> str:
 
 
 def analyze(root: Path, max_rows: int) -> tuple:
-    """(candidates, per-dataset summaries)."""
-    rows_out, summaries = [], []
+    """(candidates, per-dataset summaries, unparseable files)."""
+    rows_out, summaries, unparseable = [], [], []
     for path in data_files(root):
         stats = read_dataset(path, max_rows)
+        display = rel(path, root)
+        if stats.get("parse_error"):
+            unparseable.append(display)
+            rows_out.append(candidate(
+                "unparseable_dataset", display, 1,
+                "looks like a dataset but does not parse (" + stats["parse_error"] + ") — it supplies "
+                "no examples to anything, and nothing here says so",
+                CONFIRM["unparseable_dataset"],
+            ))
+            continue
         if not stats or not stats.get("rows"):
             continue
-        display = rel(path, root)
         rows = stats["rows"]
         labels = label_coverage(stats["fields"])
         best = labels[0][1] if labels else 0
-        summaries.append({"file": display, "rows": rows, "labeled": best,
+        summaries.append({"file": display, "rows": rows, "labeled": best, "labels": labels,
                           "label_fields": [name for name, _ in labels], "truncated": stats["truncated"]})
 
         detail = str(rows) + " record(s)"
@@ -203,16 +227,17 @@ def analyze(root: Path, max_rows: int) -> tuple:
         detail += "; fields: " + (describe(stats["fields"], rows) or "none")
         rows_out.append(candidate("dataset", display, 1, detail, CONFIRM["dataset"]))
 
-        if labels and best < rows:
-            name, count = labels[0]
+        for name, count in labels:
+            if count >= rows:
+                continue
             pct = round(100.0 * count / rows, 1)
             rows_out.append(candidate(
                 "partial_labels", display, 1,
                 name + " populated on " + str(count) + " of " + str(rows) + " record(s) (" + str(pct)
-                + "%) — a reference metric over this file has n=" + str(count) + ", not " + str(rows),
+                + "%) — a reference metric reading this field has n=" + str(count) + ", not " + str(rows),
                 CONFIRM["partial_labels"],
             ))
-        elif not labels:
+        if not labels:
             rows_out.append(candidate(
                 "no_label_field", display, 1,
                 str(rows) + " record(s), no recognized ground-truth field — accuracy, recall, and "
@@ -232,20 +257,24 @@ def analyze(root: Path, max_rows: int) -> tuple:
                 str(stats["bad_rows"]) + " of " + str(rows) + " record(s) did not parse",
                 CONFIRM["unparseable_rows"],
             ))
-    return rows_out, summaries
+    return rows_out, summaries, unparseable
 
 
-def headline_for(summaries: list) -> str:
+def headline_for(summaries: list, unparseable: list) -> str:
     if not summaries:
+        if unparseable:
+            return (str(len(unparseable)) + " file(s) look like datasets but do not parse ("
+                    + ", ".join(unparseable[:3]) + ") and no dataset parsed at all — corrupted "
+                    "measurement input is not the same as absent measurement input.")
         return ("No JSON/JSONL/CSV datasets found under this path. If metrics are reported anyway, "
                 "find what they read — measurement with no stored examples cannot be re-derived.")
 
-    partial = [s for s in summaries if s["label_fields"] and s["labeled"] < s["rows"]]
-    if partial:
-        worst = min(partial, key=lambda s: s["labeled"] / max(s["rows"], 1))
-        return (worst["file"] + ": " + str(worst["rows"]) + " record(s), " + worst["label_fields"][0]
-                + " populated on " + str(worst["labeled"])
-                + " — every reference metric over this file has that as its n.")
+    sparse = [(s, name, n) for s in summaries for name, n in s["labels"] if n < s["rows"]]
+    if sparse:
+        worst_set, worst_field, worst_n = min(sparse, key=lambda t: t[2] / max(t[0]["rows"], 1))
+        return (worst_set["file"] + ": " + str(worst_set["rows"]) + " record(s), " + worst_field
+                + " populated on " + str(worst_n)
+                + " — every reference metric reading that field has it as its n.")
 
     unlabeled = [s for s in summaries if not s["label_fields"]]
     if len(unlabeled) == len(summaries):
@@ -281,16 +310,19 @@ def main() -> int:
         print("error: no such path: " + str(root), file=sys.stderr)
         return 2
 
-    rows, summaries = analyze(root, args.max_rows)
-    order = ["partial_labels", "no_label_field", "small_n", "unparseable_rows", "dataset"]
+    rows, summaries, unparseable = analyze(root, args.max_rows)
+    order = ["unparseable_dataset", "partial_labels", "no_label_field", "small_n",
+             "unparseable_rows", "dataset"]
     rows.sort(key=lambda r: (order.index(r["kind"]) if r["kind"] in order else 99, r["file"]))
     counts = {
         "datasets": len(summaries),
+        "datasets_unparseable": len(unparseable),
         "records_total": sum(s["rows"] for s in summaries),
         "records_labeled_max": max([s["labeled"] for s in summaries], default=0),
         "candidates_total": len(rows),
     }
-    emit(envelope("count_examples", root, headline_for(summaries), CAVEAT, counts, rows[:args.limit]), args.format)
+    emit(envelope("count_examples", root, headline_for(summaries, unparseable), CAVEAT, counts,
+                  rows[:args.limit]), args.format)
     return 0
 
 

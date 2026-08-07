@@ -91,9 +91,10 @@ judge confound, prompt and model-version drift, silent fail-soft, non-determinis
 contamination, trajectory-blind agent evals, RAG's two failure surfaces — are the ones
 that most often make an otherwise careful number meaningless.
 
-For the statistics: can n resolve the effect the ship rule cares about? Is the
-comparison paired? Is the resampling seeded? Were N metrics × K arms tested with no
-multiple-comparisons correction? (It almost always is absent — say so.)
+For the statistics: can n resolve the effect the ship rule cares about — computed
+from the spread of the deltas, not assumed from n alone? Is the comparison paired? Is
+the resampling seeded? Were N metrics × K arms tested with no multiple-comparisons
+correction? (It almost always is absent — say so.)
 
 ### 5. Reconcile and rank
 
@@ -126,7 +127,7 @@ Any of these, on sight, is worth a candidate row.
 | `temperature` unset or > 0 with a single run | The headline is one draw from a distribution reported as a fact |
 | A composite that averages `[v for v in vals if v is not None]` | Skipped metrics vanish; survivors' mean is reported as the whole |
 | Hand-written weights (`0.4 / 0.2 / 0.4`) with no derivation | A magic number decides the headline |
-| A ship rule of "+3 points" with n in the tens | The decision rule is finer than the instrument |
+| A ship rule of "+3 points" with n in the tens | The rule may be finer than the instrument — compute the interval, don't assume it |
 | `[:100]` or `sample(` inside the eval loop | "We measured everything" is false and unlabelled |
 | A flag defaulting to `False` around the better method | The good result was never actually measured in production |
 | A scoring change that only ever moved scores up | Progress on the dashboard, no change in the world |

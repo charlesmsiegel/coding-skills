@@ -30,7 +30,7 @@ from pathlib import Path
 
 from common import (
     CODE_SUFFIXES, CONFIG_SUFFIXES, add_common_args, candidate, configure_output,
-    emit, envelope, iter_files, read_lines, rel,
+    emit, envelope, iter_files, read_source, rel, skipped_note,
 )
 
 # Tokens that make an identifier a measure on their own.
@@ -63,7 +63,8 @@ _DEF_RE = re.compile(r"\b(?:def|function|func|fn)\s+([A-Za-z_][\w]*)\s*\(")
 # `accuracy = ...`, `self.win_rate = ...`, `const qualityScore = ...`, `NDCG_AT_10 = ...`
 # The lookarounds keep `score == 0.75` out: a comparison is not a definition, and it
 # is already caught (better) by _COMPARE_RE below.
-_ASSIGN_RE = re.compile(r"^\s*(?:(?:const|let|var|final|public|private|static)\s+)*"
+_ASSIGN_RE = re.compile(r"^\s*(?:(?:export|default|const|let|var|final|readonly|"
+                        r"public|private|protected|static)\s+)*"
                         r"(?:self\.|this\.)?([A-Za-z_][\w]*)\s*(?::[^=\n]+?)?"
                         r"(?<![=!<>+\-*/])=(?!=)\s*(.+)$")
 # `"accuracy": 0.81` in JSON/dict, and `accuracy:` in YAML
@@ -91,6 +92,12 @@ CONFIRM = {
     "renormalized_composite": "check whether the composite reports how many components contributed",
     "no_consumer": "grep the name yourself before believing this; a runtime-built key reads as unused",
 }
+
+
+# pytest calls these by collection, not by a textual reference, so "referenced
+# nowhere" is always true of them and says nothing. Left in `metric_definition`,
+# excluded from the dead-measurement map.
+_DISCOVERED_RE = re.compile(r"^(?:test_|Test)|_test$")
 
 
 def tokens_of(name: str) -> frozenset:
@@ -150,8 +157,8 @@ def name_candidates(line: str, stripped: str, path_display: str, lineno: int, de
         # Only module-level definitions are eligible for the dead-measurement check:
         # a local inside a function is a step in a computation, and "this local is
         # never read in another file" is not a finding.
-        if top_level:
-            defined.setdefault(name, (path_display, lineno))
+        if top_level and not _DISCOVERED_RE.search(name):
+            defined.setdefault(name, []).append((path_display, lineno))
         if not is_threshold:
             out.append(candidate(
                 "metric_definition", path_display, lineno,
@@ -209,39 +216,50 @@ def scan_line(line: str, path_display: str, lineno: int, defined: dict) -> list:
 
 
 def scan(root: Path) -> tuple:
-    """(candidates, defined-name -> site, files scanned)."""
+    """(candidates, defined-name -> sites, corpus, files skipped unread)."""
     files = iter_files(root, CODE_SUFFIXES | CONFIG_SUFFIXES)
     found = []
     defined: dict = {}
     corpus = {}
+    skipped = []
     for path in files:
-        lines = read_lines(path)
+        lines, reason = read_source(path)
         display = rel(path, root)
+        if reason:
+            skipped.append((display, reason))
+            continue
         corpus[display] = lines
         for lineno, line in enumerate(lines, 1):
             found += scan_line(line, display, lineno, defined)
-    return found, defined, corpus
+    return found, defined, corpus, skipped
 
 
 def dead_metrics(defined: dict, corpus: dict) -> list:
-    """Module-level metric names that appear nowhere but their own definition.
+    """Module-level metric names that appear nowhere but their own definitions.
 
     Deliberately strict: one reference anywhere — the same file included — is
     enough to clear a name. A helper called only by its own module is not dead
     measurement, and a detector that says it is gets switched off.
+
+    *Every* definition site is excluded, not just the first. Two files defining
+    the same unused metric would otherwise each count as the other's consumer,
+    and the pair would clear each other.
     """
     out = []
-    for name, (display, lineno) in sorted(defined.items()):
+    for name, sites in sorted(defined.items()):
         if len(name) < 4:
             continue  # too short to grep meaningfully; `acc` matches everything
         pattern = re.compile(r"\b" + re.escape(name) + r"\b")
+        definition_sites = set(sites)
         uses = 0
         for other, lines in corpus.items():
             for other_line, text in enumerate(lines, 1):
-                if (other, other_line) == (display, lineno):
+                if (other, other_line) in definition_sites:
                     continue
                 uses += len(pattern.findall(text))
-        if uses == 0:
+        if uses:
+            continue
+        for display, lineno in sites:
             out.append(candidate(
                 "no_consumer", display, lineno,
                 name + " is defined here and referenced nowhere in the tree — candidate dead measurement",
@@ -273,9 +291,11 @@ def headline_for(rows: list, defined: dict, files: int) -> str:
     zeros = [r for r in rows if r["kind"] == "zero_default"]
     weights = [r for r in rows if r["kind"] == "composite_weight"]
     if dead:
-        names = ", ".join(sorted({r["detail"].split(" ")[0] for r in dead})[:4])
-        return (str(len(dead)) + " metric name(s) defined and referenced nowhere else in the tree ("
-                + names + ") — a number nobody reads is dead measurement, and usually the bigger finding.")
+        unique = sorted({r["detail"].split(" ")[0] for r in dead})
+        names = ", ".join(unique[:4])
+        return (str(len(unique)) + " metric name(s) defined and referenced nowhere else in the tree, at "
+                + str(len(dead)) + " site(s) (" + names
+                + ") — a number nobody reads is dead measurement, and usually the bigger finding.")
     if renorm:
         return (str(len(renorm)) + " site(s) drop missing values before aggregating: a run where half the "
                 "components skipped can report the survivors' average as if it were the whole.")
@@ -311,16 +331,18 @@ def main() -> int:
         print("error: no such path: " + str(root), file=sys.stderr)
         return 2
 
-    rows, defined, corpus = scan(root)
+    rows, defined, corpus, skipped = scan(root)
     rows += dead_metrics(defined, corpus)
     shown = dedupe(rows, args.limit)
     counts = {
         "files_scanned": len(corpus),
+        "files_skipped_unread": len(skipped),
         "metric_names": len(defined),
         "candidates_total": len(rows),
         "candidates_shown": len(shown),
     }
-    emit(envelope("find_metrics", root, headline_for(rows, defined, len(corpus)), CAVEAT, counts, shown), args.format)
+    headline = headline_for(rows, defined, len(corpus)) + skipped_note(skipped)
+    emit(envelope("find_metrics", root, headline, CAVEAT, counts, shown), args.format)
     return 0
 
 

@@ -91,10 +91,18 @@ The instrument must be finer than the decision rule.
   written down; if it isn't written down, that's the first finding.
 - What is **n**? Not the dataset size — the number of examples that supplied every
   input to the metric in question.
-- Can n resolve the effect? A bootstrap over 30 paired deltas has an interval wider
-  than most effects teams argue about. Rough shape: a difference in a proportion around
-  0.5 needs on the order of hundreds of paired examples to resolve a few points; tens
-  of examples resolve tens of points.
+- Can n resolve the effect? **This is a calculation, not a rule of thumb** — the answer
+  depends on the spread of the per-item deltas, and asserting "n=30 can't resolve 3
+  points" without looking at that spread is manufacturing a finding, which is the thing
+  this skill exists to stop. Low-variance paired continuous deltas can resolve a few
+  points at n=30; a noisy binary metric may not resolve them at n=300.
+
+  So: find the deltas and compute (or find) the interval. If per-item scores aren't
+  stored, that itself is the finding — the comparison cannot be checked by anyone, and
+  the honest report is "unresolved", not "too small". As a sanity anchor while you look:
+  a difference in a proportion near 0.5 typically needs hundreds of paired examples to
+  resolve a few points, which is why small-n proportion comparisons deserve the
+  calculation rather than the benefit of the doubt.
 
 If a confidence interval or bootstrap exists, read it for three things:
 

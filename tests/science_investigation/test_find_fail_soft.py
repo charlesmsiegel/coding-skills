@@ -176,3 +176,97 @@ def test_a_clean_tree_is_reported_without_claiming_it_is_clean(tmp_path):
     payload = run(tmp_path)
     assert payload["candidates"] == []
     assert "Read the caveat" in payload["headline"]
+
+
+# ---- review fixes ------------------------------------------------------------ #
+
+def test_a_handler_returning_a_real_low_score_is_not_a_zero(tmp_path):
+    """`return 0.75` once matched the bare `0` alternative — a false headline."""
+    (tmp_path / "s.py").write_text(
+        "def score(row):\n"
+        "    try:\n"
+        "        return judge(row)\n"
+        "    except ValueError:\n"
+        "        return 0.75\n",
+        encoding="utf-8",
+    )
+    assert not kinds(run(tmp_path), "error_becomes_zero")
+
+
+def test_a_handler_returning_an_empty_string_is_a_zero(tmp_path):
+    """The documented empty-result case; a word boundary cannot follow a quote."""
+    (tmp_path / "s.py").write_text(
+        "def answer(row):\n"
+        "    try:\n"
+        "        return generate(row)\n"
+        "    except TimeoutError:\n"
+        '        return ""\n',
+        encoding="utf-8",
+    )
+    assert kinds(run(tmp_path), "error_becomes_zero")
+
+
+def test_returning_none_is_a_swallowed_error_not_a_zero(tmp_path):
+    """null-for-unmeasurable is the shape this skill recommends; don't call it a zero."""
+    (tmp_path / "s.py").write_text(
+        "def score(row):\n"
+        "    try:\n"
+        "        return judge(row)\n"
+        "    except TimeoutError:\n"
+        "        return None\n",
+        encoding="utf-8",
+    )
+    payload = run(tmp_path)
+    assert not kinds(payload, "error_becomes_zero")
+    assert kinds(payload, "swallowed_error")
+
+
+def test_a_comment_mentioning_rethrow_does_not_excuse_a_swallowed_error(tmp_path):
+    (tmp_path / "s.py").write_text(
+        "def score(row):\n"
+        "    try:\n"
+        "        return judge(row)\n"
+        "    except Exception:\n"
+        "        # cannot rethrow here, the batch would die\n"
+        "        pass\n",
+        encoding="utf-8",
+    )
+    assert kinds(run(tmp_path), "swallowed_error")
+
+
+@pytest.mark.parametrize("line", [
+    "ENABLE_RERANKER: bool = False",
+    "const useReranker: boolean = false",
+    "let featureAdaptiveCutoff: boolean = false",
+])
+def test_annotated_declarations_still_read_as_default_off(tmp_path, line):
+    (tmp_path / "settings.py").write_text(line + "\n", encoding="utf-8")
+    assert kinds(run(tmp_path), "default_off_flag")
+
+
+@pytest.mark.parametrize("line", [
+    "rows = random.sample(rows, 50)",
+    "rows = random.choices(rows, k=50)",
+    "rows = df.sample(n=50)",
+])
+def test_the_real_python_sampling_signatures_are_caught(tmp_path, line):
+    (tmp_path / "run.py").write_text(line + "\n", encoding="utf-8")
+    assert kinds(run(tmp_path), "silent_cap")
+
+
+@pytest.mark.parametrize("model", ["gpt-4-0613", "gpt-4-1106-preview"])
+def test_dated_provider_snapshots_count_as_pinned(tmp_path, model):
+    (tmp_path / "call.py").write_text('client.complete(model="' + model + '")\n', encoding="utf-8")
+    assert not kinds(run(tmp_path), "unpinned_model")
+
+
+def test_dot_env_files_are_scanned(tmp_path):
+    (tmp_path / ".env").write_text("ENABLE_RERANKER=false\n", encoding="utf-8")
+    assert kinds(run(tmp_path), "default_off_flag")
+
+
+def test_a_file_too_large_to_read_is_reported_as_unread(tmp_path):
+    (tmp_path / "huge.py").write_text("# padding\n" * 250_000, encoding="utf-8")
+    payload = run(tmp_path)
+    assert payload["counts"]["files_skipped_unread"] == 1
+    assert "NOT read" in payload["headline"]

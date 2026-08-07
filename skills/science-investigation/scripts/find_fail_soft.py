@@ -31,7 +31,7 @@ from pathlib import Path
 
 from common import (
     CODE_SUFFIXES, CONFIG_SUFFIXES, add_common_args, candidate, configure_output,
-    emit, envelope, iter_files, read_lines, rel,
+    emit, envelope, iter_files, read_source, rel, skipped_note,
 )
 
 KIND_ORDER = ["error_becomes_zero", "swallowed_error", "default_off_flag",
@@ -52,23 +52,46 @@ _HANDLER_RE = re.compile(
     r"^\s*(?:\}\s*)?(?:except\b[^:]*:|rescue\b)"
     r"|\bcatch\s*(?:\([^)]*\))?\s*\{"
 )
-_ZERO_BODY_RE = re.compile(r"""\breturn\s+(?:0|0\.0*|""|''|None|null)\b"""
-                           r"""|=\s*(?:0|0\.0*|""|'')\s*$"""
-                           r"""|\bappend\(\s*(?:0|0\.0*|""|'')\s*\)"""
-                           r"""|\bscore\w*\s*=\s*(?:0|0\.0*|""|'')""")
-_EMPTY_BODY_RE = re.compile(r"^\s*(?:pass|continue|break|return|\}|;)\s*$")
+# A complete zero literal, never a prefix of one: `0`, `0.`, `0.00` — but not the
+# `0` inside `0.75`, which would make every "return a real low score" path a false
+# error_becomes_zero. The empty-string forms carry no trailing word boundary,
+# because there is no word character after a quote for one to sit against.
+# `return None` is deliberately NOT here: null-for-unmeasurable is the practice
+# this skill recommends, so calling it a zero would punish the good shape. It
+# still records nothing, so _EMPTY_BODY_RE below catches it as a swallowed error.
+_ZERO = r"""(?:0(?:\.0*)?(?![\d.])|""|'')"""
+_ZERO_BODY_RE = re.compile(r"\breturn\s+" + _ZERO
+                           + r"|=\s*" + _ZERO + r"\s*;?\s*$"
+                           + r"|\bappend\(\s*" + _ZERO
+                           + r"|\bscore\w*\s*=\s*" + _ZERO)
+_EMPTY_BODY_RE = re.compile(r"^\s*(?:pass|continue|break|return(?:\s+(?:None|null|nil))?|\}|;)\s*$")
 _SURFACED_RE = re.compile(r"\braise\b|\bthrow\b|\brethrow\b")
+# `# cannot rethrow here` must not count as re-raising, or the `pass` under it
+# never surfaces. Comments are stripped before the check.
+_COMMENT_RE = re.compile(r"(?<![:\w])#.*$|//.*$")
 
 # The flag word may open the name (`enable_reranker`) or sit inside it
 # (`rag.use_reranker`), so the prefix is optional. `on` alone matches half the
 # words in English, which is what _ENABLE_TOKEN_RE below exists to filter back out.
 _FLAG_NAME = r"[\w.]*(?:enable|enabled|use|using|with|allow|feature|flag|active|on)[\w]*"
+# An optional type annotation may sit between the name and the value:
+# `ENABLE_RERANKER: bool = False`, `const useReranker: boolean = false`.
+_ANNOTATED = r"\s*(?::\s*[A-Za-z_][\w.\[\]<>| ]*)?\s*[:=]\s*"
 _DEFAULT_OFF_RE = re.compile(
-    r"\b(" + _FLAG_NAME + r")\s*[:=]\s*(?:false|0)\b"
-    r"|\b(" + _FLAG_NAME + r")\s*[:=]\s*[\"'](?:false|off|0|no)[\"']",
+    r"\b(" + _FLAG_NAME + r")" + _ANNOTATED + r"(?:false|0)\b"
+    r"|\b(" + _FLAG_NAME + r")" + _ANNOTATED + r"[\"'](?:false|off|0|no)[\"']",
     re.IGNORECASE,
 )
-_ENABLE_TOKEN_RE = re.compile(r"enable|enabled|use_|using|with_|allow|feature|flag|_on\b|is_on", re.IGNORECASE)
+# The name is confirmed by its *tokens*, not by a substring: `connection_timeout`
+# contains "on" and `user_id` contains "use", while `useReranker` and
+# `ENABLE_RERANKER` are genuine switches. Splitting first is what tells them apart.
+_TOKEN_RE = re.compile(r"[A-Z]+(?![a-z])|[A-Z][a-z0-9]*|[a-z0-9]+")
+FLAG_TOKENS = frozenset({"enable", "enabled", "disable", "use", "using", "with",
+                         "allow", "feature", "flag", "active", "on", "toggle"})
+
+
+def is_flag_name(name: str) -> bool:
+    return bool({t.lower() for t in _TOKEN_RE.findall(name)} & FLAG_TOKENS)
 
 _CAP_RE = re.compile(
     r"\[\s*:\s*\d{1,6}\s*\]"                             # rows[:100]
@@ -76,7 +99,7 @@ _CAP_RE = re.compile(
     r"|\bislice\(\s*[^,]+,\s*\d+"                          # islice(rows, 50)
     r"|\blimit\s*[=:(]\s*\d+"                              # limit=100
     r"|\blimit\s+\d+"                                      # SQL LIMIT 100
-    r"|\b(?:sample|choices|choice)\(\s*[^)]*\bn\s*="        # sample(rows, n=50)
+    r"|\b(?:sample|choices|choice)\(\s*[^)]*(?:\b[nk]\s*=\s*\d|,\s*\d+\s*\))"  # sample(rows, 50) / (rows, k=50) / (n=50)
     r"|\bmax_(?:examples|rows|samples|cases|items|records)\s*[=:]\s*\d+",
     re.IGNORECASE,
 )
@@ -90,7 +113,9 @@ _MODEL_RE = re.compile(
     r"[\"']((?:gpt|claude|gemini|llama|mistral|mixtral|command|titan|sonnet|opus|haiku|o[134]|text-embedding)"
     r"[A-Za-z0-9._-]*)[\"']"
 )
-_PINNED_RE = re.compile(r"\d{4}-\d{2}-\d{2}|\d{6,8}|-v\d+|@\d")
+# A full date, a compact date, a four-digit provider snapshot (gpt-4-0613,
+# gpt-4-1106-preview), an explicit -v2, or an @-pinned tag.
+_PINNED_RE = re.compile(r"\d{4}-\d{2}-\d{2}|\d{6,8}|-\d{4}(?!\d)|-v\d+|@\d")
 
 
 def handler_body(lines: list, index: int, max_lines: int = 8) -> list:
@@ -126,7 +151,9 @@ def scan_handlers(lines: list, display: str) -> list:
         if not _HANDLER_RE.search(line):
             continue
         body = handler_body(lines, index)
-        joined = "\n".join(body)
+        code = [_COMMENT_RE.sub("", b).rstrip() for b in body]
+        code = [b for b in code if b.strip()]
+        joined = "\n".join(code)
         if _SURFACED_RE.search(joined):
             continue  # re-raised: the error is not being hidden
         if _ZERO_BODY_RE.search(joined):
@@ -135,13 +162,13 @@ def scan_handlers(lines: list, display: str) -> list:
                 "a failure here yields 0/empty — indistinguishable from a genuine low score",
                 CONFIRM["error_becomes_zero"], line.strip() + " ... " + " ".join(b.strip() for b in body)[:120],
             ))
-        elif body and all(_EMPTY_BODY_RE.match(b) for b in body):
+        elif code and all(_EMPTY_BODY_RE.match(b) for b in code):
             out.append(candidate(
                 "swallowed_error", display, index + 1,
                 "handler records nothing — the example is lost without a trace",
                 CONFIRM["swallowed_error"], line.strip(),
             ))
-        elif not body:
+        elif not code:
             out.append(candidate(
                 "swallowed_error", display, index + 1,
                 "empty handler",
@@ -157,7 +184,7 @@ def scan_line(line: str, display: str, lineno: int) -> list:
         return out
 
     match = _DEFAULT_OFF_RE.search(line)
-    if match and _ENABLE_TOKEN_RE.search(match.group(0)):
+    if match and is_flag_name(match.group(1) or match.group(2) or ""):
         out.append(candidate(
             "default_off_flag", display, lineno,
             "a component defaults to off here",
@@ -193,14 +220,18 @@ def scan_line(line: str, display: str, lineno: int) -> list:
 
 def scan(root: Path) -> tuple:
     files = iter_files(root, CODE_SUFFIXES | CONFIG_SUFFIXES)
-    rows = []
+    rows, skipped, read = [], [], 0
     for path in files:
-        lines = read_lines(path)
+        lines, reason = read_source(path)
         display = rel(path, root)
+        if reason:
+            skipped.append((display, reason))
+            continue
+        read += 1
         rows += scan_handlers(lines, display)
         for lineno, line in enumerate(lines, 1):
             rows += scan_line(line, display, lineno)
-    return rows, len(files)
+    return rows, read, skipped
 
 
 def headline_for(rows: list, files: int) -> str:
@@ -260,13 +291,13 @@ def main() -> int:
         print("error: no such path: " + str(root), file=sys.stderr)
         return 2
 
-    rows, files = scan(root)
-    headline = headline_for(rows, files)
+    rows, files, skipped = scan(root)
+    headline = headline_for(rows, files) + skipped_note(skipped)
     if args.kind:
         rows = [r for r in rows if r["kind"] == args.kind]
     rows.sort(key=lambda r: (KIND_ORDER.index(r["kind"]) if r["kind"] in KIND_ORDER else 99, r["file"], r["line"]))
 
-    counts = {"files_scanned": files, "candidates_total": len(rows)}
+    counts = {"files_scanned": files, "files_skipped_unread": len(skipped), "candidates_total": len(rows)}
     for kind in KIND_ORDER:
         found = sum(1 for r in rows if r["kind"] == kind)
         if found:
