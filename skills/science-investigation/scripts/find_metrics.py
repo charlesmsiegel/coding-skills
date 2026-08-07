@@ -56,10 +56,19 @@ THRESHOLD_TOKENS = frozenset({
 })
 
 _SPLIT_RE = re.compile(r"[A-Z]+(?![a-z])|[A-Z][a-z0-9]*|[a-z0-9]+")
-_NUMBER = r"-?\d+(?:\.\d+)?"
+# Leading-dot decimals and scientific notation are ordinary threshold literals:
+# `quality_score > .75`, `pvalue < 1e-3`. Requiring a digit prefix missed both.
+_NUMBER = r"-?(?:\d+\.?\d*|\.\d+)(?:[eE][-+]?\d+)?"
 
-# `def compute_accuracy(`, `func Accuracy(`, `fn recall(`
-_DEF_RE = re.compile(r"\b(?:def|function|func|fn)\s+([A-Za-z_][\w]*)\s*\(")
+# `def compute_accuracy(`, `func Accuracy(`, `fn recall(`, `func (r *Runner) Accuracy(`,
+# and the C-family typed method `double accuracy(` / `public float winRate(`.
+# A bare `qualityScore(` is deliberately NOT matched: it is indistinguishable from
+# a call, and treating every call as a definition would bury the real ones.
+_DEF_RE = re.compile(
+    r"\b(?:def|function|func|fn)\s+(?:\([^)]*\)\s*)?([A-Za-z_][\w]*)\s*\("
+    r"|^\s*(?:(?:public|private|protected|static|final|virtual|override|async|export)\s+)*"
+    r"(?:[A-Za-z_][\w:<>,\[\] ]*?[\w>\]])\s+([A-Za-z_][\w]*)\s*\([^;]*\)\s*(?:const\s*)?\{"
+)
 # `accuracy = ...`, `self.win_rate = ...`, `const qualityScore = ...`, `NDCG_AT_10 = ...`
 # The lookarounds keep `score == 0.75` out: a comparison is not a definition, and it
 # is already caught (better) by _COMPARE_RE below.
@@ -129,7 +138,7 @@ def named_on(line: str, stripped: str) -> list:
     names = []
     definition = _DEF_RE.search(line)
     if definition:
-        names.append((definition.group(1), ""))
+        names.append((definition.group(1) or definition.group(2), ""))
     assignment = _ASSIGN_RE.match(line)
     if assignment:
         names.append((assignment.group(1), assignment.group(2)))
@@ -268,6 +277,22 @@ def dead_metrics(defined: dict, corpus: dict) -> list:
     return out
 
 
+MEASURE_KINDS = ("metric_definition", "threshold", "composite_weight", "renormalized_composite")
+
+
+def scope_zero_defaults(rows: list) -> list:
+    """Drop zero-default rows from files with no measurement content at all.
+
+    `return 0` in a CLI's main() and `settings.get("retries", 0)` are not
+    measurement, and reporting them as "zero-default sites" in an unrelated
+    subtree manufactures measurement content — the one thing this skill tells its
+    reader never to do. A zero default inside an exception handler is still caught
+    by find_fail_soft.py, which reads the handler rather than the name.
+    """
+    measured = {r["file"] for r in rows if r["kind"] in MEASURE_KINDS}
+    return [r for r in rows if r["kind"] != "zero_default" or r["file"] in measured]
+
+
 def dedupe(rows: list, limit: int) -> list:
     """One row per (kind, file, detail); kinds ordered by how often they matter."""
     order = ["no_consumer", "renormalized_composite", "zero_default", "composite_weight",
@@ -284,6 +309,14 @@ def dedupe(rows: list, limit: int) -> list:
 
 
 def headline_for(rows: list, defined: dict, files: int) -> str:
+    """The headline the rows support.
+
+    Definition counts come from the emitted rows, not from `defined`: that map
+    holds only module-level names (it exists for the dead-metric check), so a
+    metric defined under an indented YAML key produced a "No metric definitions
+    found" headline sitting directly above the definition row it had just
+    printed. A report that contradicts its own body stops the reader.
+    """
     if not files:
         return "Nothing to scan: no source or config files found under this path."
     dead = [r for r in rows if r["kind"] == "no_consumer"]
@@ -305,9 +338,14 @@ def headline_for(rows: list, defined: dict, files: int) -> str:
     if weights:
         return (str(len(weights)) + " composite/weight site(s): ask where each weight was derived, "
                 "since an unexplained weight decides the headline.")
-    if defined:
-        return (str(len(defined)) + " metric name(s) across " + str(files)
+    named = {r["detail"].split(" ")[0] for r in rows if r["kind"] == "metric_definition"}
+    if named:
+        return (str(len(named)) + " metric name(s) across " + str(files)
                 + " file(s). Build the metric x inputs x consumer x N inventory from these.")
+    thresholds = [r for r in rows if r["kind"] == "threshold"]
+    if thresholds:
+        return (str(len(thresholds)) + " threshold site(s) but no metric definition: the decisions are "
+                "visible here and whatever produces the numbers they gate is not.")
     return ("No metric definitions found under this path — if that is unexpected, measurement lives "
             "elsewhere; if it is expected, say so in one line and stop.")
 
@@ -315,6 +353,9 @@ def headline_for(rows: list, defined: dict, files: int) -> str:
 CAVEAT = (
     "Name-based and textual. A measure computed through a name this vocabulary does not know is "
     "invisible, and an ordinary variable that happens to be called `score` shows up here. "
+    "Definitions are recognized by a keyword (`def`/`func`/`function`), a Go receiver, or a typed "
+    "C-family signature; a bare class method (`qualityScore(rows) {`) is NOT matched, because it is "
+    "textually identical to a call and matching it would report every call site as a definition. "
     "Consumer counts are literal text matches, so a metric read through a key built at runtime "
     "reads as unused, and a name matched inside a comment reads as used. Confirm every row by reading."
 )
@@ -333,6 +374,7 @@ def main() -> int:
 
     rows, defined, corpus, skipped = scan(root)
     rows += dead_metrics(defined, corpus)
+    rows = scope_zero_defaults(rows)
     shown = dedupe(rows, args.limit)
     counts = {
         "files_scanned": len(corpus),
