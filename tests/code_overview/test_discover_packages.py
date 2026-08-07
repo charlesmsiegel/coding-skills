@@ -211,6 +211,20 @@ def test_discovery_never_descends_into_ignored_trees(run_script, repo, tmp_path)
             assert not root.startswith(("node_modules", "vendor")), root
 
 
+def test_dotnet_projects_are_discovered_by_extension(run_script, repo):
+    """A .csproj is named after its project, so there is no fixed filename."""
+    for name in ("Billing", "Web"):
+        repo.write(f"src/{name}/{name}.csproj", "<Project Sdk=\"Microsoft.NET.Sdk\" />\n")
+        for module in ("A", "B", "C"):
+            repo.write(f"src/{name}/{module}.cs", "public class C {}\n")
+    repo.commit("init")
+    proposal = propose(run_script, repo)
+    assert {"Billing", "Web"} <= names(proposal)
+    billing = next(p for p in proposal["packages"] if p["name"] == "Billing")
+    assert billing["roots"] == ["src/Billing"]
+    assert billing["language"] == "csharp"
+
+
 def test_sizes_exclude_generated_docs(run_script, repo):
     for module in ("a", "b", "c"):
         repo.write(f"app/{module}.py", "x = 1\n")

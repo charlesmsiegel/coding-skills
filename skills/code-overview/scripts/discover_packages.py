@@ -60,6 +60,11 @@ MANIFESTS = {
     "composer.json": "php", "Gemfile": "ruby",
 }
 
+# Manifests identified by extension rather than exact name. A .NET solution
+# names each project `<Name>.csproj`, so there is no fixed filename to look for
+# and a monorepo of them would otherwise collapse into one `src` candidate.
+MANIFEST_SUFFIXES = {".csproj": "dotnet", ".fsproj": "dotnet", ".vbproj": "dotnet"}
+
 _NAME_PATTERNS = (
     re.compile(r'^\s*name\s*=\s*["\']([^"\']+)["\']', re.MULTILINE),   # toml / setup.cfg
     re.compile(r'"name"\s*:\s*"([^"]+)"'),                              # json
@@ -86,16 +91,21 @@ def scan(repo: Path, excluded: set[str]) -> dict[str, list[Path]]:
     """Every file discovery cares about, found in a single pruned traversal."""
     found: dict[str, list[Path]] = {name: [] for name in INTERESTING}
     found["settings"] = []
+    for suffix in MANIFEST_SUFFIXES:
+        found[suffix] = []
     for dirpath, dirnames, filenames in os.walk(repo):
         dirnames[:] = sorted(
             d for d in dirnames
             if d not in SKIP_DIRS and d not in excluded and not d.startswith(".")
         )
         for name in sorted(filenames):
+            path = Path(dirpath) / name
             if name in INTERESTING:
-                found[name].append(Path(dirpath) / name)
+                found[name].append(path)
+            elif path.suffix in MANIFEST_SUFFIXES:
+                found[path.suffix].append(path)
             elif name.startswith("settings") and name.endswith(".py"):
-                found["settings"].append(Path(dirpath) / name)
+                found["settings"].append(path)
     return found
 
 
@@ -299,6 +309,14 @@ def discover(repo: Path, excluded: set[str], min_files: int) -> dict:
                 for member in cargo_members(repo, manifest):
                     add([member], member.name,
                         f"cargo workspace member ({member.relative_to(repo).as_posix()})", "rust-workspace")
+
+    # --- extension-named manifests (.NET projects)
+    for suffix, family in MANIFEST_SUFFIXES.items():
+        for manifest in found[suffix]:
+            directory = manifest.parent
+            add([directory], manifest.stem,
+                f"{manifest.name} at {directory.relative_to(repo).as_posix() or '.'}",
+                f"{family}-manifest")
 
     # --- importable Python roots the manifests did not already name
     for package in top_level_python_packages(found):

@@ -55,6 +55,11 @@ called `api` — easy to get from two manifests — would lose every link betwee
 them and could point a grade row at the wrong package. `load_map` rejects
 duplicates rather than guessing; rename one, usually to its path.
 
+**`docs` must be unique too.** Two packages pointed at one docs directory is
+silent data loss: the second build overwrites the first's health and summary
+pages, and navigation then walks the same three files twice, so only the last
+package survives. `load_map` rejects that as well.
+
 `discover_packages.py` emits a superset of this shape: the same `packages` list
 plus `too_small`, `unassigned`, and `questions`. Strip those three when saving
 the map, or leave them — the loaders ignore unknown keys.
@@ -107,7 +112,8 @@ Every `health.html` carries its numbers in machine-readable form:
 | `analyzer_errors` | detector → error, from the doctor's own report |
 | `analyzers_skipped[]` | detectors the doctor was told not to run, or that never ran |
 | `findings_out_of_scope` | findings dropped as being about code outside this unit |
-| `findings_total`, `findings_by_severity` | counts, after scoping |
+| `duplicates_merged` | same defect reported by two doctors, collapsed to one |
+| `findings_total`, `findings_by_severity` | counts, after scoping and deduplication |
 | `top_findings[]` | the worst N, with repo-relative paths |
 | `packages[]` | root scope only: one row per package, with its grade |
 

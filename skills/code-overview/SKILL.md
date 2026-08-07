@@ -122,10 +122,19 @@ out-of-scope is printed to stderr and recorded in the metadata — it should
 roughly account for the rest of the repo, and if it accounts for *everything*
 the paths don't line up.
 
-**`--doctor` is not optional.** It is how the page knows which rubric categories
-the findings could have covered. Name a doctor with no coverage profile — or
-none at all — and every category comes back ungraded rather than scoring an
-unread language A+. `--assume-full-coverage` is the deliberate override.
+**`--doctor` is not optional**, and coverage is **evidence, not capability**. A
+report from `analyze_all.py` names the analyzers that ran, so it is believed per
+category. A bare list (django) grants the doctor's profile only when no such
+report is present. A single detector's `{"issues": […]}` grants *nothing* — it
+says what it found, never what else was looked at, so an empty `find_duplicates`
+run cannot become an A+ in seven categories. Name a doctor with no profile and
+every category comes back ungraded rather than scoring an unread language A+.
+`--covers a,b,c` states coverage explicitly; `--assume-full-coverage` credits the
+whole rubric.
+
+**Findings from two doctors are deduplicated** on `(file, line, type)`, keeping
+the higher severity — both security detectors flag the same hardcoded
+`SECRET_KEY`, and charging one defect twice inflates the penalty by a third.
 
 **The summary.** Write a short HTML fragment first — what this package is, why it
 is shaped this way, what you noticed reading it — and pass it as `--intro-file`.
@@ -155,7 +164,10 @@ Same three documents, one scope up.
   and comparable to one. With `--map` and no explicit `--root-dir`, it is sized
   over the union of the mapped packages' roots — code the user chose to leave
   unassigned contributes no findings, so it must not pad the denominator either.
-  It reads each package's `health.html` for the grade table, so build those first.
+  Findings about files directly in the repo root (`tsconfig.json`, the root
+  manifest) are kept here even though they sit in no package; they describe the
+  whole tree. It reads each package's `health.html` for the grade table, so build
+  those first.
 - **Summary**: `build_summary.py --root --map docs/code-overview.json`.
 
 ## 5. Navigation, last

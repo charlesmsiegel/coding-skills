@@ -65,24 +65,33 @@ def warn(message: str) -> None:
 # findings
 # --------------------------------------------------------------------------
 
-def normalize_findings(data) -> tuple[list[dict], dict[str, str], set[str]]:
-    """Flatten any doctor's JSON into (findings, analyzer_errors, analyzers_skipped).
+# What a findings file's JSON shape tells us about how much was examined.
+#   full     analyze_all.py's report — names the analyzers that ran, so coverage
+#            is evidence rather than assumption
+#   flat     django-code-doctor's bare list — no manifest of what ran, so only
+#            the doctor's own profile describes it
+#   partial  a single detector's {"issues": [...]} — one detector looked at one
+#            thing, and nothing in the file says which
+SHAPE_FULL, SHAPE_FLAT, SHAPE_PARTIAL = "full", "flat", "partial"
 
-    Three shapes in the wild: analyze_all.py's report (`categories` mapping),
-    a single detector's `{"issues": [...]}`, and django-code-doctor's flat list.
 
-    The two non-finding values matter as much as the findings, for the same
-    reason: an analyzer that crashed and an analyzer that was never run both
+def normalize_findings(data) -> dict:
+    """Flatten any doctor's JSON into one report record.
+
+    Returns `{findings, errors, ran, skipped, shape}`. The non-finding fields
+    matter as much as the findings and for the same reason: an analyzer that
+    crashed, one that was skipped, and one that was never part of the run all
     report zero, and zero from an analyzer that did not look means *unknown*,
-    not *clean*. `--skip-duplicates` is advertised by the doctors as the way to
-    skip the slowest detector, so a report missing a whole category is a normal
-    thing to be handed, not a corrupt one.
+    not *clean*.
     """
     findings: list[dict] = []
     errors: dict[str, str] = {}
     skipped: set[str] = set()
+    ran: set[str] = set()
+    shape = SHAPE_PARTIAL
 
     if isinstance(data, list):
+        shape = SHAPE_FLAT
         findings = [item for item in data if isinstance(item, dict)]
     elif isinstance(data, dict):
         meta = data.get("meta", {}) if isinstance(data.get("meta"), dict) else {}
@@ -90,36 +99,85 @@ def normalize_findings(data) -> tuple[list[dict], dict[str, str], set[str]]:
         skipped = {str(name) for name in (meta.get("analyzers_skipped") or [])}
         categories = data.get("categories")
         if isinstance(categories, dict):
+            shape = SHAPE_FULL
             for name, payload in categories.items():
                 issues = payload.get("issues", []) if isinstance(payload, dict) else []
                 for issue in issues:
                     if isinstance(issue, dict):
                         issue.setdefault("category", name)
                         findings.append(issue)
-            # An analyzer the report names as run-or-skipped but never lists is
-            # also absent. `analyzers_run` is the authoritative list.
-            ran = meta.get("analyzers_run")
-            if isinstance(ran, list) and ran:
-                skipped |= {name for name in categories if name not in set(ran)}
+            listed = meta.get("analyzers_run")
+            ran = ({str(name) for name in listed} if isinstance(listed, list) and listed
+                   else set(categories))
+            # An analyzer that appears as a category but is absent from
+            # analyzers_run never produced its section.
+            skipped |= set(categories) - ran
+            ran -= set(errors) | skipped
         elif isinstance(data.get("issues"), list):
             findings = [item for item in data["issues"] if isinstance(item, dict)]
 
     for finding in findings:
         finding.setdefault("severity", "medium")
-    return findings, errors, skipped
+    return {"findings": findings, "errors": errors, "ran": ran,
+            "skipped": skipped, "shape": shape}
 
 
-def load_findings(paths) -> tuple[list[dict], dict[str, str], set[str]]:
+def finding_identity(finding: dict) -> tuple:
+    """What makes two findings the same defect: same place, same kind.
+
+    The *whole* path, not the basename. Merging on basename would collapse
+    `src/a/models.py:3` and `src/b/models.py:3` — two different defects that
+    monorepos produce constantly — into one. Different path spellings for the
+    same file (absolute vs relative) instead fail to merge, which only leaves a
+    duplicate counted twice; that is the safe direction to be wrong in.
+    """
+    for key in ("smell_type", "issue_type", "pattern_type", "type"):
+        if finding.get(key):
+            kind = str(finding[key])
+            break
+    else:
+        kind = "issue"
+    path = str(finding.get("file", ""))
+    normalized = Path(path).as_posix().removeprefix("./") if path else ""
+    return (normalized, finding.get("line"), kind)
+
+
+_SEVERITY_RANK = {"high": 0, "medium": 1, "low": 2}
+
+
+def dedupe(findings: list[dict]) -> tuple[list[dict], int]:
+    """Collapse the same defect reported by two doctors, keeping the worst call.
+
+    Companion doctors overlap on purpose — django-code-doctor and
+    python-code-doctor both flag a hardcoded `SECRET_KEY` at the same file and
+    line, at different severities. Counting it twice charges the grade ~13
+    weighted points for one defect instead of 10, and the recommended workflow
+    runs both, so this is the normal case rather than an edge one.
+    """
+    best: dict[tuple, dict] = {}
+    order: list[tuple] = []
+    for finding in findings:
+        identity = finding_identity(finding)
+        current = best.get(identity)
+        if current is None:
+            best[identity] = finding
+            order.append(identity)
+        elif (_SEVERITY_RANK.get(str(finding.get("severity")), 1)
+              < _SEVERITY_RANK.get(str(current.get("severity")), 1)):
+            best[identity] = finding
+    return [best[identity] for identity in order], len(findings) - len(best)
+
+
+def load_findings(paths) -> tuple[list[dict], dict[str, str], set[str], list[dict], int]:
     """Read and merge several findings files. `-` reads stdin.
 
-    Skipped analyzers intersect rather than union across files: running the
-    Python doctor with `--skip-duplicates` and the Django doctor beside it
-    leaves duplication covered by neither, but a category one report skipped and
-    another covered is covered.
+    Returns the deduplicated findings, the merged analyzer errors, the analyzers
+    no report ran, the per-report records (which is what coverage is computed
+    from), and how many duplicates were collapsed.
     """
+    reports: list[dict] = []
     findings: list[dict] = []
     errors: dict[str, str] = {}
-    skipped: set[str] | None = None
     for raw in paths:
         text = sys.stdin.read() if str(raw) == "-" else Path(raw).read_text(encoding="utf-8")
         if not text.strip():
@@ -129,11 +187,19 @@ def load_findings(paths) -> tuple[list[dict], dict[str, str], set[str]]:
             data = json.loads(text)
         except json.JSONDecodeError as exc:
             raise SystemExit(f"error: {raw} is not valid JSON: {exc}") from exc
-        part, part_errors, part_skipped = normalize_findings(data)
-        findings.extend(part)
-        errors.update(part_errors)
-        skipped = part_skipped if skipped is None else (skipped & part_skipped)
-    return findings, errors, skipped or set()
+        report = normalize_findings(data)
+        reports.append(report)
+        findings.extend(report["findings"])
+        errors.update(report["errors"])
+
+    # Skipped means skipped *everywhere*: a detector one report omitted and
+    # another ran is covered. Coverage itself is computed per report, so this
+    # is only for reporting.
+    ran_anywhere = {name for report in reports for name in report["ran"]}
+    skipped = {name for report in reports for name in report["skipped"]} - ran_anywhere
+
+    findings, duplicates = dedupe(findings)
+    return findings, errors, skipped, reports, duplicates
 
 
 def within(path: str, roots: list[Path], base: Path) -> bool:
@@ -297,6 +363,20 @@ def load_map(path) -> dict:
             )
         seen.add(package["name"])
         package.setdefault("docs", str(Path(package["roots"][0]) / "docs"))
+
+    # Two packages writing to one docs directory is silent data loss: the second
+    # build overwrites the first's health and summary pages, and navigation then
+    # walks the same three files twice, so only the last package survives.
+    by_docs: dict[str, str] = {}
+    for package in packages:
+        resolved = str(Path(package["docs"]).as_posix()).rstrip("/")
+        if resolved in by_docs:
+            raise SystemExit(
+                f"error: {path} points {package['name']!r} and {by_docs[resolved]!r} at the same "
+                f"docs directory ({resolved}) — the second build would overwrite the first; "
+                "give each package its own"
+            )
+        by_docs[resolved] = package["name"]
     return data
 
 

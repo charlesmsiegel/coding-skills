@@ -199,6 +199,23 @@ def test_a_single_package_repo_has_no_package_layer(run_script, repo):
     assert "Code Map" in block, "the across-row is still useful with one package"
 
 
+def test_two_packages_sharing_a_docs_directory_are_rejected(run_script, repo):
+    """The second build would overwrite the first's pages with no warning."""
+    repo.write("docs/code-overview.json", json.dumps({
+        "schema": "code-overview/1",
+        "packages": [
+            {"name": "alpha", "roots": ["src/alpha"], "docs": "shared/docs"},
+            {"name": "beta", "roots": ["src/beta"], "docs": "shared/docs"},
+        ],
+    }))
+    for kind in KINDS:
+        repo.write(f"docs/{kind}.html", page(kind))
+    repo.commit("init")
+    result = run(run_script, repo, expect_rc=1)
+    assert "same docs directory" in result.stderr
+    assert "overwrite" in result.stderr
+
+
 def test_a_missing_map_fails_with_a_usable_message(run_script, repo, tmp_path):
     result = run_script(INJECT_NAV, "--map", tmp_path / "nope.json", "--repo", repo.path,
                         expect_rc=1)

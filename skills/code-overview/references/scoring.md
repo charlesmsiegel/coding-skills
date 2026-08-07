@@ -70,21 +70,38 @@ categories are dropped and the remaining weights renormalized.
 
 ## Ungraded is not zero, and not a hundred
 
-A category comes back ungraded in five situations:
+**Coverage is evidence, not capability.** What a category may be graded on is
+what the findings files *demonstrate* was examined — never what the named doctor
+could have done in principle. The three report shapes carry different amounts of
+evidence, and are read accordingly:
+
+| Shape | What it is | Coverage it grants |
+|---|---|---|
+| full | `analyze_all.py`'s report — has `meta.analyzers_run` | exactly the categories whose detectors ran, minus any that were skipped or crashed |
+| flat | a bare JSON list (`analyze_django.py`) | the `--doctor` profile, and only when no full report is present |
+| partial | one detector's `{"issues": [...]}` | **nothing** — one detector says what it found, never what else was looked at |
+
+When any full report is present it is believed and the others add findings
+without inflating coverage. That is what makes the recommended Python+Django
+merge behave: if the Python report skipped duplicates, the Django list beside it
+cannot silently restore duplication, because a bare list is not evidence that
+anything was examined.
+
+`--covers a,b,c` names coverage explicitly when nothing in the files can;
+`--assume-full-coverage` credits the whole rubric.
+
+Given that, a category comes back ungraded in five situations:
 
 1. **No detector covers it for this doctor.** `rubric.DOCTOR_COVERAGE` records
    this. `django-code-doctor` has no general duplication or dead-code detector,
    so duplication is ungraded for a Django app reviewed by it alone — it must
    not collect a free 100.
-2. **No known doctor produced the findings at all.** An unrecognized (or empty)
-   `--doctor` means *nothing* can be claimed as measured, so every category is
-   ungraded and the overall score is null. This is the case that matters most:
-   a doctor pointed at a language it cannot parse returns an empty findings
-   list, and an empty findings list graded as coverage is an A+. Pass
-   `--assume-full-coverage` to override deliberately.
-3. **A detector crashed.** The doctors report those under
-   `meta.analyzer_errors`, and a zero count from a crashed detector means
-   *unknown*. `build_health.py` drops the affected rubric category.
+2. **Nothing in the findings demonstrates it was examined** — an unrecognized or
+   empty `--doctor`, or a single-detector report. This is the case that matters
+   most: a doctor pointed at a language it cannot parse returns an empty findings
+   list, and an empty findings list graded as coverage is an A+.
+3. **A detector crashed.** `meta.analyzer_errors`; a zero count from a crashed
+   detector means *unknown*.
 4. **A detector was skipped or never ran.** `meta.analyzers_skipped`, plus any
    category absent from `meta.analyzers_run`. `--skip-duplicates` is advertised
    by the doctors as the way to skip the slowest detector, so being handed a
@@ -94,6 +111,27 @@ A category comes back ungraded in five situations:
 All five land in `ungraded` in the metadata and in a callout on the page. The
 only dishonest options are the two obvious ones: scoring 0 punishes a repo for
 a missing coverage artifact; scoring 100 rewards it for one.
+
+A dropped category makes the score **partial, not an upper bound**. Weights are
+renormalized over what remains, so restoring the missing category could move the
+overall either way — up if it would have scored well, down if badly. The page
+says exactly that rather than giving the reader a direction of error that does
+not hold.
+
+## Merging companion doctors
+
+Running two doctors over one tree means the same defect can arrive twice — both
+security detectors flag a hardcoded `SECRET_KEY` at the same file and line, at
+different severities. Counted twice it costs the grade ~13 weighted points
+instead of 10. Findings are therefore deduplicated on `(file, line, type)`,
+keeping the higher severity, and the merged count is reported in
+`duplicates_merged` and on the page.
+
+The key is the **whole path**, not the basename: `src/a/models.py:3` and
+`src/b/models.py:3` are two defects, and a monorepo produces that pair
+constantly. Two spellings of one path (absolute vs relative) simply fail to
+merge, which leaves a duplicate counted twice — the safe direction to be wrong
+in.
 
 Run a Django app through **both** `django-code-doctor` and `python-code-doctor`
 and pass both findings files to `build_health.py` — that is what closes the
@@ -119,6 +157,12 @@ Two mechanisms keep them aligned:
   answers the `unassigned` question with "leave it out", that code contributes no
   findings; measuring the whole checkout anyway would improve the repo's grade in
   direct proportion to how much code was excluded from analysis.
+
+  One exception, in `--root` mode only: findings about files sitting **directly
+  in the repo root** — `tsconfig.json`, the root manifest, a settings file — are
+  kept. They describe the whole tree rather than any package, and the repo grade
+  is documented to include repo-wide findings. An unmapped *directory* is still
+  out; the exception is for configuration, not for code the user excluded.
 
 ## Mapping a finding to a category
 
