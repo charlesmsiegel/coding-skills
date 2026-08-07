@@ -36,7 +36,7 @@ from pathlib import Path
 import common
 import rubric
 from common import (HEALTH_SCHEMA, doc_path, esc, git_sha, json_block, listed_packages,
-                    load_findings, load_map, measure, read_asset, read_meta, rel_href,
+                    load_map, load_reports, measure, read_asset, read_meta, rel_href,
                     render, warn, within)
 
 SEVERITY_ORDER = ("high", "medium", "low")
@@ -344,7 +344,18 @@ def scoring_roots(args, repo: Path) -> list[str]:
     if args.root_dir:
         return list(args.root_dir)
     if args.root and args.map:
-        roots = [root for package in load_map(args.map).get("packages", [])
+        packages = load_map(args.map).get("packages", [])
+        # Only packages some doctor actually reviews. A Go package beside a
+        # Python one contributes no findings, so counting its lines dilutes the
+        # Python density — far enough that an empty Python report could grade
+        # A+ over the combined total.
+        analyzed = [p for p in packages if p.get("doctor")]
+        skipped = [p["name"] for p in packages if not p.get("doctor")]
+        if skipped and analyzed:
+            warn("packages with no doctor are excluded from the repo grade's size: "
+                 f"{', '.join(skipped)}. Their lines would dilute findings they cannot "
+                 "contribute to; they still appear in the package table as ungraded.")
+        roots = [root for package in (analyzed or packages)
                  for root in package.get("roots", [])]
         if roots and "." not in roots:
             return sorted(set(roots))
@@ -399,38 +410,48 @@ def resolve_coverage(args, reports: list[dict]):
                   for report in evidenced
                   for name in (report["skipped"] | set(report["errors"]))
                   if name in rubric.DETECTOR_CATEGORIES}
-        return ran - absent
+        covered = ran - absent
+        # Evidence still cannot exceed what the named doctor is able to detect.
+        # A report claiming a duplication analyzer ran, handed over with
+        # --doctor django-code-doctor, is a mislabeled run rather than a reason
+        # to grade a category that doctor has no detector for.
+        profile = rubric.DOCTOR_COVERAGE.get(args.doctor)
+        return covered & set(profile) if profile is not None else covered
 
-    if any(report["shape"] == common.SHAPE_PARTIAL for report in reports):
-        warn("a findings file is a single detector's output, which says nothing about what "
-             "else was examined — every category is ungraded. Pass --covers a,b,c to name "
-             "what this analysis actually looked at, or --assume-full-coverage.")
-        return set()
-
-    covered = rubric.DOCTOR_COVERAGE.get(args.doctor)
-    if covered is None:
-        # No known doctor produced these findings, so nothing here can be
-        # claimed as measured. An empty findings list from a doctor that could
-        # not read the language would otherwise render as an A+, which is the
-        # one output this skill must never produce.
-        warn(f"no coverage profile for doctor {args.doctor!r} — every category is ungraded. "
-             "Pass --assume-full-coverage if the findings really do cover the whole rubric, "
-             "--covers a,b,c to name what was examined, or add the doctor to "
-             "rubric.DOCTOR_COVERAGE.")
-        return set()
-    return set(covered)
+    # Nothing here names what ran. A bare JSON list is what `analyze_django.py`
+    # emits *and* what `find_duplicates.py --format json` emits, so the file
+    # cannot distinguish a full Django run from one detector that found nothing;
+    # crediting the doctor's profile graded the latter A+ in every category.
+    warn("no findings file says which analyzers ran — a bare list or a single detector's "
+         "output cannot, so every category is ungraded. Pass --covers a,b,c to declare what "
+         "this analysis examined (for django-code-doctor alone that is "
+         f"{','.join(sorted(rubric.DOCTOR_COVERAGE['django-code-doctor']))}), or "
+         "--assume-full-coverage.")
+    return set()
 
 
-def build(args, findings: list[dict], errors: dict[str, str], skipped: set[str],
-          reports: list[dict], duplicates: int) -> tuple[str, dict]:
+def build(args, reports: list[dict], errors: dict[str, str],
+          skipped: set[str]) -> tuple[str, dict]:
     repo = Path(args.repo).resolve()
     relative_roots = scoring_roots(args, repo)
     roots = [repo / r for r in relative_roots]
+
+    # A root that vanished between runs measures zero lines, and a clean report
+    # over nothing would grade A+ for a package that no longer exists. Map drift
+    # is exactly what the re-run workflow anticipates, so it has to be caught.
+    missing_roots = [r for r, path in zip(relative_roots, roots) if not path.exists()]
+    if missing_roots:
+        warn(f"these roots do not exist: {', '.join(missing_roots)} — the package map is "
+             "stale. Nothing is graded over a path that is not there.")
 
     # Keep only findings about the code this document is a claim about. The
     # doctors are run from the repo root so they can see manifests, tests and
     # settings; without that context they invent findings (a package with no
     # manifest of its own reports a missing one) and miss real ones.
+    #
+    # Scoping happens per report and *before* deduplication, so the merged-
+    # duplicate count describes this unit. Deduplicating first let a package
+    # page announce duplicates that were merged in a different package.
     scope = [repo / s for s in (args.scope or relative_roots)]
     out_of_scope = 0
     if scope and [Path(s).resolve() for s in scope] != [repo]:
@@ -444,9 +465,14 @@ def build(args, findings: list[dict], errors: dict[str, str], skipped: set[str],
             # in the repo root qualify; an unmapped *directory* is still out.
             return args.root and is_repo_root_file(path, repo)
 
-        kept = [f for f in findings if in_scope(f)]
-        out_of_scope = len(findings) - len(kept)
-        findings = kept
+        scoped = []
+        for report in reports:
+            kept = [f for f in report["findings"] if in_scope(f)]
+            out_of_scope += len(report["findings"]) - len(kept)
+            scoped.append({**report, "findings": kept})
+        reports = scoped
+
+    findings, duplicates = common.dedupe(reports)
 
     # Size over what was analyzed, which for a Django package includes its
     # templates. Each override replaces only its own field, so `--files` alone
@@ -477,6 +503,7 @@ def build(args, findings: list[dict], errors: dict[str, str], skipped: set[str],
         "commit": args.commit or git_sha(repo),
         "size": size,
         "sized_extensions": sorted(extensions - common.CODE_EXTENSIONS),
+        "missing_roots": missing_roots,
         "score": scored["score"],
         "grade": scored["grade"],
         "categories": scored["categories"],
@@ -625,8 +652,8 @@ def main(argv=None) -> int:
     if not args.name:
         args.name = Path(args.repo).resolve().name if args.root else "package"
 
-    findings, errors, skipped, reports, duplicates = load_findings(args.findings)
-    page, meta = build(args, findings, errors, skipped, reports, duplicates)
+    reports, errors, skipped = load_reports(args.findings)
+    page, meta = build(args, reports, errors, skipped)
 
     out = Path(args.out)
     out.parent.mkdir(parents=True, exist_ok=True)

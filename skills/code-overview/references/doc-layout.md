@@ -58,7 +58,14 @@ duplicates rather than guessing; rename one, usually to its path.
 **`docs` must be unique too.** Two packages pointed at one docs directory is
 silent data loss: the second build overwrites the first's health and summary
 pages, and navigation then walks the same three files twice, so only the last
-package survives. `load_map` rejects that as well.
+package survives. `load_map` rejects that as well, comparing normalized paths so
+`src/a/docs` and `src/a/../a/docs` collide as they should.
+
+**Only a package that *is* the repository may use `docs`.** The collapse rule
+needs both halves — `roots: ["."]` *and* `docs: "docs"`. A package rooted at
+`src/api` that merely points `docs` at the repo's own directory is misconfigured,
+not collapsed: treating it as collapsed would drop it from navigation and every
+roll-up while the root build silently overwrote its pages. `load_map` rejects it.
 
 `discover_packages.py` emits a superset of this shape: the same `packages` list
 plus `too_small`, `unassigned`, and `questions`. Strip those three when saving

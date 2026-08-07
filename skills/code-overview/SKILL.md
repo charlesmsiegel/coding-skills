@@ -122,15 +122,24 @@ out-of-scope is printed to stderr and recorded in the metadata — it should
 roughly account for the rest of the repo, and if it accounts for *everything*
 the paths don't line up.
 
-**`--doctor` is not optional**, and coverage is **evidence, not capability**. A
-report from `analyze_all.py` names the analyzers that ran, so it is believed per
-category. A bare list (django) grants the doctor's profile only when no such
-report is present. A single detector's `{"issues": […]}` grants *nothing* — it
-says what it found, never what else was looked at, so an empty `find_duplicates`
-run cannot become an A+ in seven categories. Name a doctor with no profile and
-every category comes back ungraded rather than scoring an unread language A+.
-`--covers a,b,c` states coverage explicitly; `--assume-full-coverage` credits the
-whole rubric.
+**Coverage is evidence, not capability.** Only `analyze_all.py`'s report — the
+envelope naming `analyzers_run` — is evidence, and it is believed per category
+(capped by the `--doctor` profile). **Every other shape grades nothing**: a bare
+JSON list, a single detector's `{"issues": […]}`, an empty file. That is not
+excessive caution — `analyze_django.py` and `find_duplicates.py --format json`
+emit the *same* bare-list shape, so nothing in the file distinguishes a full
+Django run from one detector that found nothing, and inferring the doctor's
+profile from it scored the latter A+ in all seven categories.
+
+So: **the Python/TypeScript doctors need no flag** (their report is an envelope),
+and **`django-code-doctor` run alone needs `--covers`**:
+
+```bash
+--covers correctness,security,tests,complexity,design,hygiene   # django's profile
+```
+
+The recommended Python+Django merge needs no flag either, since the Python report
+carries the evidence. `--assume-full-coverage` credits the whole rubric.
 
 **Findings from two doctors are deduplicated** on `(file, line, type)`, keeping
 the higher severity — both security detectors flag the same hardcoded
@@ -173,8 +182,11 @@ Same three documents, one scope up.
   unassigned contributes no findings, so it must not pad the denominator either.
   Findings about files directly in the repo root (`tsconfig.json`, the root
   manifest) are kept here even though they sit in no package; they describe the
-  whole tree. It reads each package's `health.html` for the grade table, so build
-  those first.
+  whole tree. Packages with **no doctor are left out of the repo grade's size** —
+  their lines would dilute findings they cannot contribute — while still
+  appearing in the table as ungraded. It reads each package's `health.html` for
+  the grade table, so build those first; a package with no health page stays in
+  the table marked *not generated* rather than vanishing from it.
 - **Summary**: `build_summary.py --root --map docs/code-overview.json`.
 
 ## 5. Navigation, last

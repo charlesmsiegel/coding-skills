@@ -22,12 +22,17 @@ def graded(run_script, repo):
     for module in range(4):
         repo.write(f"src/app/m{module}.py", "\n".join(f"x{i}=1" for i in range(300)))
     report = repo.path / "findings.json"
-    report.write_text(json.dumps([
-        {"file": "src/app/m0.py", "line": 4, "severity": "high", "category": "security",
-         "description": "hardcoded secret", "suggestion": "load it from the environment"},
-        {"file": "src/app/m1.py", "line": 9, "severity": "medium", "category": "duplicates",
-         "description": "duplicate block"},
-    ]))
+    report.write_text(json.dumps({
+        "meta": {"analyzers_run": ["mutation_hazards", "security", "untested_modules",
+                                   "complexity", "design_smells", "duplicates",
+                                   "naming_issues", "findings"]},
+        "categories": {"findings": {"issues": [
+            {"file": "src/app/m0.py", "line": 4, "severity": "high", "category": "security",
+             "description": "hardcoded secret", "suggestion": "load it from the environment"},
+            {"file": "src/app/m1.py", "line": 9, "severity": "medium", "category": "duplicates",
+             "description": "duplicate block"},
+        ]}},
+    }))
     run_script(BUILD_HEALTH, "--out", repo.path / "src/app/docs/health.html",
                "--findings", report, "--repo", repo.path, "--name", "app",
                "--root-dir", "src/app", "--language", "python",
@@ -176,3 +181,36 @@ def test_prose_is_html_escaped_where_it_is_not_meant_to_be_html(run_script, grad
     text = build(run_script, graded, "--highlight", "<img src=x onerror=alert(1)>").read_text()
     assert "<img src=x" not in text
     assert "&lt;img" in text
+
+
+def test_the_portal_marks_a_package_with_no_health_page(run_script, repo):
+    """The documented codemap-only answer, seen from the page readers land on."""
+    for module in range(3):
+        repo.write(f"src/api/m{module}.py", "\n".join(f"x{i}=1" for i in range(300)))
+        repo.write(f"src/svc/m{module}.go", "package main\n")
+    repo.write("docs/code-overview.json", json.dumps({
+        "schema": "code-overview/1",
+        "packages": [
+            {"name": "api", "roots": ["src/api"], "docs": "src/api/docs",
+             "language": "python", "doctor": "python-code-doctor"},
+            {"name": "svc", "roots": ["src/svc"], "docs": "src/svc/docs",
+             "language": "go", "doctor": ""},
+        ],
+    }))
+    repo.commit("init")
+    report = repo.path / "f.json"
+    report.write_text(json.dumps({
+        "meta": {"analyzers_run": ["security", "findings"]},
+        "categories": {"findings": {"issues": []}},
+    }))
+    run_script(BUILD_HEALTH, "--out", repo.path / "src/api/docs/health.html",
+               "--findings", report, "--repo", repo.path, "--name", "api",
+               "--root-dir", "src/api", "--doctor", "python-code-doctor")
+    out = repo.path / "docs/summary.html"
+    run_script(BUILD_SUMMARY, "--root", "--out", out, "--repo", repo.path,
+               "--name", "whole-repo", "--map", repo.path / "docs/code-overview.json")
+    text = out.read_text()
+    assert "not generated" in text, "a row of bare em-dashes reads as an unexplained hole"
+    assert "has no health page and is therefore ungraded" in text, (
+        "and the caption must stop claiming every package has one"
+    )

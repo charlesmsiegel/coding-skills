@@ -77,9 +77,25 @@ evidence, and are read accordingly:
 
 | Shape | What it is | Coverage it grants |
 |---|---|---|
-| full | `analyze_all.py`'s report — has `meta.analyzers_run` | the categories whose detectors ran, **minus every category any skipped or crashed detector belonged to** |
-| flat | a bare JSON list (`analyze_django.py`) | the `--doctor` profile, and only when no full report is present |
-| partial | one detector's `{"issues": [...]}`, or a zero-byte file | **nothing** — one detector says what it found, never what else was looked at |
+| full | `analyze_all.py`'s report — an envelope with `meta.analyzers_run` | the categories whose detectors ran, **minus every category any skipped or crashed detector belonged to**, intersected with the `--doctor` profile |
+| partial | anything else — a bare JSON list, one detector's `{"issues": [...]}`, or a zero-byte file | **nothing** |
+
+There is deliberately no "a bare list means the whole doctor ran" rule, because
+that shape is ambiguous in a way that cannot be resolved from the file:
+`analyze_django.py` prints a bare list, and so does
+`find_duplicates.py --format json`, which prints `[]`. Treating it as a full
+Django run graded an empty single-detector run as an **A+ in all seven
+categories**. When a bare list really does cover part of the rubric, say which
+part with `--covers`; nothing in the file can know.
+
+For `django-code-doctor` alone that is:
+
+```
+--covers correctness,security,tests,complexity,design,hygiene
+```
+
+(no duplication — it has no such detector). The recommended Python+Django merge
+needs no flag: the Python report is a full envelope and supplies the evidence.
 
 A rubric category usually has several detectors behind it, and the subtraction is
 deliberately all-or-nothing: skipping `exception_issues` ungrades **Correctness**
@@ -87,10 +103,14 @@ even though `mutation_hazards` ran. A partly-measured category can only ever mis
 findings, never invent them, so grading it would systematically flatter the code —
 and "mostly measured" is not a thing the score can express.
 
-A zero-byte findings file is treated as `partial` rather than as no file at all.
-It is what a doctor leaves behind when it fails *after* the shell created the
-redirect target, and dropping it silently would leave no report, no contrary
-evidence, and an A+ built on an empty artifact.
+Evidence is also capped by the doctor's profile. A report whose envelope claims a
+duplication analyzer ran, handed over with `--doctor django-code-doctor`, is a
+mislabeled run rather than a reason to grade a category that doctor cannot detect.
+
+A zero-byte findings file counts as a report, not as no file at all. It is what a
+doctor leaves behind when it fails *after* the shell created the redirect target,
+and dropping it silently would leave no report, no contrary evidence, and an A+
+built on an empty artifact.
 
 When any full report is present it is believed and the others add findings
 without inflating coverage. That is what makes the recommended Python+Django
