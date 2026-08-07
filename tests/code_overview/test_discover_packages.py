@@ -155,6 +155,62 @@ def test_a_single_package_repo_is_questioned(run_script, repo):
     assert "single-package" in {q["id"] for q in proposal["questions"]}
 
 
+def test_a_mixed_language_package_is_questioned(run_script, repo):
+    """One doctor cannot speak for two languages, but both inflate the divisor."""
+    for module in range(6):
+        repo.write(f"svc/handler{module}.py", "x = 1\n")
+    for module in range(4):
+        repo.write(f"svc/widget{module}.ts", "export const x = 1;\n")
+    repo.write("svc/__init__.py", "")
+    repo.commit("init")
+    proposal = propose(run_script, repo)
+    svc = next(p for p in proposal["packages"] if p["name"] == "svc")
+    assert svc["language"] == "python"
+    assert svc["mixed_with"] == ["typescript"]
+    assert "mixed-languages" in {q["id"] for q in proposal["questions"]}
+
+
+def test_javascript_folded_into_typescript_is_not_called_mixed(run_script, repo):
+    """The JS→TS fold is deliberate; it must not generate a spurious question."""
+    for module in range(4):
+        repo.write(f"web/legacy{module}.js", "module.exports = 1;\n")
+        repo.write(f"web/new{module}.ts", "export const x = 1;\n")
+    repo.write("web/package.json", '{"name": "web"}')
+    repo.commit("init")
+    proposal = propose(run_script, repo)
+    web = next(p for p in proposal["packages"] if p["name"] == "web")
+    assert web["language"] == "typescript"
+    assert web["mixed_with"] == []
+    assert "mixed-languages" not in {q["id"] for q in proposal["questions"]}
+
+
+def test_an_incidental_second_language_is_not_called_mixed(run_script, repo):
+    for module in range(20):
+        repo.write(f"app/m{module}.py", "x = 1\n")
+    repo.write("app/build.sh", "echo hi\n")
+    repo.write("app/__init__.py", "")
+    repo.commit("init")
+    app = next(p for p in propose(run_script, repo)["packages"] if p["name"] == "app")
+    assert app["mixed_with"] == [], "one shell script does not make a package bilingual"
+
+
+def test_discovery_never_descends_into_ignored_trees(run_script, repo, tmp_path):
+    """rglob-per-manifest-name would walk node_modules once per supported name."""
+    for index in range(60):
+        repo.write(f"node_modules/dep{index}/package.json", '{"name": "dep"}')
+        repo.write(f"node_modules/dep{index}/index.js", "module.exports = 1;\n")
+    repo.write("vendor/github.com/x/go.mod", "module x\n")
+    for module in ("a", "b", "c"):
+        repo.write(f"app/{module}.py", "x = 1\n")
+    repo.write("app/__init__.py", "")
+    repo.commit("init")
+    proposal = propose(run_script, repo)
+    assert "app" in names(proposal)
+    for package in proposal["packages"] + proposal["too_small"]:
+        for root in package["roots"]:
+            assert not root.startswith(("node_modules", "vendor")), root
+
+
 def test_sizes_exclude_generated_docs(run_script, repo):
     for module in ("a", "b", "c"):
         repo.write(f"app/{module}.py", "x = 1\n")

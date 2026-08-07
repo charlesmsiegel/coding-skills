@@ -28,7 +28,8 @@ import re
 import sys
 from pathlib import Path
 
-from common import DOC_KINDS, DOC_TITLES, doc_path, esc, load_map, rel_href, warn
+from common import (DOC_KINDS, DOC_TITLES, doc_path, esc, listed_packages, load_map,
+                    rel_href, warn)
 
 START = "<!-- code-overview:nav -->"
 END = "<!-- /code-overview:nav -->"
@@ -136,12 +137,7 @@ def inject(path: Path, block: str) -> str:
 
 def units(repo: Path, packages: list[dict]) -> list[dict | None]:
     """The repo, then each package — skipping a package that *is* the repo."""
-    out: list[dict | None] = [None]
-    for package in packages:
-        if doc_path(repo, package, "summary").parent.resolve() == (repo / "docs").resolve():
-            continue
-        out.append(package)
-    return out
+    return [None, *listed_packages(repo, packages)]
 
 
 def main(argv=None) -> int:
@@ -153,7 +149,7 @@ def main(argv=None) -> int:
     args = parser.parse_args(argv)
 
     repo = Path(args.repo).resolve()
-    packages = load_map(args.map).get("packages", [])
+    packages = listed_packages(repo, load_map(args.map).get("packages", []))
     listed = units(repo, packages)
     standalone = len(listed) == 1
 

@@ -30,8 +30,8 @@ from pathlib import Path
 import rubric
 from build_health import (grade_class, headline_badges, render_category_rows,
                           render_package_table, render_top_findings)
-from common import (DOC_TITLES, doc_path, esc, load_map, read_asset, read_meta,
-                    rel_href, render, warn)
+from common import (DOC_TITLES, doc_path, esc, listed_packages, load_map, read_asset,
+                    read_meta, rel_href, render, warn)
 
 _TITLE_RE = re.compile(r'<h1 class="doc-title">(.*?)</h1>', re.DOTALL)
 _META_RE = re.compile(r'<div class="doc-meta">(.*?)</div>', re.DOTALL)
@@ -131,7 +131,10 @@ def build(args) -> str:
 
     packages = []
     if args.root and args.map:
-        packages = load_map(args.map).get("packages", [])
+        # A package whose docs directory *is* the repo's has no separate document
+        # set — listing it would advertise one that does not exist and link the
+        # row back to this very page. Navigation already drops it; so does this.
+        packages = listed_packages(repo, load_map(args.map).get("packages", []))
 
     described = describe_codemap(codemap_path)
     codemap_href = rel_href(out, codemap_path)

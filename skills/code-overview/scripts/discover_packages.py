@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import sys
 from collections import Counter
@@ -74,6 +75,30 @@ def is_skipped(path: Path, repo: Path, excluded: set[str]) -> bool:
     return any(p in SKIP_DIRS or p in excluded or p.startswith(".") for p in parts)
 
 
+# Filenames discovery cares about. One pruned walk collects all of them, because
+# rglob descends into node_modules before anything gets to filter the result —
+# and rglob-per-filename would repeat that walk once per name, which on a
+# monorepo with a populated dependency tree is the slowest thing this script does.
+INTERESTING = frozenset(MANIFESTS) | {"manage.py", "apps.py", "__init__.py"}
+
+
+def scan(repo: Path, excluded: set[str]) -> dict[str, list[Path]]:
+    """Every file discovery cares about, found in a single pruned traversal."""
+    found: dict[str, list[Path]] = {name: [] for name in INTERESTING}
+    found["settings"] = []
+    for dirpath, dirnames, filenames in os.walk(repo):
+        dirnames[:] = sorted(
+            d for d in dirnames
+            if d not in SKIP_DIRS and d not in excluded and not d.startswith(".")
+        )
+        for name in sorted(filenames):
+            if name in INTERESTING:
+                found[name].append(Path(dirpath) / name)
+            elif name.startswith("settings") and name.endswith(".py"):
+                found["settings"].append(Path(dirpath) / name)
+    return found
+
+
 def manifest_name(path: Path) -> str:
     try:
         text = path.read_text(encoding="utf-8", errors="replace")
@@ -104,26 +129,21 @@ def dominant_language(roots) -> tuple[str, Counter]:
     return counts.most_common(1)[0][0], counts
 
 
-def find_django_root(repo: Path, excluded: set[str]) -> Path | None:
+def find_django_root(found: dict[str, list[Path]]) -> Path | None:
     """The directory holding manage.py, if this is a Django project."""
-    for candidate in sorted(repo.rglob("manage.py")):
-        if not is_skipped(candidate, repo, excluded):
-            return candidate.parent
-    for settings in sorted(repo.rglob("settings*.py")):
-        if is_skipped(settings, repo, excluded):
-            continue
+    for candidate in found["manage.py"]:
+        return candidate.parent
+    for settings in found["settings"]:
         if "INSTALLED_APPS" in settings.read_text(encoding="utf-8", errors="replace"):
             return settings.parent.parent
     return None
 
 
-def django_apps(repo: Path, excluded: set[str]) -> list[Path]:
+def django_apps(repo: Path, found: dict[str, list[Path]]) -> list[Path]:
     """Local app directories named by INSTALLED_APPS, resolved against the tree."""
     apps: list[Path] = []
     seen: set[Path] = set()
-    for settings in sorted(repo.rglob("settings*.py")):
-        if is_skipped(settings, repo, excluded):
-            continue
+    for settings in found["settings"]:
         text = settings.read_text(encoding="utf-8", errors="replace")
         match = _INSTALLED_APPS_RE.search(text)
         if not match:
@@ -142,9 +162,7 @@ def django_apps(repo: Path, excluded: set[str]) -> list[Path]:
                     apps.append(candidate)
                     break
     # An app declared nowhere but structurally obvious still counts.
-    for apps_py in sorted(repo.rglob("apps.py")):
-        if is_skipped(apps_py, repo, excluded):
-            continue
+    for apps_py in found["apps.py"]:
         if "AppConfig" in apps_py.read_text(encoding="utf-8", errors="replace"):
             if apps_py.parent.resolve() not in seen:
                 seen.add(apps_py.parent.resolve())
@@ -186,16 +204,26 @@ def cargo_members(repo: Path, manifest: Path) -> list[Path]:
     return found
 
 
-def top_level_python_packages(repo: Path, excluded: set[str]) -> list[Path]:
+def top_level_python_packages(found: dict[str, list[Path]]) -> list[Path]:
     """Directories with __init__.py whose parent has none — importable roots."""
-    found: list[Path] = []
-    for init in sorted(repo.rglob("__init__.py")):
-        if is_skipped(init, repo, excluded):
-            continue
-        directory = init.parent
-        if not (directory.parent / "__init__.py").is_file():
-            found.append(directory)
-    return found
+    return [init.parent for init in found["__init__.py"]
+            if not (init.parent.parent / "__init__.py").is_file()]
+
+
+# A second language below this share of the files is incidental — a build script,
+# a couple of shims. At or above it, the package is genuinely mixed and one
+# doctor cannot speak for it.
+MIXED_LANGUAGE_SHARE = 0.2
+
+
+def secondary_languages(counts: Counter) -> list[str]:
+    """Languages that are a real part of a candidate beyond its dominant one."""
+    total = sum(counts.values())
+    if total == 0:
+        return []
+    dominant = counts.most_common(1)[0][0]
+    return sorted(language for language, count in counts.items()
+                  if language != dominant and count / total >= MIXED_LANGUAGE_SHARE)
 
 
 def candidate(repo: Path, roots, name: str, evidence: str, kind: str) -> dict:
@@ -212,6 +240,11 @@ def candidate(repo: Path, roots, name: str, evidence: str, kind: str) -> dict:
         "evidence": evidence,
         "size": size,
         "languages": dict(counts.most_common()),
+        # The dominant language decides the doctor, which decides what the grade
+        # claims to cover. When a real second language is present that choice is
+        # not the script's to make: the other language's files would swell the
+        # LOC denominator while no detector ever reads them.
+        "mixed_with": secondary_languages(counts),
     }
 
 
@@ -237,11 +270,13 @@ def discover(repo: Path, excluded: set[str], min_files: int) -> dict:
         candidates.append(entry)
         return entry
 
+    found = scan(repo, excluded)
+
     # --- Django apps first: they are the finest-grained real unit in a Django
     # project, and the pyproject.toml above them describes packaging, not design.
-    django_root = find_django_root(repo, excluded)
+    django_root = find_django_root(found)
     if django_root is not None:
-        for app in django_apps(repo, excluded):
+        for app in django_apps(repo, found):
             if not is_skipped(app, repo, excluded):
                 entry = add([app], app.name, f"Django app ({app.relative_to(repo).as_posix()})", "django-app")
                 if entry:
@@ -249,9 +284,7 @@ def discover(repo: Path, excluded: set[str], min_files: int) -> dict:
 
     # --- manifests
     for manifest_name_, family in MANIFESTS.items():
-        for manifest in sorted(repo.rglob(manifest_name_)):
-            if is_skipped(manifest, repo, excluded):
-                continue
+        for manifest in found[manifest_name_]:
             directory = manifest.parent
             name = manifest_name(manifest) or directory.name
             if directory.resolve() == repo:
@@ -268,7 +301,7 @@ def discover(repo: Path, excluded: set[str], min_files: int) -> dict:
                         f"cargo workspace member ({member.relative_to(repo).as_posix()})", "rust-workspace")
 
     # --- importable Python roots the manifests did not already name
-    for package in top_level_python_packages(repo, excluded):
+    for package in top_level_python_packages(found):
         add([package], package.name,
             f"importable package ({package.relative_to(repo).as_posix()})", "python-package")
 
@@ -343,6 +376,22 @@ def build_questions(candidates: list[dict], too_small: list[dict],
             "options": ["split it into its subdirectories", "keep it as one package"],
         })
 
+    mixed = [c for c in candidates if c["mixed_with"]]
+    if mixed:
+        listed = "; ".join(
+            f"{c['name']} is mostly {c['language'] or 'unknown'} with "
+            f"{', '.join(c['mixed_with'])}" for c in mixed[:8])
+        questions.append({
+            "id": "mixed-languages",
+            "question": f"These packages hold more than one language: {listed}. How should they be analyzed?",
+            "detail": "Only the dominant language's doctor would run, so the other language's "
+                      "lines swell the size the grade is divided by while no detector ever "
+                      "reads them.",
+            "options": ["run a doctor per language and merge the findings",
+                        "split the package by language",
+                        "grade the dominant language only, and say so on the page"],
+        })
+
     no_doctor = sorted({c["language"] or "unknown" for c in candidates if not c["doctor"]})
     if no_doctor:
         questions.append({
@@ -392,7 +441,8 @@ def render_text(proposal: dict) -> str:
              f"   repo total: {proposal['size']['files']} files, {proposal['size']['loc']} lines", ""]
     for entry in proposal["packages"]:
         doctor = entry["doctor"] or "(no doctor for this language)"
-        lines.append(f"  {entry['name']}  [{entry['language'] or 'unknown'} → {doctor}]")
+        mixed = f"  (+ {', '.join(entry['mixed_with'])})" if entry["mixed_with"] else ""
+        lines.append(f"  {entry['name']}  [{entry['language'] or 'unknown'} → {doctor}]{mixed}")
         lines.append(f"      roots: {', '.join(entry['roots'])}")
         lines.append(f"      {entry['size']['files']} files, {entry['size']['loc']} lines · {entry['evidence']}")
     if proposal["too_small"]:
