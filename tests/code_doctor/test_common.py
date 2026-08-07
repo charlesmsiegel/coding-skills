@@ -167,3 +167,32 @@ def test_reporter_candidate_sets_kind(common):
     reporter.candidate(1, "lead", "d", ["it may be loaded by convention"])
     assert reporter.findings[0].kind == "candidate"
     assert reporter.findings[0].suggestion == ""
+
+
+def test_probe_history_reports_not_a_repo(common, tmp_path):
+    plain = tmp_path / "plain"
+    plain.mkdir()
+    depth = common.probe_history(plain)
+    assert depth.is_repo is False
+    assert depth.usable is False
+
+
+def test_probe_history_flags_thin_history_as_unusable(common, repo):
+    """Two commits cannot support a bus-factor claim."""
+    repo.write("a.go", "package main\n")
+    repo.commit("one")
+    repo.write("b.go", "package b\n")
+    repo.commit("two")
+    depth = common.probe_history(repo.path, min_commits=20)
+    assert depth.is_repo is True
+    assert depth.is_shallow is False
+    assert depth.commit_count == 2
+    assert depth.usable is False
+
+
+def test_probe_history_accepts_sufficient_history(common, repo):
+    for i in range(25):
+        repo.write(f"f{i}.go", f"package p{i}\n")
+        repo.commit(f"commit {i}")
+    depth = common.probe_history(repo.path, min_commits=20)
+    assert depth.usable is True

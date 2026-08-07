@@ -10,7 +10,9 @@ a formality.
 
 import contextlib
 import os
+import subprocess
 import sys
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterator
@@ -245,3 +247,86 @@ class Reporter:
     def _add(self, record: Finding) -> None:
         if record.smell_type not in self.ignore:
             self.findings.append(record)
+
+
+# --------------------------------------------------------------------------- #
+# Git, and knowing when not to trust it
+# --------------------------------------------------------------------------- #
+
+def git(repo: Path, *args: str) -> str:
+    """Run a git command in ``repo``, returning stdout. Raises on failure."""
+    result = subprocess.run(
+        ["git", "-C", str(repo), *args],
+        capture_output=True, text=True, timeout=120, check=True,
+    )
+    return result.stdout
+
+
+def is_git_repo(repo: Path) -> bool:
+    try:
+        git(repo, "rev-parse", "--git-dir")
+        return True
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError):
+        return False
+
+
+@dataclass
+class HistoryDepth:
+    """What the repository's history can actually support.
+
+    A shallow CI checkout exposes only the most recent committer, which turns
+    multi-author files into apparent single-author files. Computing a bus
+    factor over that fragment produces a confidently wrong answer, which is
+    worse than no answer.
+    """
+
+    is_repo: bool
+    is_shallow: bool
+    commit_count: int
+    oldest_commit_days: int | None
+    min_commits: int = 20
+
+    @property
+    def usable(self) -> bool:
+        return self.is_repo and not self.is_shallow and self.commit_count >= self.min_commits
+
+    def explain(self) -> str:
+        if not self.is_repo:
+            return "not a git repository — history-derived findings skipped"
+        if self.is_shallow:
+            return ("shallow clone — history-derived findings skipped; "
+                    "re-run with `git fetch --unshallow` for ownership and churn")
+        if self.commit_count < self.min_commits:
+            return (f"only {self.commit_count} commit(s) of history — too few to support "
+                    "churn or ownership claims; findings skipped")
+        return f"{self.commit_count} commits of history"
+
+
+def probe_history(repo: Path, *, min_commits: int = 20) -> HistoryDepth:
+    """Establish what may be claimed from this repository's history."""
+    if not is_git_repo(repo):
+        return HistoryDepth(False, False, 0, None, min_commits=min_commits)
+
+    try:
+        shallow = git(repo, "rev-parse", "--is-shallow-repository").strip() == "true"
+    except Exception:
+        shallow = False
+
+    try:
+        count = int(git(repo, "rev-list", "--count", "HEAD").strip() or 0)
+    except Exception:
+        count = 0
+
+    oldest_days = None
+    try:
+        # `git log --reverse --max-count=1` does NOT give the oldest commit:
+        # --max-count limits the selection first, then --reverse reverses what
+        # was selected, so it returns HEAD. Ask for the root commit directly.
+        root = git(repo, "rev-list", "--max-parents=0", "HEAD").split()
+        stamp = git(repo, "log", "-1", "--format=%ct", root[-1]).strip() if root else ""
+        if stamp:
+            oldest_days = int((time.time() - int(stamp)) / 86400)
+    except Exception:
+        oldest_days = None
+
+    return HistoryDepth(True, shallow, count, oldest_days, min_commits=min_commits)
