@@ -315,7 +315,16 @@ same reasoning.
 
 - **`find_hygiene_issues.py`** — merge conflict markers, TODO/FIXME/HACK/XXX
   inventory with git-blame age, commented-out code, oversized files and lines,
-  committed `.env` files and large binaries, debug-print leftovers.
+  committed `.env` files and large binaries.
+
+  **Debug-print leftovers are deliberately absent.** An earlier draft listed
+  them. Detecting one means knowing that `console.log`, `println!`, `fmt.Println`,
+  `System.out.print`, `var_dump`, and `dbg!` are the print calls — which is a
+  per-language table, the one thing this layer does not carry. A partial table
+  would also be the worst of both: it would appear to cover debug output while
+  silently ignoring every language not on the list. The check belongs in the
+  language specialists, which already have it, and in the project's own linter,
+  which `run_project_checks.py` drives.
 
   Commented-out code uses the same five-token comment-prefix set as
   `find_duplication.py`, with literals blanked first, and is a **candidate**: a

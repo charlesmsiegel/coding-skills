@@ -1304,6 +1304,10 @@ Merge markers, oversized files, committed secrets-by-filename, and a TODO
 inventory are findings — none of them depends on knowing what language this is.
 Commented-out code is a candidate, because deciding that a commented line is
 dead code rather than a documentation example needs a reading brain.
+
+Debug-print leftovers are NOT here on purpose: naming the print call of each
+language is a per-language table, which this skill does not carry. The
+specialists have that check, and so does the project's own linter.
 """
 
 import re
@@ -1711,6 +1715,14 @@ def test_high_entropy_assignment_is_a_candidate(repo, run_script):
     assert record["also_caused_by"]
 
 
+def test_unquoted_dotenv_assignment_is_detected(repo, run_script):
+    """.env and YAML normally write the value bare — the highest-value case."""
+    repo.write("prod.env", "API_TOKEN=hJ8s0Kd93LwmZq2XvRt7YbNc4PfGh6Aa\n")
+    repo.commit("oops")
+    result = run_script(SCRIPT, repo.path, "--format", "json")
+    assert records_of(result, "hardcoded_secret_assignment")
+
+
 def test_low_entropy_placeholder_is_not_reported(repo, run_script):
     repo.write("settings.py", 'API_SECRET = "changeme"\n')
     result = run_script(SCRIPT, repo.path, "--format", "json")
@@ -1782,9 +1794,13 @@ DOCUMENTED_EXAMPLES = frozenset({
     "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
 })
 
+# The value may be quoted or bare. `.env` files and YAML — the two formats
+# most likely to hold a real credential — normally write it unquoted, so a
+# quotes-only pattern misses exactly the highest-value cases.
 SECRET_NAME = re.compile(
     r"\b(\w*(?:secret|passwd|password|token|apikey|api_key|access_key|private_key)\w*)\b"
-    r"\s*[:=]\s*['\"]([^'\"]{16,})['\"]",
+    r"\s*[:=]\s*"
+    r"""(?:['"]([^'"]{16,})['"]|([^\s'"#;,]{16,}))""",
     re.IGNORECASE,
 )
 
@@ -1886,7 +1902,8 @@ def analyze(path: Path, text: str, report: Reporter,
             continue
 
         assignment = SECRET_NAME.search(line)
-        if assignment and shannon_entropy(assignment.group(2)) >= MIN_ENTROPY_BITS:
+        value = (assignment.group(2) or assignment.group(3)) if assignment else ""
+        if assignment and shannon_entropy(value) >= MIN_ENTROPY_BITS:
             report.candidate(
                 number, "hardcoded_secret_assignment",
                 f"High-entropy value assigned to `{assignment.group(1)}`",
@@ -1950,7 +1967,7 @@ if __name__ == "__main__":
 - [ ] **Step 4: Run the tests to verify they pass**
 
 Run: `python -m pytest tests/code_doctor/test_find_secrets.py -v`
-Expected: 11 passed.
+Expected: 12 passed.
 
 - [ ] **Step 5: Commit**
 
@@ -2400,9 +2417,18 @@ def run_detector(script: str, path: Path, ignore: str) -> tuple[list[dict], dict
         return [r for r in payload if isinstance(r, dict)], {}, None
     if not isinstance(payload, dict):
         return [], {}, f"{script}: emitted {type(payload).__name__}, expected a list or object"
+    # Validate the nested field TYPES too. {"findings": 42} would raise
+    # TypeError in the comprehension, and a non-mapping completeness would
+    # crash on .items() in main — both outside the per-category isolation
+    # this function exists to provide, taking every other detector's valid
+    # results down with them.
     records = payload.get("findings") or []
-    return ([r for r in records if isinstance(r, dict)],
-            payload.get("completeness") or {}, None)
+    if not isinstance(records, list):
+        return [], {}, f"{script}: 'findings' is {type(records).__name__}, expected a list"
+    notes = payload.get("completeness") or {}
+    if not isinstance(notes, dict):
+        return [], {}, f"{script}: 'completeness' is {type(notes).__name__}, expected an object"
+    return [r for r in records if isinstance(r, dict)], notes, None
 
 
 def main() -> int:
