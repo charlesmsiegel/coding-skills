@@ -1,0 +1,192 @@
+"""Tests for science-investigation's metric enumerator.
+
+The script's job is to hand an auditor a short list of places to read, so most of
+these pin what it must *not* say: a helper used by its own module is not dead
+measurement, a comparison is not a definition, and `learning_rate` is not a metric.
+A candidate list nobody trusts gets skipped, and then the audit is done from memory.
+"""
+
+import json
+import subprocess
+import sys
+from pathlib import Path
+
+import pytest
+
+SCRIPT = Path(__file__).resolve().parents[2] / "skills" / "science-investigation" / "scripts" / "find_metrics.py"
+
+
+@pytest.fixture
+def finder(load_module):
+    return load_module(SCRIPT.parent, "find_metrics")
+
+
+def run(root, *args) -> dict:
+    result = subprocess.run(
+        [sys.executable, str(SCRIPT), str(root), "--format", "json", *args],
+        capture_output=True, text=True, timeout=120,
+    )
+    assert result.returncode == 0, result.stderr[-600:]
+    return json.loads(result.stdout)
+
+
+def kinds(payload, kind) -> list:
+    return [row for row in payload["candidates"] if row["kind"] == kind]
+
+
+# ---- name classification ---------------------------------------------------- #
+
+@pytest.mark.parametrize("name", [
+    "accuracy", "recall_at_10", "ndcgAt5", "quality_score", "win_rate",
+    "faithfulness", "judge_verdict", "MEAN_DELTA", "passRate",
+])
+def test_measure_names_are_recognized(finder, name):
+    assert finder.is_metric_name(name)
+
+
+@pytest.mark.parametrize("name", [
+    "learning_rate", "sample_rate", "retry_count", "user_id", "timeout_seconds",
+    "bitrate", "flush_interval",
+])
+def test_ordinary_names_are_not_measures(finder, name):
+    assert not finder.is_metric_name(name)
+
+
+def test_a_limit_is_not_a_measurement_threshold(finder):
+    """`max_retries = 3` is retry config; flagging it buries the real thresholds."""
+    assert not finder.is_threshold_name("max_retries")
+    assert finder.is_threshold_name("quality_threshold")
+    assert finder.is_threshold_name("SCORE_CUTOFF")
+
+
+# ---- what it finds ----------------------------------------------------------- #
+
+def test_definitions_thresholds_and_weights_are_found(tmp_path):
+    (tmp_path / "score.py").write_text(
+        "QUALITY_THRESHOLD = 0.75\n"
+        "WEIGHTS = {'relevance': 0.4, 'latency': 0.2, 'quality': 0.4}\n"
+        "\n"
+        "def accuracy(rows):\n"
+        "    return sum(rows) / len(rows)\n"
+        "\n"
+        "def gate(value):\n"
+        "    return value >= QUALITY_THRESHOLD\n",
+        encoding="utf-8",
+    )
+    payload = run(tmp_path)
+    assert kinds(payload, "threshold"), "a named constant that gates a decision must surface"
+    assert kinds(payload, "composite_weight"), "hand-written weights must surface"
+    assert any(row["detail"].startswith("accuracy") for row in kinds(payload, "metric_definition"))
+
+
+def test_every_row_is_labelled_a_candidate_with_a_confirm_step(tmp_path):
+    """The whole discipline: a script row is a hypothesis, never a finding."""
+    (tmp_path / "s.py").write_text("accuracy = 0.9\n", encoding="utf-8")
+    payload = run(tmp_path)
+    assert payload["candidates"]
+    for row in payload["candidates"]:
+        assert row["status"] == "candidate"
+        assert row["confirm"].strip()
+    assert payload["headline"] and payload["caveat"]
+
+
+def test_a_renormalizing_composite_is_flagged(tmp_path):
+    (tmp_path / "s.py").write_text(
+        "def composite(parts):\n"
+        "    got = [v for v in parts.values() if v is not None]\n"
+        "    return sum(got) / len(got)\n",
+        encoding="utf-8",
+    )
+    payload = run(tmp_path)
+    assert kinds(payload, "renormalized_composite")
+
+
+def test_an_error_path_returning_zero_is_flagged(tmp_path):
+    (tmp_path / "s.py").write_text(
+        "def score(row):\n"
+        "    if row is None:\n"
+        "        return 0.0\n"
+        "    return row['v']\n",
+        encoding="utf-8",
+    )
+    payload = run(tmp_path)
+    assert kinds(payload, "zero_default")
+
+
+# ---- what it must not say ---------------------------------------------------- #
+
+def test_a_helper_used_by_its_own_module_is_not_dead_measurement(tmp_path):
+    (tmp_path / "s.py").write_text(
+        "def judge_score(row):\n"
+        "    return 1.0\n"
+        "\n"
+        "def run(rows):\n"
+        "    return [judge_score(r) for r in rows]\n",
+        encoding="utf-8",
+    )
+    payload = run(tmp_path)
+    assert not kinds(payload, "no_consumer"), "one reference anywhere clears a name"
+
+
+def test_a_metric_referenced_nowhere_is_reported_as_a_dead_measurement_candidate(tmp_path):
+    (tmp_path / "s.py").write_text(
+        "def unused_recall(rows):\n"
+        "    return 0.5\n",
+        encoding="utf-8",
+    )
+    payload = run(tmp_path)
+    assert [row for row in kinds(payload, "no_consumer") if "unused_recall" in row["detail"]]
+    assert "dead measurement" in payload["headline"]
+
+
+def test_a_local_variable_is_never_a_dead_measurement_candidate(tmp_path):
+    (tmp_path / "s.py").write_text(
+        "def run(parts):\n"
+        "    scores_total = sum(parts)\n"
+        "    return scores_total\n",
+        encoding="utf-8",
+    )
+    payload = run(tmp_path)
+    assert not kinds(payload, "no_consumer")
+
+
+def test_a_comparison_is_not_read_as_a_definition(tmp_path):
+    (tmp_path / "s.py").write_text("quality_score == 0.75\n", encoding="utf-8")
+    payload = run(tmp_path)
+    assert not [row for row in kinds(payload, "metric_definition") if "quality_score" in row["detail"]]
+    assert kinds(payload, "threshold"), "it is a threshold comparison, and should be reported as one"
+
+
+def test_comments_are_ignored(tmp_path):
+    (tmp_path / "s.py").write_text("# accuracy = 0.99 was the old value\n", encoding="utf-8")
+    assert run(tmp_path)["candidates"] == []
+
+
+def test_a_tree_with_no_measurement_says_so_rather_than_inventing_findings(tmp_path):
+    (tmp_path / "s.py").write_text("def add(a, b):\n    return a + b\n", encoding="utf-8")
+    payload = run(tmp_path)
+    assert payload["candidates"] == []
+    assert "No metric definitions" in payload["headline"]
+
+
+def test_an_empty_tree_is_reported_as_nothing_to_scan(tmp_path):
+    payload = run(tmp_path)
+    assert payload["counts"]["files_scanned"] == 0
+    assert "Nothing to scan" in payload["headline"]
+
+
+def test_the_limit_caps_rows_but_not_the_reported_total(tmp_path):
+    (tmp_path / "s.py").write_text("".join(
+        "accuracy_%d = 0.5\n" % i for i in range(40)
+    ), encoding="utf-8")
+    payload = run(tmp_path, "--limit", "5")
+    assert len(payload["candidates"]) == 5
+    assert payload["counts"]["candidates_total"] > 5, "a silent cap is exactly what this skill audits for"
+
+
+def test_a_missing_path_exits_two(tmp_path):
+    result = subprocess.run(
+        [sys.executable, str(SCRIPT), str(tmp_path / "nope")],
+        capture_output=True, text=True, timeout=60,
+    )
+    assert result.returncode == 2
