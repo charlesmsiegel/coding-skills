@@ -124,6 +124,59 @@ def skipped_note(skipped: list) -> str:
             + "), so this result does not cover them.")
 
 
+def split_comment(line: str) -> tuple:
+    """(code, comment), split at the first `#` or `//` that is outside a string.
+
+    A regex cannot do this: `log("https://errors.example"); return 0;` has a `//`
+    inside a string literal, and cutting there discarded the `return 0` and
+    produced a clean report on a handler that scores its failures.
+    """
+    quote, index = None, 0
+    while index < len(line):
+        char = line[index]
+        if quote:
+            if char == "\\":
+                index += 2
+                continue
+            if char == quote:
+                quote = None
+        elif char in "\"'":
+            quote = char
+        elif char == "#" or (char == "/" and line[index + 1:index + 2] == "/"):
+            return line[:index], line[index:]
+        index += 1
+    return line, ""
+
+
+def mask_strings(line: str, filler: str = "\u00b7") -> str:
+    """String *bodies* replaced by a filler, quotes and length preserved.
+
+    Lets a pattern run over code without matching text that only appears inside a
+    message: `message = "quality_score > 0.8"` is not a threshold.
+    """
+    out, quote = [], None
+    index = 0
+    while index < len(line):
+        char = line[index]
+        if quote:
+            if char == "\\" and index + 1 < len(line):
+                out.append(filler * 2)
+                index += 2
+                continue
+            if char == quote:
+                quote = None
+                out.append(char)
+            else:
+                out.append(filler)
+        elif char in "\"'":
+            quote = char
+            out.append(char)
+        else:
+            out.append(char)
+        index += 1
+    return "".join(out)
+
+
 def rel(path: Path, root: Path) -> str:
     """Display path: relative to the scanned root where possible."""
     root = Path(root)

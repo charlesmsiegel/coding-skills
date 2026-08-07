@@ -428,3 +428,54 @@ def test_an_ambiguous_sampling_config_is_reported_rather_than_silenced(tmp_path)
 def test_kebab_case_flags_are_read_as_default_off(tmp_path):
     (tmp_path / "config.yaml").write_text("enable-reranker: false\n", encoding="utf-8")
     assert kinds(run(tmp_path), "default_off_flag")
+
+
+# ---- seventh review round ----------------------------------------------------- #
+
+def test_an_unconditional_reraise_is_clean_even_beside_a_zero(tmp_path):
+    """`score = 0` then `raise` always raises, so nothing reads the zero."""
+    (tmp_path / "s.py").write_text(
+        "def score(row):\n"
+        "    try:\n"
+        "        return judge(row)\n"
+        "    except Exception:\n"
+        "        score = 0\n"
+        "        raise\n",
+        encoding="utf-8",
+    )
+    assert not kinds(run(tmp_path), "error_becomes_zero")
+
+
+def test_a_nested_block_does_not_end_the_handler_body(tmp_path):
+    """The `}` closing an inner `if` cut collection short, hiding the return."""
+    (tmp_path / "m.js").write_text(
+        "function s(r) {\n"
+        "  try {\n"
+        "    return j(r);\n"
+        "  } catch (e) {\n"
+        "    if (fatal) {\n"
+        "      log(e);\n"
+        "    }\n"
+        "    return 0;\n"
+        "  }\n"
+        "}\n",
+        encoding="utf-8",
+    )
+    assert kinds(run(tmp_path), "error_becomes_zero")
+
+
+def test_a_url_inside_a_string_is_not_a_comment(tmp_path):
+    """`//` in `"https://..."` truncated the handler before its `return 0`."""
+    (tmp_path / "m.js").write_text(
+        "function s(r) {\n"
+        '  try { return j(r); } catch (e) { log("https://errors.example"); return 0; }\n'
+        "}\n",
+        encoding="utf-8",
+    )
+    assert kinds(run(tmp_path), "error_becomes_zero")
+
+
+def test_every_sampling_setting_on_a_minified_line_is_inspected(tmp_path):
+    """A zero temperature was examined and the `do_sample` beside it was not."""
+    (tmp_path / "c.json").write_text('{"temperature":0,"do_sample":true}\n', encoding="utf-8")
+    assert kinds(run(tmp_path), "nondeterminism")

@@ -31,7 +31,8 @@ from pathlib import Path
 
 from common import (
     CODE_SUFFIXES, CONFIG_SUFFIXES, add_common_args, candidate, configure_output,
-    emit, envelope, iter_files, read_source, rel, skipped_note,
+    emit, envelope, iter_files, mask_strings, read_source, rel, skipped_note,
+    split_comment,
 )
 
 KIND_ORDER = ["error_becomes_zero", "swallowed_error", "default_off_flag",
@@ -72,7 +73,6 @@ _SURFACED_RE = re.compile(r"\braise\b|\bthrow\b|\brethrow\b")
 # bodies, because `log("cannot rethrow")` above a `return 0.0` was reading as a
 # re-raise and producing a clean headline over the exact shape this tool exists
 # to find. The quotes are kept so `return ""` still matches _ZERO_BODY_RE.
-_COMMENT_RE = re.compile(r"(?<![:\w])#.*$|//.*$")
 _STRING_BODY_RE = re.compile(r"(['\"])(?:\\.|(?!\1).)*\1")
 
 # `judge(row).catch(() => 0)` — a promise rejection handler, which is fail-soft in
@@ -160,16 +160,60 @@ def handler_body(lines: list, index: int, max_lines: int = 8) -> list:
         inline = ""
     body = [inline] if inline.strip("} \t") else []
     indent = len(opener) - len(opener.lstrip())
+    depth = 0
     for line in lines[index + 1: index + 1 + max_lines]:
         if not line.strip():
             continue
         line_indent = len(line) - len(line.lstrip())
-        if line_indent <= indent and not line.strip().startswith(("}", ")")):
+        # Brace depth, so a nested block's `}` does not end the handler. Without
+        # it, `if (fatal) { ... }` above a `return 0;` cut the body short and the
+        # handler was reported clean.
+        if line.strip() == "}" and depth == 0:
             break
-        if line.strip() == "}":
+        if line_indent <= indent and depth == 0 and not line.strip().startswith(("}", ")")):
             break
         body.append(line)
+        code = split_comment(mask_strings(line))[0]
+        depth += code.count("{") - code.count("}")
     return body
+
+
+def always_raises(code: list) -> bool:
+    """Whether a raise in this body runs on every path.
+
+    A raise at the handler's own indentation always runs, so nothing reads a zero
+    assigned above it. Only a raise nested under a conditional leaves other
+    failures scored.
+    """
+    if not code:
+        return False
+    base = min(len(b) - len(b.lstrip()) for b in code)
+    raises = [b for b in code if _SURFACED_RE.search(_STRING_BODY_RE.sub(r"\1\1", b))]
+    return any(len(b) - len(b.lstrip()) <= base for b in raises)
+
+
+def classify_handler(body: list) -> tuple:
+    """(kind, detail) for one handler body, or (None, None) if it surfaces the error."""
+    code = [split_comment(b)[0].rstrip() for b in body]
+    code = [b for b in code if b.strip()]
+    joined = "\n".join(code)
+    surfaced = _SURFACED_RE.search(_STRING_BODY_RE.sub(r"\1\1", joined))
+    zeroed = _ZERO_BODY_RE.search(joined)
+
+    if surfaced and always_raises(code):
+        return None, None
+    if surfaced and not zeroed:
+        return None, None
+    if zeroed:
+        detail = "a failure here yields 0/empty — indistinguishable from a genuine low score"
+        if surfaced:
+            detail += " (another path re-raises — check which errors take which)"
+        return "error_becomes_zero", detail
+    if code and all(_EMPTY_BODY_RE.match(b) for b in code):
+        return "swallowed_error", "handler records nothing — the example is lost without a trace"
+    if not code:
+        return "swallowed_error", "empty handler — the failure leaves no trace at all"
+    return None, None
 
 
 def scan_handlers(lines: list, display: str) -> list:
@@ -178,36 +222,11 @@ def scan_handlers(lines: list, display: str) -> list:
         if not _HANDLER_RE.search(line):
             continue
         body = handler_body(lines, index)
-        code = [_COMMENT_RE.sub("", b).rstrip() for b in body]
-        code = [b for b in code if b.strip()]
-        joined = "\n".join(code)
-        surfaced = _SURFACED_RE.search(_STRING_BODY_RE.sub(r"\1\1", joined))
-        zeroed = _ZERO_BODY_RE.search(joined)
-        # A raise clears the handler only when nothing else in it produces a score.
-        # `if isinstance(exc, Fatal): raise` followed by `return 0.0` re-raises one
-        # class and scores every other failure, and reading the raise as covering
-        # the whole handler reported that as clean.
-        if surfaced and not zeroed:
-            continue
-        if zeroed:
-            detail = "a failure here yields 0/empty — indistinguishable from a genuine low score"
-            if surfaced:
-                detail += " (another path re-raises — check which errors take which)"
+        kind, detail = classify_handler(body)
+        if kind:
             out.append(candidate(
-                "error_becomes_zero", display, index + 1, detail,
-                CONFIRM["error_becomes_zero"], line.strip() + " ... " + " ".join(b.strip() for b in body)[:120],
-            ))
-        elif code and all(_EMPTY_BODY_RE.match(b) for b in code):
-            out.append(candidate(
-                "swallowed_error", display, index + 1,
-                "handler records nothing — the example is lost without a trace",
-                CONFIRM["swallowed_error"], line.strip(),
-            ))
-        elif not code:
-            out.append(candidate(
-                "swallowed_error", display, index + 1,
-                "empty handler",
-                CONFIRM["swallowed_error"], line.strip(),
+                kind, display, index + 1, detail, CONFIRM[kind],
+                line.strip() + " ... " + " ".join(b.strip() for b in body)[:120],
             ))
     return out
 
@@ -280,18 +299,22 @@ def scan_line(line: str, display: str, lineno: int, sampling_off: bool = False) 
             CONFIRM["silent_cap"], stripped,
         ))
 
-    nondet = _NONDET_RE.search(line)
-    if nondet and not sampling_off:
-        value = nondet.group(1) or nondet.group(2)
-        # top_p = 1.0 is the neutral setting, not a sampling knob turned up.
-        if nondet.group(2) is not None and float(nondet.group(2)) >= 1.0:
-            value = "0"
-        if value is None or float(value) > 0:
-            out.append(candidate(
-                "nondeterminism", display, lineno,
-                "sampling is on, so the metric is a random variable",
-                CONFIRM["nondeterminism"], stripped,
-            ))
+    # Every setting on the line, not just the first: minified JSON puts them all
+    # together, and `{"temperature":0,"do_sample":true}` looked deterministic
+    # because the zero temperature was inspected and the sampling switch was not.
+    if not sampling_off:
+        for nondet in _NONDET_RE.finditer(line):
+            value = nondet.group(1) or nondet.group(2)
+            # top_p = 1.0 is the neutral setting, not a sampling knob turned up.
+            if nondet.group(2) is not None and float(nondet.group(2)) >= 1.0:
+                value = "0"
+            if value is None or float(value) > 0:
+                out.append(candidate(
+                    "nondeterminism", display, lineno,
+                    "sampling is on, so the metric is a random variable",
+                    CONFIRM["nondeterminism"], stripped,
+                ))
+                break
 
     for model in _MODEL_RE.findall(line):
         if not _PINNED_RE.search(model):

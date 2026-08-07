@@ -144,7 +144,7 @@ def read_jsonl(path: Path, max_rows: int) -> dict:
     return {"rows": rows, "read": read, "bad_rows": bad, "fields": fields, "truncated": read < rows}
 
 
-def records_from_json(payload):
+def records_from_json(payload, data_like: bool = False):
     """The record list inside a parsed .json file, or None if it holds no dataset.
 
     An *empty* list is a dataset with zero rows, not a non-dataset: `[]` in
@@ -157,7 +157,12 @@ def records_from_json(payload):
     malformed rows rather than silently inflating or deleting N.
     """
     if isinstance(payload, list):
-        return payload if not payload or any(isinstance(r, dict) for r in payload) else None
+        if not payload or any(isinstance(r, dict) for r in payload):
+            return payload
+        # No object at all: a dataset only if the name says so. `eval.json` holding
+        # `[null, "broken"]` has two rows that cannot be scored and returning None
+        # deleted both; `allow.json` holding `["a", "b"]` is an allowlist.
+        return payload if data_like else None
     if isinstance(payload, dict):
         # A populated list wins over an earlier empty one: `{"data": [],
         # "examples": [...]}` held real records under the second key, and taking
@@ -181,7 +186,7 @@ def records_from_json(payload):
     return None
 
 
-def read_json(path: Path, max_rows: int) -> dict:
+def read_json(path: Path, max_rows: int, data_like: bool = False) -> dict:
     """Parsed records, {} if the file is simply not a dataset, or a parse error.
 
     The three outcomes are kept distinct on purpose. Collapsing "this JSON is
@@ -198,7 +203,7 @@ def read_json(path: Path, max_rows: int) -> dict:
         return {"parse_error": "invalid JSON at line " + str(exc.lineno)}
     except (OSError, ValueError) as exc:
         return {"parse_error": type(exc).__name__}
-    records = records_from_json(payload)
+    records = records_from_json(payload, data_like)
     if records is None:
         return {}
     fields: dict = {}
@@ -235,14 +240,18 @@ def read_delimited(path: Path, max_rows: int) -> dict:
     return {"rows": rows, "read": read, "bad_rows": bad, "fields": fields, "truncated": read < rows}
 
 
-def read_dataset(path: Path, max_rows: int) -> dict:
+def read_dataset(path: Path, max_rows: int, data_like: bool = False) -> dict:
     if path.name in CONFIG_NAMES:
         return {}
     if path.suffix in (".jsonl", ".ndjson"):
         return read_jsonl(path, max_rows)
     if path.suffix == ".json":
-        return read_json(path, max_rows)
+        return read_json(path, max_rows, data_like)
     return read_delimited(path, max_rows)
+
+
+def looks_like_a_record(fields) -> bool:
+    return any(str(name).strip().lower() in LABEL_FIELDS for name in fields)
 
 
 def data_files(root: Path) -> list:
@@ -272,40 +281,68 @@ def describe(fields: dict, rows: int, top: int = 6) -> str:
     return ", ".join(name + " " + str(n) + "/" + str(rows) for name, n in ranked)
 
 
+def unreadable_row(display: str, reason: str) -> dict:
+    return candidate(
+        "unparseable_dataset", display, 1,
+        "looks like a dataset but could not be read (" + reason + ") — it supplies "
+        "no examples to anything, and nothing here says so",
+        CONFIRM["unparseable_dataset"],
+    )
+
+
+def empty_row(display: str) -> dict:
+    return candidate(
+        "empty_dataset", display, 1,
+        "parses as a dataset and holds zero records — every metric reading it has n=0, "
+        "which must be reported as 'not measured' rather than as a score",
+        CONFIRM["empty_dataset"],
+    )
+
+
+def blank_summary(display: str) -> dict:
+    return {"file": display, "rows": 0, "read": 0, "labeled": 0, "labels": [],
+            "bad_rows": 0, "label_fields": [], "truncated": False}
+
+
+def is_measurement_data(path: Path, display: str, stats: dict) -> bool:
+    """A parsed CSV is not automatically measurement data.
+
+    `inventory.csv` with sku,price produced "no recognized ground-truth field:
+    reference metrics have no inputs here" — a measurement conclusion about a
+    spreadsheet. JSON/JSONL keep their existing treatment; only delimited files,
+    which are the format ordinary business data arrives in, need the gate.
+    """
+    if path.suffix not in (".csv", ".tsv"):
+        return True
+    return looks_like_data(display) or looks_like_a_record(stats["fields"])
+
+
 def analyze(root: Path, max_rows: int) -> tuple:
     """(candidates, per-dataset summaries, unparseable files)."""
     rows_out, summaries, unparseable = [], [], []
     for path in data_files(root):
-        stats = read_dataset(path, max_rows)
         display = rel(path, root)
+        stats = read_dataset(path, max_rows, looks_like_data(display))
         if stats.get("parse_error"):
             if not looks_like_data(display):
                 continue  # a broken config file is not corrupted measurement input
             unparseable.append(display)
-            rows_out.append(candidate(
-                "unparseable_dataset", display, 1,
-                "looks like a dataset but could not be read (" + stats["parse_error"] + ") — it supplies "
-                "no examples to anything, and nothing here says so",
-                CONFIRM["unparseable_dataset"],
-            ))
+            rows_out.append(unreadable_row(display, stats["parse_error"]))
             continue
         if stats.get("rows") == 0 and "fields" in stats:
-            summaries.append({"file": display, "rows": 0, "read": 0, "labeled": 0, "labels": [],
-                              "label_fields": [], "truncated": False})
-            rows_out.append(candidate(
-                "empty_dataset", display, 1,
-                "parses as a dataset and holds zero records — every metric reading it has n=0, "
-                "which must be reported as 'not measured' rather than as a score",
-                CONFIRM["empty_dataset"],
-            ))
+            summaries.append(blank_summary(display))
+            rows_out.append(empty_row(display))
             continue
         if not stats or not stats.get("rows"):
+            continue
+        if not is_measurement_data(path, display, stats):
             continue
         rows = stats["rows"]
         read = stats.get("read", rows)
         labels = label_coverage(stats["fields"])
         best = labels[0][1] if labels else 0
         summaries.append({"file": display, "rows": rows, "read": read, "labeled": best, "labels": labels,
+                          "bad_rows": stats.get("bad_rows", 0),
                           "label_fields": [name for name, _ in labels], "truncated": stats["truncated"]})
 
         detail = str(rows) + " record(s)"
@@ -376,6 +413,12 @@ def headline_for(summaries: list, unparseable: list) -> str:
         return (worst_set["file"] + ": " + str(worst_set["rows"]) + " record(s), " + worst_field
                 + " populated on " + str(worst_n)
                 + " — every reference metric reading that field has it as its n.")
+
+    all_bad = [s for s in summaries if s.get("bad_rows") and s["bad_rows"] >= s["read"] > 0]
+    if all_bad:
+        worst = all_bad[0]
+        return (worst["file"] + ": every one of the " + str(worst["read"]) + " record(s) read failed to "
+                "parse — nothing here can be scored, which is not the same as scoring badly.")
 
     unlabeled = [s for s in summaries if not s["label_fields"]]
     if len(unlabeled) == len(summaries) and any(s["truncated"] for s in summaries):

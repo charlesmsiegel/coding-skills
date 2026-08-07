@@ -323,3 +323,30 @@ def test_an_unreadable_dataset_outranks_a_reassuring_conclusion(tmp_path):
     headline = run(tmp_path)["headline"]
     assert "could not be read" in headline and "test-cases.json" in headline
     assert "fully-labeled" not in headline
+
+
+# ---- seventh review round ----------------------------------------------------- #
+
+def test_an_all_malformed_dataset_is_reported_not_deleted(tmp_path):
+    (tmp_path / "eval.json").write_text('[null, "broken"]', encoding="utf-8")
+    payload = run(tmp_path)
+    assert "2 of 2" in kinds(payload, "unparseable_rows")[0]["detail"]
+    assert "failed to parse" in payload["headline"]
+
+
+def test_an_allowlist_json_is_still_not_a_dataset(tmp_path):
+    (tmp_path / "allow.json").write_text('["a", "b", "c"]', encoding="utf-8")
+    assert run(tmp_path)["counts"]["datasets"] == 0
+
+
+def test_an_ordinary_spreadsheet_is_not_measurement_data(tmp_path):
+    """`inventory.csv` with sku,price produced a measurement conclusion."""
+    (tmp_path / "inventory.csv").write_text("sku,price\na,1\n", encoding="utf-8")
+    payload = run(tmp_path)
+    assert payload["counts"]["datasets"] == 0
+    assert "reference metrics have no inputs" not in payload["headline"]
+
+
+def test_a_labelled_csv_is_a_dataset_whatever_it_is_called(tmp_path):
+    (tmp_path / "inventory.csv").write_text("expected,input\na,b\n", encoding="utf-8")
+    assert run(tmp_path)["counts"]["datasets"] == 1

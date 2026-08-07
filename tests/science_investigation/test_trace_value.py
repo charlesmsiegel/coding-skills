@@ -178,3 +178,29 @@ def test_a_name_on_the_right_hand_side_is_a_consumer_not_a_definition(tmp_path):
     payload = run("quality_score", tmp_path)
     assert payload["counts"].get("definition") == 1
     assert "defined independently" not in payload["headline"]
+
+
+def test_an_r_right_hand_reference_is_a_consumer(tmp_path):
+    """The R-arrow precheck bypassed the general right-hand-side rule."""
+    (tmp_path / "a.R").write_text("quality_score <- compute(rows)\n", encoding="utf-8")
+    (tmp_path / "b.R").write_text("reported <- quality_score\n", encoding="utf-8")
+    payload = run("quality_score", tmp_path)
+    assert payload["counts"].get("definition") == 1
+    assert "defined independently" not in payload["headline"]
+
+
+def test_a_commented_out_definition_is_not_a_source_of_truth(tmp_path):
+    (tmp_path / "s.py").write_text(
+        "# QUALITY_THRESHOLD = 0.7\nif score > 0.7:\n    pass\n", encoding="utf-8"
+    )
+    payload = run("0.7", tmp_path)
+    assert payload["counts"].get("comment") == 1
+    assert "defined nowhere" in payload["headline"]
+
+
+def test_a_configured_value_is_not_reported_as_defined_nowhere(tmp_path):
+    (tmp_path / "c.yaml").write_text("QUALITY_THRESHOLD: 0.7\n", encoding="utf-8")
+    (tmp_path / "s.py").write_text("if score > 0.7:\n    pass\n", encoding="utf-8")
+    headline = run("0.7", tmp_path)["headline"]
+    assert "configured in c.yaml" in headline
+    assert "defined nowhere" not in headline
