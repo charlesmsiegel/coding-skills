@@ -67,15 +67,38 @@ def meta_of(page: Path) -> dict:
 
 
 def panel_of(page: Path, tab_id: str) -> str:
-    """One rendered panel, so "on the Score tab" can actually be asserted.
+    """One rendered panel's own markup, so "on the X tab" can be asserted.
+
+    Two traps this closes, and both have already produced green suites over
+    deleted rendering.
 
     Split on the panel boundary rather than the next `</section>`: the grade
     card is itself a `<section>`, so a lazy match to `</section>` stops short.
+
+    Then cut at the panel's own end — `panels()` emits every body followed by
+    a newline and `</section>` — because the chunk for the *last* panel
+    otherwise runs to end-of-file and swallows the `measurement-meta` script,
+    which carries the whole inventory as text. A panel helper that includes
+    that block is no better than asserting against the whole document.
     """
     for chunk in page.read_text(encoding="utf-8").split('<section class="panel')[1:]:
         if re.match(rf'[^>]*id="{tab_id}"', chunk):
-            return chunk
+            return chunk.split("\n</section>")[0]
     raise AssertionError(f"no {tab_id} panel on the page")
+
+
+def nav_of(page: Path) -> str:
+    """The tab bar alone — the buttons, not every string on the page."""
+    match = re.search(r'<nav class="tabs"[^>]*>(.*?)</nav>',
+                      page.read_text(encoding="utf-8"), re.S)
+    assert match, "the page has no tab bar"
+    return match.group(1)
+
+
+def table_rows(panel: str) -> list[list[str]]:
+    """Every body `<tr>` in a panel as its list of cell contents."""
+    return [cells for row in re.findall(r"<tr>(.*?)</tr>", panel, re.S)
+            if (cells := re.findall(r"<td[^>]*>(.*?)</td>", row, re.S))]
 
 
 def kpis_of(panel: str) -> dict[str, str]:
@@ -176,10 +199,10 @@ def test_the_by_importance_table_shows_each_levels_weight_and_share(run_script, 
 
 
 def test_every_tab_is_present(run_script, tmp_path):
-    text = build(run_script, tmp_path).read_text(encoding="utf-8")
+    nav = nav_of(build(run_script, tmp_path))
 
     for tab in ("Score", "Inventory", "Findings", "Unmeasurable"):
-        assert f">{tab}<" in text, f"the {tab} tab is missing"
+        assert f">{tab}<" in nav, f"the {tab} tab button is missing"
 
 
 def test_exactly_four_tabs_are_rendered_no_bogus_preamble_tab(run_script, tmp_path):
@@ -211,26 +234,57 @@ def test_the_first_tab_button_is_score_and_selected(run_script, tmp_path):
 
 
 def test_the_inventory_table_shows_every_row_with_its_weight_and_credit(run_script, tmp_path):
-    text = build(run_script, tmp_path).read_text(encoding="utf-8")
+    # Read the *rendered* table, not the document. The metadata block below the
+    # panels serializes every row, reason and citation verbatim, so
+    # `"judge_accuracy" in page_html` passed with the whole Inventory tab
+    # replaced by a single empty paragraph — which is the one tab this page
+    # exists to ship.
+    panel = panel_of(build(run_script, tmp_path), "tab-inventory")
 
-    assert "judge_accuracy" in text
-    assert "recall" in text
-    assert "gates the weekly model rollout" in text
-    assert "evals/judge.py:41" in text
+    cells = {re.search(r"<strong>([^<]*)</strong>", row[0]).group(1): row
+             for row in table_rows(panel) if row and "<strong>" in row[0]}
+    assert sorted(cells) == ["judge_accuracy", "recall"]
+
+    judge = cells["judge_accuracy"]
+    assert "mean(judge_score == gold)" in judge[0]
+    assert "gates a ship decision" in judge[1]
+    assert "gates the weekly model rollout" in judge[1]
+    assert judge[2] == "0.25", "the credit column carries the credit that was scored"
+    assert "computed over 3 labelled rows of 412" in judge[3]
+    assert judge[4] == "3 / 412", "the N a reader needs to dispute the row"
+    assert "scripts/rollout.py:88" in judge[5]
+    assert "evals/judge.py:41" in judge[6], "the file:line somebody actually opened"
+
+    recall = cells["recall"]
+    assert recall[2] == "0.00"
+    assert recall[4] == "—", "no N is a dash, never a zero that reads as measured"
 
 
 def test_a_reduced_credit_names_the_finding_that_caused_it(run_script, tmp_path):
-    text = build(run_script, tmp_path).read_text(encoding="utf-8")
+    page = build(run_script, tmp_path)
 
-    assert "small_n" in text
-    assert "Judge accuracy rests on n=3" in text
+    # The row's credit is 0.25 rather than 1.00 *because of* small_n, so the
+    # inventory row has to carry the finding id, and the Findings tab has to
+    # carry the finding itself. Both ids and titles also sit in the metadata
+    # JSON, so both halves are asserted inside their own panel.
+    inventory_panel = panel_of(page, "tab-inventory")
+    assert '<span class="badge bad">small_n</span>' in inventory_panel
+
+    findings_panel = panel_of(page, "tab-findings")
+    assert "Judge accuracy rests on n=3" in findings_panel
+    assert "<code>small_n</code>" in findings_panel
+    assert "the weekly rollout gate" in findings_panel, "blast radius, rendered"
 
 
 def test_the_unmeasurable_row_is_labelled_not_counted_as_a_defect(run_script, tmp_path):
-    text = build(run_script, tmp_path).read_text(encoding="utf-8")
-    meta = meta_of(tmp_path / "measurement.html")
+    page = build(run_script, tmp_path)
+    panel = panel_of(page, "tab-unmeasurable")
+    meta = meta_of(page)
 
-    assert "no gold set exists" in text
+    rows = table_rows(panel)
+    assert [re.search(r"<strong>([^<]*)</strong>", row[0]).group(1) for row in rows] == ["recall"]
+    assert "informs a decision" in rows[0][1]
+    assert "no gold set exists, so recall cannot be computed" in rows[0][2]
     assert meta["weight_total"] == pytest.approx(5.0), "it stays in the denominator"
     assert [r["name"] for r in meta["rows"] if r["status"] == "unmeasurable"] == ["recall"]
 
@@ -252,7 +306,7 @@ def test_an_empty_inventory_scores_null_and_says_so(run_script, tmp_path):
     meta = meta_of(out)
     assert meta["score"] is None
     assert meta["grade"] == "—"
-    assert "no measurement content" in out.read_text(encoding="utf-8").lower()
+    assert "no measurement content" in panel_of(out, "tab-score").lower()
 
 
 def test_an_invalid_inventory_writes_no_document(run_script, tmp_path):
@@ -306,13 +360,13 @@ def test_an_inventory_with_no_schema_at_all_is_refused(run_script, tmp_path):
 def test_the_inventory_tab_explains_what_each_credit_step_means(run_script, tmp_path):
     # A bare 0.25 in a Credit column is meaningless to a reader who has not
     # memorised the ladder, and a row nobody can read is a row nobody disputes.
-    text = build(run_script, tmp_path).read_text(encoding="utf-8")
+    panel = panel_of(build(run_script, tmp_path), "tab-inventory")
 
     for label in ("measured, nothing found against it", "measured, one medium finding",
                   "measured, one high finding",
                   # the apostrophe is HTML-escaped on the way out
                   "not measured, or unmeasurable with today&#x27;s data"):
-        assert label in text, f"the credit legend is missing {label!r}"
+        assert label in panel, f"the credit legend is missing {label!r}"
 
 
 def test_a_finding_missing_its_optional_prose_never_renders_the_word_None(run_script, tmp_path):
@@ -326,10 +380,10 @@ def test_a_finding_missing_its_optional_prose_never_renders_the_word_None(run_sc
 
     run_script(SCRIPT, "--out", out, "--inventory", path, "--name", "billing")
 
-    text = out.read_text(encoding="utf-8")
-    assert "<h3>None</h3>" not in text and "<p>None</p>" not in text
-    assert "untitled finding" in text
-    assert ">unrated<" in text
+    panel = panel_of(out, "tab-findings")
+    assert "<h3>None</h3>" not in panel and "<p>None</p>" not in panel
+    assert "untitled finding" in panel
+    assert ">unrated<" in panel
 
 
 def test_optional_strings_fall_back_rather_than_printing_None(load_module):
@@ -342,19 +396,26 @@ def test_optional_strings_fall_back_rather_than_printing_None(load_module):
 
 
 def test_the_intro_prose_is_placed_on_the_score_tab(run_script, tmp_path):
+    # "in the page" is not what this test is named for: the prose landed on any
+    # tab at all — or on none, with only the metadata block matching — and this
+    # still passed. The claim is *placement*, so it is checked as placement.
     intro = tmp_path / "intro.html"
     intro.write_text("<p>Billing scores itself with a judge nobody pinned.</p>",
                      encoding="utf-8")
 
-    text = build(run_script, tmp_path, "--intro-file", intro).read_text(encoding="utf-8")
+    page = build(run_script, tmp_path, "--intro-file", intro)
 
-    assert "nobody pinned" in text
+    assert "nobody pinned" in panel_of(page, "tab-score")
+    for elsewhere in ("tab-inventory", "tab-findings", "tab-unmeasurable"):
+        assert "nobody pinned" not in panel_of(page, elsewhere), (
+            f"the prose belongs beside the grade it explains, not on {elsewhere}"
+        )
 
 
 def test_a_missing_intro_file_is_said_on_the_page_not_silently_dropped(run_script, tmp_path):
-    text = build(run_script, tmp_path).read_text(encoding="utf-8")
+    panel = panel_of(build(run_script, tmp_path), "tab-score")
 
-    assert "no written summary" in text.lower()
+    assert "no written summary" in panel.lower()
 
 
 def test_a_template_override_is_used(run_script, tmp_path):
@@ -362,10 +423,12 @@ def test_a_template_override_is_used(run_script, tmp_path):
     custom.write_text("<html><body>MARKER<!--TABS_NAV--><!--TABS_PANELS--></body></html>",
                       encoding="utf-8")
 
-    text = build(run_script, tmp_path, "--template", custom).read_text(encoding="utf-8")
+    page = build(run_script, tmp_path, "--template", custom)
 
-    assert "MARKER" in text
-    assert "judge_accuracy" in text
+    assert "MARKER" in page.read_text(encoding="utf-8")
+    assert "judge_accuracy" in panel_of(page, "tab-inventory"), (
+        "the override replaces the shell, not the panels rendered into it"
+    )
 
 
 def test_script_closing_tags_inside_the_metadata_cannot_end_the_block(run_script, tmp_path):

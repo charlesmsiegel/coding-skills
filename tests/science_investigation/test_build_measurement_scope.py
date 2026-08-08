@@ -22,14 +22,27 @@ def meta_of(page: Path) -> dict:
 
 
 def panel_of(page: Path, tab_id: str) -> str:
-    """One rendered panel, so 'on the Score tab' can actually be asserted."""
+    """One rendered panel's own markup, so 'on the Score tab' can be asserted."""
     # Split on the panel boundary rather than the next </section>: the grade
     # card is itself a <section>, so a lazy match to </section> stops short.
+    # Then cut at this panel's own end — panels() writes each body followed by
+    # a newline and </section> — because the last panel's chunk otherwise runs
+    # to end-of-file and swallows the measurement-meta script, which carries
+    # the entire inventory as text and makes any substring check vacuous.
     text = page.read_text(encoding="utf-8")
     for chunk in text.split('<section class="panel')[1:]:
         if re.match(rf'[^>]*id="{tab_id}"', chunk):
-            return chunk
+            return chunk.split("\n</section>")[0]
     raise AssertionError(f"no {tab_id} panel on the page")
+
+
+def state_cells(panel: str) -> dict[str, str]:
+    """The Packages roll-up table as {package name: the State cell it shows}."""
+    assert "<h3>Packages</h3>" in panel, "the Score tab carries no Packages table"
+    table = panel.split("<h3>Packages</h3>")[1]
+    return {cells[0]: cells[-1]
+            for row in re.findall(r"<tr>(.*?)</tr>", table, re.S)
+            if len(cells := re.findall(r"<td[^>]*>(.*?)</td>", row, re.S)) == 5}
 
 
 def row(name, evidence, importance=3, credit=1.0, n=100) -> dict:
@@ -80,12 +93,44 @@ def test_dropped_rows_are_named_on_the_page_not_only_on_stderr(run_script, tmp_p
     assert "defined outside this unit" in score_panel
 
 
+def test_a_package_build_with_no_scope_at_all_says_it_took_everything(run_script, tmp_path):
+    # An empty scope list means "everything" — right for --root, silently wrong
+    # for a package, where it scores the whole repository's inventory as this
+    # one package's and then counts the same rows again under every other
+    # package. The audit is repo-wide by design, so this is the easy mistake,
+    # and it produces a plausible number rather than a crash.
+    out = tmp_path / "billing.html"
+    result = run_script(SCRIPT, "--out", out, "--inventory", inventory(tmp_path),
+                        "--name", "billing", "--repo", tmp_path)
+
+    assert len(meta_of(out)["rows"]) == 3, "it really did take every row"
+    assert "warning" in result.stderr.lower()
+    assert "--root-dir" in result.stderr and "--scope" in result.stderr
+
+
+def test_a_scoped_package_build_is_not_warned_at(run_script, tmp_path):
+    out = tmp_path / "billing.html"
+    result = run_script(SCRIPT, "--out", out, "--inventory", inventory(tmp_path),
+                        "--name", "billing", "--repo", tmp_path, "--root-dir", "src/billing")
+
+    assert "neither --scope nor --root-dir" not in result.stderr
+
+
+def test_the_repository_roll_up_is_not_warned_at_for_covering_everything(run_script, tmp_path):
+    # --root *is* the declaration that everything belongs here.
+    out = tmp_path / "root.html"
+    result = run_script(SCRIPT, "--out", out, "--inventory", inventory(tmp_path),
+                        "--name", "repo", "--repo", tmp_path, "--root")
+
+    assert "neither --scope nor --root-dir" not in result.stderr
+
+
 def test_a_page_that_dropped_nothing_carries_no_scope_note(run_script, tmp_path):
     out = tmp_path / "root.html"
     run_script(SCRIPT, "--out", out, "--inventory", inventory(tmp_path), "--name", "repo",
                "--repo", tmp_path, "--root")
 
-    assert "defined outside this unit" not in out.read_text(encoding="utf-8")
+    assert "defined outside this unit" not in panel_of(out, "tab-score")
 
 
 def test_an_unattached_finding_survives_scoping_rather_than_vanishing(run_script, tmp_path):
@@ -116,12 +161,18 @@ def test_an_unattached_finding_survives_scoping_rather_than_vanishing(run_script
     run_script(SCRIPT, "--out", out, "--inventory", inv, "--name", "billing",
                "--repo", tmp_path, "--root-dir", "src/billing")
 
-    text = out.read_text(encoding="utf-8")
+    # Every finding — id, title, detail — is also serialized into the
+    # measurement-meta block, so both of these assertions passed against a page
+    # with the Findings tab rendered as an empty paragraph. The claim is that a
+    # reader still sees the finding, so it is read out of the Findings panel.
+    panel = panel_of(out, "tab-findings")
     assert [f["id"] for f in meta_of(out)["findings"]] == ["unpinned_judge"], (
         "the unattached finding stays; the one attached to a dropped row goes with it"
     )
-    assert "No judge prompt is version-pinned anywhere" in text
-    assert "No confirmed findings" not in text
+    assert "No judge prompt is version-pinned anywhere" in panel
+    assert "every score in the repo" in panel, "its blast radius, rendered"
+    assert "search n=4" not in panel, "the finding that went with its dropped row"
+    assert "No confirmed findings" not in panel
 
 
 def test_not_audited_is_labelled_repository_wide_on_a_scoped_page(run_script, tmp_path):
@@ -139,10 +190,15 @@ def test_not_audited_is_labelled_repository_wide_on_a_scoped_page(run_script, tm
     run_script(SCRIPT, "--out", root, "--inventory", inv, "--name", "repo",
                "--repo", tmp_path, "--root")
 
-    scoped_text = scoped.read_text(encoding="utf-8")
-    assert "the analytics dashboard" in scoped_text, "still listed, never filtered"
-    assert "Not audited (whole repository)" in scoped_text
-    assert "Not audited (whole repository)" not in root.read_text(encoding="utf-8")
+    # `not_audited` is copied verbatim into the metadata block, so the "still
+    # listed" half of this passed with the gap list deleted from the rendering.
+    scoped_panel = panel_of(scoped, "tab-score")
+    assert "the analytics dashboard" in scoped_panel, "still listed, never filtered"
+    assert "Not audited (whole repository)" in scoped_panel
+    assert "Not audited (whole repository)" not in panel_of(root, "tab-score")
+    assert "the analytics dashboard" in panel_of(root, "tab-score"), (
+        "the root page lists it too — labelled differently, never dropped"
+    )
 
 
 def test_a_row_defined_elsewhere_belongs_to_the_package_that_defines_it(run_script, tmp_path):
@@ -230,7 +286,7 @@ def test_a_package_with_no_rows_scores_null_rather_than_vanishing(run_script, tm
     meta = meta_of(out)
     assert meta["score"] is None
     assert meta["rows"] == []
-    assert "no measurement content" in out.read_text(encoding="utf-8").lower()
+    assert "no measurement content" in panel_of(out, "tab-score").lower()
 
 
 def test_scope_can_differ_from_root_dir(run_script, tmp_path):
@@ -276,6 +332,10 @@ def test_a_package_with_no_document_stays_in_the_table_marked_not_generated(run_
     assert row_["name"] == "ghost"
     assert row_["generated"] is False
     assert row_["score"] is None
+    # "stays in the table" is a claim about the table, and the metadata alone
+    # satisfied it. A package nobody built and a package with nothing to
+    # measure must not collapse into the same cell.
+    assert state_cells(panel_of(out, "tab-score")) == {"ghost": "not generated"}
 
 
 def test_a_null_scoring_package_is_listed_as_no_measurement_content(run_script, tmp_path):
@@ -290,8 +350,11 @@ def test_a_null_scoring_package_is_listed_as_no_measurement_content(run_script, 
     run_script(SCRIPT, "--out", out, "--inventory", inventory(tmp_path), "--name", "repo",
                "--repo", tmp_path, "--root", "--package", f"utils:{package}")
 
-    text = out.read_text(encoding="utf-8")
-    assert "no measurement content" in text.lower()
+    # Not `"no measurement content" in text`: render_package_table's lead
+    # paragraph says that phrase unconditionally, so the check was satisfied by
+    # a static sentence rather than by the state it names. The claim is that
+    # *utils* is listed in that state, which is one cell of one row.
+    assert state_cells(panel_of(out, "tab-score")) == {"utils": "no measurement content"}
     assert meta_of(out)["packages"][0]["score"] is None
 
 
