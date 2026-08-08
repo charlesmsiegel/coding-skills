@@ -305,8 +305,39 @@ def main(argv: list[str] | None = None) -> int:
         print(f"error: {exc}", file=sys.stderr)
         return 2
 
-    roots = [args.repo / part for part in (args.root_dirs or ["."])]
+    relative_roots = list(args.root_dirs or ["."])
+    roots = [args.repo / part for part in relative_roots]
+    missing_roots = [r for r, path in zip(relative_roots, roots) if not path.exists()]
     size = measure(roots, CODE_EXTENSIONS)
+
+    # `measure` returns {files: 0, loc: 0} for a path that is not there, and
+    # says nothing. build_health.py:944 guards the same drift — "a clean report
+    # over a root that no longer exists scored a confident A+" — and here it is
+    # worse in two ways. The grade comes from the verdicts, not from the size,
+    # so nothing about measuring nothing lowers the letter: a typo'd --root-dir
+    # renders A+ (100.0) over "0 files · 0 lines". And the size test is the only
+    # non-judgment half of the exemption, so an unmeasurable unit with two
+    # trivial votes is exempted on a pure vote — collapsing the two gates that
+    # exist because either alone is gameable.
+    #
+    # Refusing, rather than ungrading as build_health does. Its ungraded shape
+    # is score null / grade "—", and here that shape is already spoken for: it
+    # is what "too small to warrant a theory" looks like, so an ungraded theory
+    # page would read as an exemption for a package that may be enormous. There
+    # is no honest page to write, so none is written — the same answer this
+    # script already gives a verdict whose grade cannot be argued with. Any
+    # missing root is enough, not only all of them: a partially-measured unit
+    # sizes part of the code while the panel judged all of it.
+    if missing_roots or size["files"] == 0:
+        reason = (f"these roots do not exist: {', '.join(missing_roots)}" if missing_roots
+                  else f"no source files under {', '.join(relative_roots)}")
+        print(f"error: {reason} — the panel judged code this run cannot see, so the size "
+              "gate that is half the exemption test, and the file and line counts under "
+              "the letter, would be computed over nothing. Refusing to write a page: an "
+              "empty unit would render either a confident grade or a null that reads as "
+              "'too small to warrant a theory'. Check --root-dir against the package map.",
+              file=sys.stderr)
+        return 2
 
     try:
         # The floor is never offered at repo scope: a repository of individually

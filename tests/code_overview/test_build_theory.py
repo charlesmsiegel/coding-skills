@@ -82,6 +82,33 @@ def three(tmp_path, **overrides) -> tuple:
     return tuple(verdict_file(tmp_path, i, **overrides) for i in range(3))
 
 
+def verdict_args(files) -> list:
+    args = []
+    for path in files:
+        args += ["--verdict", str(path)]
+    return args
+
+
+_ROW_RE = re.compile(r"<tr><td><strong>(.*?)</strong>(.*?)</tr>", re.S)
+
+
+def dimension_rows(panel: str) -> dict:
+    """label -> the rest of that dimension's row, from the Dimensions table.
+
+    Row-scoped rather than panel-scoped: `holds` appears in the tab's own
+    static intro ("A step below *holds* must cite…"), so a substring check
+    against the panel passes whatever the rubric computed — which is how the
+    median step, the output of the whole rubric, went untested.
+    """
+    return {label: cells for label, cells in _ROW_RE.findall(panel)}
+
+
+def doc_meta_line(text: str) -> str:
+    match = re.search(r'<div class="doc-meta">(.*?)</div>', text, re.S)
+    assert match, "the page carries no doc-meta line"
+    return match.group(1)
+
+
 # --- the grade -------------------------------------------------------------
 
 def test_a_unanimous_panel_renders_its_grade(repo_with_code, run_script, tmp_path):
@@ -262,3 +289,75 @@ def test_script_closing_tags_in_a_verdict_cannot_end_the_metadata_block(repo_wit
 
     assert "</script><script>alert(1)" not in page.read_text(encoding="utf-8")
     assert meta_of(page)["theory"].startswith("</script>")
+
+
+# --- the roots the panel is a claim about -----------------------------------
+
+def test_a_root_that_does_not_exist_is_refused_rather_than_graded(repo_with_code,
+                                                                  run_script, tmp_path):
+    """A typo'd --root-dir measured nothing and rendered A+ (100.0) over
+    "0 files · 0 lines", because the grade comes from the verdicts and nothing
+    about measuring nothing lowers it."""
+    out = tmp_path / "theory.html"
+    result = run_script(SCRIPT, "--out", out, "--name", "billing", "--repo", repo_with_code.path,
+                        "--root-dir", "src/biling", *verdict_args(three(tmp_path)),
+                        expect_rc=2)
+
+    assert not out.exists(), "a confident letter over code this run never saw is worse than none"
+    assert "src/biling" in result.stderr, "the stderr has to name the root that is not there"
+
+
+def test_a_missing_root_cannot_exempt_a_unit_on_the_vote_alone(repo_with_code, run_script,
+                                                               tmp_path):
+    """The size gate is the only non-judgment half of the exemption. Over a root
+    that measures 0 files it passes for free, so two trivial votes rendered
+    exempt/null — the two gates collapsed into the one that is gameable."""
+    files = (verdict_file(tmp_path, 0, trivial=True, trivial_reason="nothing much here"),
+             verdict_file(tmp_path, 1, trivial=True, trivial_reason="nothing much here"),
+             verdict_file(tmp_path, 2))
+    out = tmp_path / "theory.html"
+    run_script(SCRIPT, "--out", out, "--name", "billing", "--repo", repo_with_code.path,
+               "--root-dir", "src/biling", *verdict_args(files), expect_rc=2)
+
+    assert not out.exists(), "'too small to warrant a theory' must not be said about unread code"
+
+
+def test_a_root_with_no_source_files_is_refused(repo, run_script, tmp_path):
+    """The other shape of the same drift: the directory is there and empty."""
+    repo.write("src/billing/NOTES.md", "no code here\n")
+    repo.commit()
+    out = tmp_path / "theory.html"
+    result = run_script(SCRIPT, "--out", out, "--name", "billing", "--repo", repo.path,
+                        "--root-dir", "src/billing", *verdict_args(three(tmp_path)),
+                        expect_rc=2)
+
+    assert not out.exists()
+    assert "no source files" in result.stderr
+
+
+# --- no exemption floor at repo scope ---------------------------------------
+
+def test_repo_scope_offers_no_exemption_floor_however_trivial_the_repo(repo, run_script,
+                                                                       tmp_path):
+    """Same fixture that is exempt at package scope, built with --root.
+
+    A repository of individually trivial packages still has a system-level
+    question worth asking, so `--root` must reach score_panel with the floor
+    switched off. Only the parameter was tested before, never that --root
+    passes it — a repo could have come back null with nothing noticing.
+    """
+    repo.write("a.py", "x = 1\n")
+    repo.write("b.py", "y = 2\n")
+    repo.commit()
+    files = (verdict_file(tmp_path, 0, trivial=True, trivial_reason="two constants"),
+             verdict_file(tmp_path, 1, trivial=True, trivial_reason="two constants"),
+             verdict_file(tmp_path, 2))
+    out = tmp_path / "theory.html"
+    run_script(SCRIPT, "--out", out, "--name", "repo", "--repo", repo.path, "--root",
+               *verdict_args(files))
+
+    meta = meta_of(out)
+    assert meta["scope"] == "repository", "the fixture must actually be at repo scope"
+    assert meta["exempt"] is False
+    assert meta["score"] is not None and meta["grade"] != "—"
+    assert "too small" not in panel_of(out.read_text(encoding="utf-8"), "tab-grade").lower()

@@ -269,6 +269,23 @@ as **not generated** rather than being dropped from the table or scored as a
 failure — verified by running the script with a `--package` pointing at a
 path that does not exist.
 
+A `--root-dir` that does not exist, or that holds no source files, is
+**refused**: exit 2, a message on stderr, no page. `build_health.py` ungrades
+in the same situation; this one cannot, because its ungraded shape — `score:
+null`, `grade: "—"` — is already what *too small to warrant a theory* looks
+like, so an ungraded theory page would read as an exemption for a package that
+may be enormous. The grade here comes from the verdicts, not the size, so
+nothing about measuring nothing lowers the letter: before the guard, a typo'd
+`--root-dir` rendered **A+ (100.0)** over "0 files · 0 lines", and with two
+trivial votes it rendered exempt/null — the size gate passing for free
+collapses the two exemption gates into the one that is gameable.
+
+The roll-up table's state column says both when both hold: a package that is
+exempt *and* split the panel reads `too small to warrant a theory; panel
+disagreed on Abstraction`. Dimensions are named by their labels everywhere
+they are shown — inside `theory.html`, in the roll-up, and on the portal card
+— never by their keys.
+
 ## Generating the atlases
 
 Pass `--exclude docs` to the `code-visualization` analyzers. Without it, a

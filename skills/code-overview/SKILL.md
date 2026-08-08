@@ -257,6 +257,10 @@ python "$SKILL/scripts/build_theory.py" --out <DOCS>/theory.html --name <pkg> \
   --verdict $WORK/<pkg>-judge3.json --template "$SKILL/assets/template.html"
 ```
 
+`--root-dir` must point at code that is there: a root that does not exist, or
+that holds no source files, is refused (exit 2, nothing written) rather than
+graded over nothing. See `references/doc-layout.md`.
+
 The median per dimension sets the score. **Where the judges differ by two rungs
 or more, that is reported as a finding** — three careful readers disagreeing
 about what code models is a fact about the code, and the median alone would hide
