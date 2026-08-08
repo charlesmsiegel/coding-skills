@@ -259,7 +259,7 @@ import sys
 import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Iterator
+from typing import Iterator, Sequence
 
 SEVERITY_ICONS = {"high": "🔴", "medium": "🟡", "low": "🟢"}
 SEVERITY_RANK = {"high": 0, "medium": 1, "low": 2}
@@ -350,7 +350,7 @@ def is_source(rel_parts: tuple[str, ...], path: Path) -> bool:
     Not-binary is not the same as is-source: branch counting and duplication
     shingling over a README manufactures findings out of prose.
     """
-    if any(part in DOC_DIR_NAMES for part in rel_parts[:-1]):
+    if any(part.lower() in DOC_DIR_NAMES for part in rel_parts[:-1]):
         return False
     if path.suffix.lower() in NON_CODE_SUFFIXES:
         return False
@@ -672,11 +672,15 @@ class Finding:
     smell_type: str
     description: str
     suggestion: str = ""
-    also_caused_by: list[str] = field(default_factory=list)
+    # Tuples, not lists. `frozen=True` blocks reassignment but not in-place
+    # mutation, so a list here lets `candidate.also_caused_by.clear()` walk a
+    # validated record into a schema-invalid state that __post_init__ never
+    # sees again — and it would then serialise and emit like any other.
+    also_caused_by: tuple[str, ...] = ()
     severity: str = "medium"
     kind: str = "finding"
     code_snippet: str = ""
-    related_lines: list[int] = field(default_factory=list)
+    related_lines: tuple[int, ...] = ()
 
     def __post_init__(self) -> None:
         if self.kind not in VALID_KINDS:
@@ -721,17 +725,17 @@ class Reporter:
         self._add(Finding(
             file=str(self.path), line=line, smell_type=smell_type,
             description=description, suggestion=suggestion, severity=severity,
-            kind="finding", code_snippet=snippet, related_lines=related or [],
+            kind="finding", code_snippet=snippet, related_lines=tuple(related or ()),
         ))
 
     def candidate(self, line: int, smell_type: str, description: str,
-                  also_caused_by: list[str], severity: str = "low",
-                  snippet: str = "", related: list[int] | None = None) -> None:
+                  also_caused_by: "Sequence[str]", severity: str = "low",
+                  snippet: str = "", related: "Sequence[int] | None" = None) -> None:
         self._add(Finding(
             file=str(self.path), line=line, smell_type=smell_type,
-            description=description, also_caused_by=also_caused_by,
+            description=description, also_caused_by=tuple(also_caused_by),
             severity=severity, kind="candidate", code_snippet=snippet,
-            related_lines=related or [],
+            related_lines=tuple(related or ()),
         ))
 
     def _add(self, record: Finding) -> None:
@@ -1246,7 +1250,7 @@ report so a degraded run cannot be mistaken for a clean one."
 
 **Interfaces:**
 - Consumes: `Reporter`, `run_file_detector`, `walk_files` from `common`
-- Produces: a CLI, plus `unmerged_paths(root: Path) -> set[Path] | None` (None when git is unavailable). Finding types: `merge_conflict_marker` (high, **finding only when git reports the path unmerged**; **candidate** otherwise), `oversized_file` (medium, finding), `oversized_line` (low, finding), `committed_env_file` (high, finding), `todo_inventory` (low, finding), `commented_out_code` (low, **candidate**)
+- Produces: a CLI, plus `unmerged_paths(root: Path) -> set[Path] | None` (None when git is unavailable). Finding types: `merge_conflict_marker` (high, **finding only when git reports the path unmerged**; **candidate** otherwise), `oversized_file` (medium, finding), `oversized_line` (low, finding), `committed_env_file` (high, finding), `todo_inventory` (low, **candidate**), `commented_out_code` (low, **candidate**)
 
 The comment-prefix set `("//", "#", "--", ";")` and block markers `("/*", "*/")` are the skill's one documented concession to language syntax, per the spec. String literals are blanked before prefixes are matched.
 
@@ -1368,6 +1372,19 @@ def test_todo_in_a_non_source_text_file_is_inventoried(repo, run_script):
     assert "todo_inventory" in types_in(result)
 
 
+def test_todo_records_are_candidates_not_defects(repo, run_script):
+    """No comment prefix is unambiguous without a parser.
+
+    Python's `total // TODO` is floor division on a variable named TODO, so
+    even `//` cannot support a confirmed finding.
+    """
+    repo.write("app.py", "result = total // TODO\n")
+    result = run_script(SCRIPT, repo.path, "--format", "json")
+    for record in records_of(result, "todo_inventory"):
+        assert record["kind"] == "candidate"
+        assert record["suggestion"] == ""
+
+
 def test_oversized_file_is_reported_once(repo, run_script):
     repo.write("big.go", "package main\n" + "var x = 1\n" * 1500)
     result = run_script(SCRIPT, repo.path, "--format", "json")
@@ -1428,12 +1445,14 @@ MAX_COMMITTED_BYTES = 10 * 1024 * 1024
 # literals have been blanked. Five tokens, and no detector branches on which
 # language a file is. A mis-classified line loses a candidate, never invents
 # a finding.
+# There is no unambiguous comment prefix at the text level, and an earlier
+# draft of this file wrongly assumed `//` and `--` were two. They are not:
+# `//` is floor division in Python, `--` is decrement in C and C++, `#` opens
+# a C preprocessor directive and a Rust attribute, and `;` separates assembly
+# instructions. Without a parser this detector cannot establish that any of
+# them begins a comment — so everything derived from one is a candidate, and
+# the record says which benign readings are available.
 LINE_COMMENT_PREFIXES = ("//", "#", "--", ";")
-# `//` and `--` begin a comment in every language that uses them. `#` and `;`
-# do not: `#` opens a C preprocessor directive and a Rust attribute, `;` is an
-# instruction separator in assembly. A hit on those two supports a candidate,
-# never a finding.
-UNAMBIGUOUS_PREFIXES = ("//", "--")
 
 _STRING_LITERAL = re.compile(r"""(["'`])(?:\\.|(?!\1).)*\1""")
 _TODO = re.compile(r"\b(TODO|FIXME|HACK|XXX)\b")
@@ -1458,16 +1477,6 @@ def blank_literals(line: str) -> str:
     return _STRING_LITERAL.sub(lambda m: m.group(1) + " " * (len(m.group(0)) - 2) + m.group(1), line)
 
 
-def unambiguous_comment(line: str) -> bool:
-    """Whether this line's comment marker is one no language repurposes."""
-    blanked = blank_literals(line)
-    positions = [(blanked.find(pfx), pfx) for pfx in LINE_COMMENT_PREFIXES]
-    hits = [(index, pfx) for index, pfx in positions if index != -1]
-    if not hits:
-        return False
-    return min(hits)[1] in UNAMBIGUOUS_PREFIXES
-
-
 def comment_body(line: str) -> str | None:
     """The text after a line-comment prefix, or None if there is no comment."""
     blanked = blank_literals(line)
@@ -1490,23 +1499,15 @@ def check_text_file(path: Path, text: str, report: Reporter,
         body = comment_body(line)
         if body is not None:
             todo = _TODO.search(body)
-            if todo and unambiguous_comment(line):
-                report.finding(
-                    number, "todo_inventory",
-                    f"{todo.group(1)}: {body[:80]}",
-                    "Convert it to a tracked issue or delete it. An undated TODO in the "
-                    "source is a decision nobody owns.",
-                    severity="low", snippet=line.strip()[:120],
-                )
-            elif todo:
-                # `#` and `;` are syntax, not comments, in several languages —
-                # C's `#define TODO 1` is not debt someone forgot to file.
+            if todo:
                 report.candidate(
                     number, "todo_inventory",
-                    f"{todo.group(1)} on a line whose comment prefix is ambiguous",
+                    f"{todo.group(1)}: {body[:80]}",
                     also_caused_by=[
-                        "a C preprocessor directive or Rust attribute, where `#` is syntax",
-                        "an assembly or ini line, where `;` is not a comment",
+                        "the prefix is an operator, not a comment — `//` is floor "
+                        "division in Python, `--` is decrement in C",
+                        "`#` opens a C preprocessor directive or a Rust attribute; "
+                        "`;` separates assembly instructions",
                         "a literal string that happens to contain the word",
                     ],
                     severity="low", snippet=line.strip()[:120],
@@ -1618,17 +1619,15 @@ def check_source_file(path: Path, text: str, report: Reporter) -> None:
         if body is None or _TODO.search(body):
             continue
 
-        # Same gate the TODO path uses: `#` and `;` are syntax in several
-        # languages, so a "comment" behind one may be a preprocessor directive
-        # or a statement separator, and the text after it is live code.
-        if _LOOKS_LIKE_CODE.search(body) and unambiguous_comment(line):
+        if _LOOKS_LIKE_CODE.search(body):
             report.candidate(
                 number, "commented_out_code",
                 "Commented-out line that looks like code",
                 also_caused_by=[
                     "a documentation example shown as a comment",
-                    "a language where this prefix is not a comment "
-                    "(`#` opens a Rust attribute and a C preprocessor directive)",
+                    "the prefix is an operator, not a comment — `//` is floor "
+                    "division in Python, `--` is decrement in C, `#` opens a "
+                    "preprocessor directive or a Rust attribute",
                     "deliberately disabled code with a nearby explanation",
                 ],
                 severity="low", snippet=line.strip()[:120],
@@ -1696,7 +1695,7 @@ if __name__ == "__main__":
 - [ ] **Step 4: Run the tests to verify they pass**
 
 Run: `python -m pytest tests/code_doctor/test_find_hygiene_issues.py -v`
-Expected: 12 passed.
+Expected: 13 passed.
 
 - [ ] **Step 5: Commit**
 
@@ -1750,6 +1749,17 @@ def test_private_key_block_with_a_body_is_a_finding(repo, run_script):
     record = records_of(result, "private_key_material")[0]
     assert record["kind"] == "finding"
     assert record["severity"] == "high"
+
+
+def test_redacted_key_block_is_a_candidate(repo, run_script):
+    """BEGIN / <redacted> / END has both markers and no key."""
+    repo.write("README.md",
+               "Example:\n\n-----BEGIN RSA PRIVATE KEY-----\n"
+               "<redacted>\n-----END RSA PRIVATE KEY-----\n")
+    repo.commit("docs")
+    result = run_script(SCRIPT, repo.path, "--format", "json")
+    record = records_of(result, "private_key_material")[0]
+    assert record["kind"] == "candidate"
 
 
 def test_bare_private_key_header_is_a_candidate(repo, run_script):
@@ -1929,9 +1939,14 @@ def has_key_payload(lines: list[str], start: int) -> bool:
     both. Requiring an END marker or base64 body keeps rotate-and-purge advice
     attached to something that is actually a key.
     """
-    window = lines[start:start + 40]
-    if any(KEY_END.search(candidate) for candidate in window):
-        return True
+    window = []
+    for candidate in lines[start:start + 40]:
+        if KEY_END.search(candidate):
+            break
+        window.append(candidate)
+    # The terminator is not payload. A doc block of BEGIN / <redacted> / END
+    # has both markers and no key, and must not draw rotate-and-purge advice.
+    # Require actual base64 body BETWEEN the markers.
     return sum(1 for candidate in window if BASE64_LINE.fullmatch(candidate.strip())) >= 2
 
 
@@ -2070,7 +2085,7 @@ if __name__ == "__main__":
 - [ ] **Step 4: Run the tests to verify they pass**
 
 Run: `python -m pytest tests/code_doctor/test_find_secrets.py -v`
-Expected: 12 passed.
+Expected: 13 passed.
 
 - [ ] **Step 5: Commit**
 

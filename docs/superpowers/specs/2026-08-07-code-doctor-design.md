@@ -275,6 +275,15 @@ same reasoning.
   `url = "https://x"; do_unique_work()` from losing its trailing call to a `//`
   that was never a comment.
 
+  **No comment prefix is unambiguous.** An earlier draft of this spec treated
+  `//` and `--` as safe because "every language that uses them means a comment
+  by them". That is false: `//` is floor division in Python, `--` is decrement
+  in C and C++. Combined with `#` (C preprocessor directive, Rust attribute)
+  and `;` (assembly separator), *every* prefix in the set is ambiguous — so
+  nothing derived from one supports a finding. TODO inventory and
+  commented-out code are both **candidates**, and each record names the
+  operator readings available for its prefix.
+
   **Ambiguous lines are retained, not stripped.** An earlier draft argued the
   ambiguity was safe because a mis-normalized line would merely fail to match its
   twin. That is only half true, and the wrong half: stripping is a *deleting*
