@@ -94,6 +94,20 @@ def test_gitignored_files_are_not_walked(common, repo):
     assert "thing.gen.go" not in found, "walked a gitignored file"
 
 
+def test_wide_walk_still_sees_gitignored_files(common, repo):
+    """The security scan must not inherit the source walk's blind spot.
+
+    A credential in a gitignored file is still worth reporting — as a
+    candidate, not a committed leak — and an ignore rule anyone can edit must
+    not be a way to hide one from the scanner.
+    """
+    repo.write(".gitignore", "local.yaml\n")
+    repo.write("local.yaml", "token: abc\n")
+    repo.commit("ignore local")
+    found = {p.name for p in common.walk_files(repo.path, source_only=False)}
+    assert "local.yaml" in found
+
+
 def test_unreadable_file_is_not_silently_classified_binary(common, repo):
     """An OSError must reach the caller, not masquerade as a binary skip."""
     target = repo.write("locked.go", "package main\n")
