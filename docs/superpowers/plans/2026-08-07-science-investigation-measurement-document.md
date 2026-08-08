@@ -1453,24 +1453,47 @@ Expected: FAIL — `unrecognized arguments: --root-dir`.
 Add these functions above `main`:
 
 ```python
-def defining_path(entry: dict) -> str:
+_LINE_SUFFIX = re.compile(r":\d+$")
+
+
+def defining_path(entry: dict, repo: Path | None = None) -> str:
     """Where the measurable thing is *defined* — the first evidence citation.
 
     A metric defined in evals/ that scores a service's output cites both. It
     belongs to whoever defines it: assigning it to the service would give two
     packages the same row and double-count it in the repository denominator.
+
+    The line number is stripped as a trailing `:<digits>` rather than by
+    splitting on the first colon. Splitting turned `C:\\repo\\src\\billing\\m.py:10`
+    into `"C"`, so every row citing a Windows absolute path silently matched no
+    scope and vanished from the package that defined it. Normalizing separators
+    first does not help — `C:/repo/...` still carries the drive colon.
     """
     for citation in entry.get("evidence") or []:
         text = str(citation).strip()
-        if text:
-            return text.split(":", 1)[0].replace("\\", "/").removeprefix("./")
+        if not text:
+            continue
+        path = _LINE_SUFFIX.sub("", text).replace("\\", "/").removeprefix("./")
+        if repo is not None:
+            # An absolute citation inside the repo is made relative so it can be
+            # matched against repo-relative scopes. One outside the repo is left
+            # alone: it then matches nothing, which is correct, and is a visible
+            # out-of-scope count rather than a silent mangling.
+            try:
+                candidate = Path(path)
+                if candidate.is_absolute():
+                    path = candidate.relative_to(Path(repo).resolve()).as_posix()
+            except (ValueError, OSError):
+                pass
+        return path
     return ""
 
 
-def in_scope(entry: dict, scopes: list[str]) -> bool:
+def in_scope(entry: dict, scopes: list[str], repo: Path | None = None) -> bool:
     if not scopes:
         return True
-    path = defining_path(entry)
+    path = defining_path(entry, repo)
+    # The trailing slash is what stops `src/bill` from capturing `src/billing`.
     return any(path == scope or path.startswith(scope.rstrip("/") + "/")
                for scope in scopes)
 
@@ -1548,7 +1571,7 @@ After `inventory = read_inventory(...)` succeeds, partition before scoring:
         scopes = [str(s).replace("\\", "/").strip("/")
                   for s in (args.scopes or args.root_dirs)]
         inventory["rows"] = [entry for entry in inventory["rows"]
-                             if in_scope(entry, scopes)]
+                             if in_scope(entry, scopes, args.repo)]
         kept_findings = {str(entry.get("finding")) for entry in inventory["rows"]
                          if entry.get("finding")}
         inventory["findings"] = [f for f in inventory["findings"]
