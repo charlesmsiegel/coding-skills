@@ -286,4 +286,14 @@ def test_the_skill_documents_all_four_documents():
     assert "measurement.html" in text
     assert "build_measurement.py" in text
     assert "merge_reports.py" in text
-    assert "candidates" in text.lower()
+
+    # The word "candidates" predates this doc (discover_packages' proposal
+    # candidates, an unrelated feature) — asserting on the vocabulary alone
+    # would pass even with the finding/candidate distinction deleted. Pin
+    # the substance instead, scoped to the bullet that states it: a
+    # candidate is excluded from the score and carries no fix.
+    section = re.search(r"- \*\*Defect vs lead\.\*\*.*?(?=\n\n)", text, re.DOTALL)
+    assert section, "SKILL.md must document the finding vs. candidate distinction"
+    claim = section.group(0)
+    assert "candidates are not" in claim, "must say candidates are excluded from the score"
+    assert "carries no fix" in claim, "must say a candidate carries no fix"
