@@ -438,7 +438,7 @@ def is_repo_wide(path: str, repo: Path, sized_extensions=frozenset()) -> bool:
     return resolved.suffix.lower() not in sized_extensions
 
 
-def resolve_coverage(args, reports: list[dict]):
+def resolve_coverage(args, reports: list[dict], trusted: set[str] | None = None):
     """Which rubric categories this analysis is entitled to grade.
 
     Coverage is **evidence**, not the doctor's advertised capability. A report
@@ -447,7 +447,17 @@ def resolve_coverage(args, reports: list[dict]):
     rules rather than being credited with everything the doctor could have done.
     That distinction is what stops `--skip-duplicates`, a crashed detector, or a
     single-detector report from being read as a clean bill of health.
+
+    `trusted` is who a report may speak for. Default (`None`) is the ordinary
+    single-doctor run's `{"", args.doctor}`. A merged envelope passes every
+    doctor it names running instead — each one is still resolved by its own
+    per-detector evidence below, never by its bare presence in the envelope,
+    which is what makes this the *only* coverage path rather than a second one
+    beside it: a doctor whose own detector crashed does not get credited just
+    because it is a doctor the envelope trusts.
     """
+    if trusted is None:
+        trusted = {"", args.doctor}
     if args.assume_full_coverage:
         return GRADE_EVERYTHING
     if args.covers:
@@ -482,7 +492,7 @@ def resolve_coverage(args, reports: list[dict]):
     # cover the same rubric categories. An unlabelled report is attributed to
     # --doctor, which is right for the ordinary single-doctor run.
     foreign = [r for r in reports
-               if r["shape"] == common.SHAPE_FULL and r["doctor"] and r["doctor"] != args.doctor]
+               if r["shape"] == common.SHAPE_FULL and r["doctor"] and r["doctor"] not in trusted]
     if foreign:
         warn("these reports were produced by a different doctor than "
              f"{args.doctor or '(none named)'} and contribute findings but no coverage: "
@@ -490,7 +500,7 @@ def resolve_coverage(args, reports: list[dict]):
 
     evidenced = [report for report in reports
                  if report["shape"] == common.SHAPE_FULL
-                 and report["doctor"] in ("", args.doctor)]
+                 and report["doctor"] in trusted]
     if evidenced:
         # Resolve each report on its own, then union. Both halves matter.
         #
@@ -642,28 +652,44 @@ def build(args, reports: list[dict], errors: dict[str, str],
     if args.files is not None:
         size["files"] = args.files
 
-    covered = resolve_coverage(args, reports)
-    if doctors:
-        # Coverage is the union of what the doctors that ran can speak to —
-        # read from the envelope, not declared by --doctor. A doctor with no
-        # analyzers_run evidence contributes nothing, which is why `shape`
-        # gates it here rather than the doctor's name doing so.
-        covered = set()
-        for report in reports:
-            if report["shape"] == common.SHAPE_FULL:
-                covered |= rubric.DOCTOR_COVERAGE.get(report["doctor"], set())
+    # A merged doctor is trusted the same way an unlabelled --findings report
+    # is: resolved by its own per-detector evidence, never by its bare
+    # presence in the envelope. There is one coverage path, not a coarse one
+    # beside the fine one — unioning DOCTOR_COVERAGE for every doctor the
+    # envelope names credited a category no detector had actually run,
+    # including one whose detector for it had crashed.
+    trusted = ({""} | set(doctors)) if doctors else None
+    covered = resolve_coverage(args, reports, trusted)
 
-    # A doctor that crashed measured nothing. Only the categories it *alone*
-    # covered become unknown — where a surviving doctor covers the same ground,
-    # that ground was still measured.
-    surviving: set[str] = set()
-    for name in doctors:
-        surviving |= rubric.DOCTOR_COVERAGE.get(name, set())
-    for failed in doctor_errors:
-        covered -= rubric.DOCTOR_COVERAGE.get(failed, set()) - surviving
+    if doctor_errors or completeness:
+        if covered is GRADE_EVERYTHING:
+            # Direct evidence of a gap outranks a blanket human assertion: a
+            # doctor the envelope says crashed, or a completeness gate the
+            # producer itself called inadequate, cannot be waved off by
+            # --assume-full-coverage into a clean bill of health for exactly
+            # the categories that evidence names.
+            warn("--assume-full-coverage is overridden for the categories the merged "
+                 "envelope has direct evidence of a gap in (a failed doctor or an "
+                 "inadequate completeness signal) — a demonstrated failure outranks a "
+                 "blanket assertion that everything was covered.")
+            covered = set(rubric.CATEGORY_KEYS)
 
-    for block in completeness.values():
-        covered -= rubric.ungraded_from_completeness(block)
+        # A doctor that crashed measured nothing. Only the categories it
+        # *alone* covered become unknown — where a surviving doctor covers the
+        # same ground, that ground was still measured.
+        surviving: set[str] = set()
+        for name in doctors:
+            surviving |= rubric.DOCTOR_COVERAGE.get(name, set())
+        for failed, message in doctor_errors.items():
+            profile = rubric.DOCTOR_COVERAGE.get(failed)
+            if profile is None:
+                warn(f"{failed} failed ({message}) but is not a doctor this rubric knows "
+                     "the coverage profile of, so nothing is subtracted for it.")
+                continue
+            covered -= profile - surviving
+
+        for block in completeness.values():
+            covered -= rubric.ungraded_from_completeness(block)
 
     # Nothing to divide by means nothing was examined, whatever the reports say.
     # The LOC floor turns an empty tree into a 1000-line denominator, so a clean

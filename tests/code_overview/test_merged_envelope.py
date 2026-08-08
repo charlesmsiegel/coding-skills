@@ -27,8 +27,14 @@ def envelope(tmp_path, **overrides) -> Path:
     payload = {
         "schema": "code-doctor-merge/1",
         "doctors_run": ["code-doctor", "python-code-doctor"],
-        "analyzers_run": {"code-doctor": ["hygiene", "secrets"],
-                          "python-code-doctor": ["find_security_issues"]},
+        # Real detector-category tokens (the ones analyze_all.py's own
+        # `meta.analyzers_run` names, e.g. FULL_RUN in test_build_health.py) —
+        # not doctor names. Coverage is now resolved per detector, the same
+        # way a --findings report is, so a token has to be one
+        # `rubric.DETECTOR_CATEGORIES` actually recognizes to grant credit.
+        "analyzers_run": {"code-doctor": ["duplicates", "naming_issues"],
+                          "python-code-doctor": ["mutation_hazards", "security",
+                                                 "design_smells"]},
         "analyzers_skipped": {"code-doctor": [], "python-code-doctor": []},
         "analyzer_errors": {},
         "doctor_errors": {},
@@ -93,7 +99,7 @@ def test_coverage_comes_from_doctors_run_not_a_flag(repo_with_code, run_script, 
 
 def test_code_doctor_alone_leaves_correctness_ungraded(repo_with_code, run_script, tmp_path):
     solo = envelope(tmp_path, doctors_run=["code-doctor"],
-                    analyzers_run={"code-doctor": ["hygiene", "secrets"]})
+                    analyzers_run={"code-doctor": ["duplicates", "naming_issues"]})
 
     meta = meta_of(build(repo_with_code, run_script, tmp_path, solo))
 
@@ -102,7 +108,7 @@ def test_code_doctor_alone_leaves_correctness_ungraded(repo_with_code, run_scrip
 
 def test_a_failed_doctor_ungrades_what_it_covered(repo_with_code, run_script, tmp_path):
     broken = envelope(tmp_path, doctors_run=["code-doctor"],
-                      analyzers_run={"code-doctor": ["hygiene"]},
+                      analyzers_run={"code-doctor": ["naming_issues"]},
                       doctor_errors={"python-code-doctor": "crashed reading settings"})
 
     meta = meta_of(build(repo_with_code, run_script, tmp_path, broken))
@@ -153,3 +159,85 @@ def test_out_of_scope_candidates_are_dropped_with_the_findings(repo_with_code, r
     meta = meta_of(build(repo_with_code, run_script, tmp_path, elsewhere))
 
     assert meta["candidates_total"] == 0
+
+
+def test_a_failed_doctor_does_not_ungrade_what_a_surviving_doctor_also_covers(
+        repo_with_code, run_script, tmp_path):
+    """python-code-doctor's own security detector completed; django's crash beside
+    it is not this category's gap — the surviving doctor still measured it."""
+    covered_by_both = envelope(tmp_path, doctors_run=["python-code-doctor"],
+                               analyzers_run={"python-code-doctor": ["security"]},
+                               doctor_errors={"django-code-doctor": "crashed reading settings"})
+
+    meta = meta_of(build(repo_with_code, run_script, tmp_path, covered_by_both))
+
+    assert "security" not in meta["ungraded"]
+
+
+def test_a_merged_findings_severity_is_normalised(repo_with_code, run_script, tmp_path):
+    """A finding's severity is charged at whatever weight this normalizes it to;
+    the count reported beside it has to agree, or the numbers contradict."""
+    shouting = envelope(tmp_path, findings=[
+        {"doctor": "code-doctor", "file": "src/app/mod0.py", "line": 1,
+         "smell_type": "hardcoded_secret_assignment", "severity": "High",
+         "description": "an unnormalised severity token", "suggestion": "read it from env",
+         "kind": "finding"},
+    ])
+
+    meta = meta_of(build(repo_with_code, run_script, tmp_path, shouting))
+
+    assert meta["findings_by_severity"]["high"] == 1, (
+        "an unnormalised 'High' is charged full high weight but would be counted nowhere"
+    )
+
+
+def test_assume_full_coverage_yields_to_a_doctor_that_demonstrably_crashed(
+        repo_with_code, run_script, tmp_path):
+    """merge_reports.py emits exactly this combination when every doctor failed:
+    an envelope naming no doctors but recording why each one failed. Subtracting
+    a doctor's profile from the --assume-full-coverage sentinel must not crash,
+    and the demonstrated failure has to win over the blanket assertion."""
+    every_doctor_failed = envelope(tmp_path, doctors_run=[], analyzers_run={},
+                                   findings=[], candidates=[],
+                                   doctor_errors={"code-doctor": "crashed",
+                                                  "python-code-doctor": "crashed"})
+
+    out = build(repo_with_code, run_script, tmp_path, every_doctor_failed,
+               "--assume-full-coverage")
+    meta = meta_of(out)
+
+    assert meta["score"] is None
+    assert len(meta["ungraded"]) == 7
+
+
+def test_a_non_list_findings_field_grades_nothing(repo_with_code, run_script, tmp_path):
+    """`{"findings": {...}}` must not be silently read as zero findings and A+."""
+    malformed = envelope(tmp_path, findings={"oops": "should have been a list"})
+
+    meta = meta_of(build(repo_with_code, run_script, tmp_path, malformed))
+
+    assert meta["score"] is None
+    assert meta["doctors"] == []
+
+
+def test_a_non_dict_completeness_block_grades_nothing(repo_with_code, run_script, tmp_path):
+    """A `completeness` value that is not itself a dict must not crash the page."""
+    malformed = envelope(tmp_path, completeness={"code-doctor": "not a dict"})
+
+    meta = meta_of(build(repo_with_code, run_script, tmp_path, malformed))
+
+    assert meta["score"] is None
+    assert meta["doctors"] == []
+
+
+def test_an_unrecognised_failed_doctor_is_named_in_a_warning(repo_with_code, run_script,
+                                                             tmp_path):
+    """A failed doctor this rubric has no coverage profile for must not silently
+    subtract nothing — the gap in the warning has to name the doctor."""
+    out = tmp_path / "health.html"
+    mystery = envelope(tmp_path, doctor_errors={"mystery-doctor": "boom"})
+
+    result = run_script(SCRIPT, "--out", out, "--repo", repo_with_code.path, "--name", "app",
+                        "--root-dir", "src/app", "--merged", mystery)
+
+    assert "mystery-doctor" in result.stderr

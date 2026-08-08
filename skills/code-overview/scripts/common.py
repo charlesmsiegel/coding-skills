@@ -669,6 +669,31 @@ def load_merged(path) -> dict:
         warn(f"{path} is not a {MERGE_SCHEMA} envelope — nothing from it is graded")
         return blank
 
+    # A malformed shape here is worse than a missing one. `"findings": {...}`
+    # (a dict where a list belongs) would otherwise be silently skipped by
+    # `data.get("findings") or []` and read as zero findings — a clean bill of
+    # health from a producer that never actually reported zero — and a
+    # `completeness` value that is not a dict raises deep inside
+    # `rubric.ungraded_from_completeness` instead of being caught here. Reject
+    # the whole envelope rather than guess at a partial reading of it.
+    findings_field = data.get("findings")
+    if findings_field is not None and not isinstance(findings_field, list):
+        warn(f"{path} has a `findings` field that is not a list — nothing from this "
+             "envelope is graded")
+        return blank
+    candidates_field = data.get("candidates")
+    if candidates_field is not None and not isinstance(candidates_field, list):
+        warn(f"{path} has a `candidates` field that is not a list — nothing from this "
+             "envelope is graded")
+        return blank
+    completeness_field = data.get("completeness")
+    if completeness_field is not None and (
+            not isinstance(completeness_field, dict)
+            or any(not isinstance(block, dict) for block in completeness_field.values())):
+        warn(f"{path} has a `completeness` field that is not a dict of dicts — nothing "
+             "from this envelope is graded")
+        return blank
+
     doctors = [str(name) for name in (data.get("doctors_run") or [])]
     analyzers = data.get("analyzers_run") or {}
     skipped = data.get("analyzers_skipped") or {}
@@ -678,35 +703,45 @@ def load_merged(path) -> dict:
     by_doctor: dict[str, dict] = {}
     for doctor in doctors:
         ran = {str(name) for name in (analyzers.get(doctor) or [])}
+        doctor_skipped = {str(name) for name in (skipped.get(doctor) or [])}
+        doctor_errors_here = {str(k): str(v) for k, v in (errors.get(doctor) or {}).items()}
+        # A doctor listed with no analyzers_run evidence is exactly the bare
+        # list case: nothing in it distinguishes a full run from one detector
+        # that found nothing, so it grants no coverage profile. Decided from
+        # the raw list, before the skipped/errored reduction below — a doctor
+        # whose every named analyzer crashed still said *something* about what
+        # ran (all of it bad), which is SHAPE_FULL, not the "said nothing"
+        # SHAPE_PARTIAL.
+        shape = SHAPE_PARTIAL if (doctor in unknown or not ran) else SHAPE_FULL
+        # Mirrors normalize_findings: an analyzer that also appears skipped or
+        # crashed never completed, so it is not "ran" for per-category credit
+        # even though the envelope named it.
+        ran -= set(doctor_errors_here) | doctor_skipped
         by_doctor[doctor] = {
             "findings": [],
-            "errors": {str(k): str(v) for k, v in (errors.get(doctor) or {}).items()},
+            "errors": doctor_errors_here,
             "ran": ran,
-            "skipped": {str(name) for name in (skipped.get(doctor) or [])},
-            # A doctor listed with no analyzers_run evidence is exactly the bare
-            # list case: nothing in it distinguishes a full run from one detector
-            # that found nothing, so it grants no coverage profile.
-            "shape": SHAPE_PARTIAL if (doctor in unknown or not ran) else SHAPE_FULL,
+            "skipped": doctor_skipped,
+            "shape": shape,
             "empty_artifact": False,
             "doctor": doctor,
         }
 
-    for record in data.get("findings") or []:
+    for record in findings_field or []:
         if isinstance(record, dict):
             record["severity"] = normalize_severity(record.get("severity"))
             report = by_doctor.get(str(record.get("doctor")))
             if report is not None:
                 report["findings"].append(record)
 
-    candidates = [record for record in (data.get("candidates") or [])
-                  if isinstance(record, dict)]
+    candidates = [record for record in (candidates_field or []) if isinstance(record, dict)]
     for record in candidates:
         record["severity"] = normalize_severity(record.get("severity"))
 
     return {
         "reports": list(by_doctor.values()),
         "candidates": candidates,
-        "completeness": data.get("completeness") or {},
+        "completeness": completeness_field or {},
         "doctor_errors": {str(k): str(v) for k, v in (data.get("doctor_errors") or {}).items()},
         "doctors": doctors,
         "coverage_unknown": sorted(unknown),
