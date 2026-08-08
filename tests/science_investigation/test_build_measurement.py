@@ -113,6 +113,34 @@ def test_every_tab_is_present(run_script, tmp_path):
         assert f">{tab}<" in text, f"the {tab} tab is missing"
 
 
+def test_exactly_four_tabs_are_rendered_no_bogus_preamble_tab(run_script, tmp_path):
+    text = build(run_script, tmp_path).read_text(encoding="utf-8")
+
+    assert text.count('<button role="tab"') == 4, (
+        "the scaffold's leading comment must not become a fifth, bogus tab"
+    )
+
+
+def test_the_score_panel_is_the_one_active_on_load(run_script, tmp_path):
+    text = build(run_script, tmp_path).read_text(encoding="utf-8")
+
+    match = re.search(r'<section class="panel active" id="([^"]+)"', text)
+    assert match, "no panel is active on load"
+    assert match.group(1) == "tab-score", (
+        "the grade card must not be display:none behind a bogus first panel"
+    )
+
+
+def test_the_first_tab_button_is_score_and_selected(run_script, tmp_path):
+    text = build(run_script, tmp_path).read_text(encoding="utf-8")
+
+    match = re.search(r'<button role="tab"[^>]*>', text)
+    assert match, "no tab button is rendered"
+    first = match.group(0)
+    assert 'aria-selected="true"' in first
+    assert 'data-tab="tab-score"' in first
+
+
 def test_the_inventory_table_shows_every_row_with_its_weight_and_credit(run_script, tmp_path):
     text = build(run_script, tmp_path).read_text(encoding="utf-8")
 

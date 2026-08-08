@@ -305,7 +305,11 @@ def main(argv: list[str] | None = None) -> int:
         "TAB_FINDINGS": render_findings_tab(inventory["findings"]),
         "TAB_UNMEASURABLE": render_unmeasurable_tab(inventory["rows"]),
     })
-    fragments = [part for part in body.split("<!-- tab:") if part.strip()]
+    # Element 0 of the split is everything before the first "<!-- tab:"
+    # marker — the scaffold's leading explanatory comment — and is by
+    # definition not a tab. Without dropping it, it survives the `.strip()`
+    # filter and panels() renders it as a bogus, wrongly-active first tab.
+    fragments = [part for part in body.split("<!-- tab:")[1:] if part.strip()]
     nav, sections = panels([f"<!-- tab:{part}" for part in fragments])
 
     meta = build_metadata(inventory, scored, args.name, args)
