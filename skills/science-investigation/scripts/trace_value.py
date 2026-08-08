@@ -45,7 +45,11 @@ _COMPARE_RE = re.compile(r"(?:>=|<=|==|!=|>|<)(?!-)")
 # The needle is the thing being assigned: `quality_score = ...` / `quality_score: number =`
 _TARGET_RE = re.compile(r"^\s*(?::[^=\n]+?)?(?:(?<![=!<>+\-*/])=(?!=)|<-)")
 # ...or the thing being declared: `def quality_score(`, `const quality_score`
-_DECLARE_RE = re.compile(r"\b(?:def|function|func|fun|fn|sub|class|const|let|var)\s+$")
+_DECLARE_RE = re.compile(r"\b(?:def|function|func|fun|fn|sub|class|const|let|var)\s+$"
+                         # `double quality_score(` — the typed C-family form that
+                         # find_metrics already reads as a definition.
+                         r"|^\s*(?:(?:public|private|protected|static|final)\s+)*"
+                         r"[A-Za-z_][\w:<>,\[\] ]*?[\w>\]]\s+$")
 
 CONFIRM = {
     "text":
@@ -140,12 +144,14 @@ def scan(root: Path, pattern: re.Pattern, numeric: bool = True) -> tuple:
     """
     rows, skipped, seen = [], [], set()
     notebooks: dict = {}
+    scanned = 0
     for path in iter_files(root, CODE_SUFFIXES | CONFIG_SUFFIXES | DOC_SUFFIXES):
         display = rel(path, root)
         lines, reason, locations = unpack_source(read_source(path))
         if reason:
             skipped.append((display, reason))
             continue
+        scanned += 1
         if locations:
             notebooks[display] = locations
         for lineno, line in enumerate(lines, 1):
@@ -156,10 +162,13 @@ def scan(root: Path, pattern: re.Pattern, numeric: bool = True) -> tuple:
                     continue
                 seen.add((display, lineno, kind))
                 rows.append(candidate(kind, display, lineno, kind + " site", CONFIRM[kind], line.strip()))
-    return relocate(rows, notebooks), skipped
+    return relocate(rows, notebooks), skipped, scanned
 
 
-def headline_for(needle: str, rows: list) -> str:
+def headline_for(needle: str, rows: list, files: int = 1) -> str:
+    if not files:
+        return ("Nothing to scan: no source, config, or documentation files found under this "
+                "path. This is not evidence about '" + needle + "' either way.")
     if not rows:
         return ("'" + needle + "' appears nowhere under this path. If a report cites it, the number "
                 "is produced somewhere this scan cannot see — find that before trusting it.")
@@ -233,16 +242,16 @@ def main() -> int:
         print("error: bad regular expression: " + str(exc), file=sys.stderr)
         return 2
 
-    rows, skipped = scan(root, pattern, bool(_NUMERIC_RE.match(args.needle)) and not args.regex)
+    rows, skipped, scanned = scan(root, pattern, bool(_NUMERIC_RE.match(args.needle)) and not args.regex)
     order = ["definition", "comparison", "config", "doc", "test", "comment", "text", "other"]
     rows.sort(key=lambda r: (order.index(r["kind"]) if r["kind"] in order else 99, r["file"], r["line"]))
     counts = {"needle": args.needle, "sites": len(rows), "files": len({r["file"] for r in rows}),
-              "files_skipped_unread": len(skipped)}
+              "files_scanned": scanned, "files_skipped_unread": len(skipped)}
     for kind in order:
         found = sum(1 for r in rows if r["kind"] == kind)
         if found:
             counts[kind] = found
-    headline = headline_for(args.needle, rows) + skipped_note(skipped)
+    headline = headline_for(args.needle, rows, scanned) + skipped_note(skipped)
     emit(envelope("trace_value", root, headline, CAVEAT, counts, rows[:args.limit]), args.format)
     return 0
 

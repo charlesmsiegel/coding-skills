@@ -31,7 +31,7 @@ from pathlib import Path
 from common import (
     CODE_SUFFIXES, CONFIG_SUFFIXES, add_common_args, candidate, configure_output, emit,
     envelope, is_config, iter_files, mask_strings, read_source, rel, relocate, skipped_note,
-    unpack_source,
+    split_comment, unpack_source,
 )
 
 # Tokens that make an identifier a measure on their own.
@@ -73,6 +73,7 @@ _DEF_RE = re.compile(
     r"|^\s*(?:(?:public|private|protected|static|final|virtual|override|async|export)\s+)*"
     r"(?:[A-Za-z_][\w:<>,\[\] ]*?[\w>\]])\s+([A-Za-z_][\w]*)\s*\([^;]*\)\s*(?:const\s*)?\{"
 )
+_SQL_ALIAS_RE = re.compile(r"(?i:\bas\s+)[\"'`]?([A-Za-z_][\w]*)[\"'`]?\s*(?=,|$|\s)")
 # `accuracy = ...`, `self.win_rate = ...`, `const qualityScore = ...`, `NDCG_AT_10 = ...`
 # The lookarounds keep `score == 0.75` out: a comparison is not a definition, and it
 # is already caught (better) by _COMPARE_RE below.
@@ -101,11 +102,12 @@ _LITERAL_END = r"[fFdDlLuU]?(?![\w.])"
 # `accuracy(rows) >= 0.8` gates exactly as `accuracy >= 0.8` does; without the
 # optional call the decision site was inventoried nowhere.
 _CALL = r"(?:\([^()]*\))?"
-_COMPARE_RE = re.compile(r"([A-Za-z_][\w.]*)" + _CALL + r"\s*(>=|<=|==|>|<)\s*("
+_OPS = r"(>=|<=|==|!=|>|<)"
+_COMPARE_RE = re.compile(r"([A-Za-z_][\w.]*)" + _CALL + r"\s*" + _OPS + r"\s*("
                          + _NUMBER + r")" + _LITERAL_END)
 _COMPARE_MIRRORED_RE = re.compile(r"(?<![\w.])(" + _NUMBER + r")" + _LITERAL_END
-                                  + r"\s*(>=|<=|==|>|<)\s*([A-Za-z_][\w.]*)")
-_MIRROR = {">=": "<=", "<=": ">=", ">": "<", "<": ">", "==": "=="}
+                                  + r"\s*" + _OPS + r"\s*([A-Za-z_][\w.]*)")
+_MIRROR = {">=": "<=", "<=": ">=", ">": "<", "<": ">", "==": "==", "!=": "!="}
 # `[v for v in parts.values() if v is not None]` / `.filter(v => v !== null)` —
 # the composite silently renormalizes over whichever components produced a value.
 _RENORMALIZE_RE = re.compile(
@@ -180,6 +182,9 @@ def named_on(line: str, stripped: str) -> list:
     definition = _DEF_RE.search(line)
     if definition:
         names.append((next(g for g in definition.groups() if g), ""))
+    # One SELECT can define several measures; the single search above records only
+    # the first, so every later alias vanished from the inventory.
+    names += [(alias, "") for alias in _SQL_ALIAS_RE.findall(line)]
     assignment = _ASSIGN_RE.match(line)
     if assignment:
         names.append((assignment.group(1), assignment.group(2)))
@@ -207,7 +212,11 @@ def comparable(line: str, is_config_file: bool) -> str:
     nothing, and reporting it as a threshold invents a decision site. Config files
     are left alone, because there the quoted text *is* the value.
     """
-    return line if is_config_file else mask_strings(line)
+    if is_config_file:
+        return line
+    # Comments go too: `result = run()  # legacy: quality_score > 0.8` documents an
+    # old gate, it does not gate anything now.
+    return split_comment(mask_strings(line))[0]
 
 
 def name_candidates(line: str, stripped: str, path_display: str, lineno: int, defined: dict) -> list:

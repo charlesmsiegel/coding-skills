@@ -46,9 +46,18 @@ finding; a report that lists only what *is* measured implies the rest is fine.
 | Recall / coverage | A gold set of everything that should have been found | Precision on what you happened to look at |
 | Calibration | Realized outcomes per prediction | Confidence scores nobody has checked |
 | Causal effect ("the feature caused +4%") | A control arm | A before/after correlation |
-| Ranking quality (nDCG, MAP) | Graded relevance, not binary clicks | A click-through proxy |
+| Ranking quality (nDCG, MAP) | Relevance judgments per query — clicks are not judgments | A click-through proxy |
 | Faithfulness (LLM/RAG) | Retrieved context stored per example | An answer with no audit trail |
 | Regression detection | A stable baseline run | Two numbers from two different instruments |
+
+On that ranking row, keep two requirements apart. **MAP is defined on binary
+relevance** and is perfectly computable from binary qrels; nDCG accepts binary
+relevance too, and graded judgments only make it more informative. What neither can
+be computed from is *clicks*, which measure what was shown and noticed rather than
+what was relevant. So the finding is "no relevance judgments exist" or "the only
+judgments are graded and the metric needs them", never "MAP requires graded
+relevance" — telling a team with valid binary qrels that their evaluation is
+unmeasurable is exactly the manufactured finding this skill warns against.
 
 **LLM instance:** a RAG system reporting "94% accuracy" with no gold passage set cannot
 report recall at all — it can only tell you how often it was right about the questions
@@ -110,8 +119,12 @@ If a confidence interval or bootstrap exists, read it for three things:
   and is usually a large win. Unpaired comparison over a small heterogeneous eval set
   is mostly measuring which items landed in which arm.
 - **Seeding.** Is the resampling seeded and reproducible? An unseeded bootstrap gives a
-  different interval each run, which means the interval itself is being cherry-picked
-  by whoever reruns it.
+  different interval on every run, so the published interval carries Monte Carlo noise
+  on top of sampling noise and cannot be reproduced from the report. Say that, and say
+  how much it moves across reruns if you can. Do **not** call it cherry-picking: that is
+  a claim about someone selectively reporting reruns, and it needs evidence of selection
+  — several runs recorded and the most favourable one published. Absent that evidence,
+  an unseeded bootstrap is a reproducibility defect and nothing more.
 - **Multiple comparisons.** N metrics × K arms × however many weekly reruns is a lot of
   tests. Correction is almost always absent — note it, and note how many tests were
   actually run, because that's the number that sets the false-positive rate.

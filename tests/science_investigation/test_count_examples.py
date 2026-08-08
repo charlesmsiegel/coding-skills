@@ -412,3 +412,16 @@ def test_the_unlabeled_candidate_is_scoped_to_what_was_read(tmp_path):
     (tmp_path / "eval.jsonl").write_text('{"q":"x"}\n{"gold":"g"}\n', encoding="utf-8")
     row = kinds(run(tmp_path, "--max-rows", "1"), "no_label_field")[0]
     assert "1 of 2 record(s) read" in row["detail"]
+
+
+# ---- tenth review round ------------------------------------------------------- #
+
+def test_a_name_that_merely_starts_with_a_hint_is_not_a_dataset(tmp_path):
+    """`runtime` is not a run, and `runtime.json` is not measurement data."""
+    (tmp_path / "runtime.json").write_text('[{"host":"a","pid":1}]', encoding="utf-8")
+    assert run(tmp_path)["counts"]["datasets"] == 0
+
+
+def test_a_hint_as_a_whole_segment_still_counts(tmp_path):
+    (tmp_path / "eval_runs.json").write_text('[{"host":"a"}]', encoding="utf-8")
+    assert run(tmp_path)["counts"]["datasets"] == 1
