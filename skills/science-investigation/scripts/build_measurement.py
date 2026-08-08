@@ -19,6 +19,7 @@ from __future__ import annotations
 import argparse
 import html
 import json
+import re
 import sys
 from datetime import date
 from pathlib import Path
@@ -71,7 +72,8 @@ def read_inventory(path: Path) -> dict:
 # tabs
 # --------------------------------------------------------------------------
 
-def render_score_tab(scored: dict, rows: list[dict], intro: str, not_audited: list) -> str:
+def render_score_tab(scored: dict, rows: list[dict], intro: str,
+                     not_audited: list, package_table: str = "") -> str:
     score = scored["score"]
     shown = "—" if score is None else f"{score:.1f}"
     gates = scored["by_importance"].get("3") or {}
@@ -135,7 +137,7 @@ def render_score_tab(scored: dict, rows: list[dict], intro: str, not_audited: li
         '<div class="tbl-wrap"><table><thead><tr><th>Importance</th>'
         '<th class="num">Things</th><th class="num">Weight</th>'
         '<th class="num">Measured</th><th class="num">Share</th></tr></thead>'
-        f"<tbody>{breakdown_rows}</tbody></table></div>{gaps}"
+        f"<tbody>{breakdown_rows}</tbody></table></div>{gaps}{package_table}"
     )
 
 
@@ -245,10 +247,11 @@ def panels(fragments: list[str]) -> tuple[str, str]:
     return "\n".join(nav), "\n".join(sections)
 
 
-def build_metadata(inventory: dict, scored: dict, name: str, args) -> dict:
-    return {
+def build_metadata(inventory: dict, scored: dict, name: str, args,
+                   out_of_scope: int, packages: list[dict]) -> dict:
+    meta = {
         "schema": rubric.DOCUMENT_SCHEMA,
-        "scope": "package",
+        "scope": "repository" if args.root else "package",
         "package": name,
         "generated": args.generated or date.today().isoformat(),
         "commit": args.commit or "",
@@ -260,7 +263,80 @@ def build_metadata(inventory: dict, scored: dict, name: str, args) -> dict:
         "rows": inventory["rows"],
         "findings": inventory["findings"],
         "not_audited": inventory["not_audited"],
+        "rows_out_of_scope": out_of_scope,
     }
+    if args.root:
+        meta["packages"] = packages
+    return meta
+
+
+def defining_path(entry: dict) -> str:
+    """Where the measurable thing is *defined* — the first evidence citation.
+
+    A metric defined in evals/ that scores a service's output cites both. It
+    belongs to whoever defines it: assigning it to the service would give two
+    packages the same row and double-count it in the repository denominator.
+    """
+    for citation in entry.get("evidence") or []:
+        text = str(citation).strip()
+        if text:
+            return text.split(":", 1)[0].replace("\\", "/").removeprefix("./")
+    return ""
+
+
+def in_scope(entry: dict, scopes: list[str]) -> bool:
+    if not scopes:
+        return True
+    path = defining_path(entry)
+    return any(path == scope or path.startswith(scope.rstrip("/") + "/")
+               for scope in scopes)
+
+
+def read_package_grade(name: str, path: Path) -> dict:
+    """A package row for the root table, read back out of its own document."""
+    blank = {"name": name, "score": None, "grade": rubric.UNGRADED,
+             "rows": 0, "generated": False}
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError:
+        return blank
+    match = re.search(r'id="measurement-meta">(.*?)</script>', text, re.S)
+    if not match:
+        return blank
+    try:
+        meta = json.loads(match.group(1).replace("<\\/", "</"))
+    except json.JSONDecodeError:
+        return blank
+    return {"name": name, "score": meta.get("score"),
+            "grade": meta.get("grade", rubric.UNGRADED),
+            "rows": len(meta.get("rows") or []), "generated": True}
+
+
+def render_package_table(packages: list[dict]) -> str:
+    if not packages:
+        return ""
+    parts = []
+    for item in packages:
+        score = "—" if item["score"] is None else f"{item['score']:.1f}"
+        if not item["generated"]:
+            state = "not generated"
+        elif item["score"] is None:
+            state = "no measurement content"
+        else:
+            state = "graded"
+        parts.append(
+            f"<tr><td>{esc(item['name'])}</td>"
+            f'<td class="num">{score}</td>'
+            f'<td class="num">{esc(item["grade"])}</td>'
+            f'<td class="num">{item["rows"]}</td>'
+            f"<td>{state}</td></tr>"
+        )
+    body = "".join(parts)
+    return ("<h3>Packages</h3><p class=\"dim\">A package with nothing measurable is listed "
+            "as having no measurement content, not as passing.</p>"
+            '<div class="tbl-wrap"><table><thead><tr><th>Package</th><th class="num">Score</th>'
+            '<th class="num">Grade</th><th class="num">Things</th><th>State</th></tr></thead>'
+            f"<tbody>{body}</tbody></table></div>")
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -274,7 +350,16 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--generated", default="")
     parser.add_argument("--template", type=Path, default=ASSETS / "template.html")
     parser.add_argument("--body", type=Path, default=ASSETS / "measurement-body.html")
+    parser.add_argument("--repo", type=Path, default=Path("."))
+    parser.add_argument("--root-dir", action="append", default=[], dest="root_dirs")
+    parser.add_argument("--scope", action="append", default=[], dest="scopes")
+    parser.add_argument("--root", action="store_true")
+    parser.add_argument("--package", action="append", default=[], dest="packages",
+                        metavar="NAME:PATH")
     args = parser.parse_args(argv)
+
+    if args.packages and not args.root:
+        parser.error("--package builds the repository roll-up table and needs --root")
 
     try:
         inventory = read_inventory(args.inventory)
@@ -284,6 +369,21 @@ def main(argv: list[str] | None = None) -> int:
     except (OSError, json.JSONDecodeError) as exc:
         print(f"error: {args.inventory}: {exc}", file=sys.stderr)
         return 2
+
+    total_rows = len(inventory["rows"])
+    if not args.root:
+        scopes = [str(s).replace("\\", "/").strip("/")
+                  for s in (args.scopes or args.root_dirs)]
+        inventory["rows"] = [entry for entry in inventory["rows"]
+                             if in_scope(entry, scopes)]
+        kept_findings = {str(entry.get("finding")) for entry in inventory["rows"]
+                         if entry.get("finding")}
+        inventory["findings"] = [f for f in inventory["findings"]
+                                 if str(f.get("id")) in kept_findings]
+    out_of_scope = total_rows - len(inventory["rows"])
+    if out_of_scope:
+        print(f"note: {out_of_scope} row(s) dropped as defined outside this unit",
+              file=sys.stderr)
 
     scored = rubric.score_inventory(inventory["rows"])
 
@@ -298,9 +398,15 @@ def main(argv: list[str] | None = None) -> int:
                  "says what this unit measures and why is the one part no script can "
                  "produce, and this page is weaker without it.</div>")
 
+    packages = []
+    for spec in args.packages:
+        label, _, location = spec.partition(":")
+        packages.append(read_package_grade(label.strip(), Path(location.strip())))
+
     body = fill(args.body.read_text(encoding="utf-8"), {
         "TAB_SCORE": render_score_tab(scored, inventory["rows"], intro,
-                                      inventory["not_audited"]),
+                                      inventory["not_audited"],
+                                      render_package_table(packages)),
         "TAB_INVENTORY": render_inventory_tab(inventory["rows"]),
         "TAB_FINDINGS": render_findings_tab(inventory["findings"]),
         "TAB_UNMEASURABLE": render_unmeasurable_tab(inventory["rows"]),
@@ -312,7 +418,7 @@ def main(argv: list[str] | None = None) -> int:
     fragments = [part for part in body.split("<!-- tab:")[1:] if part.strip()]
     nav, sections = panels([f"<!-- tab:{part}" for part in fragments])
 
-    meta = build_metadata(inventory, scored, args.name, args)
+    meta = build_metadata(inventory, scored, args.name, args, out_of_scope, packages)
     sections += (f'\n<script type="application/json" id="measurement-meta">'
                  f"{json_block(meta)}</script>")
 
