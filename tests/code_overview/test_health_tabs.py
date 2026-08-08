@@ -62,6 +62,51 @@ def page(repo, run_script, tmp_path) -> str:
     return out.read_text(encoding="utf-8")
 
 
+def ungraded_envelope(tmp_path) -> Path:
+    """The same fixture data, but code-doctor names no analyzer it ran.
+
+    `page` below used to be the ungraded case by accident: a producer/consumer
+    mismatch meant its `analyzers_run` tokens ("hygiene", "secrets") never
+    resolved into rubric categories at all, so *every* category came back
+    ungraded regardless of what the envelope said. That mismatch is fixed now
+    — those tokens resolve, and `page` legitimately grades Hygiene and
+    Security. So the ungraded case needs its own envelope, and it needs to be
+    ungraded on purpose rather than by bug.
+
+    An empty `analyzers_run` entry for code-doctor is that case, and it is the
+    one `common.load_merged` itself documents: nothing distinguishes a doctor
+    that ran no analyzers from one that never started, so the report is read
+    as SHAPE_PARTIAL and grants no coverage profile at all — see the "bare
+    list" comment on `resolve_coverage`. That is a more honest "nothing could
+    be graded" than a doctor absent from `rubric.DOCTOR_COVERAGE` (which
+    would mean an *unknown* doctor, not a doctor that ran and produced
+    nothing) or an envelope whose only doctor failed outright (which is a
+    different, already-covered claim: see `doctor_errors` in the base
+    `envelope`, exercised by the coverage-tab tests below).
+    """
+    payload = json.loads(envelope(tmp_path).read_text(encoding="utf-8"))
+    payload["analyzers_run"] = {}
+    path = tmp_path / "ungraded.json"
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    return path
+
+
+@pytest.fixture
+def ungraded_page(repo, run_script, tmp_path) -> str:
+    """A page that genuinely earns no grade at all.
+
+    Companion to `graded_page` below: that fixture proves a grade renders when
+    one is earned, this one proves the placeholder renders when nothing is.
+    """
+    for i in range(12):
+        repo.write(f"src/app/mod{i}.py", "def f():\n    return 1\n" * 20)
+    repo.commit()
+    out = tmp_path / "ungraded.html"
+    run_script(SCRIPT, "--out", out, "--repo", repo.path, "--name", "app",
+               "--root-dir", "src/app", "--merged", ungraded_envelope(tmp_path))
+    return out.read_text(encoding="utf-8")
+
+
 @pytest.fixture
 def graded_page(repo, run_script, tmp_path) -> str:
     """A page that actually earns a letter.
@@ -97,6 +142,33 @@ def health_meta(page: str) -> dict:
 
 _COVERAGE_PANEL_RE = re.compile(
     r'<section class="panel(?: active)?" id="tab-coverage"[^>]*>(.*?)</section>', re.DOTALL)
+_GRADE_PANEL_RE = re.compile(
+    r'<section class="panel(?: active)?" id="tab-grade"[^>]*>(.*?)'
+    r'(?=<section class="panel|<script type="application/json" id="code-health-meta">)',
+    re.DOTALL)
+
+
+def grade_panel(page: str) -> str:
+    """Just the Grade tab's own markup — not the whole document.
+
+    Unlike Coverage, the Grade tab's body itself opens a nested
+    `<section class="gradecard ...">` — so the naive "stop at the first
+    `</section>`" pattern `coverage_panel` uses stops there too, truncating
+    the panel before the placeholder callout that comes after it. Stopping
+    instead at the *next* `<section class="panel` (the following tab) or the
+    trailing `code-health-meta` script — whichever comes first — captures the
+    whole tab regardless of what it nests.
+
+    The `code-health-meta` JSON block sits later in the same page and is
+    itself keyed by strings a careless assertion could match — `health_meta`
+    exists so score/grade checks go through the parsed JSON instead of a
+    substring search. Any prose check (like the placeholder-grade callout)
+    needs the same discipline `coverage_panel` documents: scope to the panel
+    that is supposed to carry it, not the document as a whole.
+    """
+    match = _GRADE_PANEL_RE.search(page)
+    assert match, "no Grade panel found"
+    return match.group(1)
 
 
 def coverage_panel(page: str) -> str:
@@ -143,13 +215,20 @@ def test_the_visible_grade_card_carries_the_grade(graded_page):
     )
 
 
-def test_an_ungraded_page_shows_the_dash_and_says_the_grade_is_a_placeholder(page):
-    # The other half of the same claim: when nothing could be graded, the card
-    # must not quietly render something that reads like a grade.
-    assert health_meta(page)["score"] is None
-    card = re.search(r'<div class="letter">([^<]*)</div>', page)
+def test_an_ungraded_page_shows_the_dash_and_says_the_grade_is_a_placeholder(ungraded_page):
+    # The other half of the same claim as test_the_visible_grade_card_carries_
+    # the_grade: when nothing could be graded, the card must not quietly
+    # render something that reads like a grade. `page` cannot stand in for
+    # that anymore — its code-doctor entry now genuinely resolves Hygiene and
+    # Security coverage (see `ungraded_envelope`'s docstring) — so this uses
+    # the dedicated `ungraded_page` fixture instead.
+    assert health_meta(ungraded_page)["score"] is None
+    card = re.search(r'<div class="letter">([^<]*)</div>', ungraded_page)
     assert card and card.group(1).strip() == "—"
-    assert "the grade shown is a placeholder" in page
+    # Scoped to the Grade panel: the placeholder callout is only meaningful
+    # where the grade card itself lives, not merely present somewhere in the
+    # document.
+    assert "the grade shown is a placeholder" in grade_panel(ungraded_page)
 
 
 def test_the_grade_tab_is_the_one_that_opens(page):
