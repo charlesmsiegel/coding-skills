@@ -1,6 +1,6 @@
 ---
 name: code-overview
-description: Build a navigable documentation set for a codebase, one per package rather than one per repo. Works out what the packages/modules/subsystems are (confirming with the user), then per package runs code-visualization into codemap.html, one code-doctor call into health.html — a graded page with a 0-100 score and letter grade — and science-investigation into measurement.html, scored null rather than zero when nothing is measurable — plus a summary.html linking all three. Collates these into repo-level summary.html, codemap.html, health.html and measurement.html, and injects navigation so every page links up to the overall document of its own type, across to its siblings, and back down. Use when the user wants an overview, health report, grade, measurement audit, or score for a codebase, per-package docs, or docs for a monorepo — "document this repo", "how healthy is each package", "grade this codebase", "overview of every service". For one unscored atlas use code-visualization; for one PR use pr-visualization.
+description: Build a navigable documentation set for a codebase, one per package rather than one per repo. Works out the packages/modules (confirming with the user), then per package runs code-visualization into codemap.html, code-doctor into health.html (0-100 score, letter grade), science-investigation into measurement.html (null when nothing is measurable), and a three-judge panel into theory.html grading whether the code expresses a coherent theory of its problem, in Naur's sense — plus a summary.html linking all four. Collates these at repo level too, and injects navigation linking every page up, across, and down. Use when the user wants an overview, health report, grade, measurement audit, theory judgment, or score for a codebase, per-package docs, or docs for a monorepo — "document this repo", "how healthy is each package", "grade this codebase", "overview of every service". For one unscored atlas use code-visualization; for one PR use pr-visualization.
 ---
 
 # Code Overview — a graded, navigable document set
@@ -31,8 +31,8 @@ page.
 
 ```
 docs/code-overview.json      the package map — the input to every other script
-docs/{summary,codemap,health,measurement}.html          repo level
-<pkg-root>/docs/{summary,codemap,health,measurement}.html   one set per package
+docs/{summary,codemap,health,measurement,theory}.html          repo level
+<pkg-root>/docs/{summary,codemap,health,measurement,theory}.html   one set per package
 ```
 
 Full layout, the nav contract, and the metadata schema: `references/doc-layout.md`.
@@ -146,7 +146,7 @@ measurement content* list. Most packages in a typical repo are that page, and
 that is the correct output.
 
 Pass `--template "$SKILL/assets/template.html"` to `code-visualization`'s
-`assemble.py` too. That one flag is what makes the four documents read as one
+`assemble.py` too. That one flag is what makes the five documents read as one
 artifact instead of three tools' output.
 
 **The grade.** Pass the merged envelope from step 2; `build_health.py` partitions
@@ -221,9 +221,67 @@ python "$SKILL/scripts/build_summary.py" --out <DOCS>/summary.html --repo <repo>
 It reads the grade back out of `health.html` rather than being told it, so the
 two documents cannot disagree.
 
-## 4. The repo level
+## 4. The theory panel
 
-Same four documents, one scope up.
+`theory.html` asks Naur's question: does this unit's code express a coherent
+theory of the problem it solves? Unlike health and measurement, **this grade is
+a judgment** — so the protocol is built to make the judgment disputable rather
+than authoritative.
+
+**Dispatch three judges per unit, independently.** Each gets the package's code
+and `theory-building`'s doctrine; **none gets another judge's output**. A judge
+that saw the others would converge on them, and the spread — the one signal a
+panel exists to produce — would vanish.
+
+Each judge writes a `theory-verdict/1` JSON file:
+
+```json
+{"schema": "theory-verdict/1", "unit": "billing",
+ "theory": "≤3 sentences: what this models, in the world",
+ "instead_of": "the other coherent reading, and why not it",
+ "trivial": false, "trivial_reason": "",
+ "dimensions": {"absorption": {"step": 0.5, "rationale": "two of four rehearsals need a parallel path", "evidence": ["src/billing/charge.py:88"]}},
+ "rehearsals": [{"requirement": "refunds settle in a second currency", "verdict": "patch", "why": "currency is assumed at module scope", "evidence": ["src/billing/money.py:12"]}]}
+```
+
+Five dimensions, every one required: `absorption` (30), `world_mapping` (25),
+`abstraction` (20), `justification` (15), `honest_limits` (10). Steps come from
+a four-rung ladder — `1.0` holds, `0.5` partial, `0.25` strained, `0.0` absent —
+and **a step below 1.0 must cite the evidence that lowered it**. At least three
+absorption rehearsals, each landing as `extension` or `patch`.
+
+```bash
+python "$SKILL/scripts/build_theory.py" --out <DOCS>/theory.html --name <pkg> \
+  --repo <repo> --root-dir <root> --model <model-id> \
+  --verdict $WORK/<pkg>-judge1.json --verdict $WORK/<pkg>-judge2.json \
+  --verdict $WORK/<pkg>-judge3.json --template "$SKILL/assets/template.html"
+```
+
+The median per dimension sets the score. **Where the judges differ by two rungs
+or more, that is reported as a finding** — three careful readers disagreeing
+about what code models is a fact about the code, and the median alone would hide
+it.
+
+**A unit with no theory scores badly; it is not null.** Naur: "If the theory
+can't be stated, there isn't one." Recording that as unmeasurable is the dodge
+this document set refuses. `null` is reserved for units genuinely **too small to
+warrant a theory**, which requires *both* a size test (≤3 files and ≤200 lines,
+computed) and ≥2 of the 3 judges voting trivial with a reason. Either gate alone
+is gameable.
+
+**The floor is not offered at repo scope** — a repository of individually
+trivial packages still has a system-level question worth asking.
+
+**Say what this grade is when you present it.** A model auditing abstractions is
+partly circular: the weakness that produces repetition-with-variants also
+evaluates whether the repetition was warranted. Three judges narrow that; they do
+not close it. The theory statement itself is the deliverable — it is the artifact
+that gets lost when only the code is handed over — and the grade is a byproduct
+of having tried to write it.
+
+## 5. The repo level
+
+Same five documents, one scope up.
 
 - **Atlas**: a genuine repo-wide `code-visualization` run into `docs/codemap.html`.
   Cross-package coupling and cycles only exist at this scope, so this is not a
@@ -254,9 +312,16 @@ Same four documents, one scope up.
   the table cannot disagree with the pages it summarizes. Every mapped package
   gets a row, including the ones that scored `null` — the table calls those *no
   measurement content*, not a blank cell.
+- **Theory**: `build_theory.py --root --out docs/theory.html --name <repo>
+  --root-dir <root> [--root-dir ...] --verdict ... (×3, one panel over the whole
+  scope)`. No exemption floor at this scope — a repository of individually
+  trivial packages still has a system-level question worth asking. Unlike
+  health and measurement, `build_theory.py` has no `--package` flag and writes
+  no per-package roll-up; a root `theory.html` is one more panel-scored page,
+  not a table of every package's grade.
 - **Summary**: `build_summary.py --root --map docs/code-overview.json`.
 
-## 5. Navigation, last
+## 6. Navigation, last
 
 ```bash
 python "$SKILL/scripts/inject_nav.py" --map docs/code-overview.json --repo <repo>
@@ -332,14 +397,15 @@ nothing at all rather than everything.
 python "$SKILL/scripts/discover_packages.py" <repo> [--format text|json] [--exclude d1,d2] [--min-files N]
 python "$SKILL/scripts/build_health.py"  --out FILE [--merged JSON] [--findings JSON ...] [--root]
 python "$SCIENCE/scripts/build_measurement.py" --out FILE --inventory JSON --name NAME [--root]
+python "$SKILL/scripts/build_theory.py"  --out FILE --name NAME --verdict JSON --verdict JSON --verdict JSON [--root] [--model ID]
 python "$SKILL/scripts/build_summary.py" --out FILE [--root] [--intro-file HTML] [--highlight TEXT]
 python "$SKILL/scripts/inject_nav.py"    --map docs/code-overview.json --repo <repo> [--check]
 ```
 
 Templates live in `assets/` — `assets/template.html` is the shared page shell
-(its design tokens are code-visualization's, which is what makes the four
+(its design tokens are code-visualization's, which is what makes the five
 document types read as one artifact), with `assets/health-body.html`,
-`assets/summary-body.html`, and `assets/measurement-body.html` supplying the
-three layouts. `measurement-body.html` is a byte-identical copy of
-`science-investigation`'s own — one source of truth, pinned by
-`tests/test_shared_assets.py`.
+`assets/summary-body.html`, `assets/measurement-body.html`, and
+`assets/theory-body.html` supplying the four layouts. `measurement-body.html`
+is a byte-identical copy of `science-investigation`'s own — one source of
+truth, pinned by `tests/test_shared_assets.py`.

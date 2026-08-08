@@ -364,3 +364,24 @@ compares them directly. What differs is what each divides — say which when you
 present them together. The rubric itself lives in
 `science-investigation/scripts/rubric.py`; a CI test pins the band table
 identical to this skill's.
+
+## The theory grade
+
+    score = 100 × Σ(weight × median step) / Σ(weight)
+
+A third question again: health asks how dense the detectable defects are,
+measurement how much of what matters is measured, theory whether the code
+expresses a coherent model of its problem at all.
+
+Its ladder is ordinal — `absent`, `strained`, `partial`, `holds` — and
+disagreement between judges is counted in **rungs**, not in the values, because
+the values are unevenly spaced on purpose and arithmetic distance would rank the
+same disagreement differently depending on where it sat.
+
+Its bands are the same as the other two, imported directly from `rubric.py`
+rather than copied — `theory_rubric.py` ships in the same skill, so the
+standalone-installability rule that forces the science-investigation copy does
+not apply.
+
+**Unlike the other two, this grade is a judgment.** Present it with that said
+out loud, and never compare letters produced by different models.

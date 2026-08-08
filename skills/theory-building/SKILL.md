@@ -269,6 +269,17 @@ not make a reliable review. What they can do is fail *differently*, which is the
 value on offer here: the note says where to look, so the human's attention lands where
 the model's self-assessment is weakest.
 
+## Judging code you did not write
+
+The gates above govern code being produced now. To apply the same doctrine to an
+existing codebase — a package you are inheriting, or one you are about to hand
+over — `code-overview` builds a `theory.html` per unit: three judges score the
+five dimensions drawn from these gates, the median sets a grade, and the places
+they disagree are reported rather than averaged away.
+
+This skill ships no code for that on purpose. It is doctrine; the judging, the
+arithmetic and the document belong to the skill that owns the document set.
+
 ## Sources
 
 - Peter Naur, "Programming as Theory Building" (1985), reprinted in *Computing: A Human

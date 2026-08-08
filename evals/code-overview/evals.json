@@ -34,6 +34,16 @@
       "id": "every-package-gets-a-measurement-page",
       "prompt": "Build the overview. Only the evals package actually computes any metrics — skip measurement for the other six.",
       "expected_output": "Builds a measurement page for all seven, explaining that a package with nothing measurable scores null and says so in one line, and that the repo document lists them as having no measurement content. Does not skip the pages, and does not manufacture metrics to fill them."
+    },
+    {
+      "id": "a-shapeless-package-scores-badly-not-null",
+      "prompt": "The theory page for our utils package came back with an F. It's just a pile of helper functions people add to — surely that's a null, not a fail?",
+      "expected_output": "Explains that null is reserved for units too small to warrant a theory, which requires both a size test and a 2-of-3 judge vote, and that a package big enough to accumulate helpers is exactly a package that should have a theory. Points at the dimension rows and their evidence rather than defending the letter, and notes the grade is a judgment whose rows are the arguable part."
+    },
+    {
+      "id": "theory-panel-disagreement-is-a-finding",
+      "prompt": "Two of the three judges said our scheduler's abstraction 'holds' and one said 'strained'. Just take the majority and move on?",
+      "expected_output": "Notes that one rung of disagreement does not raise the banner but two does, checks which it was, and treats a two-rung split as a finding about the code's clarity rather than about the judges. Does not simply discard the minority reading — the Disagreement tab exists because the median hides it."
     }
   ]
 }

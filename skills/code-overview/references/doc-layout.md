@@ -8,18 +8,20 @@ docs/summary.html           portal: overall grade, package table, links
 docs/codemap.html           repo-wide code-visualization atlas
 docs/health.html            repo-wide grade + per-package grade table
 docs/measurement.html       repo-wide measurement grade + per-package table
+docs/theory.html            repo-wide theory grade + per-package table
 
 <pkg-root>/docs/summary.html      package portal
 <pkg-root>/docs/codemap.html      package-scoped atlas
 <pkg-root>/docs/health.html       package grade
 <pkg-root>/docs/measurement.html  package measurement grade
+<pkg-root>/docs/theory.html       package theory grade
 ```
 
 A package's docs directory defaults to `<first root>/docs` and is overridable
 per package via the map's `docs` field — useful when a package's first root is
 somewhere you would rather not write, or when two packages share a parent.
 
-**A single-package repo whose root is the repo root produces the three root
+**A single-package repo whose root is the repo root produces the five root
 documents only.** `inject_nav.py` detects this (the package's docs directory
 resolves to `<repo>/docs`) and drops the package layer rather than generating a
 document that links to itself.
@@ -86,7 +88,7 @@ the map, or leave them — the loaders ignore unknown keys.
 | Row | Contents |
 |---|---|
 | Up | `⌂ Overall <Type>` → the repo-level document **of the same type**, then the package name |
-| Across | `Summary · Code Map · Health · Measurement` for this package, current one `aria-current="page"` |
+| Across | `Summary · Code Map · Health · Measurement · Theory` for this package, current one `aria-current="page"` |
 | Sideways | The same document type in every other package |
 
 The block is delimited by `<!-- code-overview:nav -->` and `<!-- /code-overview:nav -->`
@@ -196,8 +198,11 @@ the repo root" rule now governs both analysis skills:
    `merge_reports.py` → one envelope
 3. **science-investigation's scripts once, from the repo root** → one inventory,
    partitioned per package by the `file:line` evidence on each row
-4. per package: codemap → `build_health.py` → measurement → `build_summary.py`
+4. per package: codemap → `build_health.py` → measurement → **three independent
+   theory judges, none seeing another's verdict → `build_theory.py`** →
+   `build_summary.py`
 5. root: codemap → `build_health.py --root` → measurement `--root` →
+   **`build_theory.py --root`** (no exemption floor at this scope) →
    `build_summary.py --root`
 6. `inject_nav.py`, then `inject_nav.py --check`
 
@@ -226,6 +231,27 @@ doctored package instead, which is the looser answer. `build_measurement.py
 section already distinguishes — though it does so without a matching stderr
 note, so re-running it after the package pages exist is worth doing on faith
 rather than waiting to be told.
+
+## The theory metadata block
+
+`<script type="application/json" id="theory-meta">`, schema `theory/1`, same
+`</` → `<\/` escaping as the other two.
+
+| Field | Meaning |
+|---|---|
+| `scope` | `package` or `repository` |
+| `score`, `grade` | 0–100 and a letter; `null` only when exempt |
+| `exempt`, `exempt_reason` | too small to warrant a theory, and the evidence for that |
+| `panel_size`, `model` | how many judges, and which model — letters from different models are not comparable |
+| `dimensions[]` | per dimension: `key`, `label`, `weight`, `step`, `step_label`, `rung`, `spread`, `disputed`, `steps[]`, `rationales[]`, `evidence[]` |
+| `disputed[]` | dimension keys where the judges were ≥2 rungs apart |
+| `theory` | the first judge's theory statement, for roll-ups |
+| `verdicts[]` | all three verdicts verbatim |
+
+Unlike `health.html` and `measurement.html`, `build_theory.py` takes no
+`--package` flag and writes no `packages[]` roll-up row at root scope — a root
+`theory.html` is one more panel-scored page, over the union of the mapped
+roots, not a table of every package's theory grade.
 
 ## Generating the atlases
 

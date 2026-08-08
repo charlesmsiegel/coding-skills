@@ -297,3 +297,41 @@ def test_the_skill_documents_all_four_documents():
     claim = section.group(0)
     assert "candidates are not" in claim, "must say candidates are excluded from the score"
     assert "carries no fix" in claim, "must say a candidate carries no fix"
+
+
+def test_a_five_document_set_survives_the_link_gate(repo, run_script, tmp_path):
+    import json as _json
+
+    docs = repo.path / "src" / "app" / "docs"
+    docs.mkdir(parents=True)
+    root_docs = repo.path / "docs"
+    root_docs.mkdir(parents=True, exist_ok=True)
+    for base in (docs, root_docs):
+        for kind in ("summary", "codemap", "health", "measurement", "theory"):
+            (base / f"{kind}.html").write_text(
+                "<html><body><header></header></body></html>", encoding="utf-8")
+    mapping = root_docs / "code-overview.json"
+    mapping.write_text(_json.dumps({"schema": "code-overview/1", "packages": [
+        {"name": "app", "roots": ["src/app"], "docs": "src/app/docs",
+         "language": "python", "doctor": "code-doctor"}]}), encoding="utf-8")
+
+    inject = CO / "inject_nav.py"
+    run_script(inject, "--map", mapping, "--repo", repo.path)
+    run_script(inject, "--map", mapping, "--repo", repo.path, "--check", expect_rc=0)
+
+    text = (docs / "theory.html").read_text(encoding="utf-8")
+    assert "Overall Theory" in text
+    assert text.count("<!-- code-overview:nav -->") == 1
+
+
+def test_the_skill_documents_the_panel_protocol():
+    text = (CO.parent / "SKILL.md").read_text(encoding="utf-8")
+    section = text.split("## 4. The theory panel", 1)
+    assert len(section) == 2, "no theory-panel section"
+    body = section[1].split("\n## ", 1)[0]
+
+    assert "build_theory.py" in body
+    assert "independent" in body.lower()
+    assert "median" in body.lower()
+    for phrase in ("three", "disagree"):
+        assert phrase in body.lower()
