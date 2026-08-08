@@ -507,3 +507,59 @@ def test_a_live_fractional_setting_is_not_a_component_defaulting_to_off(tmp_path
 def test_an_actual_zero_flag_is_still_default_off(tmp_path):
     (tmp_path / "s.py").write_text("enable_reranker = 0\n", encoding="utf-8")
     assert kinds(run(tmp_path), "default_off_flag")
+
+
+# ---- ninth review round ------------------------------------------------------- #
+
+def test_a_one_line_conditional_reraise_still_leaves_the_zero_path(tmp_path):
+    """Regression: the indentation heuristic read `if ...: raise` as unconditional."""
+    (tmp_path / "s.py").write_text(
+        "def score(row):\n"
+        "    try:\n"
+        "        return judge(row)\n"
+        "    except Exception as exc:\n"
+        "        if isinstance(exc, FatalError): raise\n"
+        "        return 0.0\n",
+        encoding="utf-8",
+    )
+    assert kinds(run(tmp_path), "error_becomes_zero")
+
+
+def test_a_semicolon_terminated_empty_return_is_a_swallowed_error(tmp_path):
+    (tmp_path / "m.js").write_text(
+        "function s(r) {\n  try { return j(r); } catch (e) {\n    return;\n  }\n}\n",
+        encoding="utf-8",
+    )
+    assert kinds(run(tmp_path), "swallowed_error")
+
+
+def test_fractional_dataframe_sampling_is_a_cap(tmp_path):
+    (tmp_path / "run.py").write_text("rows = frame.sample(frac=0.1)\n", encoding="utf-8")
+    assert kinds(run(tmp_path), "silent_cap")
+
+
+def test_every_flag_on_a_minified_line_is_evaluated(tmp_path):
+    """`onboarding` matches the broad pattern first and fails token validation."""
+    (tmp_path / "c.json").write_text('{"onboarding":false,"enable-reranker":false}\n', encoding="utf-8")
+    assert kinds(run(tmp_path), "default_off_flag")
+
+
+def test_a_quoted_sampling_switch_does_not_disable_detection(tmp_path):
+    (tmp_path / "s.py").write_text(
+        'note = "do_sample: false"\ntemperature = 0.8\n', encoding="utf-8"
+    )
+    assert kinds(run(tmp_path), "nondeterminism")
+
+
+def test_the_filter_annotation_appears_even_when_it_selects_nothing(tmp_path):
+    (tmp_path / "s.py").write_text(
+        "def score(row):\n"
+        "    try:\n"
+        "        return judge(row)\n"
+        "    except Exception:\n"
+        "        return 0.0\n",
+        encoding="utf-8",
+    )
+    payload = run(tmp_path, "--kind", "nondeterminism")
+    assert payload["candidates"] == []
+    assert "--kind nondeterminism: 0 row(s) shown" in payload["headline"]

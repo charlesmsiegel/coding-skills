@@ -66,8 +66,9 @@ _ZERO_BODY_RE = re.compile(r"\breturn\s+" + _ZERO
                            + r"|=\s*" + _ZERO + r"\s*;?\s*$"
                            + r"|\bappend\(\s*" + _ZERO
                            + r"|\bscore\w*\s*=\s*" + _ZERO)
-_EMPTY_BODY_RE = re.compile(r"^\s*(?:pass|continue|break|return(?:\s+(?:None|null|nil))?|\}|;)\s*$")
+_EMPTY_BODY_RE = re.compile(r"^\s*(?:pass|continue|break|return(?:\s+(?:None|null|nil))?|\}|;)\s*;?\s*$")
 _SURFACED_RE = re.compile(r"\braise\b|\bthrow\b|\brethrow\b")
+_CONDITIONAL_RE = re.compile(r"^(?:if|elif|else\b|when|case|unless)\b|^\}?\s*else\b")
 # `# cannot rethrow here` must not count as re-raising, or the `pass` under it
 # never surfaces. Comments are stripped before the check — and so are string
 # bodies, because `log("cannot rethrow")` above a `return 0.0` was reading as a
@@ -117,7 +118,7 @@ _CAP_RE = re.compile(
     r"|\bislice\(\s*[^,]+,\s*\d+"                          # islice(rows, 50)
     r"|\blimit[\"']?\s*[=:(]\s*\d+"                        # limit=100, "limit": 100
     r"|\blimit\s+\d+"                                      # SQL LIMIT 100
-    r"|\b(?:sample|choices|choice)\(\s*[^)]*(?:\b[nk]\s*=\s*\d|,\s*\d+\s*\))"  # sample(rows, 50) / (rows, k=50) / (n=50)
+    r"|\b(?:sample|choices|choice)\(\s*[^)]*(?:\b[nk]\s*=\s*\d|\bfrac\s*=\s*[\d.]|,\s*\d+\s*\))"
     r"|\bmax_(?:examples|rows|samples|cases|items|records)[\"']?\s*[=:]\s*\d+"
     r"|\bhead\s+-n?\s*\d+",                                # head -n 50 / head -50
     re.IGNORECASE,
@@ -189,7 +190,11 @@ def always_raises(code: list) -> bool:
         return False
     base = min(len(b) - len(b.lstrip()) for b in code)
     raises = [b for b in code if _SURFACED_RE.search(_STRING_BODY_RE.sub(r"\1\1", b))]
-    return any(len(b) - len(b.lstrip()) <= base for b in raises)
+    # Indentation alone is not enough: `if isinstance(exc, Fatal): raise` sits at
+    # the base indent and still runs only for one class, so the paths below it are
+    # still scored. A raise with a conditional in front of it is conditional.
+    return any(len(b) - len(b.lstrip()) <= base and not _CONDITIONAL_RE.match(b.strip())
+               for b in raises)
 
 
 def classify_handler(body: list) -> tuple:
@@ -276,21 +281,23 @@ def scan_line(line: str, display: str, lineno: int, sampling_off: bool = False) 
 
     out += scan_promise_catches(line, display, lineno)
 
-    match = _DEFAULT_OFF_RE.search(line)
-    if match and is_flag_name(match.group(1) or match.group(2) or ""):
+    # Every match, not the first: the flag pattern is deliberately broad, so on a
+    # minified line the first hit is often a near-miss (`onboarding` contains
+    # "on") that token validation rejects — and stopping there missed the real
+    # `enable-reranker` switch beside it.
+    if any(is_flag_name(m.group(1) or m.group(2) or "") for m in _DEFAULT_OFF_RE.finditer(line)):
         out.append(candidate(
             "default_off_flag", display, lineno,
             "a component defaults to off here",
             CONFIRM["default_off_flag"], stripped,
         ))
-    else:
-        negated = _DISABLE_ON_RE.search(line)
-        if negated and is_flag_name(negated.group(1) or negated.group(2) or "", DISABLE_TOKENS):
-            out.append(candidate(
-                "default_off_flag", display, lineno,
-                "a component is disabled here by a negative switch defaulting to on",
-                CONFIRM["default_off_flag"], stripped,
-            ))
+    elif any(is_flag_name(m.group(1) or m.group(2) or "", DISABLE_TOKENS)
+             for m in _DISABLE_ON_RE.finditer(line)):
+        out.append(candidate(
+            "default_off_flag", display, lineno,
+            "a component is disabled here by a negative switch defaulting to on",
+            CONFIRM["default_off_flag"], stripped,
+        ))
 
     if _CAP_RE.search(line):
         out.append(candidate(
@@ -339,7 +346,7 @@ def scan(root: Path) -> tuple:
         handled = scan_handlers(lines, display)
         rows += handled
         seen_handlers = {(r["kind"], r["line"]) for r in handled}
-        sampling_off = sampling_disabled("\n".join(split_comment(b)[0] for b in lines))
+        sampling_off = sampling_disabled("\n".join(split_comment(mask_strings(b))[0] for b in lines))
         for lineno, line in enumerate(lines, 1):
             rows += [r for r in scan_line(line, display, lineno, sampling_off)
                      if (r["kind"], r["line"]) not in seen_handlers]
@@ -410,9 +417,9 @@ def main() -> int:
         # candidate because it was filtered out would be the worse failure — but it
         # has to say so, or the headline and the rows below it appear to disagree.
         shown = [r for r in rows if r["kind"] == args.kind]
-        if shown and headline_for(shown, files) != headline:
+        if headline_for(shown, files) != headline:
             headline = ("[--kind " + args.kind + ": " + str(len(shown)) + " row(s) shown; this "
-                        "headline covers the whole tree] " + headline)
+                        "headline covers the whole tree, including rows not shown] " + headline)
         rows = shown
     rows.sort(key=lambda r: (KIND_ORDER.index(r["kind"]) if r["kind"] in KIND_ORDER else 99, r["file"], r["line"]))
 

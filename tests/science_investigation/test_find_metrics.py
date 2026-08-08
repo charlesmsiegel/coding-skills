@@ -511,3 +511,16 @@ def test_javascript_nullish_zero_defaults_are_flagged(tmp_path):
         "function f(result) { return result.accuracy ?? 0; }\n", encoding="utf-8"
     )
     assert kinds(run(tmp_path), "zero_default")
+
+
+# ---- ninth review round ------------------------------------------------------- #
+
+def test_lowercase_sql_aliases_are_definitions(tmp_path):
+    """SQL keywords are case-insensitive."""
+    (tmp_path / "m.sql").write_text("select avg(correct) as accuracy from evals;\n", encoding="utf-8")
+    assert kinds(run(tmp_path), "metric_definition")
+
+
+def test_a_commented_out_sql_query_is_not_a_live_metric(tmp_path):
+    (tmp_path / "q.sql").write_text("-- SELECT AVG(correct) AS accuracy FROM evals\n", encoding="utf-8")
+    assert run(tmp_path)["candidates"] == []
