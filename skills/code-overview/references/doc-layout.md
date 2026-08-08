@@ -202,8 +202,8 @@ the repo root" rule now governs both analysis skills:
    theory judges, none seeing another's verdict → `build_theory.py`** →
    `build_summary.py`
 5. root: codemap → `build_health.py --root` → measurement `--root` →
-   **`build_theory.py --root`** (no exemption floor at this scope) →
-   `build_summary.py --root`
+   **`build_theory.py --root`, `--package name:path` per package for the
+   roll-up table** (no exemption floor at this scope) → `build_summary.py --root`
 6. `inject_nav.py`, then `inject_nav.py --check`
 
 Steps 2 and 3 share the same failure mode, which is why both are stated rather
@@ -247,11 +247,27 @@ rather than waiting to be told.
 | `disputed[]` | dimension keys where the judges were ≥2 rungs apart |
 | `theory` | the first judge's theory statement, for roll-ups |
 | `verdicts[]` | all three verdicts verbatim |
+| `packages[]` | root scope only, and only when `--package` was passed |
 
-Unlike `health.html` and `measurement.html`, `build_theory.py` takes no
-`--package` flag and writes no `packages[]` roll-up row at root scope — a root
-`theory.html` is one more panel-scored page, over the union of the mapped
-roots, not a table of every package's theory grade.
+`packages[]` is thinner than `health.html`'s or `measurement.html`'s: each row
+is exactly what `read_package_grade` reads back out of that package's own
+`theory-meta` block — `name`, `score`, `grade`, `exempt`, `disputed[]`, and
+`generated` (false, with `score: null` and `grade: "—"`, when the package's
+`theory.html` does not exist yet or carries no metadata block). There is no
+`roots` or `size` on the row; the page just states, per package, whether it
+has a theory grade yet and what it was.
+
+## The theory roll-up, at root scope
+
+`build_theory.py --root` accepts repeated `--package NAME:PATH` — `PATH`
+pointing at that package's `theory.html` — and refuses the flag without
+`--root` (`--package builds the repository roll-up table and needs --root`).
+Each package is read back out of its own document, the same discipline as the
+health and measurement roll-ups, so the table cannot disagree with the pages
+it summarizes. A package whose `theory.html` is missing or unparsable renders
+as **not generated** rather than being dropped from the table or scored as a
+failure — verified by running the script with a `--package` pointing at a
+path that does not exist.
 
 ## Generating the atlases
 

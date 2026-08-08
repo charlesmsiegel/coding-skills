@@ -314,11 +314,15 @@ Same five documents, one scope up.
   measurement content*, not a blank cell.
 - **Theory**: `build_theory.py --root --out docs/theory.html --name <repo>
   --root-dir <root> [--root-dir ...] --verdict ... (×3, one panel over the whole
-  scope)`. No exemption floor at this scope — a repository of individually
-  trivial packages still has a system-level question worth asking. Unlike
-  health and measurement, `build_theory.py` has no `--package` flag and writes
-  no per-package roll-up; a root `theory.html` is one more panel-scored page,
-  not a table of every package's grade.
+  scope) --package <pkg>:<pkg-docs>/theory.html [--package ...]`. `--package`
+  needs `--root` — passed without it, the script refuses rather than silently
+  ignoring it. Reads each package's grade back out of its own `theory.html`,
+  the same discipline as the summary, health and measurement roll-ups, so the
+  table cannot disagree with the pages it summarizes. A package whose
+  `theory.html` does not exist yet, or carries no metadata block, is listed as
+  *not generated* rather than dropped from the table or scored against it. No
+  exemption floor at this scope — a repository of individually trivial
+  packages still has a system-level question worth asking.
 - **Summary**: `build_summary.py --root --map docs/code-overview.json`.
 
 ## 6. Navigation, last
@@ -397,7 +401,7 @@ nothing at all rather than everything.
 python "$SKILL/scripts/discover_packages.py" <repo> [--format text|json] [--exclude d1,d2] [--min-files N]
 python "$SKILL/scripts/build_health.py"  --out FILE [--merged JSON] [--findings JSON ...] [--root]
 python "$SCIENCE/scripts/build_measurement.py" --out FILE --inventory JSON --name NAME [--root]
-python "$SKILL/scripts/build_theory.py"  --out FILE --name NAME --verdict JSON --verdict JSON --verdict JSON [--root] [--model ID]
+python "$SKILL/scripts/build_theory.py"  --out FILE --name NAME --verdict JSON --verdict JSON --verdict JSON [--root [--package NAME:FILE ...]] [--model ID]
 python "$SKILL/scripts/build_summary.py" --out FILE [--root] [--intro-file HTML] [--highlight TEXT]
 python "$SKILL/scripts/inject_nav.py"    --map docs/code-overview.json --repo <repo> [--check]
 ```
