@@ -88,16 +88,24 @@ def validate(rows: list[dict], findings: list[dict]) -> None:
             _fail(name, "duplicate row name; each measurable thing appears once")
         seen.add(name)
 
-        if entry.get("importance") not in IMPORTANCE_LABELS:
+        # `isinstance(x, bool)` first, because JSON `true` equals 1 and `false`
+        # equals 0 in Python: without the guard a boolean importance silently
+        # becomes weight 1 and a boolean credit becomes full or zero credit,
+        # neither of which the author ever wrote down.
+        importance = entry.get("importance")
+        if isinstance(importance, bool) or importance not in IMPORTANCE_LABELS:
             _fail(name, f"importance must be one of {sorted(IMPORTANCE_LABELS)}, "
-                        f"got {entry.get('importance')!r}")
+                        f"got {importance!r}")
         if not str(entry.get("importance_reason") or "").strip():
             _fail(name, "importance_reason must name the decision this number drives; "
                         "'important' is not a justification")
 
         credit = entry.get("credit")
-        if credit not in CREDIT_STEPS:
+        if isinstance(credit, bool) or credit not in CREDIT_STEPS:
             _fail(name, f"credit must be one of {list(CREDIT_STEPS)}, got {credit!r}")
+        if not str(entry.get("credit_reason") or "").strip():
+            _fail(name, "credit_reason must say what this credit rests on; a credit "
+                        "column with no reason beside it cannot be argued with")
 
         status = entry.get("status")
         if status not in STATUSES:
@@ -120,11 +128,16 @@ def validate(rows: list[dict], findings: list[dict]) -> None:
             if credit == 0.0:
                 _fail(name, "status 'measured' with credit 0 is contradictory; use "
                             "'not_measured' or 'unmeasurable'")
+            # n >= 1, not n >= 0: a metric computed over zero examples has not
+            # been measured, and letting n == 0 through hands it full credit —
+            # an A+ for an aggregate with no aggregate under it.
             n = entry.get("n")
-            if not isinstance(n, int) or isinstance(n, bool) or n < 0:
+            if not isinstance(n, int) or isinstance(n, bool) or n < 1:
                 _fail(name, "credit above zero requires n, the number of real examples it "
-                            "was computed over; '0.8 over 30' and '0.8 over 3' are "
-                            "different facts")
+                            "was computed over, and n must be at least 1: a metric "
+                            "computed over zero examples has not been measured. "
+                            "'0.8 over 30' and '0.8 over 3' are different facts, and "
+                            "both differ from '0.8 over nothing'")
             if credit < 1.0:
                 finding_id = str(entry.get("finding") or "").strip()
                 if not finding_id:

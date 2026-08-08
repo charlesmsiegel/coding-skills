@@ -165,6 +165,32 @@ def test_credit_above_zero_requires_the_n_it_was_computed_over(rubric):
         rubric.validate([row(n=None)], [])
 
 
+def test_a_metric_computed_over_zero_examples_is_not_measured(rubric):
+    # n == 0 used to pass and take credit 1.0 with it, so an aggregate with no
+    # aggregate under it scored A+ / 100.
+    with pytest.raises(rubric.InventoryError, match="zero examples"):
+        rubric.validate([row(n=0)], [])
+
+
+def test_a_boolean_importance_is_not_silently_weight_one(rubric):
+    # JSON `true` == 1 in Python, so an unguarded membership test accepts it.
+    with pytest.raises(rubric.InventoryError, match="importance"):
+        rubric.validate([row(importance=True)], [])
+
+
+def test_a_boolean_credit_is_not_silently_full_or_zero_credit(rubric):
+    with pytest.raises(rubric.InventoryError, match="credit"):
+        rubric.validate([row(credit=True)], [])
+
+    with pytest.raises(rubric.InventoryError, match="credit"):
+        rubric.validate([row(credit=False, status="not_measured", n=None)], [])
+
+
+def test_a_credit_with_no_reason_beside_it_is_rejected(rubric):
+    with pytest.raises(rubric.InventoryError, match="credit_reason"):
+        rubric.validate([row(credit_reason="  ")], [])
+
+
 def test_duplicate_row_names_are_rejected(rubric):
     with pytest.raises(rubric.InventoryError, match="duplicate"):
         rubric.validate([row(), row()], [])
