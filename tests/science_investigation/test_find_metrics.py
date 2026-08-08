@@ -524,3 +524,18 @@ def test_lowercase_sql_aliases_are_definitions(tmp_path):
 def test_a_commented_out_sql_query_is_not_a_live_metric(tmp_path):
     (tmp_path / "q.sql").write_text("-- SELECT AVG(correct) AS accuracy FROM evals\n", encoding="utf-8")
     assert run(tmp_path)["candidates"] == []
+
+
+def test_notebook_candidates_report_an_openable_cell_location(tmp_path):
+    """A minified notebook is one physical line, so `nb.ipynb:7` cannot be opened."""
+    notebook = {
+        "cells": [
+            {"cell_type": "markdown", "source": ["# notes\n"]},
+            {"cell_type": "code", "source": ["x = 1\n", "accuracy = 0.8\n"]},
+        ],
+        "metadata": {}, "nbformat": 4, "nbformat_minor": 5,
+    }
+    (tmp_path / "nb.ipynb").write_text(json.dumps(notebook), encoding="utf-8")
+    row = kinds(run(tmp_path), "metric_definition")[0]
+    assert row["file"] == "nb.ipynb#cell1"
+    assert row["line"] == 2, "line is relative to the cell, not to the extracted stream"

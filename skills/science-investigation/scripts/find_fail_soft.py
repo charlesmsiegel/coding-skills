@@ -30,9 +30,9 @@ import argparse
 from pathlib import Path
 
 from common import (
-    CODE_SUFFIXES, CONFIG_SUFFIXES, add_common_args, candidate, configure_output,
-    emit, envelope, iter_files, mask_strings, read_source, rel, skipped_note,
-    split_comment,
+    CODE_SUFFIXES, CONFIG_SUFFIXES, add_common_args, candidate, configure_output, emit,
+    envelope, iter_files, mask_strings, read_source, rel, relocate, skipped_note,
+    split_comment, unpack_source,
 )
 
 KIND_ORDER = ["error_becomes_zero", "swallowed_error", "default_off_flag",
@@ -336,13 +336,16 @@ def scan_line(line: str, display: str, lineno: int, sampling_off: bool = False) 
 def scan(root: Path) -> tuple:
     files = iter_files(root, CODE_SUFFIXES | CONFIG_SUFFIXES)
     rows, skipped, read = [], [], 0
+    notebooks: dict = {}
     for path in files:
-        lines, reason = read_source(path)
+        lines, reason, locations = unpack_source(read_source(path))
         display = rel(path, root)
         if reason:
             skipped.append((display, reason))
             continue
         read += 1
+        if locations:
+            notebooks[display] = locations
         handled = scan_handlers(lines, display)
         rows += handled
         seen_handlers = {(r["kind"], r["line"]) for r in handled}
@@ -350,7 +353,7 @@ def scan(root: Path) -> tuple:
         for lineno, line in enumerate(lines, 1):
             rows += [r for r in scan_line(line, display, lineno, sampling_off)
                      if (r["kind"], r["line"]) not in seen_handlers]
-    return rows, read, skipped
+    return relocate(rows, notebooks), read, skipped
 
 
 def headline_for(rows: list, files: int) -> str:

@@ -119,25 +119,67 @@ def read_source(path: Path) -> tuple:
 
 
 def notebook_source(text: str) -> tuple:
-    """A notebook's code-cell source, as lines.
+    """A notebook's code-cell source, as lines, plus per-line cell locations.
 
     `.ipynb` is JSON: read as raw text its code sits inside quoted strings, where
     string masking hides it and a metrics notebook reports no metrics at all,
     while markdown prose and stored outputs read as source to every scanner.
+
+    The locations matter as much as the lines. A row pointing at `nb.ipynb:7`
+    cannot be opened — the file may be one physical line — so each extracted line
+    carries the cell it came from, and scanners report `nb.ipynb#cell2:3`.
     """
     try:
         payload = json.loads(text)
     except (json.JSONDecodeError, ValueError) as exc:
         return [], "unreadable notebook (" + type(exc).__name__ + ")"
-    lines = []
+    lines, locations, index = [], [], 0
     for cell in payload.get("cells", []) if isinstance(payload, dict) else []:
-        if not isinstance(cell, dict) or cell.get("cell_type") != "code":
+        if not isinstance(cell, dict):
+            continue
+        if cell.get("cell_type") != "code":
+            index += 1
             continue
         source = cell.get("source") or []
         if isinstance(source, str):
             source = source.splitlines()
-        lines += [str(line).rstrip("\n") for line in source]
-    return lines, None
+        for offset, line in enumerate(source, 1):
+            lines.append(str(line).rstrip("\n"))
+            locations.append(("cell" + str(index), offset))
+        index += 1
+    return lines, None, locations
+
+
+def locate(display: str, lineno: int, locations) -> tuple:
+    """(file, line) for a row, expanded to a cell reference inside a notebook."""
+    if not locations or lineno > len(locations):
+        return display, lineno
+    cell, offset = locations[lineno - 1]
+    return display + "#" + cell, offset
+
+
+def relocate(rows: list, locations_by_file: dict) -> list:
+    """Rewrite notebook rows to cell references, once, at the end of a scan.
+
+    Purely presentational, and deliberately last: the scanners index lines the way
+    they read them, and only the reported location needs to be something an
+    auditor can actually open.
+    """
+    if not locations_by_file:
+        return rows
+    for row in rows:
+        locations = locations_by_file.get(row["file"])
+        if locations:
+            row["file"], row["line"] = locate(row["file"], row["line"], locations)
+    return rows
+
+
+def unpack_source(result: tuple) -> tuple:
+    """(lines, reason, locations) from read_source, whatever arity it returned."""
+    if len(result) == 3:
+        return result
+    lines, reason = result
+    return lines, reason, None
 
 
 def skipped_note(skipped: list) -> str:
