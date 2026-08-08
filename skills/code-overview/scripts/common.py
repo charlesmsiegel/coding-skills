@@ -45,11 +45,21 @@ TEMPLATE_EXTENSIONS = frozenset({".html", ".htm", ".jinja", ".jinja2", ".j2", ".
 
 # Directories never worth walking into. Vendored or generated, both of which
 # would distort size and finding counts alike.
+#
+# `bin` is deliberately NOT here, though `obj` is. It was, as a pair with `obj`
+# for .NET build output, but `bin/` is maintained source in Python, Ruby and
+# shell projects — python-code-doctor treats it as an entrypoint directory
+# (`_ENTRYPOINT_SEGMENTS = {"scripts", "bin"}`) and reports findings from it.
+# Skipping it here kept those findings in the numerator while dropping their
+# lines from the denominator, which can only push a grade down, and a repo of
+# nothing but `bin/*.sh` produced no package at all. .NET build output is
+# excluded anyway: `bin/` holds .dll/.pdb/.exe, none of which are in
+# CODE_EXTENSIONS.
 SKIP_DIRS = frozenset({
     ".git", ".hg", ".svn", "node_modules", "vendor", "venv", ".venv", "env",
     "__pycache__", ".mypy_cache", ".pytest_cache", ".ruff_cache", ".tox", ".nox",
     "dist", "build", "target", "out", ".next", ".nuxt", ".svelte-kit", "coverage",
-    "htmlcov", ".idea", ".vscode", "site-packages", ".gradle", "bin", "obj",
+    "htmlcov", ".idea", ".vscode", "site-packages", ".gradle", "obj",
     ".terraform", "Pods", ".dart_tool", ".cache", "docs",
 })
 
@@ -90,6 +100,24 @@ def warn(message: str) -> None:
 # in all seven categories. When a bare list really does cover the rubric, say so
 # with --covers; nothing else can know.
 SHAPE_FULL, SHAPE_PARTIAL = "full", "partial"
+
+
+SEVERITIES = ("high", "medium", "low")
+
+
+def normalize_severity(value) -> str:
+    """Fold a severity to one of the three tokens the rest of the code compares.
+
+    Normalized once, at the door, because the two consumers disagreed about
+    case. `rubric.severity_weight` lowercases, so `"High"` was charged the full
+    ten-point weight; every count, icon, sort and metadata field matches the
+    lowercase token exactly, so the same finding was reported as zero highs and
+    ranked among the mediums. A finding that moves the grade like a high and
+    reads like a medium is the worst of both. `--covers` invites producers this
+    skill has never seen, so this cannot be left to convention.
+    """
+    token = str(value).strip().lower() if value is not None else ""
+    return token if token in SEVERITIES else "medium"
 
 
 def normalize_findings(data) -> dict:
@@ -133,7 +161,7 @@ def normalize_findings(data) -> dict:
             findings = [item for item in data["issues"] if isinstance(item, dict)]
 
     for finding in findings:
-        finding.setdefault("severity", "medium")
+        finding["severity"] = normalize_severity(finding.get("severity"))
     return {"findings": findings, "errors": errors, "ran": ran,
             "skipped": skipped, "shape": shape, "empty_artifact": False}
 
@@ -447,6 +475,25 @@ def load_map(path) -> dict:
             )
         seen.add(package["name"])
         package.setdefault("docs", str(Path(package["roots"][0]) / "docs"))
+        # Every path in the map is documented as repo-relative, and the scripts
+        # treat it that way — `repo / path`. An absolute path or a `..` escape
+        # silently reaches outside the checkout: sizing would measure someone
+        # else's code, and inject_nav.py would rewrite summary.html, codemap.html
+        # and health.html wherever `docs` pointed. `roots: ["/"]` even satisfied
+        # is_repo_root. Nothing legitimate needs it, so it is rejected here
+        # rather than defended against at each use.
+        for field in ("roots", "docs"):
+            value = package[field]
+            for entry in ([value] if isinstance(value, str) else value):
+                escapes = (Path(entry).is_absolute()
+                           or os.path.normpath(entry).split(os.sep)[0] == "..")
+                if escapes:
+                    raise SystemExit(
+                        f"error: {path} gives package {package['name']!r} the {field} "
+                        f"{entry!r}, which points outside the repository — every path in "
+                        "the map has to be repo-relative, because they are all resolved "
+                        "against the repo root and written to"
+                    )
 
     # Two packages writing to one docs directory is silent data loss: the second
     # build overwrites the first's health and summary pages, and navigation then

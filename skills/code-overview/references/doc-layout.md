@@ -44,8 +44,11 @@ read by every later script:
 ```
 
 `roots` is a list because a unit is not always a directory: a Django app and its
-templates, a service and the shared types only it uses. Every path is
-repo-relative. `doctor` empty means no doctor ships for that language — the
+templates, a service and the shared types only it uses. **Every path is
+repo-relative, and that is enforced** — an absolute path or a `..` escape is
+rejected by `load_map`. The scripts all resolve these as `repo / path`, so a path
+that leaves the checkout would size the grade over someone else's code and point
+`inject_nav.py` at documents outside the repository to rewrite. `doctor` empty means no doctor ships for that language — the
 health page is then built with every category ungraded, or skipped entirely,
 according to what the user chose.
 

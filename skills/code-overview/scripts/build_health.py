@@ -401,16 +401,30 @@ def scoring_roots(args, repo: Path, rolled_up: list[dict] | None = None) -> list
     return ["."]
 
 
-def is_repo_root_file(path: str, repo: Path) -> bool:
-    """A file sitting directly in the repo root — repo-wide configuration."""
+def is_repo_wide(path: str, repo: Path) -> bool:
+    """Does this finding describe the repository rather than any one package?
+
+    Two shapes qualify, and missing the second one was expensive:
+
+    - **A file directly in the repo root** — `tsconfig.json`, the root manifest,
+      a settings module. It belongs to no package but describes the whole tree.
+    - **The repo root itself.** A finding with no single file to point at is
+      reported *against the directory*: `find_untested_modules.py` emits
+      `no_tests_in_repo` and `find_dependency_issues.py` emits
+      `no_dependency_manifest` with `file=str(root)`. Requiring `is_file()` sent
+      both — high severity, and about the repo as a whole — out of scope, so a
+      project with no tests and no manifest rolled up to a clean **A+**.
+    """
     if not path:
         return False
     try:
         candidate = Path(path)
         resolved = (candidate if candidate.is_absolute() else repo / candidate).resolve()
-        return resolved.parent == repo and resolved.is_file()
     except (OSError, ValueError):
         return False
+    if resolved == repo:
+        return True
+    return resolved.parent == repo and resolved.is_file()
 
 
 def resolve_coverage(args, reports: list[dict]):
@@ -450,28 +464,47 @@ def resolve_coverage(args, reports: list[dict]):
 
     evidenced = [report for report in reports if report["shape"] == common.SHAPE_FULL]
     if evidenced:
-        # At least one report says what it ran. Believe it, and let the other
-        # reports contribute findings without inflating what was examined.
-        ran = {rubric.DETECTOR_CATEGORIES[name]
-               for report in evidenced for name in report["ran"]
-               if name in rubric.DETECTOR_CATEGORIES}
-        # A rubric category usually has several detectors behind it. If any of
-        # them was skipped or crashed, the category was only *partly* measured —
-        # and a partial measurement can only ever miss findings, never invent
-        # them, so grading it would systematically flatter the code. Skipping
-        # exception_issues while running mutation_hazards leaves Correctness
-        # unmeasured, not clean.
-        absent = {rubric.DETECTOR_CATEGORIES[name]
-                  for report in evidenced
-                  for name in (report["skipped"] | set(report["errors"]))
-                  if name in rubric.DETECTOR_CATEGORIES}
-        covered = ran - absent
+        # Resolve each report on its own, then union. Both halves matter.
+        #
+        # Per report, because a failure belongs to the run it happened in. The
+        # workflow hands every findings file to every package, so a mixed repo
+        # passes a Python report and a TypeScript one side by side — and a
+        # crashed `tsconfig` analyzer, which maps to Security, was subtracted
+        # from the *combined* set and ungraded Security on a Python package
+        # whose own security detector had completed cleanly.
+        #
+        # Union, because a category one report skipped and another measured is
+        # measured. That is what makes companion doctors add up.
+        covered: set[str] = set()
+        for report in evidenced:
+            ran = {rubric.DETECTOR_CATEGORIES[name] for name in report["ran"]
+                   if name in rubric.DETECTOR_CATEGORIES}
+            # A rubric category usually has several detectors behind it. If any
+            # of *this report's* detectors for it was skipped or crashed, the
+            # category was only partly measured — and a partial measurement can
+            # only miss findings, never invent them, so grading it would
+            # systematically flatter the code. Skipping exception_issues while
+            # running mutation_hazards leaves Correctness unmeasured, not clean.
+            absent = {rubric.DETECTOR_CATEGORIES[name]
+                      for name in (report["skipped"] | set(report["errors"]))
+                      if name in rubric.DETECTOR_CATEGORIES}
+            covered |= ran - absent
         # Evidence still cannot exceed what the named doctor is able to detect.
         # A report claiming a duplication analyzer ran, handed over with
         # --doctor django-code-doctor, is a mislabeled run rather than a reason
         # to grade a category that doctor has no detector for.
         profile = rubric.DOCTOR_COVERAGE.get(args.doctor)
         return covered & set(profile) if profile is not None else covered
+
+    if not reports:
+        # The documented "codemap plus an ungraded health page" answer for a
+        # language no doctor covers. There is no artifact to point at, and the
+        # skill says not to invent one, so this is a normal input rather than a
+        # mistake — it just cannot be graded.
+        warn("no findings were supplied, so every category is ungraded. That is the "
+             "documented answer for a language with no doctor; pass --covers a,b,c if "
+             "something did examine this code.")
+        return set()
 
     # Nothing here names what ran. A bare JSON list is what `analyze_django.py`
     # emits *and* what `find_duplicates.py --format json` emits, so the file
@@ -500,10 +533,15 @@ def build(args, reports: list[dict], errors: dict[str, str],
     # A root that vanished between runs measures zero lines, and a clean report
     # over nothing would grade A+ for a package that no longer exists. Map drift
     # is exactly what the re-run workflow anticipates, so it has to be caught.
+    # Warning about it was not enough — the previous version said "nothing is
+    # graded over a path that is not there" and then printed A+ (100.0). The
+    # enforcement is on measured size below, because zero files is the honest
+    # test: it catches a renamed root, an emptied one, and a filter that matched
+    # nothing, all of which mean the same thing — nothing was examined.
     missing_roots = [r for r, path in zip(relative_roots, roots) if not path.exists()]
     if missing_roots:
         warn(f"these roots do not exist: {', '.join(missing_roots)} — the package map is "
-             "stale. Nothing is graded over a path that is not there.")
+             "stale, and the lines behind any findings about them are not being counted.")
 
     # Keep only findings about the code this document is a claim about. The
     # doctors are run from the repo root so they can see manifests, tests and
@@ -520,11 +558,11 @@ def build(args, reports: list[dict], errors: dict[str, str],
             path = str(finding.get("file", ""))
             if within(path, scope, repo):
                 return True
-            # The repo grade has to keep findings about repo-level configuration
-            # — tsconfig.json, the root manifest, settings — which belong to no
-            # package but describe the whole tree. Only files sitting directly
-            # in the repo root qualify; an unmapped *directory* is still out.
-            return args.root and is_repo_root_file(path, repo)
+            # The repo grade has to keep findings about the repository itself —
+            # root-level configuration, and the whole-project findings reported
+            # against the root directory. An unmapped *sub*directory is still
+            # out; the exception is for the repo, not for code the user excluded.
+            return args.root and is_repo_wide(path, repo)
 
         scoped = []
         for report in reports:
@@ -547,6 +585,16 @@ def build(args, reports: list[dict], errors: dict[str, str],
         size["files"] = args.files
 
     covered = resolve_coverage(args, reports)
+    # Nothing to divide by means nothing was examined, whatever the reports say.
+    # The LOC floor turns an empty tree into a 1000-line denominator, so a clean
+    # report over a root that no longer exists scored a confident A+ for code
+    # that is not there. An explicit --loc/--files is the caller asserting a size
+    # this script cannot see, and is left alone.
+    if size["files"] == 0 and args.loc is None and args.files is None:
+        warn(f"no source files under {', '.join(relative_roots)} — there is nothing to "
+             "grade, so every category is ungraded rather than scored against an empty "
+             "tree. Check the roots in the package map.")
+        covered = set()
     scored = score_categories(findings, size["loc"], covered)
 
     meta = {
@@ -704,8 +752,11 @@ def main(argv=None) -> int:
                              "ungraded rather than scoring an unread language A+")
     args = parser.parse_args(argv)
 
-    if not args.findings:
-        parser.error("--findings is required (pass '-' to read a doctor's JSON from stdin)")
+    # `--findings` is deliberately optional. The documented answer for a Go or
+    # Rust package is "codemap plus an ungraded health page", and there is no
+    # findings artifact to supply for it — requiring one would force the agent
+    # to fabricate an empty JSON file, which this skill tells it not to do (and
+    # which an empty file now correctly refuses to grade anyway).
     if not args.name:
         args.name = Path(args.repo).resolve().name if args.root else "package"
 

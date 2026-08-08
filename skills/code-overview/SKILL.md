@@ -187,9 +187,12 @@ Same three documents, one scope up.
   and comparable to one. With `--map` and no explicit `--root-dir`, it is sized
   over the union of the mapped packages' roots — code the user chose to leave
   unassigned contributes no findings, so it must not pad the denominator either.
-  Findings about files directly in the repo root (`tsconfig.json`, the root
-  manifest) are kept here even though they sit in no package; they describe the
-  whole tree. Packages with **no doctor**, and packages with **no graded health
+  Repo-wide findings are kept here even though they sit in no package: files
+  directly in the repo root (`tsconfig.json`, the root manifest), *and* findings
+  reported against the root directory itself — `no_tests_in_repo` and
+  `no_dependency_manifest` carry `file=<repo root>` because no single file is to
+  blame, and dropping them made a repo with neither tests nor a manifest roll up
+  to an A+. Packages with **no doctor**, and packages with **no graded health
   page**, are left out of the repo grade's size — their lines would dilute
   findings they cannot contribute — while still appearing in the table as
   ungraded. A doctor named in the map is an intention; only a graded health page
@@ -221,7 +224,9 @@ plain JS, Java, a mixed package — **ask the user** which they want:
   naming whatever produced the findings (or nothing at all): with no coverage
   profile, every category comes back ungraded and the score is null. The package
   appears in the roll-up as ungraded rather than dragging the average down with a
-  fabricated F — or, worse, floating it with a fabricated A+.
+  fabricated F — or, worse, floating it with a fabricated A+. **`--findings` is
+  optional for exactly this case** — omit it entirely rather than writing an
+  empty JSON file, which is a distinct thing meaning "a doctor crashed".
 - **Codemap only.** No `health.html`; the nav drops the link and the summary says
   why.
 - **The closest doctor anyway.** Sometimes right for a JS package with no
