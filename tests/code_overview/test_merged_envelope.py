@@ -128,6 +128,60 @@ def test_a_doctor_cannot_be_credited_a_category_its_own_profile_excludes(
     assert "correctness" in meta["ungraded"]
 
 
+def test_an_unlabelled_findings_report_grants_no_coverage_on_the_merged_path(
+        repo_with_code, run_script, tmp_path):
+    """The hole this test pins: `--findings` reports are appended to `--merged`
+    ones, and a *bare* path (no `<doctor>:` label) is attributed to `--doctor`
+    — which is empty on the ordinary `--merged` invocation. `DOCTOR_COVERAGE.
+    get("")` is `None`, the same value an unrecognized name produces, and used
+    to be read as "no profile to cap against" (uncapped) instead of "no one to
+    credit" (no coverage). The envelope names only code-doctor, whose profile
+    excludes Correctness — the exact category an unlabelled report claiming
+    `mutation_hazards` ran must not be able to unlock."""
+    solo = envelope(tmp_path, doctors_run=["code-doctor"],
+                    analyzers_run={"code-doctor": ["duplicates", "naming_issues"]})
+    unlabelled = tmp_path / "unlabelled.json"
+    unlabelled.write_text(json.dumps({
+        "meta": {"analyzers_run": ["mutation_hazards"], "analyzer_errors": {}},
+        "categories": {"mutation_hazards": {"issues": []}},
+    }), encoding="utf-8")
+
+    out = build(repo_with_code, run_script, tmp_path, solo, "--findings", str(unlabelled))
+    meta = meta_of(out)
+
+    correctness = next(row for row in meta["categories"] if row["key"] == "correctness")
+    assert correctness["graded"] is False, (
+        "an unlabelled report with no --doctor to attribute it to has no established "
+        "provenance and must not be able to grant coverage code-doctor's own profile "
+        "withholds"
+    )
+    assert correctness["score"] is None
+    assert "correctness" in meta["ungraded"]
+
+
+def test_a_labelled_findings_report_still_grants_coverage_on_the_merged_path(
+        repo_with_code, run_script, tmp_path):
+    """The fix above must not over-tighten: a *labelled* `--findings <doctor>:<path>`
+    report has unambiguous provenance and grades exactly as it did before —
+    capped by its own named doctor's profile, same as a merged-envelope report."""
+    solo = envelope(tmp_path, doctors_run=["python-code-doctor"],
+                    analyzers_run={"python-code-doctor": []})
+    labelled = tmp_path / "labelled.json"
+    labelled.write_text(json.dumps({
+        "meta": {"analyzers_run": ["mutation_hazards"], "analyzer_errors": {}},
+        "categories": {"mutation_hazards": {"issues": []}},
+    }), encoding="utf-8")
+
+    out = build(repo_with_code, run_script, tmp_path, solo,
+               "--findings", f"python-code-doctor:{labelled}")
+    meta = meta_of(out)
+
+    assert "correctness" not in meta["ungraded"], (
+        "labelled provenance names python-code-doctor directly, whose profile covers "
+        "correctness — the label must still work exactly as it did before this fix"
+    )
+
+
 def test_a_failed_doctor_ungrades_what_it_covered(repo_with_code, run_script, tmp_path):
     """`correctness` is ungraded here purely because code-doctor's own profile
     excludes it (resolve_coverage's per-report cap) — python-code-doctor never

@@ -554,6 +554,14 @@ def resolve_coverage(args, reports: list[dict], trusted: set[str] | None = None)
     beside it: a doctor whose own detector crashed does not get credited just
     because it is a doctor the envelope trusts.
     """
+    # Remembered before the default fills `trusted` in, because it is the
+    # actual basis for two things below: whether an unlabelled report is
+    # attributable to anyone, and what a "different doctor than ..." warning
+    # should name as the reason. Both have to reflect who this *call* trusts
+    # — the merged envelope's `doctors_run`, or the single `--doctor` flag —
+    # not `args.doctor`'s mere presence, which does not change what a
+    # --merged caller trusts even when it is also set.
+    merged_trust = trusted is not None
     if trusted is None:
         trusted = {"", args.doctor}
     if args.assume_full_coverage:
@@ -595,12 +603,16 @@ def resolve_coverage(args, reports: list[dict], trusted: set[str] | None = None)
         # "than {args.doctor}" reads as nonsense once trust can come from a
         # merged envelope naming several doctors rather than one --doctor
         # flag — "different doctor than (none named)" beside a page that
-        # trusted three of them. Named singular only when there is one to
-        # name; otherwise the envelope's own trusted set is what to blame.
+        # trusted three of them. Worse, it was flatly wrong whenever --merged
+        # and --doctor were both given: trust still came from the envelope's
+        # `doctors_run`, not from `--doctor` (which is not even necessarily a
+        # member of it), but the warning named `--doctor` anyway because it
+        # happened to be set. `merged_trust` is what actually decides which
+        # basis is real, not whether `args.doctor` is truthy.
         others = trusted - {""}
-        trust_desc = (args.doctor if args.doctor
-                      else (f"the merged envelope's trusted doctors ({', '.join(sorted(others))})"
-                            if others else "(none named)"))
+        trust_desc = ((f"the merged envelope's trusted doctors ({', '.join(sorted(others))})"
+                       if others else "(none named)") if merged_trust
+                      else (args.doctor if args.doctor else "(none named)"))
         warn(f"these reports were produced by a different doctor than {trust_desc} and "
              "contribute findings but no coverage: "
              f"{', '.join(sorted({r['doctor'] for r in foreign}))}.")
@@ -621,6 +633,7 @@ def resolve_coverage(args, reports: list[dict], trusted: set[str] | None = None)
         # Union, because a category one report skipped and another measured is
         # measured. That is what makes companion doctors add up.
         covered: set[str] = set()
+        unattributed = 0
         for report in evidenced:
             ran = {rubric.DETECTOR_CATEGORIES[name] for name in report["ran"]
                    if name in rubric.DETECTOR_CATEGORIES}
@@ -647,10 +660,24 @@ def resolve_coverage(args, reports: list[dict], trusted: set[str] | None = None)
             # has no business reporting.
             #
             # An unlabelled report (report["doctor"] == "") speaks for
-            # --doctor, same as it always has — capped by --doctor's profile,
-            # or left uncapped when --doctor is itself unset or unrecognized.
-            # That is the existing --findings-only behaviour and must not
-            # change here.
+            # --doctor, same as it always has, capped by --doctor's profile —
+            # but only when --doctor is actually set. That is the existing
+            # --findings-only behaviour (where --doctor is documented as
+            # always paired with a bare --findings file) and must not change
+            # here. When --doctor is *also* unset — the normal state of the
+            # --merged path, which attributes every one of its own records by
+            # their `doctor` field instead of a flag — an unlabelled report
+            # has no established provenance at all. Leaving it uncapped
+            # (`DOCTOR_COVERAGE.get("")` is None, same as an unrecognized
+            # name, and used to be read as "no profile to cap against"
+            # instead of "no one to credit") is exactly the hole being closed
+            # here: a code-doctor-only merge plus one unlabelled --findings
+            # report claiming `mutation_hazards` ran could grade Correctness
+            # A+ — the one category code-doctor's own profile exists to
+            # withhold. Nothing here says whose evidence this is, so the safe
+            # reading is that the report contributes its findings but grants
+            # no coverage at all: a category nothing established is ungraded,
+            # not graded on an anonymous claim.
             #
             # A *named* report — every merged-envelope report, or a labelled
             # `--findings <doctor>:<path>` — is capped by its own doctor's
@@ -659,14 +686,20 @@ def resolve_coverage(args, reports: list[dict], trusted: set[str] | None = None)
             # decision, not a fallout of `.get(..., set())`. This rubric has
             # no coverage profile to check an unrecognized doctor's claims
             # against, and crediting its raw per-detector tokens with no
-            # upper bound at all is exactly the hole being closed here — the
-            # empty set is the safe direction to be wrong in.
+            # upper bound at all is exactly the same hole in another guise —
+            # the empty set is the safe direction to be wrong in either way.
             if report["doctor"]:
                 profile = rubric.DOCTOR_COVERAGE.get(report["doctor"], set())
                 covered |= resolved & profile
-            else:
+            elif args.doctor:
                 profile = rubric.DOCTOR_COVERAGE.get(args.doctor)
                 covered |= resolved if profile is None else (resolved & profile)
+            elif resolved:
+                unattributed += 1
+        if unattributed:
+            warn(f"{unattributed} --findings report(s) have no '<doctor>:' label and no "
+                 "--doctor to attribute them to, so they contribute findings but no "
+                 "coverage. Label them '<doctor>:path', or pass --doctor, to credit them.")
         return covered
 
     if not reports:
@@ -855,18 +888,24 @@ def build(args, reports: list[dict], candidates: list[dict] | None = None,
         # *alone* covered become unknown — where a surviving doctor covers the
         # same ground, that ground was still measured.
         #
-        # This is a no-op whenever `covered` came from resolve_coverage's
-        # ordinary per-report evidenced loop: each report there is already
-        # capped by its OWN doctor's profile, so `covered` can never exceed
-        # the union of every *running* doctor's profile — i.e. it is always a
-        # subset of `surviving`, and subtracting `profile - surviving` from a
-        # set that cannot intersect it changes nothing. It stays load-bearing
-        # for the two paths that are NOT built from per-report-capped
-        # evidence: `--assume-full-coverage` (materialized to every category
-        # above) and `--covers` (an arbitrary human-declared set) — both can
-        # name a category no running doctor's own profile actually reaches,
-        # and only this subtraction pulls a failed doctor's exclusive ground
-        # back out of them. See test_assume_full_coverage_yields_to_a_doctor_
+        # This is USUALLY a no-op when `covered` came from resolve_coverage's
+        # ordinary per-report evidenced loop, but "always a subset of
+        # `surviving`" does not actually hold there — it is a per-report
+        # claim, not a global one. A *named* report is capped by its own
+        # doctor's profile, and that doctor has to be one of `doctors` to
+        # have reached the loop as `evidenced` in the first place, so its
+        # contribution is guaranteed inside `surviving`. An *unlabelled*
+        # report capped by `--doctor` instead carries no such guarantee:
+        # `--doctor` can name a doctor the envelope never ran (a merge
+        # analyzed by code-doctor and python-code-doctor, graded with
+        # `--doctor django-code-doctor` pointed at a hand-picked report), so
+        # `covered` can exceed `surviving` and this subtraction genuinely
+        # removes ground from it — the same way it does for the two paths
+        # that are NOT built from per-report-capped evidence at all:
+        # `--assume-full-coverage` (materialized to every category above) and
+        # `--covers` (an arbitrary human-declared set), which can equally
+        # name a category no running doctor's own profile actually reaches.
+        # See test_assume_full_coverage_yields_to_a_doctor_
         # that_demonstrably_crashed and test_assume_full_coverage_does_not_
         # over_subtract_what_a_survivor_covers in test_merged_envelope.py.
         surviving: set[str] = set()
