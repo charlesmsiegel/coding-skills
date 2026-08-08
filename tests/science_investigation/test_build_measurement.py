@@ -203,6 +203,37 @@ def test_an_invalid_inventory_writes_no_document(run_script, tmp_path):
     assert "finding" in result.stderr
 
 
+def test_an_inventory_declaring_an_unknown_schema_is_refused(run_script, tmp_path):
+    # The rules the score assumes are the ones this version's validator
+    # enforces. A file written against some other version is not a slightly
+    # different inventory; it is an unknown contract.
+    out = tmp_path / "measurement.html"
+    path = inventory(tmp_path)
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    payload["schema"] = "totally-bogus/9"
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+    result = run_script(SCRIPT, "--out", out, "--inventory", path,
+                        "--name", "billing", expect_rc=2)
+
+    assert not out.exists()
+    assert "schema" in result.stderr
+
+
+def test_an_inventory_with_no_schema_at_all_is_refused(run_script, tmp_path):
+    out = tmp_path / "measurement.html"
+    path = inventory(tmp_path)
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    del payload["schema"]
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+    result = run_script(SCRIPT, "--out", out, "--inventory", path,
+                        "--name", "billing", expect_rc=2)
+
+    assert not out.exists()
+    assert "schema" in result.stderr
+
+
 def test_the_intro_prose_is_placed_on_the_score_tab(run_script, tmp_path):
     intro = tmp_path / "intro.html"
     intro.write_text("<p>Billing scores itself with a judge nobody pinned.</p>",

@@ -59,6 +59,18 @@ def read_inventory(path: Path) -> dict:
     data = json.loads(path.read_text(encoding="utf-8"))
     if not isinstance(data, dict):
         raise rubric.InventoryError("inventory must be a JSON object")
+    # The schema key is not decoration. Every rule the validator enforces —
+    # credit is a ladder, unmeasurable rows stay in the denominator, evidence
+    # is file:line you opened — is a contract the author accepted by naming
+    # this version. A file naming another version, or naming none, was written
+    # against rules this builder does not know, so the score it would produce
+    # is a claim about nothing. INVENTORY_SCHEMA existed and was never checked.
+    schema = data.get("schema")
+    if schema != rubric.INVENTORY_SCHEMA:
+        raise rubric.InventoryError(
+            f"inventory must declare a 'schema' of {rubric.INVENTORY_SCHEMA!r}, "
+            f"got {schema!r}"
+        )
     rows = data.get("rows") or []
     findings = data.get("findings") or []
     if not isinstance(rows, list) or not isinstance(findings, list):
