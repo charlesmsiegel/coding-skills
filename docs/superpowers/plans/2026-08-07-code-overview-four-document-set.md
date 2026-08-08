@@ -870,8 +870,22 @@ def page(repo, run_script, tmp_path) -> str:
 
 
 def test_all_four_tabs_are_present(page):
+    # Exactly four, not "at least four": the preamble of a body scaffold has
+    # already once been split into a fifth, bogus tab that rendered *active* and
+    # hid the grade card. Counting the buttons is what catches that; asserting a
+    # title appears somewhere in the HTML does not.
+    assert page.count('<button role="tab"') == 4
     for title in ("Grade", "Findings", "Candidates", "Coverage"):
         assert f">{title}<" in page, f"the {title} tab is missing"
+
+
+def test_the_visible_grade_card_carries_the_grade(page):
+    # Every other assertion here reads the page as one string, which a hidden or
+    # mis-rendered panel satisfies just as well as a correct one. This one pins
+    # what a reader actually sees: the letter inside the grade card element.
+    card = re.search(r'<div class="letter">([^<]*)</div>', page)
+    assert card, "no grade card rendered"
+    assert card.group(1).strip() not in ("", "None")
 
 
 def test_the_grade_tab_is_the_one_that_opens(page):
