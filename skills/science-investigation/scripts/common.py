@@ -110,9 +110,34 @@ def read_source(path: Path) -> tuple:
         size = path.stat().st_size
         if size > MAX_SOURCE_BYTES:
             return [], "larger than " + str(MAX_SOURCE_BYTES // 1_000_000) + "MB (" + str(size) + " bytes)"
-        return path.read_text(encoding="utf-8", errors="replace").splitlines(), None
+        text = path.read_text(encoding="utf-8-sig", errors="replace")
     except OSError as exc:
         return [], "unreadable (" + type(exc).__name__ + ")"
+    if path.suffix == ".ipynb":
+        return notebook_source(text)
+    return text.splitlines(), None
+
+
+def notebook_source(text: str) -> tuple:
+    """A notebook's code-cell source, as lines.
+
+    `.ipynb` is JSON: read as raw text its code sits inside quoted strings, where
+    string masking hides it and a metrics notebook reports no metrics at all,
+    while markdown prose and stored outputs read as source to every scanner.
+    """
+    try:
+        payload = json.loads(text)
+    except (json.JSONDecodeError, ValueError) as exc:
+        return [], "unreadable notebook (" + type(exc).__name__ + ")"
+    lines = []
+    for cell in payload.get("cells", []) if isinstance(payload, dict) else []:
+        if not isinstance(cell, dict) or cell.get("cell_type") != "code":
+            continue
+        source = cell.get("source") or []
+        if isinstance(source, str):
+            source = source.splitlines()
+        lines += [str(line).rstrip("\n") for line in source]
+    return lines, None
 
 
 def skipped_note(skipped: list) -> str:

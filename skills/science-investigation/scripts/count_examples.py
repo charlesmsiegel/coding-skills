@@ -172,9 +172,11 @@ def records_from_json(payload, data_like: bool = False):
             value = payload.get(key)
             if not isinstance(value, list):
                 continue
-            if any(isinstance(r, dict) for r in value):
+            if value:
+                # Unambiguously dataset-shaped: `{"data": [null, "broken"]}` is two
+                # rows that cannot be scored, not an absent dataset.
                 return value
-            if not value and empty is None:
+            if empty is None:
                 empty = value
         if empty is not None:
             return empty
@@ -198,7 +200,7 @@ def read_json(path: Path, max_rows: int, data_like: bool = False) -> dict:
         if size > MAX_JSON_BYTES:
             return {"parse_error": "too large to decode whole (" + str(size) + " bytes); --max-rows "
                                    "cannot bound a single JSON array — convert to JSONL to count it"}
-        payload = json.loads(path.read_text(encoding="utf-8", errors="replace"))
+        payload = json.loads(path.read_text(encoding="utf-8-sig", errors="replace"))
     except json.JSONDecodeError as exc:
         return {"parse_error": "invalid JSON at line " + str(exc.lineno)}
     except (OSError, ValueError) as exc:
@@ -330,6 +332,8 @@ def analyze(root: Path, max_rows: int) -> tuple:
             rows_out.append(unreadable_row(display, stats["parse_error"]))
             continue
         if stats.get("rows") == 0 and "fields" in stats:
+            if not is_measurement_data(path, display, stats):
+                continue   # a header-only inventory.csv is not empty measurement input
             summaries.append(blank_summary(display))
             rows_out.append(empty_row(display))
             continue
@@ -461,6 +465,11 @@ def main() -> int:
                         help="stop reading a file after this many records (default: 200000)")
     args = parser.parse_args()
 
+    if args.max_rows < 0:
+        # JSON slicing reads all but the last record; JSONL reads none. Silently
+        # format-dependent coverage is exactly the kind of number this tool exists
+        # to stop anyone quoting.
+        parser.error("--max-rows must be zero or greater")
     root = Path(args.root)
     if not root.exists():
         print("error: no such path: " + str(root), file=sys.stderr)

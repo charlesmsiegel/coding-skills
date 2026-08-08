@@ -350,3 +350,37 @@ def test_an_ordinary_spreadsheet_is_not_measurement_data(tmp_path):
 def test_a_labelled_csv_is_a_dataset_whatever_it_is_called(tmp_path):
     (tmp_path / "inventory.csv").write_text("expected,input\na,b\n", encoding="utf-8")
     assert run(tmp_path)["counts"]["datasets"] == 1
+
+
+# ---- eighth review round ------------------------------------------------------ #
+
+def test_malformed_records_under_a_wrapper_key_are_retained(tmp_path):
+    (tmp_path / "eval.json").write_text('{"data": [null, "broken"]}', encoding="utf-8")
+    payload = run(tmp_path)
+    assert "2 of 2" in kinds(payload, "unparseable_rows")[0]["detail"]
+
+
+def test_a_header_only_spreadsheet_is_not_empty_measurement_input(tmp_path):
+    """The delimited gate has to run before the empty-dataset branch too."""
+    (tmp_path / "inventory.csv").write_text("sku,price\n", encoding="utf-8")
+    payload = run(tmp_path)
+    assert not kinds(payload, "empty_dataset")
+    assert payload["counts"]["datasets"] == 0
+
+
+def test_a_json_export_with_a_byte_order_mark_is_not_corrupt(tmp_path):
+    (tmp_path / "eval.json").write_text('[{"gold":"a"}]', encoding="utf-8-sig")
+    payload = run(tmp_path)
+    assert not kinds(payload, "unparseable_dataset")
+    assert payload["counts"]["records_total"] == 1
+
+
+def test_a_negative_row_cap_is_refused(tmp_path):
+    """JSON slicing reads all but the last record; JSONL reads none."""
+    write_jsonl(tmp_path / "eval.jsonl", [{"gold": "a"}])
+    result = subprocess.run(
+        [sys.executable, str(SCRIPT), str(tmp_path), "--max-rows", "-1"],
+        capture_output=True, text=True, timeout=60,
+    )
+    assert result.returncode == 2
+    assert "zero or greater" in result.stderr
