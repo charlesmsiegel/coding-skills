@@ -2,6 +2,7 @@
 
 import json
 import os
+import pathlib
 
 import pytest
 
@@ -375,3 +376,182 @@ def test_shallow_clone_detected(common, repo, tmp_path):
     assert depth.is_repo is True
     assert depth.is_shallow is True
     assert depth.usable is False
+
+
+# --------------------------------------------------------------------------- #
+# coverage_gaps — the completeness record that keeps lost files from
+# silently aggregating into "No problems found".
+# --------------------------------------------------------------------------- #
+
+def test_coverage_gaps_empty_in_empty_out(common):
+    assert common.coverage_gaps([], []) == {}
+
+
+def test_coverage_gaps_unreadable_only(common):
+    gaps = common.coverage_gaps(["a.go", "b.go"], [])
+    assert set(gaps) == {"files_unreadable"}
+    assert "2 file(s)" in gaps["files_unreadable"]
+    assert "a.go" in gaps["files_unreadable"]
+    assert "b.go" in gaps["files_unreadable"]
+
+
+def test_coverage_gaps_failed_only(common):
+    gaps = common.coverage_gaps([], ["c.go"])
+    assert set(gaps) == {"files_detector_failed"}
+    assert "1 file(s)" in gaps["files_detector_failed"]
+    assert "c.go" in gaps["files_detector_failed"]
+
+
+def test_coverage_gaps_both(common):
+    gaps = common.coverage_gaps(["a.go"], ["c.go"])
+    assert set(gaps) == {"files_unreadable", "files_detector_failed"}
+    assert "a.go" in gaps["files_unreadable"]
+    assert "c.go" in gaps["files_detector_failed"]
+
+
+def test_coverage_gaps_truncates_long_list_but_keeps_true_count(common):
+    """The message shows only the first 5 names but the true total count.
+
+    Source truncates the joined names to ``[:5]`` and appends an ellipsis when
+    there were more, while the leading count comes from ``len(unreadable)`` —
+    the untruncated list. A naive implementation could truncate the count too
+    (silently understating how much coverage was actually lost), which is
+    exactly the failure this test exists to catch.
+    """
+    unreadable = [f"file{i}.go" for i in range(7)]
+    gaps = common.coverage_gaps(unreadable, [])
+    note = gaps["files_unreadable"]
+    assert "7 file(s)" in note, "must report the true total, not the truncated count"
+    assert "file0.go" in note
+    assert "file4.go" in note
+    assert "file5.go" not in note, "sixth name onward must be truncated away"
+    assert "file6.go" not in note
+    assert note.endswith("…")
+
+
+# --------------------------------------------------------------------------- #
+# run_file_detector — the end-to-end per-file main(), driven through argv so
+# no subprocess is needed.
+# --------------------------------------------------------------------------- #
+
+def _noop_analyze(path, text, reporter):
+    pass
+
+
+def test_run_file_detector_clean_tree_returns_zero_no_findings(common, repo, capsys):
+    repo.write("a.go", "package main\n")
+    repo.write("b.go", "package main\n")
+    rc = common.run_file_detector(
+        "desc", "clean", _noop_analyze,
+        argv=[str(repo.path), "--format", "json"],
+    )
+    assert rc == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload == []
+
+
+def test_run_file_detector_crash_is_isolated_to_one_file(common, repo, capsys):
+    """A detector bug costs the one file it crashed on, not the whole scan."""
+    repo.write("good.go", "package main\n")
+    repo.write("bad.go", "package main\n")
+
+    def analyze(path, text, reporter):
+        if path.name == "bad.go":
+            raise ValueError("boom")
+        reporter.finding(1, "smell", "d", "fix it")
+
+    rc = common.run_file_detector(
+        "desc", "clean", analyze,
+        argv=[str(repo.path), "--format", "json"],
+    )
+    assert rc == 0
+    err = capsys.readouterr()
+    payload = json.loads(err.out)
+    assert payload["completeness"]["files_detector_failed"].startswith("1 file(s)")
+    assert "bad.go" in payload["completeness"]["files_detector_failed"]
+    # the crash on bad.go must not have prevented good.go from being analyzed
+    assert len(payload["findings"]) == 1
+    assert payload["findings"][0]["file"].endswith("good.go")
+
+
+def test_run_file_detector_unreadable_file_surfaces_in_completeness(
+    common, repo, capsys, monkeypatch
+):
+    """Simulates an unreadable file via monkeypatched Path.read_text.
+
+    The suite runs as root, where ``chmod 000`` does not deny access (root
+    ignores DAC permission bits), so a real permission-denied file would be
+    read successfully and this test would pass vacuously. Monkeypatching
+    ``Path.read_text`` to raise ``OSError`` for one specific filename produces
+    a genuine, unconditional read failure regardless of the user running the
+    suite, while leaving every other file (including git's own reads during
+    the walk) untouched.
+    """
+    repo.write("good.go", "package main\n")
+    repo.write("unreadable.go", "package main\n")
+
+    original_read_text = pathlib.Path.read_text
+
+    def fake_read_text(self, *args, **kwargs):
+        if self.name == "unreadable.go":
+            raise OSError("simulated permission denied")
+        return original_read_text(self, *args, **kwargs)
+
+    monkeypatch.setattr(pathlib.Path, "read_text", fake_read_text)
+
+    rc = common.run_file_detector(
+        "desc", "clean", _noop_analyze,
+        argv=[str(repo.path), "--format", "json"],
+    )
+    assert rc == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["completeness"]["files_unreadable"].startswith("1 file(s)")
+    assert "unreadable.go" in payload["completeness"]["files_unreadable"]
+
+
+def test_run_file_detector_missing_path_returns_2_and_prints_nothing_clean(
+    common, tmp_path, capsys
+):
+    """A typo'd scan path must exit loudly, never resemble a clean report."""
+    rc = common.run_file_detector(
+        "desc", "clean", _noop_analyze,
+        argv=[str(tmp_path / "does-not-exist"), "--format", "json"],
+    )
+    assert rc == 2
+    out = capsys.readouterr()
+    assert out.out == "", "a failed scan must not print anything on stdout"
+    assert "does-not-exist" in out.err
+    assert "clean" not in out.err.lower()
+
+
+# --------------------------------------------------------------------------- #
+# fail_on_bad_path — stderr, never stdout, on a bad scan root.
+# --------------------------------------------------------------------------- #
+
+def test_fail_on_bad_path_writes_stderr_not_stdout(common, capsys):
+    rc = common.fail_on_bad_path(common.ScanPathError("nope: no such file or directory"))
+    assert rc == 2
+    out = capsys.readouterr()
+    assert out.out == ""
+    assert "nope" in out.err
+    assert "error:" in out.err
+
+
+# --------------------------------------------------------------------------- #
+# build_parser — the shared path / --format / --ignore CLI surface.
+# --------------------------------------------------------------------------- #
+
+def test_build_parser_defaults(common):
+    parser = common.build_parser("a detector")
+    args = parser.parse_args([])
+    assert args.path == "."
+    assert args.format == "text"
+    assert args.ignore == ""
+
+
+def test_build_parser_rejects_unknown_format(common, capsys):
+    parser = common.build_parser("a detector")
+    with pytest.raises(SystemExit) as excinfo:
+        parser.parse_args(["--format", "xml"])
+    assert excinfo.value.code == 2
+    assert "invalid choice" in capsys.readouterr().err
