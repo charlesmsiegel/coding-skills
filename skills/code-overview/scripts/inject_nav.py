@@ -14,7 +14,7 @@ constraint shapes the whole design:
   two-item row, never a dangling href.
 
 Three rows: up to the repo-level document *of the same type*, across this
-package's three documents, and sideways to the same type in sibling packages.
+package's four documents, and sideways to the same type in sibling packages.
 
 Usage:
   python inject_nav.py --map docs/code-overview.json --repo .
@@ -41,7 +41,7 @@ _HEADER_END_RE = re.compile(r"</header>", re.IGNORECASE)
 _BODY_START_RE = re.compile(r"<body[^>]*>", re.IGNORECASE)
 
 HOME_LABELS = {"summary": "Overall Summary", "codemap": "Overall Code Map",
-               "health": "Overall Health"}
+               "health": "Overall Health", "measurement": "Overall Measurement"}
 
 STYLE = """<style>
 .co-nav{position:sticky;top:0;z-index:60;max-width:1280px;margin:0 auto;padding:10px 28px;
@@ -88,7 +88,7 @@ def nav_html(repo: Path, package: dict | None, kind: str, packages: list[dict],
             f'{esc(HOME_LABELS[kind])}</span></div>'
         )
 
-    # Row 2 — this unit's three documents.
+    # Row 2 — this unit's four documents.
     siblings = []
     for other in DOC_KINDS:
         target = doc_path(repo, package, other)

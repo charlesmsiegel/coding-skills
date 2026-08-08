@@ -477,8 +477,9 @@ def read_meta(path: Path) -> dict | None:
 # the package map
 # --------------------------------------------------------------------------
 
-DOC_KINDS = ("summary", "codemap", "health")
-DOC_TITLES = {"summary": "Summary", "codemap": "Code Map", "health": "Health"}
+DOC_KINDS = ("summary", "codemap", "health", "measurement")
+DOC_TITLES = {"summary": "Summary", "codemap": "Code Map", "health": "Health",
+              "measurement": "Measurement"}
 
 
 def load_map(path) -> dict:
