@@ -1,6 +1,7 @@
 """The walk: what counts as source, what counts as text, what is skipped."""
 
 import json
+import os
 
 import pytest
 
@@ -69,6 +70,40 @@ def test_symlinks_are_never_followed(common, repo, tmp_path):
     (repo.path / "link.go").symlink_to(outside)
     found = {p.name for p in common.walk_files(repo.path, source_only=True)}
     assert found == {"app.go"}
+
+
+def test_symlink_scan_root_raises(common, repo, tmp_path):
+    """Refusing to follow it is right; reporting it clean is not."""
+    link = tmp_path / "link-to-repo"
+    link.symlink_to(repo.path)
+    with pytest.raises(common.ScanPathError, match="symlink"):
+        list(common.walk_files(link, source_only=True))
+
+
+def test_gitignored_files_are_not_walked(common, repo):
+    """The design promises .gitignore awareness, not just EXCLUDE_DIRS."""
+    repo.write(".gitignore", "generated/\n*.gen.go\n")
+    repo.write("generated/big.go", "package generated\n")
+    repo.write("thing.gen.go", "package thing\n")
+    repo.write("app.go", "package main\n")
+    repo.commit("ignore generated")
+    found = {p.name for p in common.walk_files(repo.path, source_only=True)}
+    assert "app.go" in found
+    assert "big.go" not in found, "walked into a gitignored directory"
+    assert "thing.gen.go" not in found, "walked a gitignored file"
+
+
+def test_unreadable_file_is_not_silently_classified_binary(common, repo):
+    """An OSError must reach the caller, not masquerade as a binary skip."""
+    target = repo.write("locked.go", "package main\n")
+    os.chmod(target, 0o000)
+    try:
+        if os.access(target, os.R_OK):
+            pytest.skip("running as a user that ignores file permissions (root)")
+        with pytest.raises(OSError):
+            common.is_probably_binary(target)
+    finally:
+        os.chmod(target, 0o644)
 
 
 def test_bin_directory_is_scanned(common, repo):
