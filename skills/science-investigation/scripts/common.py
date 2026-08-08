@@ -143,6 +143,11 @@ def notebook_source(text: str) -> tuple:
         source = cell.get("source") or []
         if isinstance(source, str):
             source = source.splitlines()
+        if not isinstance(source, list):
+            # `{"source": 42}` is a valid JSON notebook and an invalid cell. Iterating
+            # it raised TypeError out of read_source and killed the entire scan, so a
+            # single corrupt cell took the whole audit down with it.
+            return [], "unreadable notebook (cell source is not text)"
         for offset, line in enumerate(source, 1):
             lines.append(str(line).rstrip("\n"))
             locations.append(("cell" + str(index), offset))

@@ -208,6 +208,14 @@ def classify_handler(body: list) -> tuple:
     if surfaced and always_raises(code):
         return None, None
     if surfaced and not zeroed:
+        # The paths that do not raise still have to record something. `if fatal:
+        # raise` followed by `return None` loses every non-fatal example silently.
+        remainder = [b for b in code if not _SURFACED_RE.search(_STRING_BODY_RE.sub(r"\1\1", b))
+                     and not _CONDITIONAL_RE.match(b.strip())]
+        if remainder and all(_EMPTY_BODY_RE.match(b) for b in remainder):
+            return ("swallowed_error",
+                    "the paths that do not re-raise record nothing — those examples are lost "
+                    "without a trace")
         return None, None
     if zeroed:
         detail = "a failure here yields 0/empty — indistinguishable from a genuine low score"
@@ -269,11 +277,24 @@ _SAMPLING_OFF_RE = re.compile(r"\bdo_sample[\"']?\s*[=:]\s*false", re.IGNORECASE
 _SAMPLING_ON_RE = re.compile(r"\bdo_sample[\"']?\s*[=:]\s*true", re.IGNORECASE)
 
 
-def sampling_disabled(text: str) -> bool:
-    return bool(_SAMPLING_OFF_RE.search(text)) and not _SAMPLING_ON_RE.search(text)
+def sampling_disabled(line: str) -> bool:
+    """Whether an off switch on *this line* settles it.
+
+    Only the same line counts. A `do_sample=False` on one generation call cannot
+    vouch for a `temperature=0.8` on a different call in the same file, and a
+    textual scan cannot tell which block a setting belongs to. Two attempts to
+    infer it from the file — first file-wide, then a line window — each produced a
+    clean report over a metric that is a random variable.
+
+    So the scan reports and says what it saw. A candidate the reader dismisses in
+    five seconds is the cost; a false clean is the failure this tool exists to
+    prevent, and it is not a close call between them.
+    """
+    return bool(_SAMPLING_OFF_RE.search(line))
 
 
-def scan_line(line: str, display: str, lineno: int, sampling_off: bool = False) -> list:
+def scan_line(line: str, display: str, lineno: int, sampling_off: bool = False,
+              switched_off_elsewhere: bool = False) -> list:
     out = []
     stripped = line.strip()
     if not stripped or stripped.startswith(("#", "//", "*", "<!--")):
@@ -316,9 +337,12 @@ def scan_line(line: str, display: str, lineno: int, sampling_off: bool = False) 
             if nondet.group(2) is not None and float(nondet.group(2)) >= 1.0:
                 value = "0"
             if value is None or float(value) > 0:
+                detail = "sampling is on, so the metric is a random variable"
+                if switched_off_elsewhere:
+                    detail += " (this file also switches sampling off somewhere — check which "
+                    detail += "call this setting belongs to)"
                 out.append(candidate(
-                    "nondeterminism", display, lineno,
-                    "sampling is on, so the metric is a random variable",
+                    "nondeterminism", display, lineno, detail,
                     CONFIRM["nondeterminism"], stripped,
                 ))
                 break
@@ -349,9 +373,11 @@ def scan(root: Path) -> tuple:
         handled = scan_handlers(lines, display)
         rows += handled
         seen_handlers = {(r["kind"], r["line"]) for r in handled}
-        sampling_off = sampling_disabled("\n".join(split_comment(mask_strings(b))[0] for b in lines))
+        text = "\n".join(split_comment(mask_strings(b))[0] for b in lines)
+        switched_off = bool(_SAMPLING_OFF_RE.search(text))
         for lineno, line in enumerate(lines, 1):
-            rows += [r for r in scan_line(line, display, lineno, sampling_off)
+            code = split_comment(mask_strings(line))[0]
+            rows += [r for r in scan_line(line, display, lineno, sampling_disabled(code), switched_off)
                      if (r["kind"], r["line"]) not in seen_handlers]
     return relocate(rows, notebooks), read, skipped
 

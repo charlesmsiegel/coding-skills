@@ -81,6 +81,9 @@ CONFIRM = {
 }
 
 
+_SEGMENT_RE = re.compile(r"[A-Z]+(?![a-z])|[A-Z][a-z0-9]*|[a-z0-9]+")
+
+
 def looks_like_data(display: str) -> bool:
     """Whether an unparseable file is plausibly a dataset rather than a config.
 
@@ -89,8 +92,14 @@ def looks_like_data(display: str) -> bool:
     is the manufacturing error this gate exists to prevent. A token may extend a
     hint (`testdata`, `results`) but may not merely contain one.
     """
-    tokens = re.split(r"[^A-Za-z0-9]+", display.lower())
-    return any(token.startswith(hint) for token in tokens if token for hint in DATASET_HINTS)
+    # Segments, not prefixes. `runtime.json` starts with the hint `run` and is not a
+    # run record; `casual` is not a case. A hint counts when it is a whole segment of
+    # the name — separator-delimited or camelCase — or that segment's plural.
+    segments = []
+    for token in re.split(r"[^A-Za-z0-9]+", display):
+        segments += [part.lower() for part in _SEGMENT_RE.findall(token)]
+    return any(segment == hint or segment == hint + "s"
+               for segment in segments for hint in DATASET_HINTS)
 
 
 def is_populated(value) -> bool:

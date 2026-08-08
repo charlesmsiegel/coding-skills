@@ -539,3 +539,35 @@ def test_notebook_candidates_report_an_openable_cell_location(tmp_path):
     row = kinds(run(tmp_path), "metric_definition")[0]
     assert row["file"] == "nb.ipynb#cell1"
     assert row["line"] == 2, "line is relative to the cell, not to the extracted stream"
+
+
+# ---- tenth review round ------------------------------------------------------- #
+
+def test_a_threshold_in_a_trailing_comment_is_not_a_live_gate(tmp_path):
+    (tmp_path / "s.py").write_text("result = run()  # legacy: quality_score > 0.8\n", encoding="utf-8")
+    assert not kinds(run(tmp_path), "threshold")
+
+
+def test_a_not_equal_comparison_is_a_gate(tmp_path):
+    (tmp_path / "s.py").write_text("if accuracy != 1.0:\n    pass\n", encoding="utf-8")
+    assert kinds(run(tmp_path), "threshold")
+
+
+def test_every_alias_in_one_sql_query_is_inventoried(tmp_path):
+    (tmp_path / "q.sql").write_text(
+        "SELECT AVG(correct) AS accuracy, AVG(score) AS quality_score FROM evals;\n",
+        encoding="utf-8",
+    )
+    found = {row["detail"].split(" ")[0] for row in kinds(run(tmp_path), "metric_definition")}
+    assert found == {"accuracy", "quality_score"}
+
+
+def test_a_corrupt_notebook_cell_skips_the_file_rather_than_the_audit(tmp_path):
+    """`{"source": 42}` raised TypeError out of read_source and killed the scan."""
+    (tmp_path / "nb.ipynb").write_text(
+        '{"cells":[{"cell_type":"code","source":42}],"metadata":{},"nbformat":4,"nbformat_minor":5}',
+        encoding="utf-8",
+    )
+    payload = run(tmp_path)
+    assert payload["counts"]["files_skipped_unread"] == 1
+    assert "NOT read" in payload["headline"]

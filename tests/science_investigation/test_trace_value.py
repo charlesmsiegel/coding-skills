@@ -234,3 +234,17 @@ def test_regex_mode_still_classifies_numeric_matches_as_numeric(tmp_path):
     payload = run(r"0\.7", tmp_path, "--regex")
     assert payload["counts"].get("definition") == 1
     assert "defined nowhere" not in payload["headline"]
+
+
+def test_a_typed_c_family_declaration_is_a_definition(tmp_path):
+    (tmp_path / "a.cpp").write_text("double quality_score(int n) { return 1.0; }\n", encoding="utf-8")
+    (tmp_path / "b.cpp").write_text("double quality_score(int n) { return 2.0; }\n", encoding="utf-8")
+    assert "defined independently in 2 place(s)" in run("quality_score", tmp_path)["headline"]
+
+
+def test_an_empty_scan_is_not_an_absence_result(tmp_path):
+    """Nothing was inspected, which is not evidence the value is missing."""
+    payload = run("0.7", tmp_path)
+    assert payload["counts"]["files_scanned"] == 0
+    assert "Nothing to scan" in payload["headline"]
+    assert "appears nowhere" not in payload["headline"]

@@ -563,3 +563,37 @@ def test_the_filter_annotation_appears_even_when_it_selects_nothing(tmp_path):
     payload = run(tmp_path, "--kind", "nondeterminism")
     assert payload["candidates"] == []
     assert "--kind nondeterminism: 0 row(s) shown" in payload["headline"]
+
+
+# ---- tenth review round ------------------------------------------------------- #
+
+def test_a_conditional_reraise_whose_other_path_records_nothing_is_swallowed(tmp_path):
+    """`if fatal: raise` then `return None` loses every non-fatal example."""
+    (tmp_path / "s.py").write_text(
+        "def score(row):\n"
+        "    try:\n"
+        "        return judge(row)\n"
+        "    except Exception as exc:\n"
+        "        if isinstance(exc, FatalError): raise\n"
+        "        return None\n",
+        encoding="utf-8",
+    )
+    assert kinds(run(tmp_path), "swallowed_error")
+
+
+def test_an_off_switch_on_another_call_does_not_silence_this_one(tmp_path):
+    """Two calls, two configs: a textual scan cannot tell which block a setting
+    belongs to, so it reports and says so rather than going quiet."""
+    (tmp_path / "s.py").write_text(
+        "a = call(prompt, do_sample=False)\nb = call(prompt, temperature=0.8)\n",
+        encoding="utf-8",
+    )
+    rows = kinds(run(tmp_path), "nondeterminism")
+    assert rows and "also switches sampling off" in rows[0]["detail"]
+
+
+def test_a_same_line_off_switch_still_settles_it(tmp_path):
+    (tmp_path / "s.py").write_text(
+        "a = call(prompt, do_sample=False, temperature=0.8)\n", encoding="utf-8"
+    )
+    assert not kinds(run(tmp_path), "nondeterminism")
