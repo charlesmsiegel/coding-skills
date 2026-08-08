@@ -18,8 +18,8 @@ from pathlib import Path
 
 from common import (Reporter, ScanPathError, build_parser, configure_output,
                     coverage_gaps, emit, fail_on_bad_path, is_probably_binary,
-                    tracked_paths, unmerged_paths, walk_files, walk_paths,
-                    warn_detector_error, warn_unreadable)
+                    parse_ignore, read_text, tracked_paths, unmerged_paths,
+                    walk_files, walk_paths, warn_detector_error, warn_unreadable)
 
 MERGE_MARKERS = ("<<<<<<< ", "=======", ">>>>>>> ")
 MAX_FILE_LINES = 1000
@@ -50,7 +50,29 @@ _LOOKS_LIKE_CODE = re.compile(r"[;{}]\s*$|\)\s*[;{]?\s*$|=[^=]|\w+\s*\(")
 # are deliberately absent: both routinely hold nothing but registry, index,
 # and proxy settings, so a name-only rule would call ordinary committed
 # config a credential leak. find_secrets.py inspects their contents instead.
-SECRET_FILENAMES = frozenset({".env", ".env.local", ".env.production"})
+#
+# `.env.<environment>` is a family, not a fixed list: `.env.staging`,
+# `.env.development`, `.env.test`, and any other environment name someone
+# invents are exactly as credential-bearing as `.env.production` — matched by
+# prefix below rather than enumerated, since enumerating them is a losing
+# game the moment a team names an environment nobody anticipated.
+SECRET_FILENAMES = frozenset({".env", ".env.local"})
+ENV_FAMILY_PREFIX = ".env."
+
+# The documented exception to the family match above: these names exist
+# specifically to be a committed, secret-free template for developers to copy
+# from, so treating them as leaks would be the false positive this whole
+# check exists to avoid on every other `.env.*` name.
+ENV_TEMPLATE_NAMES = frozenset({".env.example", ".env.sample", ".env.template"})
+
+
+def is_secret_env_filename(name: str) -> bool:
+    """Whether ``name`` is a `.env` variant meant to hold real credentials."""
+    if name in SECRET_FILENAMES:
+        return True
+    if name in ENV_TEMPLATE_NAMES:
+        return False
+    return name.startswith(ENV_FAMILY_PREFIX)
 
 
 def blank_literals(line: str) -> str:
@@ -131,7 +153,7 @@ def check_metadata(path: Path, report: Reporter, tracked: set[Path] | None) -> N
     Runs over walk_paths, so binaries reach it — a committed multi-gigabyte
     archive is precisely what this should catch, and it is never text.
     """
-    if path.name in SECRET_FILENAMES:
+    if is_secret_env_filename(path.name):
         if tracked is None:
             report.candidate(
                 1, "committed_env_file",
@@ -227,7 +249,7 @@ def check_source_file(path: Path, text: str, report: Reporter) -> None:
 def main() -> int:
     configure_output()
     args = build_parser(__doc__).parse_args()
-    ignore = set(args.ignore.split(",")) if args.ignore else set()
+    ignore = parse_ignore(args.ignore)
     root = Path(args.path)
 
     findings = []
@@ -247,7 +269,7 @@ def main() -> int:
             check_metadata(filepath, report, tracked)
             if filepath in text_files:
                 try:
-                    text = filepath.read_text(encoding="utf-8", errors="replace")
+                    text = read_text(filepath)
                 except OSError as exc:
                     warn_unreadable(filepath, exc)
                     unreadable.append(str(filepath))
