@@ -46,11 +46,13 @@ first. Recommending an edit on heuristic evidence is how a tool like this talks
 someone into deleting live code.
 
 Degrade audibly, too: a detector whose evidence can be incomplete (a file it
-could not read, git being unavailable, a shallow clone) says so in the report
-rather than staying silent about it. Where completeness cannot be established
-at all, the detector suppresses the finding rather than footnoting a guess —
-and never asserts a negative ("no problems found") from an index it knows is
-incomplete.
+could not read, git being unavailable for a given path) says so in the report
+rather than staying silent about it. Where a specific record's evidence is
+incomplete — git could not confirm whether a marker sits in a live conflict,
+or whether a file is tracked — the detector reports it as a candidate, with
+the uncertainty named in its `also_caused_by`, rather than asserting it as a
+confirmed finding. And it never asserts a negative ("no problems found") from
+a scan that lost files it could not read.
 
 ## The three layers
 
@@ -134,16 +136,17 @@ cannot, so run it too. **Ask the repository, not the filenames:**
 python "$SKILL/scripts/route.py" <repo> --format json
 ```
 
-It answers with the specialists the repo's own manifests justify, each with the
-evidence: a declared dependency, a `tsconfig.json`, a `manage.py` beside a
-settings module defining `INSTALLED_APPS`. A Go service containing three Python
-scripts routes nowhere, on purpose — a filename census would send it to
-`python-code-doctor`, which would report the missing `pyproject.toml` it was
-never supposed to have as a finding.
+It answers with the specialists the repo's own manifests justify —
+`python-code-doctor`, `django-code-doctor`, `typescript-code-doctor` — each
+with the evidence: a declared dependency, a `tsconfig.json`, a `manage.py`
+beside a settings module defining `INSTALLED_APPS`. A Go service containing
+three Python scripts routes nowhere, on purpose — a filename census would send
+it to `python-code-doctor`, which would report the missing `pyproject.toml` it
+was never supposed to have as a finding.
 
 **You are half of this protocol.** A Python subprocess cannot load a skill, so
-`route.py` names one and stops. For each route, load that skill and run its
-`analyze_all.py` over **the repository root** — never a package subdirectory,
+`route.py` only names one and stops — loading it is on you. Run its
+`analyze_all.py` over **the repository root**, never a package subdirectory,
 where a doctor cannot see the root manifest or the test tree and reports their
 absence as findings.
 
