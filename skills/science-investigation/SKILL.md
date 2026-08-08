@@ -114,6 +114,65 @@ Re-run the scripts and check every number in your draft against fresh output.
 
 A measurement audit that ships a wrong count has failed on its own terms.
 
+### 7. Ship it as a graded document
+
+The report can be prose. It is better as `measurement.html` — a tabbed page
+carrying a **measurement-coverage score**, which answers the question prose
+tends to dodge: *how much of what matters here is actually measured?*
+
+Write the audit as an inventory file (`measurement-inventory/1`), one row per
+measurable thing:
+
+```json
+{"schema": "measurement-inventory/1", "subject": "billing",
+ "rows": [{"name": "judge_accuracy", "importance": 3,
+           "importance_reason": "gates the weekly model rollout",
+           "credit": 0.25, "credit_reason": "computed over 3 labelled rows of 412",
+           "finding": "small_n", "n": 3, "n_total": 412,
+           "formula": "mean(judge_score == gold)",
+           "consumer": "scripts/rollout.py:88 gates the release",
+           "evidence": ["evals/judge.py:41"], "status": "measured"}],
+ "findings": [{"id": "small_n", "severity": "high",
+               "title": "Judge accuracy rests on n=3",
+               "detail": "3 of 412 rows carry a gold label.",
+               "evidence": ["evals/judge.py:41"],
+               "blast_radius": "the weekly rollout gate"}],
+ "not_audited": ["the analytics dashboard — no access"]}
+```
+
+```bash
+python "$SKILL/scripts/build_measurement.py" --out docs/measurement.html \
+  --inventory $WORK/inventory.json --name billing --intro-file $WORK/intro.html
+```
+
+**Importance is blast radius**, and the reason must name the decision: `3` gates a ship decision, `2` informs a decision someone makes, `1` is informational.
+**Credit is set by the worst confirmed finding**: `1.0` nothing found, `0.5` one
+medium finding, `0.25` one high finding, `0.0` not measured — or unmeasurable
+with today's data.
+
+    score = 100 × Σ(importance × credit) / Σ(importance)
+
+**Everything measurable stays in the denominator, including what today's data
+structurally cannot measure** — recall with no gold set, calibration with no
+outcomes, causal effect with no control arm. Dropping those rows is how silence
+gets read as success, and it is the single easiest way to make this score a lie.
+
+The builder refuses an inventory that cannot support its own score, and writes
+no document when it does: a credit below 1.0 with no finding named, an aggregate
+with no N, an unmeasurable row carrying credit. Fix the row rather than
+loosening the rule — the whole value of the number is that the table under it
+can be argued with.
+
+A unit with nothing measurable scores **null**, not zero and not A+, and says
+"no measurement content here" on the page. Most packages in a typical repo are
+that page, and that is the correct output.
+
+`--root-dir` partitions one repository-wide audit into per-package pages by
+where each thing is *defined*; `--root` with `--package name:path` builds the
+repository roll-up. Run the audit **once from the repository root**: pointed at
+a subdirectory, `find_metrics.py` cannot see `evals/` and reports a
+thoroughly-measured pipeline as having no measurement.
+
 ## Red flags
 
 Any of these, on sight, is worth a candidate row.

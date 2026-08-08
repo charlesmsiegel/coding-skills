@@ -81,7 +81,9 @@ mechanical.
   Four stdlib scripts enumerate metrics and thresholds, count labeled examples, find
   default-off flags and swallowed errors, and trace one threshold across the tree — each
   emitting a headline, a caveat, and rows explicitly marked as candidates to confirm by
-  reading. It reports; it does not fix.
+  reading. It reports; it does not fix. Ships the audit as a graded measurement.html —
+  importance-weighted measured things over measurable things, with the inventory table
+  the score was computed from.
 - **[update-docs](skills/update-docs/)** — build or refresh a project's own
   documentation skill. `check_doc_staleness.py` checks citations against the tree and
   infers missing coverage from churn.

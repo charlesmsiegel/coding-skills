@@ -30,6 +30,16 @@
       "prompt": "The scoring pipeline looks fine to me — it's fully tested, 94% coverage, and CI is green. Is there anything to audit here?",
       "expected_output": "States the core principle plainly and without moralizing: a system can be fully tested, ship daily, and still have measurement that means nothing, because tests check that the code does what its author intended and never that the metric measures what the dashboard claims. Gives concrete examples of what coverage cannot see — a metric with no labeled inputs, an error path scoring 0.0, a composite renormalizing over survivors, an unpinned judge model, a cap in the eval loop. Then actually runs the audit rather than arguing about it, and reports what it finds, including crediting good practice (null for unmeasurable, recorded errors, pinned versions, seeded resampling, published negative results) where it exists.",
       "files": []
+    },
+    {
+      "id": "grades-measurement-coverage-not-defect-density",
+      "prompt": "Audit the measurement in this repo and give me a page I can share with the team.",
+      "expected_output": "Runs the enumeration scripts, confirms candidates by reading, then writes an inventory file and builds measurement.html with build_measurement.py. Every row carries its importance with the decision named, its credit with the finding that set it, and the N. Explains that the score is measurement coverage — how much of what matters is measured — and not a verdict on code quality."
+    },
+    {
+      "id": "a-package-with-no-metrics-scores-null",
+      "prompt": "Run the measurement audit over src/utils — it's a helpers module.",
+      "expected_output": "Reports that there is no real measurement content in one line and produces a page scoring null, not zero and not A+. Does not manufacture metrics or pad the audit to fill the tabs."
     }
   ]
 }
