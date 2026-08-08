@@ -2191,6 +2191,17 @@ def test_json_passthrough_round_trips():
     assert json.loads(out)[0]["smell_type"] == "merge_conflict_marker"
 
 
+def test_malformed_findings_field_is_an_error_not_an_empty_report():
+    """A broken detector must not render as a clean repository."""
+    result = subprocess.run(
+        [sys.executable, str(SCRIPT)],
+        input=json.dumps({"findings": {"one": FINDING}}),
+        capture_output=True, text=True, timeout=60,
+    )
+    assert result.returncode == 1
+    assert "No findings" not in result.stdout
+
+
 def test_json_output_keeps_completeness():
     out = run({"completeness": {"history": "shallow clone"}, "findings": [FINDING]},
               "--format", "json")
@@ -2235,6 +2246,10 @@ from pathlib import Path
 from common import SEVERITY_ICONS, SEVERITY_RANK, configure_output
 
 
+class MalformedReport(ValueError):
+    """The input is valid JSON but not a findings report."""
+
+
 def load(source: str | None) -> tuple[list[dict], dict]:
     """Read either shape a detector emits: a bare list, or a wrapped object."""
     raw = Path(source).read_text(encoding="utf-8") if source else sys.stdin.read()
@@ -2243,8 +2258,21 @@ def load(source: str | None) -> tuple[list[dict], dict]:
         return [r for r in data if isinstance(r, dict)], {}
     if isinstance(data, dict):
         records = data.get("findings") or []
-        return [r for r in records if isinstance(r, dict)], data.get("completeness") or {}
-    return [], {}
+        # A malformed payload must not render as an empty clean artifact.
+        # {"findings": {"one": {...}}} or {"findings": "oops"} would otherwise
+        # filter down to nothing and print "No findings." — turning a broken
+        # detector into an apparently clean repository.
+        if not isinstance(records, list):
+            raise MalformedReport(
+                f"'findings' is {type(records).__name__}, expected a list"
+            )
+        notes = data.get("completeness") or {}
+        if not isinstance(notes, dict):
+            raise MalformedReport(
+                f"'completeness' is {type(notes).__name__}, expected an object"
+            )
+        return [r for r in records if isinstance(r, dict)], notes
+    raise MalformedReport(f"top level is {type(data).__name__}, expected a list or object")
 
 
 def location(record: dict, root: Path | None) -> str:
@@ -2321,7 +2349,7 @@ def main() -> int:
 
     try:
         records, completeness = load(args.source)
-    except (OSError, json.JSONDecodeError) as exc:
+    except (OSError, json.JSONDecodeError, MalformedReport) as exc:
         print(f"error: could not read findings ({exc})", file=sys.stderr)
         return 1
 
@@ -2374,7 +2402,7 @@ if __name__ == "__main__":
 - [ ] **Step 4: Run the tests to verify they pass**
 
 Run: `python -m pytest tests/code_doctor/test_format_findings.py -v`
-Expected: 10 passed.
+Expected: 11 passed.
 
 - [ ] **Step 5: Commit**
 
