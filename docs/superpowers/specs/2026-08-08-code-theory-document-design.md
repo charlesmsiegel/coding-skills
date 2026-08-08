@@ -78,9 +78,13 @@ instead of inviting a 73 that means nothing more than a 68.
 score = 100 × Σ(weight × step) / Σ(weight)
 ```
 
-Letter bands are health's and measurement's, copied verbatim, so a B− means one
-score range on all three pages. This is the **third** copy of that table; CI
-pins all three identical (see *Integration*).
+Letter bands are health's and measurement's, so a B− means one score range on
+all three pages. Unlike the measurement copy, this one is **imported, not
+copied**: `theory_rubric.py` ships inside `code-overview` alongside `rubric.py`,
+so it reads `GRADE_BANDS`, `UNGRADED` and `grade_for` directly from its sibling.
+The standalone-installability rule that forced the science-investigation copy
+does not apply within a single skill, and a copy here would be an unforced
+fourth thing to keep pinned.
 
 ## The panel
 
@@ -198,8 +202,9 @@ docs/{summary,codemap,health,measurement,theory}.html            repo level
 - **Repo level** asks the sharper question — does the *system* have a theory —
   over its own panel of three, with `--package name:path` rows read back from
   each package's page.
-- **CI**: the letter-band pin in `tests/test_shared_assets.py` extends from two
-  `rubric.py` copies to three.
+- **CI**: unchanged. The letter-band pin in `tests/test_shared_assets.py` still
+  covers exactly the two cross-skill `rubric.py` copies; `theory_rubric.py`
+  imports its bands from its sibling and so cannot drift from them.
 
 Tabs: `Grade` · `Theory` (the statement, the rejected reading, the rehearsals) ·
 `Dimensions` (the rows, with spread) · `Disagreement` (only where spread ≥ 2).
