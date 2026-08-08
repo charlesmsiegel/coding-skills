@@ -934,3 +934,104 @@ def test_the_root_grade_excludes_packages_whose_report_never_arrived(run_script,
     assert meta["roots"] == ["src/api"], "web was never analyzed, so it is not measured"
     assert meta["size"]["loc"] < 1000, "6000 unexamined TypeScript lines stay out"
     assert "no graded health page" in result.stderr
+
+
+def test_whole_project_findings_survive_root_scoping(run_script, repo):
+    """Findings with no single file to blame are reported against the directory.
+
+    `find_untested_modules.py` and `find_dependency_issues.py` emit
+    `no_tests_in_repo` and `no_dependency_manifest` with `file=str(root)`.
+    Requiring a *file* dropped both — high severity, and about the whole tree —
+    so a repo with no tests and no manifest rolled up to a clean A+.
+    """
+    for module in range(3):
+        repo.write(f"src/api/m{module}.py", "\n".join(f"x{i} = {i}" for i in range(300)))
+    repo.write("docs/code-overview.json", json.dumps({
+        "schema": "code-overview/1",
+        "packages": [{"name": "api", "roots": ["src/api"], "docs": "src/api/docs",
+                      "language": "python", "doctor": "python-code-doctor"}],
+    }))
+    repo.commit("init")
+    report = repo.path / "f.json"
+    report.write_text(json.dumps(full_report([
+        {"file": str(repo.path), "line": 1, "severity": "high",
+         "smell_type": "no_tests_in_repo", "description": "no tests"},
+        {"file": str(repo.path), "line": 1, "severity": "high",
+         "smell_type": "no_dependency_manifest", "description": "no manifest"},
+    ])))
+    out = repo.path / "docs/health.html"
+    run_script(BUILD_HEALTH, "--root", "--out", out,
+               "--map", repo.path / "docs/code-overview.json", "--findings", report,
+               "--repo", repo.path, "--name", "whole", "--doctor", "python-code-doctor")
+    meta = read_meta(out)
+    assert meta["findings_total"] == 2, "both whole-project findings are in scope"
+    assert meta["findings_out_of_scope"] == 0
+    assert meta["grade"] != "A+", "a repo with no tests and no manifest is not flawless"
+
+
+def test_a_companions_crashed_detector_does_not_ungrade_this_doctor(run_script, sized_repo,
+                                                                    tmp_path):
+    """A TypeScript failure must not ungrade a Python package's Security."""
+    python = tmp_path / "py.json"
+    python.write_text(json.dumps(full_report([])))
+    typescript = tmp_path / "ts.json"
+    typescript.write_text(json.dumps({
+        "meta": {"analyzers_run": ["tsconfig", "complexity"],
+                 "analyzer_errors": {"tsconfig": "crashed"}, "analyzers_skipped": []},
+        "categories": {"tsconfig": {"issues": []}, "complexity": {"issues": []}},
+    }))
+    out = sized_repo.path / "h.html"
+    run_script(BUILD_HEALTH, "--out", out, "--findings", python, "--findings", typescript,
+               "--repo", sized_repo.path, "--name", "app", "--root-dir", "src/app",
+               "--doctor", "python-code-doctor")
+    assert read_meta(out)["ungraded"] == [], (
+        "the Python security detector completed; another language's crash is not its gap"
+    )
+
+
+def test_a_skipped_detector_still_ungrades_within_its_own_report(run_script, sized_repo,
+                                                                 tmp_path):
+    """Per-report resolution must not weaken the same-report subtraction."""
+    report = tmp_path / "py.json"
+    report.write_text(json.dumps({
+        "meta": {"analyzers_run": [a for a in FULL_RUN if a != "security"],
+                 "analyzer_errors": {}, "analyzers_skipped": ["security"]},
+        "categories": {"findings": {"issues": []}},
+    }))
+    out = sized_repo.path / "h.html"
+    run_script(BUILD_HEALTH, "--out", out, "--findings", report, "--repo", sized_repo.path,
+               "--name", "app", "--root-dir", "src/app", "--doctor", "python-code-doctor")
+    assert "security" in read_meta(out)["ungraded"]
+
+
+def test_an_empty_tree_is_ungraded_rather_than_flawless(run_script, repo):
+    """The LOC floor turns nothing into 1000 lines, and a clean report into an A+."""
+    repo.write("src/app/thing.py", "x = 1\n")
+    repo.commit("init")
+    report = repo.path / "f.json"
+    report.write_text(json.dumps(full_report([])))
+    out = repo.path / "h.html"
+    result = run_script(BUILD_HEALTH, "--out", out, "--findings", report,
+                        "--repo", repo.path, "--name", "gone", "--root-dir", "src/vanished",
+                        "--doctor", "python-code-doctor")
+    meta = read_meta(out)
+    assert meta["score"] is None, "a package that is not there cannot be graded"
+    assert meta["missing_roots"] == ["src/vanished"]
+    assert "nothing to grade" in result.stderr
+
+
+def test_an_ungraded_page_can_be_built_with_no_findings_at_all(run_script, sized_repo):
+    """The documented answer for Go or Rust: a health page with nothing graded.
+
+    There is no findings artifact for a language no doctor covers, and the
+    skill says not to invent one — so requiring --findings made the documented
+    option impossible to follow.
+    """
+    out = sized_repo.path / "h.html"
+    result = run_script(BUILD_HEALTH, "--out", out, "--repo", sized_repo.path,
+                        "--name", "svc", "--root-dir", "src/app", "--language", "go")
+    meta = read_meta(out)
+    assert meta["score"] is None
+    assert len(meta["ungraded"]) == 7
+    assert meta["findings_total"] == 0
+    assert "no findings were supplied" in result.stderr

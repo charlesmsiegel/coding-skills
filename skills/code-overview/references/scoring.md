@@ -56,6 +56,12 @@ Three properties worth knowing:
   means very small units are graded gently, which is the correct bias: there is
   not enough evidence to grade them harshly.
 
+Severities are folded to `high`/`medium`/`low` as each report is read, anything
+else becoming `medium`. The weight table lowercases but every count, icon, sort
+and metadata field matches the token exactly, so an unnormalized `"High"` moved
+the grade like a high while being reported as zero highs. `--covers` invites
+producers this skill has never seen, so this cannot be left to convention.
+
 Blank lines are excluded from LOC; comments are not. Per-language comment
 stripping is a parser's job, and the number only has to be stable enough to
 divide by.
@@ -97,9 +103,18 @@ For `django-code-doctor` alone that is:
 (no duplication — it has no such detector). The recommended Python+Django merge
 needs no flag: the Python report is a full envelope and supplies the evidence.
 
-A rubric category usually has several detectors behind it, and the subtraction is
-deliberately all-or-nothing: skipping `exception_issues` ungrades **Correctness**
-even though `mutation_hazards` ran. A partly-measured category can only ever miss
+**Each report is resolved on its own, then the results are unioned.** Both halves
+matter. Per report, because a failure belongs to the run it happened in — the
+workflow hands every findings file to every package, so a mixed repo passes a
+Python report and a TypeScript one side by side, and a crashed `tsconfig`
+analyzer (which maps to Security) was ungrading Security on a Python package
+whose own security detector had completed cleanly. Unioned, because a category
+one report skipped and another measured *is* measured; that is what makes
+companion doctors add up.
+
+Within a report, a rubric category usually has several detectors behind it, and
+the subtraction is deliberately all-or-nothing: skipping `exception_issues`
+ungrades **Correctness** even though `mutation_hazards` ran. A partly-measured category can only ever miss
 findings, never invent them, so grading it would systematically flatter the code —
 and "mostly measured" is not a thing the score can express.
 
@@ -242,11 +257,23 @@ Two mechanisms keep them aligned:
   order runs `--root` *after* the package pages exist; run before them, there is
   nothing to narrow by, so it falls back to every doctored package and says so.
 
-  One exception, in `--root` mode only: findings about files sitting **directly
-  in the repo root** — `tsconfig.json`, the root manifest, a settings file — are
-  kept. They describe the whole tree rather than any package, and the repo grade
-  is documented to include repo-wide findings. An unmapped *directory* is still
-  out; the exception is for configuration, not for code the user excluded.
+  One exception, in `--root` mode only: **repo-wide findings** are kept. Two
+  shapes qualify. Files sitting directly in the repo root — `tsconfig.json`, the
+  root manifest, a settings file — describe the whole tree rather than any
+  package. And findings reported against the **repo root directory itself**:
+  `find_untested_modules.py` emits `no_tests_in_repo` and
+  `find_dependency_issues.py` emits `no_dependency_manifest` with
+  `file=str(root)`, because there is no single file to blame. Requiring a *file*
+  dropped both — high severity, and about the project as a whole — so a repo with
+  no tests and no manifest rolled up to **A+**. An unmapped *sub*directory is
+  still out; the exception is for the repository, not for code the user excluded.
+
+- **An empty measurement is never a grade.** If the roots resolve to zero source
+  files, nothing was examined and every category is ungraded. Without this the
+  1000-line floor turned an empty tree into a confident denominator, and a clean
+  report over a root that had been renamed away scored A+ for code that was not
+  there. `--loc`/`--files` are the caller asserting a size this script cannot
+  see, and are left alone.
 
 ## Mapping a finding to a category
 

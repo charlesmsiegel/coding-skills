@@ -271,3 +271,33 @@ def test_a_package_claiming_the_repo_docs_directory_is_rejected(run_script, repo
     repo.commit("init")
     result = run(run_script, repo, expect_rc=1)
     assert "repository's own docs directory" in result.stderr
+
+
+def test_a_map_path_outside_the_repository_is_rejected(run_script, repo):
+    """Every path in the map is repo-relative, and the scripts resolve it that way.
+
+    A `..` escape or an absolute path reaches outside the checkout — sizing
+    would measure someone else's code, and this script would rewrite the three
+    documents wherever `docs` pointed.
+    """
+    repo.write("docs/code-overview.json", json.dumps({
+        "schema": "code-overview/1",
+        "packages": [{"name": "evil", "roots": ["../elsewhere"], "docs": "../elsewhere/docs"}],
+    }))
+    for kind in KINDS:
+        repo.write(f"docs/{kind}.html", page(kind))
+    repo.commit("init")
+    result = run(run_script, repo, expect_rc=1)
+    assert "outside the repository" in result.stderr
+
+
+def test_an_absolute_map_path_is_rejected(run_script, repo, tmp_path):
+    repo.write("docs/code-overview.json", json.dumps({
+        "schema": "code-overview/1",
+        "packages": [{"name": "abs", "roots": [str(tmp_path)], "docs": str(tmp_path / "docs")}],
+    }))
+    for kind in KINDS:
+        repo.write(f"docs/{kind}.html", page(kind))
+    repo.commit("init")
+    result = run(run_script, repo, expect_rc=1)
+    assert "outside the repository" in result.stderr

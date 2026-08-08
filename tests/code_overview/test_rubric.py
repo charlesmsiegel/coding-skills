@@ -171,3 +171,31 @@ def test_keyword_prefixes_still_cover_their_family(rubric):
     }
     for token, category in expected.items():
         assert rubric.categorize({"type": token}) == (category, True), token
+
+
+def test_severity_is_normalized_before_it_is_counted(load_module):
+    """`severity_weight` lowercases; every counter, icon and sort matches exactly.
+
+    So `"High"` was charged the full ten-point weight while being reported as
+    zero high findings and ranked among the mediums — moving the grade like a
+    high and reading like a medium.
+    """
+    common = load_module(SCRIPTS, "common")
+    assert common.normalize_severity("High") == "high"
+    assert common.normalize_severity("HIGH") == "high"
+    assert common.normalize_severity(" low ") == "low"
+    for unusable in (None, "", "critical", 3):
+        assert common.normalize_severity(unusable) == "medium", unusable
+    report = common.normalize_findings([{"file": "a.py", "line": 1, "severity": "High"}])
+    assert report["findings"][0]["severity"] == "high"
+
+
+def test_bin_is_measured_rather_than_skipped(load_module):
+    """python-code-doctor treats bin/ as an entrypoint directory and reports from it.
+
+    Skipping it kept those findings in the numerator while dropping their lines
+    from the denominator, which can only push a grade down.
+    """
+    common = load_module(SCRIPTS, "common")
+    assert "bin" not in common.SKIP_DIRS
+    assert "obj" in common.SKIP_DIRS, ".NET build output holds no source extensions anyway"
