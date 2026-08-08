@@ -94,6 +94,30 @@ DETECTOR_CATEGORIES = {
     "unpythonic": "hygiene",
 }
 
+# code-doctor's own detector registry (`analyze_all.DETECTORS`) uses its own
+# tokens, and those are what reach a grader as `analyzers_run`. They were
+# absent from the table above, so every one of them failed to resolve and
+# `DOCTOR_COVERAGE["code-doctor"]` — which caps what the raw layer may claim —
+# was never reached at all: unreachable dead data, and a code-doctor report
+# that graded nothing.
+#
+# One token, one rubric category, deliberately the *narrowest* honest one. The
+# hygiene detector also emits `merge_conflict_marker` (Correctness) and
+# `commented_out_code` (Duplication), but a detector that can prove one defect
+# in a category has not measured that category, and crediting it would be the
+# free 100 this rubric exists to refuse. Individual findings still categorize
+# by their own smell type — see SMELL_TYPE_CATEGORIES — so a merge marker is
+# still *reported* under Correctness; it just does not make Correctness graded.
+#
+# `tests/code_doctor/test_merge_reports.py` fails if a detector is added to
+# code-doctor's registry without a row here.
+CODE_DOCTOR_DETECTORS = {
+    "hygiene": "hygiene",
+    "secrets": "security",
+}
+
+DETECTOR_CATEGORIES.update(CODE_DOCTOR_DETECTORS)
+
 # django-code-doctor emits one flat list with no `category` field, so its
 # finding types are mapped by name. Grouped by the detector they come from,
 # because that is how they are maintained upstream.

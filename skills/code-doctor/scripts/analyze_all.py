@@ -87,14 +87,21 @@ def main() -> int:
     selected = [c for c in DETECTORS if c not in skip and (not only or c in only)]
 
     findings: list[Finding] = []
-    failures: list[str] = []
+    # Keyed by category, not by script filename. The failure and the coverage
+    # claim have to be reconcilable by whoever reads the report: a consumer
+    # holding `categories_run` and a `detectors_failed` string full of
+    # `find_hygiene_issues.py` had no way to line the two up, so it could not
+    # tell which category the failure actually cost it.
+    failures: dict[str, str] = {}
+    completed: list[str] = []
     merged_notes: dict[str, str] = {}
     rejected: dict[str, list[str]] = {}
     for category in selected:
         found, notes, error = run_detector(DETECTORS[category], Path(args.path), args.ignore)
         if error:
-            failures.append(error)
+            failures[category] = error
             continue
+        completed.append(category)
         # Reconstruct here, while the category is still known. Finding's
         # __post_init__ re-validates, so one malformed record from a buggy
         # detector fails that category instead of aborting the whole report
@@ -107,13 +114,24 @@ def main() -> int:
         for label, note in notes.items():
             merged_notes[f"{category}.{label}"] = note
 
-    completeness = {
-        "categories_run": ", ".join(selected) or "none",
-        "categories_skipped": ", ".join(sorted(set(DETECTORS) - set(selected))) or "none",
+    # Lists and a mapping, not comma-joined strings. `merge_reports.py` reads
+    # `categories_run` as a list and fell through to `coverage_unknown` on
+    # every real code-doctor report because a string is not one — so the raw
+    # layer's coverage never reached a grader at all. One representation, and
+    # it is the one the consumer already required.
+    #
+    # `categories_run` means ran AND completed. A category whose detector
+    # crashed is in `categories_failed` and nowhere else: listing it as run
+    # would hand a grader a category with zero findings and no evidence that
+    # anything looked, which is the "graded from silence" outcome this whole
+    # seam exists to prevent.
+    completeness: dict = {
+        "categories_run": completed,
+        "categories_skipped": sorted(set(DETECTORS) - set(selected)),
     }
     completeness.update(merged_notes)
     if failures:
-        completeness["detectors_failed"] = "; ".join(failures)
+        completeness["categories_failed"] = dict(sorted(failures.items()))
     for category, errors in rejected.items():
         completeness[f"{category}.records_rejected"] = (
             f"{len(errors)} record(s) did not satisfy the findings schema and were "

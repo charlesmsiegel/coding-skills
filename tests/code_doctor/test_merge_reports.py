@@ -71,26 +71,33 @@ def test_candidates_are_separated_from_findings_by_kind(run_script, tmp_path):
 
 
 def test_a_specialist_envelope_keeps_its_coverage_evidence(run_script, tmp_path):
+    """The tokens here are python-code-doctor's real `analyzers_run` names.
+
+    They are the keys of its `ANALYZERS` table — `security`, `duplicates`,
+    `complexity`, `type_gaps` — not the script filenames. The filenames this
+    fixture used to carry (`find_security_issues`, `find_duplicates`) are
+    tokens no doctor emits and none that `rubric.DETECTOR_CATEGORIES` resolves,
+    so the fixture agreed with nothing on either side of the seam.
+    """
     report = write_json(tmp_path / "py.json", {
-        "meta": {"analyzers_run": ["find_security_issues", "find_duplicates"],
-                 "analyzer_errors": {"find_complexity": "timed out"},
-                 "analyzers_skipped": ["find_type_gaps"]},
+        "meta": {"analyzers_run": ["security", "duplicates"],
+                 "analyzer_errors": {"complexity": "timed out"},
+                 "analyzers_skipped": ["type_gaps"]},
         "categories": {"security": {"issues": [{"file": "s.py", "line": 3,
                                                 "issue_type": "hardcoded_secret"}]}},
     })
 
     envelope = merge(run_script, ("python-code-doctor", report))
 
-    assert envelope["analyzers_run"]["python-code-doctor"] == [
-        "find_security_issues", "find_duplicates"]
-    assert envelope["analyzer_errors"]["python-code-doctor"] == {"find_complexity": "timed out"}
-    assert envelope["analyzers_skipped"]["python-code-doctor"] == ["find_type_gaps"]
+    assert envelope["analyzers_run"]["python-code-doctor"] == ["security", "duplicates"]
+    assert envelope["analyzer_errors"]["python-code-doctor"] == {"complexity": "timed out"}
+    assert envelope["analyzers_skipped"]["python-code-doctor"] == ["type_gaps"]
     assert envelope["coverage_unknown"] == []
 
 
 def test_a_category_shaped_report_stamps_its_section_name_on_each_issue(run_script, tmp_path):
     report = write_json(tmp_path / "py.json", {
-        "meta": {"analyzers_run": ["find_security_issues"]},
+        "meta": {"analyzers_run": ["security"]},
         "categories": {"security": {"issues": [{"file": "s.py", "line": 3,
                                                 "issue_type": "hardcoded_secret"}]}},
     })
@@ -181,16 +188,96 @@ def test_text_output_names_the_doctors_and_the_failures(run_script, tmp_path):
     assert "failed" in result.stdout.lower()
 
 
-def test_windows_path_with_drive_letter_is_not_mistaken_for_the_label(run_script, tmp_path):
+def test_windows_path_with_drive_letter_is_not_mistaken_for_the_label(load_module):
     """A Windows path like C:\\work\\py.json contains a colon of its own.
 
     partition(":") on "code-doctor:C:\\work\\py.json" must split on the FIRST
     colon (after the label), leaving the drive letter as part of the path —
     not treat "C" as the label.
+
+    The drive letter is hard-coded rather than taken from `tmp_path`. It only
+    happened to be exercised at all because this suite's `tmp_path` starts
+    `C:\\` on the machine it was written on; on POSIX CI the argument had no
+    colon in it and the test asserted nothing about drive letters. The parser
+    is pure string handling, so it is tested directly and the path never has
+    to exist.
     """
-    report = write_json(tmp_path / "py.json", [{"file": "a.py", "line": 1, "smell_type": "x"}])
+    module = load_module(SCRIPT.parent, "merge_reports")
 
-    envelope = merge(run_script, ("code-doctor", report))
+    doctor, path = module._parse_report_argument(r"code-doctor:C:\work\py.json")
 
-    assert envelope["doctors_run"] == ["code-doctor"]
-    assert len(envelope["findings"]) == 1
+    assert doctor == "code-doctor"
+    assert str(path) == r"C:\work\py.json"
+
+
+# --------------------------------------------------------------------------
+# the seam: analyze_all.py's real output, through merge_reports.py, to the
+# rubric that has to resolve its tokens
+# --------------------------------------------------------------------------
+
+ANALYZE_ALL = SKILL / "scripts" / "analyze_all.py"
+RUBRIC_DIR = (Path(__file__).resolve().parent.parent.parent / "skills" / "code-overview"
+              / "scripts")
+
+
+def test_analyze_alls_own_output_resolves_to_coverage(run_script, repo, tmp_path, load_module):
+    """The producer's real bytes, fed to the consumer, must grant coverage.
+
+    Every part of this seam was tested before — with hand-built fixtures on
+    both sides — and every part passed while the seam itself was broken end to
+    end: analyze_all emitted `categories_run` as a comma-joined string,
+    merge_reports required a list, so a real code-doctor report always landed
+    in `coverage_unknown` and granted a grader nothing. Nothing hand-built can
+    catch that, because a hand-built fixture is written to match whichever side
+    the author was looking at.
+
+    The last hop is the rubric's: a token that survives the merge but resolves
+    to no rubric category is coverage that still buys nothing, which is how
+    `DOCTOR_COVERAGE["code-doctor"]` stayed unreachable.
+    """
+    repo.write("app.go", "package main\n")
+    repo.commit()
+    raw = tmp_path / "raw.json"
+    raw.write_text(run_script(ANALYZE_ALL, repo.path, "--format", "json").stdout,
+                   encoding="utf-8")
+
+    envelope = merge(run_script, ("code-doctor", raw))
+
+    assert envelope["coverage_unknown"] == [], (
+        "a real code-doctor report says what ran; it is not a bare list"
+    )
+    assert envelope["analyzers_run"]["code-doctor"] == ["hygiene", "secrets"]
+
+    rubric = load_module(RUBRIC_DIR, "rubric")
+    resolved = {rubric.DETECTOR_CATEGORIES[token]
+                for token in envelope["analyzers_run"]["code-doctor"]
+                if token in rubric.DETECTOR_CATEGORIES}
+    assert resolved == {"hygiene", "security"}, (
+        "every token code-doctor emits must resolve to a rubric category, or the coverage "
+        "it just proved buys nothing"
+    )
+    assert resolved <= rubric.DOCTOR_COVERAGE["code-doctor"], (
+        "and it must stay inside the profile that caps what the raw layer may claim"
+    )
+    assert "correctness" not in resolved, (
+        "a merge marker is the only correctness-class defect the raw layer can prove"
+    )
+
+
+def test_every_registered_detector_has_a_rubric_category(load_module):
+    """A detector added to code-doctor's registry with no rubric row is silent.
+
+    `build_health.py` resolves coverage with a membership test, so an
+    unrecognised token is skipped rather than reported: the new detector would
+    run, find things, and grant no coverage at all — the category it measures
+    coming back ungraded with nothing anywhere saying why.
+    """
+    analyze_all = load_module(ANALYZE_ALL.parent, "analyze_all")
+    rubric = load_module(RUBRIC_DIR, "rubric")
+
+    unmapped = sorted(set(analyze_all.DETECTORS) - set(rubric.DETECTOR_CATEGORIES))
+
+    assert not unmapped, (
+        f"{unmapped} are code-doctor detector categories with no row in "
+        "rubric.DETECTOR_CATEGORIES, so the coverage they report resolves to nothing"
+    )

@@ -111,7 +111,18 @@ def read_report(path: Path) -> dict:
         # actually completed. Leaving it None routes the doctor to
         # coverage_unknown, which is the honest answer.
         ran = report["completeness"].get("categories_run")
-        report["analyzers_run"] = sorted(ran) if isinstance(ran, list) else None
+        report["analyzers_run"] = sorted(str(name) for name in ran) if isinstance(ran, list) else None
+        # The other two halves of the same inventory. Without them a category
+        # analyze_all deselected or whose detector crashed reached a grader as
+        # merely *absent* from `categories_run` — indistinguishable from a
+        # category this doctor has never had a detector for, and impossible to
+        # attribute back to the run that lost it.
+        skipped = report["completeness"].get("categories_skipped")
+        if isinstance(skipped, list):
+            report["analyzers_skipped"] = sorted(str(name) for name in skipped)
+        failed = report["completeness"].get("categories_failed")
+        if isinstance(failed, dict):
+            report["analyzer_errors"] = {str(k): str(v) for k, v in failed.items()}
         return report
 
     if isinstance(data.get("issues"), list):
