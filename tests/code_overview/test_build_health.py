@@ -1017,7 +1017,7 @@ def test_an_empty_tree_is_ungraded_rather_than_flawless(run_script, repo):
     meta = read_meta(out)
     assert meta["score"] is None, "a package that is not there cannot be graded"
     assert meta["missing_roots"] == ["src/vanished"]
-    assert "nothing to grade" in result.stderr
+    assert "no longer describe the same code" in result.stderr
 
 
 def test_an_ungraded_page_can_be_built_with_no_findings_at_all(run_script, sized_repo):
@@ -1035,3 +1035,116 @@ def test_an_ungraded_page_can_be_built_with_no_findings_at_all(run_script, sized
     assert len(meta["ungraded"]) == 7
     assert meta["findings_total"] == 0
     assert "no findings were supplied" in result.stderr
+
+
+def test_a_foreign_doctors_report_grants_no_coverage(run_script, sized_repo, tmp_path):
+    """A successful foreign report is as wrong a source of coverage as a failed one.
+
+    With only a TypeScript report present, a Python package graded Security 100
+    off `tsconfig`. The doctor-profile cap cannot catch this — both doctors
+    cover the same rubric categories — so the report has to say who wrote it.
+    """
+    typescript = tmp_path / "ts.json"
+    typescript.write_text(json.dumps({
+        "meta": {"analyzers_run": ["tsconfig", "complexity"],
+                 "analyzer_errors": {}, "analyzers_skipped": []},
+        "categories": {"tsconfig": {"issues": []}, "complexity": {"issues": []}},
+    }))
+    out = sized_repo.path / "h.html"
+    result = run_script(BUILD_HEALTH, "--out", out,
+                        "--findings", f"typescript-code-doctor:{typescript}",
+                        "--repo", sized_repo.path, "--name", "app", "--root-dir", "src/app",
+                        "--doctor", "python-code-doctor")
+    meta = read_meta(out)
+    assert meta["score"] is None, "no Python analyzer examined this package"
+    assert len(meta["ungraded"]) == 7
+    assert "different doctor" in result.stderr
+
+
+def test_an_unlabelled_report_is_still_attributed_to_the_named_doctor(run_script, sized_repo):
+    """The ordinary single-doctor run must not need the label."""
+    meta = read_meta(build(run_script, sized_repo, []))
+    assert meta["score"] == 100.0
+
+
+def test_a_doctor_label_does_not_swallow_a_path(run_script, sized_repo, tmp_path):
+    """Only a prefix naming a known doctor is a label; a path stays a path."""
+    weird = tmp_path / "notadoctor.json"
+    weird.write_text(json.dumps(full_report([])))
+    out = sized_repo.path / "h.html"
+    run_script(BUILD_HEALTH, "--out", out, "--findings", weird, "--repo", sized_repo.path,
+               "--name", "app", "--root-dir", "src/app", "--doctor", "python-code-doctor")
+    assert read_meta(out)["score"] == 100.0
+
+
+def test_the_django_merge_sizes_templates_from_the_companion_report(run_script, repo):
+    """--doctor caps coverage; it does not say which doctors contributed.
+
+    The recommended merge names python-code-doctor while a Django report sits
+    beside it carrying the templates that belong in the denominator.
+    """
+    repo.write("app/views.py", "\n".join(f"v{i}=1" for i in range(400)))
+    for page in range(8):
+        repo.write(f"app/templates/t{page}.html", "\n".join(f"<p>{i}</p>" for i in range(400)))
+    repo.commit("init")
+    python = repo.path / "py.json"
+    python.write_text(json.dumps(full_report(
+        [finding(file="app/views.py", category="security", severity="high", line=3)])))
+    django = repo.path / "dj.json"
+    django.write_text(json.dumps([]))          # a clean Django run is a bare list
+    out = repo.path / "h.html"
+    run_script(BUILD_HEALTH, "--out", out, "--findings", python,
+               "--findings", f"django-code-doctor:{django}", "--repo", repo.path,
+               "--name", "app", "--root-dir", "app", "--doctor", "python-code-doctor")
+    meta = read_meta(out)
+    assert ".html" in meta["sized_extensions"]
+    assert meta["size"]["loc"] > 3000, "the analyzed templates are in the divisor"
+
+
+def test_any_missing_root_ungrades_a_multi_root_package(run_script, repo):
+    """One surviving root still measures files, so a zero-files test missed this."""
+    for module in range(4):
+        repo.write(f"src/app/m{module}.py", "\n".join(f"x{i} = {i}" for i in range(300)))
+    repo.commit("init")
+    report = repo.path / "f.json"
+    report.write_text(json.dumps(full_report([])))
+    out = repo.path / "h.html"
+    run_script(BUILD_HEALTH, "--out", out, "--findings", report, "--repo", repo.path,
+               "--name", "app", "--root-dir", "src/app", "--root-dir", "shared/types",
+               "--doctor", "python-code-doctor")
+    meta = read_meta(out)
+    assert meta["missing_roots"] == ["shared/types"]
+    assert meta["score"] is None, (
+        "half the package was sized while all of it was searched for findings"
+    )
+
+
+def test_unassigned_root_level_source_is_out_of_the_root_grade(run_script, repo):
+    """Its lines are excluded from the denominator, so its findings must go too.
+
+    The repo-wide exception is for configuration that belongs to no package —
+    not for source the user deliberately left out of the map.
+    """
+    for module in range(4):
+        repo.write(f"src/app/m{module}.py", "\n".join(f"x{i} = {i}" for i in range(300)))
+    repo.write("loose.py", "\n".join(f"y{i} = {i}" for i in range(200)))
+    repo.write("tsconfig.json", "{}\n")
+    repo.write("docs/code-overview.json", json.dumps({
+        "schema": "code-overview/1",
+        "packages": [{"name": "app", "roots": ["src/app"], "docs": "src/app/docs",
+                      "language": "python", "doctor": "python-code-doctor"}],
+    }))
+    repo.commit("init")
+    report = repo.path / "f.json"
+    report.write_text(json.dumps(full_report([
+        finding(file="loose.py", category="security", severity="high", line=3),
+        finding(file="tsconfig.json", category="security", severity="high", line=1),
+    ])))
+    out = repo.path / "docs/health.html"
+    run_script(BUILD_HEALTH, "--root", "--out", out,
+               "--map", repo.path / "docs/code-overview.json", "--findings", report,
+               "--repo", repo.path, "--name", "whole", "--doctor", "python-code-doctor")
+    meta = read_meta(out)
+    assert meta["roots"] == ["src/app"]
+    assert meta["findings_total"] == 1, "the config finding stays, the loose source goes"
+    assert meta["top_findings"][0]["file"] == "tsconfig.json"

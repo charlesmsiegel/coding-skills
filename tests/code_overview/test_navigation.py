@@ -301,3 +301,41 @@ def test_an_absolute_map_path_is_rejected(run_script, repo, tmp_path):
     repo.commit("init")
     result = run(run_script, repo, expect_rc=1)
     assert "outside the repository" in result.stderr
+
+
+def test_url_delimiters_in_a_docs_path_are_percent_encoded(run_script, repo):
+    """An href is a URL, not a path. `a#b` unencoded makes the rest a fragment.
+
+    The browser would navigate to the wrong document while a checker resolving
+    the literal string against the filesystem found the file and called the set
+    healthy — wrong in both directions at once.
+    """
+    repo.write("docs/code-overview.json", json.dumps({
+        "schema": "code-overview/1",
+        "packages": [{"name": "ab", "roots": ["a#b"], "docs": "a#b/docs"}],
+    }))
+    for kind in KINDS:
+        repo.write(f"docs/{kind}.html", page(kind))
+        repo.write(f"a#b/docs/{kind}.html", page(kind))
+    repo.commit("init")
+    run(run_script, repo)
+    text = (repo.path / "docs/summary.html").read_text()
+    assert "a%23b" in text, "the fragment delimiter has to be encoded"
+    assert 'href="../a#b' not in text
+    result = run(run_script, repo, "--check")
+    assert "BROKEN LINK" not in result.stderr, (
+        "and the gate has to decode it again before touching the filesystem"
+    )
+
+
+def test_scalar_roots_in_a_map_are_rejected(run_script, repo):
+    """`"roots": "src/api"` iterates character by character; docs became `s/docs`."""
+    repo.write("docs/code-overview.json", json.dumps({
+        "schema": "code-overview/1",
+        "packages": [{"name": "api", "roots": "src/api"}],
+    }))
+    for kind in KINDS:
+        repo.write(f"docs/{kind}.html", page(kind))
+    repo.commit("init")
+    result = run(run_script, repo, expect_rc=1)
+    assert "non-empty list" in result.stderr

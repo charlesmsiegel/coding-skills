@@ -103,14 +103,22 @@ For `django-code-doctor` alone that is:
 (no duplication — it has no such detector). The recommended Python+Django merge
 needs no flag: the Python report is a full envelope and supplies the evidence.
 
-**Each report is resolved on its own, then the results are unioned.** Both halves
-matter. Per report, because a failure belongs to the run it happened in — the
-workflow hands every findings file to every package, so a mixed repo passes a
-Python report and a TypeScript one side by side, and a crashed `tsconfig`
-analyzer (which maps to Security) was ungrading Security on a Python package
-whose own security detector had completed cleanly. Unioned, because a category
-one report skipped and another measured *is* measured; that is what makes
-companion doctors add up.
+**A report only speaks for the doctor that produced it**, named by labelling the
+file `--findings <doctor>:<path>`. Nothing inside a report identifies its author,
+and the workflow hands every report to every package, so without the label a
+foreign report is read as evidence about this package: with only a TypeScript
+report present, a Python package graded Security **100** off `tsconfig`. The
+doctor-profile cap cannot catch that, because both doctors cover the same rubric
+categories. An unlabelled report is attributed to `--doctor`, which is right for
+the ordinary single-doctor run and why the label is only required when more than
+one doctor's findings are passed.
+
+**Each report is then resolved on its own, and the results are unioned.** Both
+halves matter. Per report, because a failure belongs to the run it happened in —
+a crashed `tsconfig` analyzer was ungrading Security on a Python package whose
+own security detector had completed cleanly. Unioned, because a category one
+report skipped and another measured *is* measured; that is what makes companion
+doctors add up.
 
 Within a report, a rubric category usually has several detectors behind it, and
 the subtraction is deliberately all-or-nothing: skipping `exception_issues`
@@ -205,9 +213,13 @@ Python lines alone makes a template-heavy package look far worse than it is.
 So the denominator's extension set is derived from **what the analysis reached**,
 which two signals report:
 
-- **The doctor parses markup.** `rubric.DOCTORS_ANALYZING_TEMPLATES` names them —
-  `django-code-doctor` reads templates on every run, so its template lines are in
-  the denominator whether or not any of them was faulty.
+- **A contributing doctor parses markup.** `rubric.DOCTORS_ANALYZING_TEMPLATES`
+  names them — `django-code-doctor` reads templates on every run, so its template
+  lines are in the denominator whether or not any of them was faulty.
+  *Contributing* means every doctor that supplied a report, read from the
+  `--findings <doctor>:<path>` labels — not just the one `--doctor` names. That
+  flag caps coverage, and reading it as the whole story left a clean Django run's
+  templates out of the divisor in this skill's own recommended merge.
 - **A finding points at one.** This still catches what a doctor profile cannot
   know: an unrecognized `--doctor`, or a third-party tool declared via `--covers`.
 
@@ -258,9 +270,15 @@ Two mechanisms keep them aligned:
   nothing to narrow by, so it falls back to every doctored package and says so.
 
   One exception, in `--root` mode only: **repo-wide findings** are kept. Two
-  shapes qualify. Files sitting directly in the repo root — `tsconfig.json`, the
-  root manifest, a settings file — describe the whole tree rather than any
-  package. And findings reported against the **repo root directory itself**:
+  shapes qualify. Non-source files sitting directly in the repo root —
+  `tsconfig.json`, the root manifest, a CI config — describe the whole tree
+  rather than any package, and contribute no lines to any denominator, so
+  keeping them costs nothing. A root-level *source* file is not kept unless `.`
+  is itself mapped: a `loose.py` the user left unassigned is code they chose not
+  to grade, and counting its findings while its lines stay out of the divisor is
+  the same asymmetry pointed the other way — it penalizes the repo for code
+  outside the scope its own map defines. And findings reported against the
+  **repo root directory itself**:
   `find_untested_modules.py` emits `no_tests_in_repo` and
   `find_dependency_issues.py` emits `no_dependency_manifest` with
   `file=str(root)`, because there is no single file to blame. Requiring a *file*
@@ -268,12 +286,14 @@ Two mechanisms keep them aligned:
   no tests and no manifest rolled up to **A+**. An unmapped *sub*directory is
   still out; the exception is for the repository, not for code the user excluded.
 
-- **An empty measurement is never a grade.** If the roots resolve to zero source
-  files, nothing was examined and every category is ungraded. Without this the
-  1000-line floor turned an empty tree into a confident denominator, and a clean
-  report over a root that had been renamed away scored A+ for code that was not
-  there. `--loc`/`--files` are the caller asserting a size this script cannot
-  see, and are left alone.
+- **A partial measurement is never a grade.** If *any* configured root is missing,
+  or the roots resolve to zero source files, every category is ungraded. Without
+  this the 1000-line floor turned an empty tree into a confident denominator, and
+  a clean report over a root that had been renamed away scored A+ for code that
+  was not there. One missing root out of several is the same problem and harder
+  to see: the surviving roots still measure files, so the page was sized over
+  part of the package while the findings covered all of it. `--loc`/`--files` are
+  the caller asserting a size this script cannot see, and are left alone.
 
 ## Mapping a finding to a category
 

@@ -199,3 +199,30 @@ def test_bin_is_measured_rather_than_skipped(load_module):
     common = load_module(SCRIPTS, "common")
     assert "bin" not in common.SKIP_DIRS
     assert "obj" in common.SKIP_DIRS, ".NET build output holds no source extensions anyway"
+
+
+def test_an_explicitly_empty_analyzers_run_is_believed(load_module):
+    """`"analyzers_run": []` says nothing ran; it is not a missing field.
+
+    Treating it as falsy substituted the category keys, so a report that had
+    initialized empty sections and completed no analyzers graded them clean.
+    """
+    common = load_module(SCRIPTS, "common")
+    empty = common.normalize_findings({
+        "meta": {"analyzers_run": [], "analyzer_errors": {}, "analyzers_skipped": []},
+        "categories": {"security": {"issues": []}, "complexity": {"issues": []}},
+    })
+    assert empty["ran"] == set()
+    absent = common.normalize_findings({
+        "meta": {"analyzer_errors": {}},
+        "categories": {"security": {"issues": []}},
+    })
+    assert absent["ran"] == {"security"}, "an absent key still falls back to the sections"
+
+
+def test_only_a_known_doctor_prefix_is_read_as_a_label(load_module):
+    common = load_module(SCRIPTS, "common")
+    assert common.split_doctor_label("django-code-doctor:dj.json") == (
+        "django-code-doctor", "dj.json")
+    assert common.split_doctor_label("reports/x.json") == ("", "reports/x.json")
+    assert common.split_doctor_label("C:/reports/x.json") == ("", "C:/reports/x.json")

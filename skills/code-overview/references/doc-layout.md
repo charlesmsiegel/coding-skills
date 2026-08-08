@@ -44,8 +44,11 @@ read by every later script:
 ```
 
 `roots` is a list because a unit is not always a directory: a Django app and its
-templates, a service and the shared types only it uses. **Every path is
-repo-relative, and that is enforced** — an absolute path or a `..` escape is
+templates, a service and the shared types only it uses. It must **be** a list
+even with one entry — `["src/api"]`, never `"src/api"` — because every consumer
+iterates it, and a bare string is taken apart character by character: the docs
+path became `s/docs` and each letter its own scoring root. `load_map` rejects it.
+**Every path is repo-relative, and that is enforced** — an absolute path or a `..` escape is
 rejected by `load_map`. The scripts all resolve these as `repo / path`, so a path
 that leaves the checkout would size the grade over someone else's code and point
 `inject_nav.py` at documents outside the repository to rewrite. `doctor` empty means no doctor ships for that language — the
@@ -96,6 +99,11 @@ Two constraints make it safe to inject into a document this skill did not write:
   correctly in a page shell that has never heard of this skill.
 - **Existence-checked links.** A document that was not generated is not linked.
   A package with no atlas gets a two-item across-row, never a dangling href.
+- **Percent-encoded, then HTML-escaped.** An href is a URL inside HTML and a path
+  is neither. A docs directory named `a#b` emitted literally sends a browser to a
+  fragment of the wrong document, while a checker resolving the same string
+  against the filesystem finds the file and reports the set healthy. `--check`
+  peels both layers off before touching disk.
 
 `--check` reports what would change and validates every href without writing;
 it exits 1 if any link is broken. Run it as the last step of a rebuild.

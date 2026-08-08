@@ -401,19 +401,28 @@ def scoring_roots(args, repo: Path, rolled_up: list[dict] | None = None) -> list
     return ["."]
 
 
-def is_repo_wide(path: str, repo: Path) -> bool:
+def is_repo_wide(path: str, repo: Path, sized_extensions=frozenset()) -> bool:
     """Does this finding describe the repository rather than any one package?
 
     Two shapes qualify, and missing the second one was expensive:
 
-    - **A file directly in the repo root** — `tsconfig.json`, the root manifest,
-      a settings module. It belongs to no package but describes the whole tree.
     - **The repo root itself.** A finding with no single file to point at is
       reported *against the directory*: `find_untested_modules.py` emits
       `no_tests_in_repo` and `find_dependency_issues.py` emits
       `no_dependency_manifest` with `file=str(root)`. Requiring `is_file()` sent
       both — high severity, and about the repo as a whole — out of scope, so a
       project with no tests and no manifest rolled up to a clean **A+**.
+    - **A non-source file directly in the repo root** — `tsconfig.json`, the
+      root manifest, a CI config. It belongs to no package but describes the
+      whole tree, and it contributes no lines to any denominator, so keeping it
+      costs nothing.
+
+    A *source* file directly in the repo root is deliberately excluded unless
+    the repo itself is mapped. `loose.py` that the user left unassigned is code
+    they chose not to grade: counting its findings while `scoring_roots` leaves
+    its lines out is the same numerator/denominator asymmetry as everywhere
+    else, pointed the other way — it penalizes the repo for code outside the
+    scope it defined.
     """
     if not path:
         return False
@@ -424,7 +433,9 @@ def is_repo_wide(path: str, repo: Path) -> bool:
         return False
     if resolved == repo:
         return True
-    return resolved.parent == repo and resolved.is_file()
+    if resolved.parent != repo or not resolved.is_file():
+        return False
+    return resolved.suffix.lower() not in sized_extensions
 
 
 def resolve_coverage(args, reports: list[dict]):
@@ -462,7 +473,24 @@ def resolve_coverage(args, reports: list[dict]):
              "the surviving reports examined.")
         return set()
 
-    evidenced = [report for report in reports if report["shape"] == common.SHAPE_FULL]
+    # A report only speaks for the doctor that produced it. The workflow passes
+    # every findings file to every package, so a package's page routinely sees
+    # reports from doctors that never looked at its language — and a *successful*
+    # foreign report is as wrong a source of coverage as a failed one. With only
+    # a TypeScript report present, a Python package graded Security 100 off
+    # `tsconfig`; the doctor-profile cap could not catch it, because both doctors
+    # cover the same rubric categories. An unlabelled report is attributed to
+    # --doctor, which is right for the ordinary single-doctor run.
+    foreign = [r for r in reports
+               if r["shape"] == common.SHAPE_FULL and r["doctor"] and r["doctor"] != args.doctor]
+    if foreign:
+        warn("these reports were produced by a different doctor than "
+             f"{args.doctor or '(none named)'} and contribute findings but no coverage: "
+             f"{', '.join(sorted({r['doctor'] for r in foreign}))}.")
+
+    evidenced = [report for report in reports
+                 if report["shape"] == common.SHAPE_FULL
+                 and report["doctor"] in ("", args.doctor)]
     if evidenced:
         # Resolve each report on its own, then union. Both halves matter.
         #
@@ -530,6 +558,13 @@ def build(args, reports: list[dict], errors: dict[str, str],
     relative_roots = scoring_roots(args, repo, packages)
     roots = [repo / r for r in relative_roots]
 
+    # Every doctor that contributed a report, for sizing. Not just --doctor:
+    # that flag caps coverage, and the recommended Python+Django merge names
+    # python-code-doctor while a Django report sits beside it carrying the
+    # templates that belong in the denominator.
+    report_doctors = {report["doctor"] for report in reports if report["doctor"]}
+    report_doctors.add(args.doctor)
+
     # A root that vanished between runs measures zero lines, and a clean report
     # over nothing would grade A+ for a package that no longer exists. Map drift
     # is exactly what the re-run workflow anticipates, so it has to be caught.
@@ -554,6 +589,16 @@ def build(args, reports: list[dict], errors: dict[str, str],
     scope = [repo / s for s in (args.scope or relative_roots)]
     out_of_scope = 0
     if scope and [Path(s).resolve() for s in scope] != [repo]:
+        # Which extensions this analysis would put in the denominator, before
+        # the findings-derived part (that would be circular — it is computed
+        # from the scoped findings below). Used only to tell a root-level
+        # *source* file, whose lines are not being measured, from root-level
+        # configuration, whose lines nothing measures anywhere.
+        measured_here = ("." in relative_roots)
+        root_file_exclusions = (frozenset() if measured_here
+                                else common.sizing_extensions([], args.include_extension,
+                                                              report_doctors))
+
         def in_scope(finding: dict) -> bool:
             path = str(finding.get("file", ""))
             if within(path, scope, repo):
@@ -561,8 +606,9 @@ def build(args, reports: list[dict], errors: dict[str, str],
             # The repo grade has to keep findings about the repository itself —
             # root-level configuration, and the whole-project findings reported
             # against the root directory. An unmapped *sub*directory is still
-            # out; the exception is for the repo, not for code the user excluded.
-            return args.root and is_repo_wide(path, repo)
+            # out, and so is unassigned root-level source; the exception is for
+            # the repo, not for code the user chose to leave outside the map.
+            return args.root and is_repo_wide(path, repo, root_file_exclusions)
 
         scoped = []
         for report in reports:
@@ -577,7 +623,7 @@ def build(args, reports: list[dict], errors: dict[str, str],
     # templates. Each override replaces only its own field, so `--files` alone
     # and `--loc` alone both work; coupling them made one silently ignored and
     # the other zero out the count it did not set.
-    extensions = common.sizing_extensions(findings, args.include_extension, args.doctor)
+    extensions = common.sizing_extensions(findings, args.include_extension, report_doctors)
     size = measure(roots, extensions)
     if args.loc is not None:
         size["loc"] = args.loc
@@ -590,10 +636,18 @@ def build(args, reports: list[dict], errors: dict[str, str],
     # report over a root that no longer exists scored a confident A+ for code
     # that is not there. An explicit --loc/--files is the caller asserting a size
     # this script cannot see, and is left alone.
-    if size["files"] == 0 and args.loc is None and args.files is None:
-        warn(f"no source files under {', '.join(relative_roots)} — there is nothing to "
-             "grade, so every category is ungraded rather than scored against an empty "
-             "tree. Check the roots in the package map.")
+    if (missing_roots or size["files"] == 0) and args.loc is None and args.files is None:
+        # Any missing root is enough, not only all of them. A two-root package
+        # whose `shared/types` was deleted still measures its `src/app` files,
+        # so a files-are-zero test left it graded — against a denominator
+        # covering part of the package while the findings covered all of it.
+        # Partial sizing is exactly the asymmetry the whole scoping design
+        # exists to prevent.
+        reason = (f"these roots do not exist: {', '.join(missing_roots)}" if missing_roots
+                  else f"no source files under {', '.join(relative_roots)}")
+        warn(f"{reason} — the findings and the lines they would be divided by no longer "
+             "describe the same code, so every category is ungraded rather than scored "
+             "against a partial tree. Check the roots in the package map.")
         covered = set()
     scored = score_categories(findings, size["loc"], covered)
 
@@ -712,7 +766,11 @@ def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     parser.add_argument("--out", required=True, help="path to write health.html to")
     parser.add_argument("--findings", action="append", default=[],
-                        help="doctor JSON file; repeat to merge, '-' for stdin")
+                        help="doctor JSON file, optionally '<doctor>:<path>' to say which "
+                             "doctor produced it; repeat to merge, '-' for stdin. Label them "
+                             "whenever more than one doctor's findings are passed — an "
+                             "unlabelled report is attributed to --doctor, so a foreign one "
+                             "would grant coverage it has no evidence for")
     parser.add_argument("--name", default="", help="package name (or repo name with --root)")
     parser.add_argument("--root-dir", action="append", default=[],
                         help="package root, repo-relative; repeat for a multi-root package. "
