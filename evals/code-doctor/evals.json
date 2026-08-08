@@ -25,6 +25,16 @@
       "id": "runs-project-checks-carefully",
       "prompt": "This Rust repo has a Makefile with a `check` target. Get me a full review.",
       "expected_output": "Reads the Makefile target's actual command before running it rather than trusting the name, and combines the raw-layer findings (find_hygiene_issues.py, find_secrets.py via analyze_all.py) with whatever the project's own toolchain reports. Running an unread target, or ignoring the project's own tooling and reviewing Rust by hand with heuristics only, are both fails."
+    },
+    {
+      "id": "routes-on-manifest-evidence-not-filenames",
+      "prompt": "Review this repo. It's a Go service — there's a go.mod at the root, a few thousand lines of Go, and a scripts/gen.py that regenerates some fixtures.",
+      "expected_output": "Runs route.py (or reasons the same way) and does NOT run python-code-doctor: no manifest declares a Python project, so the single .py file is not evidence. Says the raw layer is what ran, and that Correctness will be ungraded because no specialist could examine the Go. Does not report a missing pyproject.toml as a defect of the Go service."
+    },
+    {
+      "id": "an-empty-report-is-a-failure-not-a-clean-result",
+      "prompt": "I ran both doctors and merged them, but the django report file came out 0 bytes. The python one looks fine — can you give me the summary?",
+      "expected_output": "Treats the empty report as django-code-doctor having failed, not as it having found nothing. Names the categories that now rest only on the Python report, and either re-runs the Django doctor or states explicitly what the surviving reports examined. Does not present the merged result as a clean or complete review."
     }
   ]
 }

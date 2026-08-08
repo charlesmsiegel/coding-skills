@@ -42,7 +42,8 @@ A repository of agentic skills to help with AI coding.
   benign explanations instead, and the dataclass raises if a detector confuses them.
   Every detector whose evidence can be incomplete reports that incompleteness, so a
   degraded run never reads as a clean repository. It measures quality and bugs;
-  **code-visualization** explains architecture.
+  **code-visualization** explains architecture. Routes to the language specialists
+  on manifest evidence and merges every doctor's report into one attributed envelope.
 - **[theory-building](skills/theory-building/)** — governs code being written *now*:
   state the theory, reuse before inventing, abstract over repetition, treat tests as a
   floor. Guides only, no scripts.

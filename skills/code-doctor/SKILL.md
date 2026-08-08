@@ -74,9 +74,7 @@ structurally cannot:
 This skill also ships `scripts/route.py` (decides, from the repo's own manifests
 rather than a filename census, which specialists are justified) and
 `scripts/merge_reports.py` (unions several doctors' reports into one attributed
-envelope). Their run-and-merge protocol is documented separately; for now it is
-enough to know they exist and to load the matching specialist yourself when the
-table above applies.
+envelope). See **Routing to the specialists** below for the full protocol.
 
 ## Running the scripts
 
@@ -125,6 +123,66 @@ The deliverable is always an **artifact, never a side effect.** Produce a findin
 list, cards, or JSON. This skill does **not** create tickets in any system on its
 own. When the user wants findings filed, **ask which tracker or MCP to use** and
 create them through that tool — never assume or fabricate one.
+
+## Routing to the specialists
+
+The raw layer works on any repository. Where the project declares a language
+this repo has a specialist for, that specialist finds things the raw layer
+cannot, so run it too. **Ask the repository, not the filenames:**
+
+```bash
+python "$SKILL/scripts/route.py" <repo> --format json
+```
+
+It answers with the specialists the repo's own manifests justify, each with the
+evidence: a declared dependency, a `tsconfig.json`, a `manage.py` beside a
+settings module defining `INSTALLED_APPS`. A Go service containing three Python
+scripts routes nowhere, on purpose — a filename census would send it to
+`python-code-doctor`, which would report the missing `pyproject.toml` it was
+never supposed to have as a finding.
+
+**You are half of this protocol.** A Python subprocess cannot load a skill, so
+`route.py` names one and stops. For each route, load that skill and run its
+`analyze_all.py` over **the repository root** — never a package subdirectory,
+where a doctor cannot see the root manifest or the test tree and reports their
+absence as findings.
+
+Keep every report, then union them:
+
+```bash
+python "$SKILL/scripts/merge_reports.py" \
+  --report code-doctor:$WORK/raw.json \
+  --report python-code-doctor:$WORK/py.json \
+  --report django-code-doctor:$WORK/dj.json \
+  --out $WORK/merged.json --format json
+```
+
+The envelope carries `doctors_run`, per-doctor `analyzers_run`, `doctor_errors`,
+`completeness`, and every record stamped with the doctor that produced it —
+findings and candidates in separate lists. **It does not deduplicate**: two
+security detectors flagging one hardcoded key stay two records, because
+collapsing them changes a count a grader divides by, and that decision belongs
+to the grader.
+
+Three results are not the same and the envelope keeps them apart:
+
+- **A doctor that ran** appears in `doctors_run` with its `analyzers_run`.
+- **A doctor that failed** appears in `doctor_errors`. An empty report file is
+  a failure, not a clean result — re-run it, and if you cannot, say which
+  categories now rest on nothing.
+- **A doctor with no coverage evidence** — a bare JSON list, which is what a
+  single detector and a whole `analyze_django.py` run both emit — appears in
+  `coverage_unknown`. Nothing in the file distinguishes a full run from one
+  detector that found nothing, so it grants no coverage.
+
+`merge_reports.py` exits 1 when every report failed. That is not a clean
+repository; it is a merge with no input.
+
+**If a routed specialist is not installed**, say so and continue with the raw
+layer. Correctness is the category that suffers: the only correctness-class
+defect this skill can prove on its own is a merge marker in a path git reports
+as unmerged, so a consumer that grades this report should leave Correctness
+ungraded rather than score it from silence.
 
 ## Reference index (load on demand)
 
