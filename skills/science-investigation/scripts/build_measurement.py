@@ -379,7 +379,24 @@ def in_scope(entry: dict, scopes: list[str], repo: Path) -> bool:
 
 
 def read_package_grade(name: str, path: Path) -> dict:
-    """A package row for the root table, read back out of its own document."""
+    """A package row for the root table, read back out of its own document.
+
+    DUPLICATED READER, ON PURPOSE. The block this parses — a
+    `<script type="application/json" id="measurement-meta">` with `</` written
+    as `<\\/` — is a cross-skill contract: code-overview's build_summary.py
+    reads the same block out of the same file through
+    `skills/code-overview/scripts/common.py:read_meta`. The two skills are
+    zipped and installed separately and cannot import one another, so the
+    reader is copied rather than shared, exactly like the four other deliberate
+    copies this repo pins in tests.
+
+    What must not diverge is the *behaviour*, and it had: `read_meta` warns
+    when the block is present but unparseable, this one returned a blank row in
+    silence — so a corrupted document was tabled as "not generated", which is
+    what a package nobody ever built also looks like. Same input, same
+    complaint, now. `tests/science_investigation/test_meta_block_contract.py`
+    is the pin.
+    """
     blank = {"name": name, "score": None, "grade": rubric.UNGRADED,
              "rows": 0, "generated": False}
     try:
@@ -391,7 +408,9 @@ def read_package_grade(name: str, path: Path) -> dict:
         return blank
     try:
         meta = json.loads(match.group(1).replace("<\\/", "</"))
-    except json.JSONDecodeError:
+    except json.JSONDecodeError as exc:
+        print(f"warning: {path} has a measurement-meta block that is not valid JSON: {exc}",
+              file=sys.stderr)
         return blank
     return {"name": name, "score": meta.get("score"),
             "grade": meta.get("grade", rubric.UNGRADED),
@@ -461,6 +480,18 @@ def main(argv: list[str] | None = None) -> int:
     if not args.root:
         scopes = [str(s).replace("\\", "/").strip("/")
                   for s in (args.scopes or args.root_dirs)]
+        # `in_scope` treats an empty scope list as "everything", which is right
+        # for --root and wrong here: a package page built with neither flag
+        # scores the whole repository's inventory as this one package's, and
+        # the roll-up then adds the same rows in again under every package.
+        # The audit is deliberately repo-wide (a script pointed at src/billing
+        # cannot see evals/), so this is the easy mistake, and it produces a
+        # plausible number rather than an obvious failure.
+        if not scopes:
+            print(f"warning: --name {args.name} is a package build but neither --scope nor "
+                  "--root-dir was given, so every row in the audit is being scored as this "
+                  "package's. Pass --root-dir/--scope to say which paths are its, or "
+                  "--root if this is the repository roll-up.", file=sys.stderr)
         inventory["rows"] = [entry for entry in all_rows
                              if in_scope(entry, scopes, args.repo)]
         kept_findings = {str(entry.get("finding")) for entry in inventory["rows"]
@@ -519,6 +550,15 @@ def main(argv: list[str] | None = None) -> int:
     nav, sections = panels([f"<!-- tab:{part}" for part in fragments])
 
     meta = build_metadata(inventory, scored, args.name, args, out_of_scope, packages)
+    # Appended AFTER the last panel's closing tag, so it is inside no
+    # `<section class="panel">` and is the last thing in TABS_PANELS. That
+    # placement is load-bearing for tests as well as for readers: the block
+    # carries the entire inventory — every row, finding, reason and citation —
+    # so any assertion made against the whole document text matches this JSON
+    # rather than the rendering, and passes with the tabs deleted. Panel-scoped
+    # assertions are the fix, and they only work because nothing here leaks
+    # into a panel. The extraction contract is unchanged: one
+    # `id="measurement-meta"` script, `</` escaped as `<\/`, one regex read.
     sections += (f'\n<script type="application/json" id="measurement-meta">'
                  f"{json_block(meta)}</script>")
 
