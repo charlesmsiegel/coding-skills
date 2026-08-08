@@ -270,6 +270,20 @@ def render_caveats(meta: dict) -> str:
     reaches more people than the one on the health page.
     """
     parts = []
+    # First, and unconditional on anything being ungraded. `ungraded` is the
+    # *consequence* of a doctor failing only where that doctor was the sole
+    # cover for a category; when a surviving doctor covers the same ground,
+    # nothing is ungraded and every other caveat here stays silent — so the
+    # portal showed a clean grade over a crashed doctor and said nothing. The
+    # health page names the failure in its Coverage tab whether or not it cost
+    # a category, and this page has to say the same thing.
+    if meta.get("doctor_errors"):
+        listed = "; ".join(f"<strong>{esc(name)}</strong> ({esc(reason)})"
+                           for name, reason in meta["doctor_errors"].items())
+        parts.append(f'<div class="callout bad">A doctor did not complete: {listed}. '
+                     "Whatever it alone covered is unknown rather than clean, and where "
+                     "another doctor covers the same ground the grade above rests on that "
+                     "one alone. See the Coverage tab on the health page.</div>")
     if meta.get("ungraded"):
         listed = ", ".join(esc(rubric.CATEGORY_LABELS.get(k, k)) for k in meta["ungraded"])
         parts.append(f'<div class="callout warn">Ungraded: {listed}. Nothing measured those, '
