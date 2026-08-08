@@ -341,12 +341,26 @@ def render_coverage(meta: dict) -> str:
     for doctor, block in (meta.get("completeness") or {}).items():
         rows = []
         for key, detail in (block or {}).items():
-            if not isinstance(detail, dict):
-                continue
-            verdict = detail.get("adequate")
-            state = "adequate" if verdict is True else ("incomplete" if verdict is False
-                                                        else "not stated")
-            numbers = ", ".join(f"{k}: {v}" for k, v in detail.items() if k != "adequate")
+            if isinstance(detail, dict):
+                verdict = detail.get("adequate")
+                state = "adequate" if verdict is True else ("incomplete" if verdict is False
+                                                            else "not stated")
+                numbers = ", ".join(f"{k}: {v}" for k, v in detail.items() if k != "adequate")
+            else:
+                # Everything code-doctor puts in a completeness block is a
+                # plain *string* — `detectors_failed`, `merge_state`
+                # ("git unavailable — conflict markers reported as
+                # candidates"), the files_unreadable accounting. Skipping
+                # every non-dict value dropped exactly the class of caveat
+                # this tab exists to name: it reached the envelope, survived
+                # into the hidden JSON metadata, and appeared nowhere a reader
+                # looks. A note carries no adequate/inadequate verdict of its
+                # own, so it is labelled as the note it is rather than given
+                # one it never claimed.
+                state = "note"
+                numbers = (", ".join(str(item) for item in detail)
+                           if isinstance(detail, (list, tuple, set))
+                           else ("" if detail is None else str(detail)))
             rows.append(f"<tr><td>{esc(key)}</td><td>{esc(state)}</td>"
                         f"<td>{esc(numbers)}</td></tr>")
         if rows:

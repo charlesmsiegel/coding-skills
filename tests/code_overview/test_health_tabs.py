@@ -23,8 +23,17 @@ def envelope(tmp_path) -> Path:
         "analyzers_skipped": {"code-doctor": ["duplication"]},
         "analyzer_errors": {},
         "doctor_errors": {"django-code-doctor": "crashed reading settings"},
+        # Two shapes on purpose. code-doctor's own completeness block is a flat
+        # dict of *strings* — detectors_failed, merge_state, the unreadable-file
+        # accounting — and every one of them was dropped by a renderer that only
+        # understood the {"adequate": ...} dict shape. They reached the envelope,
+        # survived into the hidden metadata, and appeared nowhere on the tab
+        # whose entire job is naming them.
         "completeness": {"code-doctor": {"reference_graph": {"adequate": False,
-                                                             "resolution_rate": 0.31}}},
+                                                             "resolution_rate": 0.31},
+                                         "detectors_failed": "find_dead_code: exited 1",
+                                         "merge_state": "git unavailable — conflict markers "
+                                                        "reported as candidates"}},
         "coverage_unknown": [],
         "findings": [{"doctor": "code-doctor", "file": "src/app/settings.py", "line": 4,
                       "smell_type": "hardcoded_secret_assignment", "severity": "high",
@@ -51,6 +60,39 @@ def page(repo, run_script, tmp_path) -> str:
     run_script(SCRIPT, "--out", out, "--repo", repo.path, "--name", "app",
                "--root-dir", "src/app", "--merged", envelope(tmp_path))
     return out.read_text(encoding="utf-8")
+
+
+@pytest.fixture
+def graded_page(repo, run_script, tmp_path) -> str:
+    """A page that actually earns a letter.
+
+    The `page` fixture above is deliberately ungraded: its `analyzers_run`
+    names no detector this rubric knows, a doctor crashed, and the reference
+    graph is inadequate, so every category is dropped and the grade is
+    rubric.UNGRADED. That is the right page for the coverage assertions and
+    the wrong one for asking whether a grade renders — which is exactly how
+    the grade-card test came to pass with grading deleted.
+    """
+    for i in range(12):
+        repo.write(f"src/app/mod{i}.py", "def f():\n    return 1\n" * 20)
+    repo.commit()
+    payload = json.loads(envelope(tmp_path).read_text(encoding="utf-8"))
+    payload["analyzers_run"] = {"code-doctor": ["security", "debug_leftovers"]}
+    payload["analyzers_skipped"] = {}
+    payload["doctor_errors"] = {}
+    payload["completeness"] = {}
+    path = tmp_path / "graded.json"
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    out = tmp_path / "graded.html"
+    run_script(SCRIPT, "--out", out, "--repo", repo.path, "--name", "app",
+               "--root-dir", "src/app", "--merged", path)
+    return out.read_text(encoding="utf-8")
+
+
+def health_meta(page: str) -> dict:
+    match = re.search(r'id="code-health-meta">(.*?)</script>', page, re.DOTALL)
+    assert match, "the page carries no code-health-meta block"
+    return json.loads(match.group(1).replace("<\\/", "</"))
 
 
 _COVERAGE_PANEL_RE = re.compile(
@@ -82,13 +124,32 @@ def test_all_four_tabs_are_present(page):
         assert f">{title}<" in page, f"the {title} tab is missing"
 
 
-def test_the_visible_grade_card_carries_the_grade(page):
-    # Every other assertion here reads the page as one string, which a hidden or
-    # mis-rendered panel satisfies just as well as a correct one. This one pins
-    # what a reader actually sees: the letter inside the grade card element.
-    card = re.search(r'<div class="letter">([^<]*)</div>', page)
+def test_the_visible_grade_card_carries_the_grade(graded_page):
+    # This used to accept any letter that was neither empty nor the word
+    # "None" — and rubric.UNGRADED is "—", which is neither. Deleting the
+    # grading arithmetic outright (weighted_overall returning None) failed 21
+    # tests elsewhere and every one in this file still passed. So: a real band
+    # letter, and the one the metadata says was computed.
+    meta = health_meta(graded_page)
+    assert meta["score"] is not None, "this fixture must produce a graded page"
+    assert re.fullmatch(r"[A-F][+-]?", str(meta["grade"])), (
+        f"{meta['grade']!r} is not a letter grade — nothing was actually graded"
+    )
+
+    card = re.search(r'<div class="letter">([^<]*)</div>', graded_page)
     assert card, "no grade card rendered"
-    assert card.group(1).strip() not in ("", "None")
+    assert card.group(1).strip() == meta["grade"], (
+        "the letter a reader sees and the letter the metadata carries are the same number"
+    )
+
+
+def test_an_ungraded_page_shows_the_dash_and_says_the_grade_is_a_placeholder(page):
+    # The other half of the same claim: when nothing could be graded, the card
+    # must not quietly render something that reads like a grade.
+    assert health_meta(page)["score"] is None
+    card = re.search(r'<div class="letter">([^<]*)</div>', page)
+    assert card and card.group(1).strip() == "—"
+    assert "the grade shown is a placeholder" in page
 
 
 def test_the_grade_tab_is_the_one_that_opens(page):
@@ -121,6 +182,22 @@ def test_the_coverage_tab_reports_the_thin_graph_rather_than_hiding_it(page):
     assert "reference_graph" in panel
     assert "incomplete" in panel
     assert "resolution_rate: 0.31" in panel
+
+
+def test_the_coverage_tab_shows_the_string_valued_caveats_too(page):
+    # Every value code-doctor writes into its completeness block is a plain
+    # string, and the renderer skipped anything that was not a dict. So the
+    # detector that crashed, and "git unavailable — conflict markers reported
+    # as candidates", reached the envelope, were copied into the hidden JSON
+    # metadata, and were shown to nobody — on the one tab that exists to name
+    # what was not measured. A caveat only in the metadata is a caveat that
+    # was not made.
+    panel = coverage_panel(page)
+
+    assert "detectors_failed" in panel
+    assert "find_dead_code: exited 1" in panel
+    assert "merge_state" in panel
+    assert "conflict markers reported as candidates" in panel
 
 
 def test_the_coverage_tab_lists_the_skipped_analyzer(page):
