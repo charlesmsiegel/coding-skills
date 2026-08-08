@@ -283,6 +283,104 @@ def render_package_table(packages: list[dict], links: dict[str, str]) -> str:
             + "".join(rows) + "</tbody></table></div>")
 
 
+def render_candidates(candidates: list[dict]) -> str:
+    """Leads, rendered so nobody mistakes one for a defect.
+
+    A candidate carries no fix and asserts nothing. The two things that keep it
+    honest on a page whose headline is a grade are the statement that it did not
+    affect that grade, and `also_caused_by` — the specific ways a healthy
+    codebase produces the same observation, so the reader can rule them out
+    instead of taking the tool's word for it.
+    """
+    note = ('<div class="callout warn"><strong>These did not affect the grade.</strong> '
+            "A candidate is an unverified lead, not a defect: it names what was observed "
+            "and the ways healthy code produces the same observation, and it deliberately "
+            "carries no fix. Confirm one before acting on it.</div>")
+    if not candidates:
+        return (note + '<p class="dim">No candidates were reported for this unit.</p>')
+
+    rows = []
+    for item in sorted(candidates, key=lambda c: (SEVERITY_ORDER.index(c.get("severity", "medium"))
+                                                  if c.get("severity") in SEVERITY_ORDER else 1,
+                                                  str(c.get("file")), line_number(c))):
+        benign = "".join(f"<li>{esc(reason)}</li>"
+                         for reason in item.get("also_caused_by") or [])
+        location = f'{item.get("file", "")}:{line_number(item)}'
+        rows.append(
+            f'<tr><td><code class="ftype">{esc(item.get("smell_type", "candidate"))}</code></td>'
+            f'<td><code class="floc">{esc(location)}</code></td>'
+            f'<td>{esc(item.get("description", ""))}'
+            f'<div class="faint">Also caused by:<ul>{benign}</ul></div></td>'
+            f'<td>{esc(item.get("doctor", ""))}</td></tr>'
+        )
+    return (note + '<div class="tbl-wrap"><table><thead><tr><th>Type</th><th>Location</th>'
+            "<th>Observed · and what else produces it</th><th>Reported by</th></tr></thead>"
+            f"<tbody>{''.join(rows)}</tbody></table></div>")
+
+
+def render_coverage(meta: dict) -> str:
+    """What was measured, what was not, and why — beside the grade that used it."""
+    parts = []
+
+    doctors = meta.get("doctors") or []
+    if doctors:
+        chips = "".join(f'<span class="badge accent">{esc(name)}</span> ' for name in doctors)
+        parts.append(f"<h3>Doctors that ran</h3><p>{chips}</p>")
+    else:
+        parts.append('<div class="callout bad">No doctor contributed to this page, so '
+                     "nothing on it was measured. The grade is a placeholder.</div>")
+
+    failures = meta.get("doctor_errors") or {}
+    if failures:
+        items = "".join(f"<li><strong>{esc(name)}</strong>: {esc(reason)}</li>"
+                        for name, reason in failures.items())
+        parts.append('<div class="callout bad"><strong>A doctor failed.</strong> Whatever it '
+                     "alone covered is unknown, not clean — those categories are ungraded "
+                     f"rather than scored from the surviving report.<ul>{items}</ul></div>")
+
+    for doctor, block in (meta.get("completeness") or {}).items():
+        rows = []
+        for key, detail in (block or {}).items():
+            if not isinstance(detail, dict):
+                continue
+            verdict = detail.get("adequate")
+            state = "adequate" if verdict is True else ("incomplete" if verdict is False
+                                                        else "not stated")
+            numbers = ", ".join(f"{k}: {v}" for k, v in detail.items() if k != "adequate")
+            rows.append(f"<tr><td>{esc(key)}</td><td>{esc(state)}</td>"
+                        f"<td>{esc(numbers)}</td></tr>")
+        if rows:
+            parts.append(f"<h3>Evidence completeness · {esc(doctor)}</h3>"
+                         '<div class="tbl-wrap"><table><thead><tr><th>Evidence</th>'
+                         "<th>Verdict</th><th>Detail</th></tr></thead>"
+                         f"<tbody>{''.join(rows)}</tbody></table></div>")
+
+    ungraded = meta.get("ungraded") or []
+    if ungraded:
+        names = ", ".join(esc(rubric.CATEGORY_LABELS.get(key, key)) for key in ungraded)
+        parts.append('<div class="callout warn"><strong>Ungraded: </strong>'
+                     f"{names}. Nothing measured these, so they are dropped from the mean "
+                     "rather than counted as zero or as a hundred.</div>")
+
+    return "".join(parts)
+
+
+def panels(fragments: list[str]) -> tuple[str, str]:
+    """Turn `<!-- tab: Title -->` fragments into code-visualization's markup."""
+    nav, sections = [], []
+    for fragment in fragments:
+        header, _, body = fragment.partition("\n")
+        title = header.removeprefix("<!-- tab:").removesuffix("-->").strip()
+        tab_id = "tab-" + title.lower().replace(" ", "-")
+        selected = "true" if not nav else "false"
+        active = " active" if not sections else ""
+        nav.append(f'<button role="tab" data-tab="{tab_id}" aria-selected="{selected}" '
+                   f'aria-controls="{tab_id}">{esc(title)}</button>')
+        sections.append(f'<section class="panel{active}" id="{tab_id}" role="tabpanel">\n'
+                        f"{body}\n</section>")
+    return "\n".join(nav), "\n".join(sections)
+
+
 def render_caveats(errors: dict[str, str], skipped: set[str], unmapped: list[str],
                    ungraded: list[str], notes: list[str], out_of_scope: int,
                    roots: list[str], duplicates: int = 0) -> str:
@@ -763,8 +861,19 @@ def build(args, reports: list[dict], errors: dict[str, str],
         "CAVEATS": render_caveats(errors, skipped, scored["unmapped_types"],
                                   scored["ungraded"], args.note, out_of_scope,
                                   relative_roots, duplicates),
-        "META_JSON": json_block(meta),
+        "CANDIDATES": render_candidates(candidates),
+        "COVERAGE": render_coverage(meta),
     })
+
+    # [1:] drops everything before the first marker. The scaffold opens with an
+    # explanatory comment, and treating that as element 0 of the split makes it a
+    # fragment: it becomes tab #1, renders *active*, and hides the grade card
+    # behind a panel with a mangled title. Everything before the first marker is
+    # by definition not a tab.
+    fragments = [f"<!-- tab:{part}" for part in body.split("<!-- tab:")[1:] if part.strip()]
+    nav, sections = panels(fragments)
+    sections += (f'\n<script type="application/json" id="code-health-meta">'
+                 f"{json_block(meta)}</script>")
 
     scope = "repository" if args.root else "package"
     page = render(read_asset("template.html"), {
@@ -775,13 +884,14 @@ def build(args, reports: list[dict], errors: dict[str, str],
             f"generated {meta['generated']}",
             meta["commit"],
             f"{size['files']} files, {size['loc']} lines",
-            f"{len(findings)} findings",
-            args.doctor,
+            f"{len(findings)} findings, {len(candidates)} candidates",
+            ", ".join(meta.get("doctors") or []) or args.doctor,
         ) if part)),
-        "DOC_BODY": body,
-        "DOC_FOOTER": ("Generated by code-overview. Grades are computed from the code doctors' "
-                       "deterministic detectors — they measure what a detector can see, not "
-                       "whether the design is right. Read the code map alongside this."),
+        "TABS_NAV": nav,
+        "TABS_PANELS": sections,
+        "DOC_FOOTER": ("Generated by code-overview. The grade is a density of detectable "
+                       "problems, not a verdict on the design — read the code map beside "
+                       "it. Candidates are leads and are excluded from the score."),
     })
     return page, meta
 
