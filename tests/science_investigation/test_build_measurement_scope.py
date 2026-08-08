@@ -21,6 +21,17 @@ def meta_of(page: Path) -> dict:
     return json.loads(match.group(1).replace("<\\/", "</"))
 
 
+def panel_of(page: Path, tab_id: str) -> str:
+    """One rendered panel, so 'on the Score tab' can actually be asserted."""
+    # Split on the panel boundary rather than the next </section>: the grade
+    # card is itself a <section>, so a lazy match to </section> stops short.
+    text = page.read_text(encoding="utf-8")
+    for chunk in text.split('<section class="panel')[1:]:
+        if re.match(rf'[^>]*id="{tab_id}"', chunk):
+            return chunk
+    raise AssertionError(f"no {tab_id} panel on the page")
+
+
 def row(name, evidence, importance=3, credit=1.0, n=100) -> dict:
     return {"name": name, "importance": importance,
             "importance_reason": "gates the release", "credit": credit,
@@ -54,6 +65,84 @@ def test_root_dir_keeps_only_the_rows_defined_under_it(run_script, tmp_path):
     meta = meta_of(out)
     assert [r["name"] for r in meta["rows"]] == ["billing_accuracy"]
     assert meta["rows_out_of_scope"] == 2
+
+
+def test_dropped_rows_are_named_on_the_page_not_only_on_stderr(run_script, tmp_path):
+    # A page that drops rows and says nothing is how a partial audit renders as
+    # a perfect score. The count belongs beside the KPI it qualifies, not in
+    # the hidden metadata block a reader never opens.
+    out = tmp_path / "billing.html"
+    run_script(SCRIPT, "--out", out, "--inventory", inventory(tmp_path), "--name", "billing",
+               "--repo", tmp_path, "--root-dir", "src/billing")
+
+    score_panel = panel_of(out, "tab-score")
+    assert "2 further rows" in score_panel
+    assert "defined outside this unit" in score_panel
+
+
+def test_a_page_that_dropped_nothing_carries_no_scope_note(run_script, tmp_path):
+    out = tmp_path / "root.html"
+    run_script(SCRIPT, "--out", out, "--inventory", inventory(tmp_path), "--name", "repo",
+               "--repo", tmp_path, "--root")
+
+    assert "defined outside this unit" not in out.read_text(encoding="utf-8")
+
+
+def test_an_unattached_finding_survives_scoping_rather_than_vanishing(run_script, tmp_path):
+    # Nothing requires a finding to name a row. One about the measurement setup
+    # generally — no seeds anywhere, no version pinning — belongs to no row, so
+    # no scope can be out of scope for it. It used to be dropped, after which
+    # the page announced "no confirmed findings".
+    payload = {
+        "schema": "measurement-inventory/1", "subject": "repo",
+        "rows": [row("billing_accuracy", ["src/billing/metrics.py:10"]),
+                 {**row("search_ndcg", ["src/search/rank.py:22"], credit=0.25),
+                  "finding": "search_small_n"}],
+        "findings": [
+            {"id": "unpinned_judge", "severity": "high",
+             "title": "No judge prompt is version-pinned anywhere",
+             "detail": "Every judge prompt is built inline from an f-string.",
+             "evidence": ["evals/judge.py:9"], "blast_radius": "every score in the repo"},
+            {"id": "search_small_n", "severity": "medium", "title": "search n=4",
+             "detail": "4 graded queries.", "evidence": ["src/search/rank.py:22"],
+             "blast_radius": "the ranking roadmap"},
+        ],
+        "not_audited": [],
+    }
+    inv = tmp_path / "unattached.json"
+    inv.write_text(json.dumps(payload), encoding="utf-8")
+
+    out = tmp_path / "billing.html"
+    run_script(SCRIPT, "--out", out, "--inventory", inv, "--name", "billing",
+               "--repo", tmp_path, "--root-dir", "src/billing")
+
+    text = out.read_text(encoding="utf-8")
+    assert [f["id"] for f in meta_of(out)["findings"]] == ["unpinned_judge"], (
+        "the unattached finding stays; the one attached to a dropped row goes with it"
+    )
+    assert "No judge prompt is version-pinned anywhere" in text
+    assert "No confirmed findings" not in text
+
+
+def test_not_audited_is_labelled_repository_wide_on_a_scoped_page(run_script, tmp_path):
+    # Labelled, not filtered: dropping these would hide a real gap, but
+    # reprinting them unlabelled reads as this package's own gap.
+    payload = json.loads(inventory(tmp_path).read_text(encoding="utf-8"))
+    payload["not_audited"] = ["the analytics dashboard — no access"]
+    inv = tmp_path / "gaps.json"
+    inv.write_text(json.dumps(payload), encoding="utf-8")
+
+    scoped = tmp_path / "billing.html"
+    run_script(SCRIPT, "--out", scoped, "--inventory", inv, "--name", "billing",
+               "--repo", tmp_path, "--root-dir", "src/billing")
+    root = tmp_path / "root.html"
+    run_script(SCRIPT, "--out", root, "--inventory", inv, "--name", "repo",
+               "--repo", tmp_path, "--root")
+
+    scoped_text = scoped.read_text(encoding="utf-8")
+    assert "the analytics dashboard" in scoped_text, "still listed, never filtered"
+    assert "Not audited (whole repository)" in scoped_text
+    assert "Not audited (whole repository)" not in root.read_text(encoding="utf-8")
 
 
 def test_a_row_defined_elsewhere_belongs_to_the_package_that_defines_it(run_script, tmp_path):

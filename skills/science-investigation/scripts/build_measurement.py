@@ -73,7 +73,8 @@ def read_inventory(path: Path) -> dict:
 # --------------------------------------------------------------------------
 
 def render_score_tab(scored: dict, rows: list[dict], intro: str,
-                     not_audited: list, package_table: str = "") -> str:
+                     not_audited: list, package_table: str = "",
+                     out_of_scope: int = 0, scoped: bool = False) -> str:
     score = scored["score"]
     shown = "—" if score is None else f"{score:.1f}"
     gates = scored["by_importance"].get("3") or {}
@@ -101,6 +102,21 @@ def render_score_tab(scored: dict, rows: list[dict], intro: str,
         '<div class="l">weight total</div></div>',
     ])
 
+    # Dropped rows used to exist only on stderr and in the hidden metadata, so
+    # a three-row inventory with two unmeasured things could render A+ / 100
+    # here with nothing on the page saying what the 100 was over. The count
+    # sits beside the "measurable things" KPI it qualifies.
+    scope_note = ""
+    if out_of_scope:
+        plural = "" if out_of_scope == 1 else "s"
+        verb = "was" if out_of_scope == 1 else "were"
+        scope_note = (
+            f'<p class="dim"><strong>{out_of_scope} further row{plural}</strong> in this '
+            f"audit {verb} defined outside this unit and {verb} left out of the score "
+            "above. They are not unmeasured — they are scored on the page of the "
+            "package that defines them, not here.</p>"
+        )
+
     breakdown_parts = []
     for level, bucket in scored["by_importance"].items():
         # Precomputed rather than nested inside the f-string: nested same-type
@@ -119,8 +135,20 @@ def render_score_tab(scored: dict, rows: list[dict], intro: str,
     gaps = ""
     if not_audited:
         items = "".join(f"<li>{esc(item)}</li>" for item in not_audited)
-        gaps = ("<h3>Not audited</h3><p class=\"dim\">A silent gap reads as a clean bill of "
-                f"health, so it is listed instead.</p><ul>{items}</ul>")
+        # Labelled, not filtered. These entries are repository-wide by nature —
+        # a dashboard nobody had access to is not any one package's gap — and
+        # dropping them from a package page would hide a real gap. So every
+        # page prints them and a scoped page says whose gap they are.
+        if scoped:
+            heading = "Not audited (whole repository)"
+            lead = ("A silent gap reads as a clean bill of health, so it is listed "
+                    "instead. This list covers the whole repository, not just this "
+                    "unit: these are things the audit never reached anywhere.")
+        else:
+            heading = "Not audited"
+            lead = ("A silent gap reads as a clean bill of health, so it is listed "
+                    "instead.")
+        gaps = (f"<h3>{esc(heading)}</h3><p class=\"dim\">{lead}</p><ul>{items}</ul>")
 
     return (
         '<!-- tab: Score -->\n'
@@ -132,7 +160,7 @@ def render_score_tab(scored: dict, rows: list[dict], intro: str,
         'It says how much of what matters is actually measured — not whether the code '
         'is correct.</p></div></section>'
         f"{headline}{intro}"
-        f'<div class="kpis">{kpis}</div>'
+        f'<div class="kpis">{kpis}</div>{scope_note}'
         "<h3>By importance</h3>"
         '<div class="tbl-wrap"><table><thead><tr><th>Importance</th>'
         '<th class="num">Things</th><th class="num">Weight</th>'
@@ -390,16 +418,28 @@ def main(argv: list[str] | None = None) -> int:
         print(f"error: {args.inventory}: {exc}", file=sys.stderr)
         return 2
 
-    total_rows = len(inventory["rows"])
+    all_rows = inventory["rows"]
+    total_rows = len(all_rows)
     if not args.root:
         scopes = [str(s).replace("\\", "/").strip("/")
                   for s in (args.scopes or args.root_dirs)]
-        inventory["rows"] = [entry for entry in inventory["rows"]
+        inventory["rows"] = [entry for entry in all_rows
                              if in_scope(entry, scopes, args.repo)]
         kept_findings = {str(entry.get("finding")) for entry in inventory["rows"]
-                         if entry.get("finding")}
-        inventory["findings"] = [f for f in inventory["findings"]
-                                 if str(f.get("id")) in kept_findings]
+                         if str(entry.get("finding") or "").strip()}
+        # A finding no row anywhere names is about the measurement setup, not
+        # about one row, so no scope can be out of scope for it. Only a finding
+        # attached exclusively to rows that this page dropped goes with them —
+        # otherwise a high finding nobody wired to a row vanishes and the page
+        # then reports "no confirmed findings", which is the exact lie this
+        # skill exists to prevent.
+        attached_anywhere = {str(entry.get("finding")) for entry in all_rows
+                             if str(entry.get("finding") or "").strip()}
+        inventory["findings"] = [
+            f for f in inventory["findings"]
+            if str(f.get("id")) in kept_findings
+            or str(f.get("id")) not in attached_anywhere
+        ]
     out_of_scope = total_rows - len(inventory["rows"])
     if out_of_scope:
         print(f"note: {out_of_scope} row(s) dropped as defined outside this unit",
@@ -426,7 +466,9 @@ def main(argv: list[str] | None = None) -> int:
     body = fill(args.body.read_text(encoding="utf-8"), {
         "TAB_SCORE": render_score_tab(scored, inventory["rows"], intro,
                                       inventory["not_audited"],
-                                      render_package_table(packages)),
+                                      render_package_table(packages),
+                                      out_of_scope=out_of_scope,
+                                      scoped=not args.root),
         "TAB_INVENTORY": render_inventory_tab(inventory["rows"]),
         "TAB_FINDINGS": render_findings_tab(inventory["findings"]),
         "TAB_UNMEASURABLE": render_unmeasurable_tab(inventory["rows"]),
