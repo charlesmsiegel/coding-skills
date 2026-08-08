@@ -57,19 +57,23 @@ A repository of agentic skills to help with AI coding.
   **code-visualization**.
 - **[code-overview](skills/code-overview/)** — the orchestrator. It analyzes nothing
   itself; it decides *what the units are*, runs the others per unit, and binds the
-  results into one navigable set. `discover_packages.py` proposes packages from
-  manifests, Django `INSTALLED_APPS` and layout, each with its evidence, and returns
-  what it could not settle as questions for the user — the right unit is a design
-  judgment, not a heuristic. Per package it drives **code-visualization** into
-  `<pkg>/docs/codemap.html` and the matching doctor into a graded
-  `<pkg>/docs/health.html`: seven weighted categories, a 0–100 score, a letter grade,
-  and a `code-health-meta` JSON block so the numbers extract without an HTML parser.
-  A category nothing measured comes back *ungraded* and is dropped from the mean
-  rather than scored 0 or 100 — including when a detector crashed, where a zero count
-  means unknown, not clean. `inject_nav.py` then links every page up to the overall
-  document of its own type, across to its siblings, and back down; it is idempotent,
-  existence-checked, and styles itself with literal fallbacks so it can be injected
-  into an atlas **code-visualization** wrote without that skill knowing.
+  results into one navigable four-document set. `discover_packages.py` proposes
+  packages from manifests, Django `INSTALLED_APPS` and layout, each with its
+  evidence, and returns what it could not settle as questions for the user — the
+  right unit is a design judgment, not a heuristic. Per package it drives
+  **code-visualization** into `<pkg>/docs/codemap.html`, one **code-doctor** call
+  into a graded `<pkg>/docs/health.html` — findings score it, candidates never do —
+  and **science-investigation** into `<pkg>/docs/measurement.html`, scored `null`
+  rather than zero when nothing is measurable, plus a `<pkg>/docs/summary.html`
+  linking all three. `health.html` carries seven weighted categories, a 0–100
+  score, a letter grade, and a `code-health-meta` JSON block so the numbers
+  extract without an HTML parser. A category nothing measured comes back
+  *ungraded* and is dropped from the mean rather than scored 0 or 100 — including
+  when a doctor crashed, where a zero count means unknown, not clean.
+  `inject_nav.py` then links every page up to the overall document of its own
+  type, across to its three siblings, and back down; it is idempotent,
+  existence-checked, and styles itself with literal fallbacks so it can be
+  injected into an atlas **code-visualization** wrote without that skill knowing.
 
 ### Workflow skills
 

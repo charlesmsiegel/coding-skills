@@ -329,3 +329,38 @@ doctor means an entry in `DOCTOR_COVERAGE` naming the categories it can speak
 to. Changing weights or half-lives changes every historical grade's meaning —
 worth saying in the commit message, because the point of the number is
 comparison over time.
+
+## The measurement grade
+
+A different question from the health grade, and it divides a different thing:
+
+    score = 100 × Σ(importance × credit) / Σ(importance)     over all measurable things
+
+Health asks *how dense are the detectable defects*. Measurement asks *how much of
+what matters is actually measured* — so its denominator is not lines of code but
+the set of things that could be measured, whether or not anyone measured them.
+
+| Importance | |
+|---|---|
+| 3 | gates a ship / release / rollout decision |
+| 2 | informs a decision someone actually makes |
+| 1 | informational |
+
+| Credit | |
+|---|---|
+| 1.0 | measured, nothing found against it |
+| 0.5 | measured, one confirmed medium finding |
+| 0.25 | measured, one confirmed high finding |
+| 0.0 | not measured, or structurally unmeasurable with today's data |
+
+**Structurally unmeasurable things stay in the denominator.** Recall with no gold
+set, calibration with no outcomes, causal effect with no control arm — dropping
+those rows would let a system that measures one easy thing perfectly score 100,
+which is precisely how silence gets read as success.
+
+**The letter bands are the health grade's, exactly.** A B- means the same score
+range on both pages, because they sit side by side in the nav and a reader
+compares them directly. What differs is what each divides — say which when you
+present them together. The rubric itself lives in
+`science-investigation/scripts/rubric.py`; a CI test pins the band table
+identical to this skill's.

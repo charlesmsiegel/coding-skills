@@ -7,10 +7,12 @@ docs/code-overview.json     the package map — the input to every other script
 docs/summary.html           portal: overall grade, package table, links
 docs/codemap.html           repo-wide code-visualization atlas
 docs/health.html            repo-wide grade + per-package grade table
+docs/measurement.html       repo-wide measurement grade + per-package table
 
-<pkg-root>/docs/summary.html    package portal
-<pkg-root>/docs/codemap.html    package-scoped atlas
-<pkg-root>/docs/health.html     package grade
+<pkg-root>/docs/summary.html      package portal
+<pkg-root>/docs/codemap.html      package-scoped atlas
+<pkg-root>/docs/health.html       package grade
+<pkg-root>/docs/measurement.html  package measurement grade
 ```
 
 A package's docs directory defaults to `<first root>/docs` and is overridable
@@ -84,7 +86,7 @@ the map, or leave them — the loaders ignore unknown keys.
 | Row | Contents |
 |---|---|
 | Up | `⌂ Overall <Type>` → the repo-level document **of the same type**, then the package name |
-| Across | `Summary · Code Map · Health` for this package, current one `aria-current="page"` |
+| Across | `Summary · Code Map · Health · Measurement` for this package, current one `aria-current="page"` |
 | Sideways | The same document type in every other package |
 
 The block is delimited by `<!-- code-overview:nav -->` and `<!-- /code-overview:nav -->`
@@ -157,29 +159,73 @@ print(meta["grade"], meta["score"])
 One root read gives every grade in the repo: `docs/health.html`'s `packages`
 array is the whole table.
 
+## The measurement metadata block
+
+`measurement.html` embeds its numbers the same way `health.html` does, with the
+same `</` → `<\/` escaping, so one extraction snippet reads both:
+
+```html
+<script type="application/json" id="measurement-meta"> … </script>
+```
+
+| Field | Meaning |
+|---|---|
+| `schema` | `measurement/1` |
+| `scope` | `package` or `repository` |
+| `package`, `generated`, `commit` | which unit, when, against which sha |
+| `score`, `grade` | 0–100 and a letter; `score` is null when nothing measurable was found |
+| `weight_total`, `weight_measured` | the two sides of the ratio |
+| `by_importance` | per level: `total`, `measured`, `share`, `rows` — `["3"]["share"]` is the ship-gate cut |
+| `rows[]` | every measurable thing: `name`, `importance`, `importance_reason`, `credit`, `credit_reason`, `finding`, `n`, `n_total`, `formula`, `consumer`, `evidence[]`, `status`, `unmeasurable_reason` |
+| `findings[]` | `id`, `severity`, `title`, `detail`, `evidence[]`, `blast_radius` |
+| `not_audited[]` | subsystems the audit could not reach |
+| `rows_out_of_scope` | rows dropped as defined outside this unit |
+| `packages[]` | root scope only: `name`, `score`, `grade`, `rows`, `generated` |
+
+`score: null` with `rows: []` is the documented "no measurement content" page.
+It is neither a pass nor a failure, and the roll-up says so in words rather
+than showing a dash that could be read either way.
+
 ## Rebuild order
 
-The scripts read each other's output, so order matters:
+The scripts read each other's output, so order matters. The "run it once from
+the repo root" rule now governs both analysis skills:
 
-1. `discover_packages.py` → confirm with the user → save `docs/code-overview.json`
-2. **the doctors, once each, from the repo root** — not per package directory
-3. per package: atlas → `build_health.py` (partitions the repo-wide findings by
-   path) → `build_summary.py`
-4. root: atlas → `build_health.py --root --map …` (reads every package
-   `health.html`) → `build_summary.py --root --map …`
-5. `inject_nav.py` (needs every document to exist, so it can skip what does not)
+1. `discover_packages.py` → confirm with the user → write `docs/code-overview.json`
+2. **code-doctor once, from the repo root** → routes to specialists →
+   `merge_reports.py` → one envelope
+3. **science-investigation's scripts once, from the repo root** → one inventory,
+   partitioned per package by the `file:line` evidence on each row
+4. per package: codemap → `build_health.py` → measurement → `build_summary.py`
+5. root: codemap → `build_health.py --root` → measurement `--root` →
+   `build_summary.py --root`
+6. `inject_nav.py`, then `inject_nav.py --check`
 
-Step 2 is the one worth stating twice. A doctor pointed at a package directory
-loses the project context several of its detectors depend on — the dependency
-manifest, the test tree, Django's settings and app registry — and the result is
-not a smaller report but a *wrong* one: fabricated findings about a missing
-manifest and missing tests, alongside real findings it can no longer see.
+Steps 2 and 3 share the same failure mode, which is why both are stated rather
+than left to the agent. A doctor pointed at a package directory loses the
+project context several of its detectors depend on — the dependency manifest,
+the test tree, Django's settings and app registry — and the result is not a
+smaller report but a *wrong* one: fabricated findings about a missing manifest
+and missing tests, alongside real findings it can no longer see.
+`find_metrics.py` pointed at `src/billing` cannot see `evals/`, so it reports a
+package with a thoroughly-measured pipeline as having no measurement — a
+fabricated null, indistinguishable on the page from an honest one.
+
+Rows whose evidence spans packages — a metric defined in `evals/` that scores a
+service's output — are assigned to the package that **defines** the metric. The
+repo-level document keeps every row regardless, so nothing is lost by the
+partition.
 
 Running `build_health.py --root` before the package health pages exist is not an
 error — it warns per missing package and leaves them out of the table. Re-run it
 after. Do re-run it: the root denominator is narrowed to packages that have a
 graded health page, so a first pass with none of them built measures every
-doctored package instead, which is the looser answer.
+doctored package instead, which is the looser answer. `build_measurement.py
+--root` degrades the same way for a missing `--package` file — its row reads
+`not generated` rather than `no measurement content`, the two states this
+section already distinguishes — though it does so without a matching stderr
+note, so re-running it after the package pages exist is worth doing on faith
+rather than waiting to be told.
 
 ## Generating the atlases
 

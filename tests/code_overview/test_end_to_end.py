@@ -250,3 +250,40 @@ def test_rebuilding_the_root_before_the_packages_warns_and_recovers(run_script, 
                "--map", map_path, "--findings", report, "--repo", repo.path,
                "--name", "whole-repo")
     assert [p["package"] for p in read_meta(repo.path / "docs/health.html")["packages"]] == ["billing"]
+
+
+def test_a_four_document_set_survives_the_link_gate(repo, run_script, tmp_path):
+    """The whole point of the set: every document exists and every link resolves."""
+    import json as _json
+
+    docs = repo.path / "src" / "app" / "docs"
+    docs.mkdir(parents=True)
+    for kind in ("summary", "codemap", "health", "measurement"):
+        (docs / f"{kind}.html").write_text("<html><body><header></header></body></html>",
+                                           encoding="utf-8")
+    root_docs = repo.path / "docs"
+    root_docs.mkdir(parents=True, exist_ok=True)
+    for kind in ("summary", "codemap", "health", "measurement"):
+        (root_docs / f"{kind}.html").write_text("<html><body><header></header></body></html>",
+                                                encoding="utf-8")
+    mapping = root_docs / "code-overview.json"
+    mapping.write_text(_json.dumps({"schema": "code-overview/1", "packages": [
+        {"name": "app", "roots": ["src/app"], "docs": "src/app/docs",
+         "language": "python", "doctor": "code-doctor"}]}), encoding="utf-8")
+
+    inject = CO / "inject_nav.py"
+    run_script(inject, "--map", mapping, "--repo", repo.path)
+    run_script(inject, "--map", mapping, "--repo", repo.path, "--check", expect_rc=0)
+
+    text = (docs / "measurement.html").read_text(encoding="utf-8")
+    assert "Overall Measurement" in text
+    assert text.count("<!-- code-overview:nav -->") == 1
+
+
+def test_the_skill_documents_all_four_documents():
+    text = (CO.parent / "SKILL.md").read_text(encoding="utf-8")
+
+    assert "measurement.html" in text
+    assert "build_measurement.py" in text
+    assert "merge_reports.py" in text
+    assert "candidates" in text.lower()

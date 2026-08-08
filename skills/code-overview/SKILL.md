@@ -1,6 +1,6 @@
 ---
 name: code-overview
-description: Build a navigable documentation set for a codebase, one per package rather than one per repo. Works out what the packages/modules/subsystems are (asking the user to confirm, and about anything ambiguous), then per package runs code-visualization into <package>/docs/codemap.html and the matching code doctor into <package>/docs/health.html — a graded page with a 0-100 score, a letter grade, and a JSON metadata block for later extraction — plus a summary.html linking both. Collates these into repo-level docs/summary.html, codemap.html and health.html, and injects navigation so every page links up to the overall document of its own type, across to its siblings, and back down. Use when the user wants an overview, health report, grade or score for a codebase, per-package docs, or docs for a monorepo — "document this repo", "how healthy is each package", "grade this codebase", "overview of every service". For one unscored atlas use code-visualization; for one PR use pr-visualization.
+description: Build a navigable documentation set for a codebase, one per package rather than one per repo. Works out what the packages/modules/subsystems are (confirming with the user), then per package runs code-visualization into codemap.html, one code-doctor call into health.html — a graded page with a 0-100 score and letter grade — and science-investigation into measurement.html, scored null rather than zero when nothing is measurable — plus a summary.html linking all three. Collates these into repo-level summary.html, codemap.html, health.html and measurement.html, and injects navigation so every page links up to the overall document of its own type, across to its siblings, and back down. Use when the user wants an overview, health report, grade, measurement audit, or score for a codebase, per-package docs, or docs for a monorepo — "document this repo", "how healthy is each package", "grade this codebase", "overview of every service". For one unscored atlas use code-visualization; for one PR use pr-visualization.
 ---
 
 # Code Overview — a graded, navigable document set
@@ -11,22 +11,28 @@ of them can do alone: deciding what the units are, running the others per unit,
 scoring the result, and binding it all into one navigable set with a consistent
 appearance.
 
-Let `SKILL=/path/to/this/skill`, and let `CV` and `DOCTOR` be the paths to the
-installed `code-visualization` and `*-code-doctor` skills. Needs **Python
-3.11+**; the scripts are stdlib-only.
+Let `SKILL=/path/to/this/skill`, and let `CV`, `DOCTOR`, and `SCIENCE` be the
+paths to the installed `code-visualization`, `code-doctor`, and
+`science-investigation` skills. Needs **Python 3.11+**; the scripts are
+stdlib-only.
 
 **If a companion is not installed**, say so and degrade rather than substitute:
-without `code-visualization` there are no code maps — build health and summary
-pages, and the nav simply omits the missing link. Without a doctor for a
-language, see *No doctor for this language* below. Never hand-write a codemap or
-invent findings to fill a page.
+without `code-visualization` there are no code maps — build health, measurement,
+and summary pages, and the nav simply omits the missing link. Without
+`code-doctor` itself there is no merged envelope at all — build codemap,
+measurement, and summary pages, and skip health entirely unless a
+hand-assembled report exists for `--findings`. Without a specialist for a
+package's language, see *No specialist for this language* below. Without
+`science-investigation` there is no measurement page — say so on the summary and
+in the nav. Never hand-write a codemap or invent findings or metrics to fill a
+page.
 
 ## What gets built
 
 ```
 docs/code-overview.json      the package map — the input to every other script
-docs/{summary,codemap,health}.html          repo level
-<pkg-root>/docs/{summary,codemap,health}.html   one set per package
+docs/{summary,codemap,health,measurement}.html          repo level
+<pkg-root>/docs/{summary,codemap,health,measurement}.html   one set per package
 ```
 
 Full layout, the nav contract, and the metadata schema: `references/doc-layout.md`.
@@ -68,48 +74,48 @@ Then write the confirmed map to `docs/code-overview.json` — the shape is in
 that appeared or vanished since. Re-litigating a settled package structure wastes
 the user's time and churns the documents.
 
-## 2. Run the doctors once, from the repo root
+## 2. Run code-doctor once, from the repo root
+
+**One doctor call.** code-doctor detects the languages and frameworks the
+repository's manifests declare, names the specialists that justifies, and merges
+every report into one envelope.
+
+```bash
+python "$DOCTOR/scripts/route.py" <repo> --format json
+# load and run each named specialist over <repo>, then:
+python "$DOCTOR/scripts/merge_reports.py" \
+  --report code-doctor:$WORK/raw.json \
+  --report python-code-doctor:$WORK/py.json \
+  --out $WORK/merged.json --format json
+```
 
 **Not once per package directory.** This is the step that is easy to get wrong
-and expensive to get wrong, because the failure is silent:
+and expensive to get wrong, because the failure is silent. Pointed at
+`src/billing` instead, a doctor cannot see the repo's `pyproject.toml` or its
+top-level `tests/`, so it reports a missing dependency manifest and "no test
+files were found" — two fabricated findings about a project that has both.
 
-```bash
-python "$DOCTOR/scripts/analyze_all.py" <repo> --format json > $WORK/findings.json
-```
+The envelope replaces three things this skill used to be told:
 
-Pointed at `src/billing` instead, a doctor cannot see the repo's `pyproject.toml`
-or its top-level `tests/`, so it reports a missing dependency manifest and "no
-test files were found" — two fabricated findings, one of them high severity in
-the Tests category — about a project that has both. `django-code-doctor` is worse:
-its whole-project class graph is built from settings and `INSTALLED_APPS`, so an
-app directory alone yields a fraction of the real findings, and a package that
-isn't recognized as Django at all yields *none*, which grades as an A+.
+- **Attribution.** Every record carries the doctor that produced it, so
+  `--findings <doctor>:<path>` is no longer needed on the normal path. It stays
+  for hand-assembled input.
+- **Coverage.** `doctors_run` and `analyzers_run` are the evidence; `--doctor`
+  no longer grants a coverage profile. A doctor in `coverage_unknown` — a bare
+  JSON list, which `analyze_django.py` and a single detector both emit — grants
+  nothing, because nothing in that shape distinguishes a full run from one
+  detector that found nothing.
+- **Defect vs lead.** Findings are scored; **candidates are not**. A candidate
+  asserts no defect and carries no fix, and charging one to the grade would
+  punish a doctor for being honest about what it could not prove.
 
-`analyze_django.py` for `django-code-doctor`. Run every doctor the map needs —
-one per language present — and keep each report; they all get passed along
-below. Do not pass `--skip`/`--skip-duplicates` unless you mean it: a skipped
-detector leaves its rubric category ungraded (which is correct, and lowers what
-the grade covers).
-
-**Label every report with the doctor that produced it** — `--findings
-<doctor>:<path>` — whenever more than one doctor's findings are passed:
-
-```bash
---findings python-code-doctor:$WORK/py.json --findings django-code-doctor:$WORK/dj.json
-```
-
-Nothing in a report says who wrote it, and the workflow hands every report to
-every package. An unlabelled report is attributed to `--doctor`, so a TypeScript
-report reaching a Python package's page granted Python coverage nothing had
-measured — an A+ from another language's analysis. The label also decides
-template sizing, so a Django report puts its templates in the denominator even
-when `--doctor` names the Python doctor.
-
-**A Django project deserves both doctors.** `django-code-doctor` has no general
-duplication or dead-code detector, so on its own those categories come back
-ungraded. Run `python-code-doctor` over the repo too, pass both JSON files
-labelled as above, and use `--doctor python-code-doctor` so the union is
-credited with full coverage.
+**Failures are named, not absorbed.** `doctor_errors` ungrades the categories
+the failed doctor covered rather than letting the surviving report score them.
+`completeness` does the same per evidence class: a reference graph the detector
+reports as inadequate ungrades Design, and inconclusive test classification
+ungrades Tests. **code-doctor alone never grades Correctness** — a merge marker
+in a git-confirmed unmerged path is the only correctness-class defect its raw
+layer can prove.
 
 ## 3. Per package
 
@@ -122,13 +128,34 @@ package's inventory tab ends up describing its own documentation. Scale judgment
 tabs to size: a 400-line package may warrant the automated tabs only, and
 code-visualization's own proportion rule covers this.
 
-**The grade.** The repo-wide findings are partitioned by path, so each package's
-page carries only findings about its own code:
+**The measurement audit.** Run `science-investigation`'s scripts **once from the
+repo root** — pointed at a package, `find_metrics.py` cannot see `evals/` and
+reports a thoroughly-measured pipeline as having no measurement. Write the
+inventory once, then build each package's page from it:
+
+```bash
+python "$SCIENCE/scripts/build_measurement.py" --out <DOCS>/measurement.html \
+  --inventory $WORK/inventory.json --name <pkg> --repo <repo> \
+  --root-dir <root> --template "$SKILL/assets/template.html" \
+  --body "$SKILL/assets/measurement-body.html" --intro-file $WORK/<pkg>-measure.html
+```
+
+**Every package gets one.** A package with nothing measurable is a short page
+scoring `null` — not zero, not A+ — and appears in the repo document's *no
+measurement content* list. Most packages in a typical repo are that page, and
+that is the correct output.
+
+Pass `--template "$SKILL/assets/template.html"` to `code-visualization`'s
+`assemble.py` too. That one flag is what makes the four documents read as one
+artifact instead of three tools' output.
+
+**The grade.** Pass the merged envelope from step 2; `build_health.py` partitions
+its findings and candidates by path, so each package's page carries only
+records about its own code:
 
 ```bash
 python "$SKILL/scripts/build_health.py" --out <DOCS>/health.html --repo <repo> \
-  --findings $WORK/findings.json --name <pkg> --root-dir <root> \
-  --language python --doctor python-code-doctor
+  --merged $WORK/merged.json --name <pkg> --root-dir <root> --language python
 ```
 
 `--scope` defaults to the `--root-dir` values, so a multi-root package
@@ -136,6 +163,11 @@ python "$SKILL/scripts/build_health.py" --out <DOCS>/health.html --repo <repo> \
 out-of-scope is printed to stderr and recorded in the metadata — it should
 roughly account for the rest of the repo, and if it accounts for *everything*
 the paths don't line up.
+
+**`--findings`, `--doctor`, and `--covers` still work** — they are how a
+hand-assembled report (a third-party tool, a report from before this skill
+called `code-doctor`) reaches the grade. The rest of this section documents
+what they mean; skip it on the normal path, where `--merged` supplies all of it.
 
 **Coverage is evidence, not capability.** Only `analyze_all.py`'s report — the
 envelope naming `analyzers_run` — is evidence, and it is believed per category
@@ -191,7 +223,7 @@ two documents cannot disagree.
 
 ## 4. The repo level
 
-Same three documents, one scope up.
+Same four documents, one scope up.
 
 - **Atlas**: a genuine repo-wide `code-visualization` run into `docs/codemap.html`.
   Cross-package coupling and cycles only exist at this scope, so this is not a
@@ -215,6 +247,13 @@ Same three documents, one scope up.
   `--root` after them.** Run before they exist, it falls back to every doctored
   package and says so. A package with no health page stays in the table marked
   *not generated* rather than vanishing from it.
+- **Measurement**: `build_measurement.py --root --out docs/measurement.html
+  --inventory $WORK/inventory.json --name <repo> --package <pkg>:<pkg-docs>/measurement.html
+  [--package ... ]`. Reads each package's grade back out of its own
+  `measurement.html`, the same discipline as the summary and health roll-ups, so
+  the table cannot disagree with the pages it summarizes. Every mapped package
+  gets a row, including the ones that scored `null` — the table calls those *no
+  measurement content*, not a blank cell.
 - **Summary**: `build_summary.py --root --map docs/code-overview.json`.
 
 ## 5. Navigation, last
@@ -230,10 +269,12 @@ block rather than stacking it. `--check` writes nothing, reports what would
 change, and **exits 1 if any link is broken** — run it as the final gate and fix
 what it names.
 
-## No doctor for this language
+## No specialist for this language
 
-Doctors ship for Python, Django, and TypeScript. For anything else — Go, Rust,
-plain JS, Java, a mixed package — **ask the user** which they want:
+Specialists ship for Python, Django, and TypeScript; `code-doctor` itself (step
+2) is language-blind and always runs, so its merged envelope exists for every
+package regardless. For a language with no specialist — Go, Rust, plain JS,
+Java, a mixed package — **ask the user** what to do beyond that:
 
 - **Codemap plus an ungraded health page.** Build `health.html` with `--doctor`
   naming whatever produced the findings (or nothing at all): with no coverage
@@ -266,6 +307,11 @@ nothing at all rather than everything.
   is what `--scope` and the root's map-derived sizing are for. Grading a package
   over findings from elsewhere, or over lines nothing analyzed, produces a number
   that looks like the others and means something different.
+- **The measurement grade is a different question from the health grade, even
+  though it sits beside it.** Health asks how dense the detectable defects are;
+  measurement asks how much of what matters is actually measured. A package can
+  be A on one and null on the other, and both are honest — say which is which
+  when presenting them together.
 - **Every document is generated, never hand-edited.** Fix the input and re-run.
 - **No dangling links.** `inject_nav.py --check` exits 0 or the set is not done.
 - **Say what was skipped.** Packages you did not build, a doctor that was
@@ -277,18 +323,23 @@ nothing at all rather than everything.
 | Load this when… | File |
 |---|---|
 | A grade looks wrong; a doctor grew a detector the rubric has not seen; explaining what a letter means | `references/scoring.md` |
+| A measurement grade looks wrong; explaining what the coverage ratio divides | `references/scoring.md` |
 | Wiring the documents together — file layout, the package map, the nav contract, the metadata schema and how to extract it, rebuild order | `references/doc-layout.md` |
 
 ## Scripts
 
 ```bash
 python "$SKILL/scripts/discover_packages.py" <repo> [--format text|json] [--exclude d1,d2] [--min-files N]
-python "$SKILL/scripts/build_health.py"  --out FILE --findings JSON [--findings JSON ...] [--root]
+python "$SKILL/scripts/build_health.py"  --out FILE [--merged JSON] [--findings JSON ...] [--root]
+python "$SCIENCE/scripts/build_measurement.py" --out FILE --inventory JSON --name NAME [--root]
 python "$SKILL/scripts/build_summary.py" --out FILE [--root] [--intro-file HTML] [--highlight TEXT]
 python "$SKILL/scripts/inject_nav.py"    --map docs/code-overview.json --repo <repo> [--check]
 ```
 
 Templates live in `assets/` — `assets/template.html` is the shared page shell
-(its design tokens are code-visualization's, which is what makes the three
-document types read as one artifact), with `assets/health-body.html` and
-`assets/summary-body.html` supplying the two layouts.
+(its design tokens are code-visualization's, which is what makes the four
+document types read as one artifact), with `assets/health-body.html`,
+`assets/summary-body.html`, and `assets/measurement-body.html` supplying the
+three layouts. `measurement-body.html` is a byte-identical copy of
+`science-investigation`'s own — one source of truth, pinned by
+`tests/test_shared_assets.py`.

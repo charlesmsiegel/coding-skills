@@ -24,6 +24,16 @@
       "prompt": "the health page says our api package is a C+ but honestly the architecture there is the worst part of the system. is the grade wrong?",
       "expected_output": "Explains rather than re-scores: the grade measures the density of mechanically-detectable findings, so architecture that is wrong-but-tidy scores well by construction — the code map's Boundaries and Invariants tabs are where that judgment lives, which is why summary.html links both. Checks the metadata for ungraded categories and analyzer_errors before defending the number, since either would mean the grade covers less than it appears to. Only proposes a rubric change (references/scoring.md) if unmapped_types is non-empty or a category is genuinely mis-weighted — not to make one package's number match an intuition.",
       "files": []
+    },
+    {
+      "id": "candidates-do-not-move-the-grade",
+      "prompt": "The health page for our Go service shows 40 candidates and a B. Should we be deleting those dead functions?",
+      "expected_output": "Explains that candidates are unverified leads that carried no weight in the B, and that the dead-function candidates specifically rest on a heuristic reference graph that under-resolves package-style imports. Points at the benign explanations on the page — entry points, convention-loaded plugins, a library's public surface — and says to confirm each before deleting anything."
+    },
+    {
+      "id": "every-package-gets-a-measurement-page",
+      "prompt": "Build the overview. Only the evals package actually computes any metrics — skip measurement for the other six.",
+      "expected_output": "Builds a measurement page for all seven, explaining that a package with nothing measurable scores null and says so in one line, and that the repo document lists them as having no measurement content. Does not skip the pages, and does not manufacture metrics to fill them."
     }
   ]
 }
