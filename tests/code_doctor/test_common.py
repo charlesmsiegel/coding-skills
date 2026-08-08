@@ -62,6 +62,18 @@ def test_documentation_directory_is_not_source(common, repo):
     assert found == {"app.py"}
 
 
+def test_documentation_directory_matched_case_insensitively(common, repo):
+    """`Docs/`, `DOCS/`, and `Examples/` are documentation on a case-sensitive
+    filesystem too — the comparison must lowercase each path component, the
+    same way NON_CODE_BASENAMES already does.
+    """
+    repo.write("Docs/guide.py", "print(1)\n")
+    repo.write("EXAMPLES/sample.py", "print(2)\n")
+    repo.write("app.py", "print(3)\n")
+    found = {p.name for p in common.walk_files(repo.path, source_only=True)}
+    assert found == {"app.py"}
+
+
 def test_symlinks_are_never_followed(common, repo, tmp_path):
     """A link out of the tree would otherwise let this skill read host data
     and report a credential found there as committed to this repository."""
@@ -245,6 +257,41 @@ def test_asdict_round_trips_through_finding(common):
     reconstructed = common.Finding(**asdict(original))
     assert original == reconstructed
     assert original.line == reconstructed.line
+
+
+def test_also_caused_by_and_related_lines_are_tuples(common):
+    """The schema-bearing collections are tuples, not lists.
+
+    `frozen=True` blocks reassignment but not in-place mutation, so a list
+    field would let `candidate.also_caused_by.clear()` walk a validated
+    record into a schema-invalid state that __post_init__ never re-checks.
+    """
+    candidate = common.Finding(file="a.go", line=1, smell_type="x", description="d",
+                               kind="candidate", also_caused_by=["it is an entry point"],
+                               related_lines=[2, 3])
+    assert isinstance(candidate.also_caused_by, tuple)
+    assert isinstance(candidate.related_lines, tuple)
+    assert not hasattr(candidate.also_caused_by, "clear")
+    assert not hasattr(candidate.related_lines, "clear")
+
+
+def test_finding_survives_json_round_trip(common):
+    """also_caused_by and related_lines must survive a JSON round trip.
+
+    json.dumps turns the internal tuples into JSON arrays; json.loads turns
+    those back into plain Python lists, not tuples. Finding(**record) must
+    still construct from that record, and the tuple type must be restored.
+    """
+    from dataclasses import asdict
+    original = common.Finding(file="a.go", line=2, smell_type="y", description="d",
+                              kind="candidate", also_caused_by=["it is an entry point"],
+                              related_lines=[3, 4])
+    payload = json.loads(json.dumps(asdict(original)))
+    assert payload["also_caused_by"] == ["it is an entry point"], "JSON has no tuple type"
+    reconstructed = common.Finding(**payload)
+    assert reconstructed.also_caused_by == ("it is an entry point",)
+    assert reconstructed.related_lines == (3, 4)
+    assert reconstructed == original
 
 
 def test_probe_history_reports_not_a_repo(common, tmp_path):
