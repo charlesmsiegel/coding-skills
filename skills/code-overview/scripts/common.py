@@ -137,16 +137,27 @@ def normalize_severity(value) -> str:
     return token if token in SEVERITIES else "medium"
 
 
-def normalize_findings(data) -> dict:
+def normalize_findings(data, source: str = "a findings file") -> dict:
     """Flatten any doctor's JSON into one report record.
 
-    Returns `{findings, errors, ran, skipped, shape}`. The non-finding fields
-    matter as much as the findings and for the same reason: an analyzer that
-    crashed, one that was skipped, and one that was never part of the run all
-    report zero, and zero from an analyzer that did not look means *unknown*,
-    not *clean*.
+    Returns `{findings, candidates, completeness, errors, ran, skipped, shape}`.
+    The non-finding fields matter as much as the findings and for the same
+    reason: an analyzer that crashed, one that was skipped, and one that was
+    never part of the run all report zero, and zero from an analyzer that did
+    not look means *unknown*, not *clean*.
+
+    Four shapes are recognised — a bare list, a `categories` envelope, a bare
+    detector's `{"issues": [...]}`, and code-doctor's
+    `{"completeness": {...}, "findings": [...]}`. Anything else **warns**. A
+    zero-byte file is loud, but an unreadable *shape* was silent: a real
+    code-doctor report handed to `--findings` parsed fine, matched no branch,
+    and returned zero findings, which graded A+/100 with no caveat anywhere on
+    the page. An unrecognised shape is exactly as much evidence as an empty
+    file — none — and has to say so.
     """
     findings: list[dict] = []
+    candidates: list[dict] = []
+    completeness: dict = {}
     errors: dict[str, str] = {}
     skipped: set[str] = set()
     ran: set[str] = set()
@@ -180,13 +191,71 @@ def normalize_findings(data) -> dict:
             # analyzers_run never produced its section.
             skipped |= set(categories) - ran
             ran -= set(errors) | skipped
+        elif isinstance(data.get("findings"), list):
+            # code-doctor's own report, and the one shape `merge_reports.py`
+            # already knew how to read while this function did not.
+            records, candidates = _split_kinds(data["findings"])
+            findings = records
+            block = data.get("completeness")
+            completeness = block if isinstance(block, dict) else {}
+            errors, skipped, ran = _code_doctor_inventory(completeness)
+            # Coverage evidence is the presence of `categories_run`, not the
+            # presence of findings. Without the key there is nothing to say
+            # what looked, which is the bare-list case in different clothing.
+            if isinstance(completeness.get("categories_run"), list):
+                shape = SHAPE_FULL
         elif isinstance(data.get("issues"), list):
             findings = [item for item in data["issues"] if isinstance(item, dict)]
+        else:
+            warn(f"{source} matched no known report shape (no `categories`, `findings` or "
+                 "`issues` key), so nothing in it could be read. It contributes no findings "
+                 "and no coverage — the same as an empty file. Check that it is a doctor's "
+                 "report and not, say, a merged envelope (pass that with --merged).")
+    else:
+        warn(f"{source} holds a bare {type(data).__name__}, which is not a report of any "
+             "shape this skill knows. Nothing in it could be read.")
 
     for finding in findings:
         finding["severity"] = normalize_severity(finding.get("severity"))
-    return {"findings": findings, "errors": errors, "ran": ran, "skipped": skipped,
+    for candidate in candidates:
+        candidate["severity"] = normalize_severity(candidate.get("severity"))
+    return {"findings": findings, "candidates": candidates, "completeness": completeness,
+            "errors": errors, "ran": ran, "skipped": skipped,
             "shape": shape, "empty_artifact": False, "doctor": ""}
+
+
+def _split_kinds(records) -> tuple[list[dict], list[dict]]:
+    """Separate asserted defects from unverified leads.
+
+    code-doctor emits both under one `findings` array, distinguished only by
+    `kind`. Reading the array wholesale would put candidates into the score,
+    which is the one thing this skill promises never to do: a candidate is a
+    lead that a healthy codebase produces too, and charging the grade for it
+    penalises code for being hard to analyse rather than for being wrong.
+    """
+    findings: list[dict] = []
+    candidates: list[dict] = []
+    for item in records:
+        if not isinstance(item, dict):
+            continue
+        (candidates if item.get("kind") == "candidate" else findings).append(item)
+    return findings, candidates
+
+
+def _code_doctor_inventory(completeness: dict) -> tuple[dict[str, str], set[str], set[str]]:
+    """`(errors, skipped, ran)` out of code-doctor's completeness block.
+
+    `categories_run` means ran *and completed*, so nothing is subtracted from
+    it here; `categories_failed` and `categories_skipped` are the categories it
+    already excludes, carried across so a reader can see which run lost them.
+    """
+    failed = completeness.get("categories_failed")
+    errors = ({str(k): str(v) for k, v in failed.items()} if isinstance(failed, dict) else {})
+    skipped_raw = completeness.get("categories_skipped")
+    skipped = {str(name) for name in skipped_raw} if isinstance(skipped_raw, list) else set()
+    ran_raw = completeness.get("categories_run")
+    ran = {str(name) for name in ran_raw} if isinstance(ran_raw, list) else set()
+    return errors, skipped - ran, ran - set(errors)
 
 
 def finding_identity(finding: dict) -> tuple:
@@ -308,7 +377,8 @@ def load_reports(paths) -> tuple[list[dict], dict[str, str], set[str]]:
             warn(f"{raw} is empty — no findings and no evidence of what was examined, so "
                  "nothing from it can be graded. Did the doctor fail after the shell "
                  "created the file?")
-            reports.append({"findings": [], "errors": {}, "ran": set(),
+            reports.append({"findings": [], "candidates": [], "completeness": {},
+                            "errors": {}, "ran": set(),
                             "skipped": set(), "shape": SHAPE_PARTIAL,
                             "empty_artifact": True, "doctor": doctor})
             continue
@@ -316,7 +386,7 @@ def load_reports(paths) -> tuple[list[dict], dict[str, str], set[str]]:
             data = json.loads(text)
         except json.JSONDecodeError as exc:
             raise SystemExit(f"error: {raw} is not valid JSON: {exc}") from exc
-        report = normalize_findings(data)
+        report = normalize_findings(data, source=str(raw))
         report["doctor"] = doctor
         reports.append(report)
         errors.update(report["errors"])
@@ -674,7 +744,7 @@ def load_merged(path) -> dict:
     """
     path = Path(path)
     blank = {"reports": [], "candidates": [], "completeness": {}, "doctor_errors": {},
-             "doctors": [], "coverage_unknown": []}
+             "doctors": []}
     try:
         text = path.read_text(encoding="utf-8")
     except OSError as exc:
@@ -744,6 +814,8 @@ def load_merged(path) -> dict:
         ran -= set(doctor_errors_here) | doctor_skipped
         by_doctor[doctor] = {
             "findings": [],
+            "candidates": [],
+            "completeness": (completeness_field or {}).get(doctor) or {},
             "errors": doctor_errors_here,
             "ran": ran,
             "skipped": doctor_skipped,
@@ -752,16 +824,48 @@ def load_merged(path) -> dict:
             "doctor": doctor,
         }
 
+    # `coverage_unknown` used to be returned and read by nobody. It is consumed
+    # here instead: a doctor that contributed findings but no inventory of what
+    # it looked at is the caveat a reader most needs, and the page otherwise
+    # says nothing about it — every category it alone could have covered comes
+    # back ungraded with no explanation of why. Returning the list as well
+    # would just re-create the unread field.
+    stranded = sorted(name for name in unknown if name in set(doctors))
+    if stranded:
+        warn(f"{', '.join(stranded)} contributed findings but no record of what "
+             "was examined (a bare list cannot say), so they grant no coverage and every "
+             "category resting on them alone is ungraded. Re-run them with a report shape "
+             "that inventories its analyzers.")
+
+    orphaned: dict[str, int] = {}
     for record in findings_field or []:
         if isinstance(record, dict):
             record["severity"] = normalize_severity(record.get("severity"))
-            report = by_doctor.get(str(record.get("doctor")))
+            name = str(record.get("doctor"))
+            report = by_doctor.get(name)
             if report is not None:
                 report["findings"].append(record)
+            else:
+                # Dropping these silently shrank the numerator against an
+                # unchanged denominator: findings vanished from the grade while
+                # the lines they were found in stayed in the divisor, so a
+                # mis-attributed record made the code look *better*. Count and
+                # say so.
+                orphaned[name] = orphaned.get(name, 0) + 1
+    if orphaned:
+        detail = ", ".join(f"{count} from {name or '(unattributed)'}"
+                           for name, count in sorted(orphaned.items()))
+        warn(f"{sum(orphaned.values())} finding(s) in {path} name a doctor that is not in "
+             f"`doctors_run` ({detail}), so they are not graded. The lines they point at are "
+             "still in the denominator, so the grade is flattering by exactly that much. "
+             "Re-merge with every doctor labelled.")
 
     candidates = [record for record in (candidates_field or []) if isinstance(record, dict)]
     for record in candidates:
         record["severity"] = normalize_severity(record.get("severity"))
+        report = by_doctor.get(str(record.get("doctor")))
+        if report is not None:
+            report["candidates"].append(record)
 
     return {
         "reports": list(by_doctor.values()),
@@ -769,5 +873,4 @@ def load_merged(path) -> dict:
         "completeness": completeness_field or {},
         "doctor_errors": {str(k): str(v) for k, v in (data.get("doctor_errors") or {}).items()},
         "doctors": doctors,
-        "coverage_unknown": sorted(unknown),
     }
