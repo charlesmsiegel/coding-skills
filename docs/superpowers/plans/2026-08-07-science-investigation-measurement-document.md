@@ -530,7 +530,7 @@ CV_TEMPLATE = Path(__file__).resolve().parents[2] / "skills" / "code-visualizati
 def token_blocks(text: str) -> str:
     """The :root token block and its light-mode twin, which must not drift."""
     root = re.search(r":root\{.*?\n\}", text, re.S)
-    light = re.search(r"@media \(prefers-color-scheme: light\)\{.*?\n\}\n\}", text, re.S)
+    light = re.search(r"@media \(prefers-color-scheme: light\)\{.*?\n\s*\}\n\}", text, re.S)
     assert root and light, "template is missing its design-token blocks"
     return root.group(0) + "\n" + light.group(0)
 
@@ -739,7 +739,7 @@ import re, pathlib
 
 cv = pathlib.Path("skills/code-visualization/assets/template.html").read_text(encoding="utf-8")
 root = re.search(r":root\{.*?\n\}", cv, re.S).group(0)
-light = re.search(r"@media \(prefers-color-scheme: light\)\{.*?\n\}\n\}", cv, re.S).group(0)
+light = re.search(r"@media \(prefers-color-scheme: light\)\{.*?\n\s*\}\n\}", cv, re.S).group(0)
 
 shell = '''<!DOCTYPE html>
 <html lang="en">

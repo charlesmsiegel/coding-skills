@@ -63,7 +63,7 @@ TEMPLATES = (
 def token_blocks(path: Path) -> str:
     text = path.read_text(encoding="utf-8")
     root = re.search(r":root\{.*?\n\}", text, re.S)
-    light = re.search(r"@media \(prefers-color-scheme: light\)\{.*?\n\}\n\}", text, re.S)
+    light = re.search(r"@media \(prefers-color-scheme: light\)\{.*?\n\s*\}\n\}", text, re.S)
     assert root and light, f"{path.name} is missing its design-token blocks"
     return root.group(0) + "\n" + light.group(0)
 
