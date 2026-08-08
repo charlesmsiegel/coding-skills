@@ -29,6 +29,7 @@ from pathlib import Path
 
 import common
 import rubric
+import theory_rubric as tr
 from build_health import (grade_class, headline_badges, render_category_rows,
                           render_package_table, render_top_findings)
 from common import (DOC_TITLES, doc_path, esc, grouped_by_doctor, listed_packages, load_map,
@@ -94,17 +95,23 @@ def render_theory_card(meta: dict | None) -> str:
     if meta is None:
         return ""
     score = meta.get("score")
-    if score is None:
-        return ('<div class="callout"><strong>Theory: too small to warrant one.</strong> '
-                f'{esc(meta.get("exempt_reason") or "")} Scored null — not zero, not a pass.'
-                "</div>")
-    grade = str(meta.get("grade", "—"))
+    # Computed before the exempt branch, not inside the graded one. A unit two
+    # judges called trivial can still split the panel two rungs, and testing
+    # exemption first threw that away — the portal is where readers land, so a
+    # disagreement dropped here is dropped for most of them. Labels, not keys:
+    # theory.html says "World-mapping" and this said `world_mapping`.
     disputed = meta.get("disputed") or []
     note = ""
     if disputed:
         note = ('<p class="dim"><strong>The panel disagreed</strong> on '
-                + esc(", ".join(str(key) for key in disputed))
+                + esc(", ".join(tr.DIMENSION_LABELS.get(str(key), str(key))
+                                for key in disputed))
                 + " — see the Theory document.</p>")
+    if score is None:
+        return ('<div class="callout"><strong>Theory: too small to warrant one.</strong> '
+                f'{esc(meta.get("exempt_reason") or "")} Scored null — not zero, not a pass.'
+                f"{note}</div>")
+    grade = str(meta.get("grade", "—"))
     return (f'<section class="gradecard {grade_class(grade)}">'
             f'<div><div class="letter">{esc(grade)}</div>'
             f'<div class="score">{score:.1f} / 100</div></div>'
@@ -127,6 +134,24 @@ def measurement_cell(meta: dict | None) -> tuple[str, str]:
     score = meta.get("score")
     if score is None:
         return "—", "no measurement content"
+    return f"{score:.1f}", str(meta.get("grade", "—"))
+
+
+def theory_cell(meta: dict | None) -> tuple[str, str]:
+    """(score, state) as displayed, for one package's theory document.
+
+    The same three outcomes `measurement_cell` keeps apart, for the same
+    reason: a package no panel has read and a package a panel judged too small
+    to warrant a theory are different facts, and one dash states neither. This
+    is the only place on the repository landing page a package's theory grade
+    appears at all — without the column it is invisible until you open the
+    package's own portal.
+    """
+    if meta is None:
+        return "—", "not generated"
+    score = meta.get("score")
+    if score is None:
+        return "—", "too small to warrant a theory"
     return f"{score:.1f}", str(meta.get("grade", "—"))
 
 
@@ -159,6 +184,8 @@ def render_package_links(repo: Path, packages: list[dict], out: Path) -> str:
         score = health.get("score")
         size = health.get("size", {})
         m_score, m_state = measurement_cell(measurement)
+        t_score, t_state = theory_cell(read_meta(doc_path(repo, package, "theory"),
+                                                 common.THEORY_BLOCK_ID))
         name = esc(package["name"])
         label = (f'<a href="{esc(rel_href(out, summary))}">{name}</a>'
                  if summary.is_file() else name)
@@ -174,7 +201,9 @@ def render_package_links(repo: Path, packages: list[dict], out: Path) -> str:
             f'font-weight:600">{esc(grade)}</td>'
             f'<td class="num">{findings}</td>'
             f'<td class="num">{esc(m_score)}</td>'
-            f'<td>{esc(m_state)}</td></tr>'
+            f'<td>{esc(m_state)}</td>'
+            f'<td class="num">{esc(t_score)}</td>'
+            f'<td>{esc(t_state)}</td></tr>'
         )
     caption = ("Each package has its own summary, code map, and health page."
                if not ungenerated else
@@ -183,9 +212,15 @@ def render_package_links(repo: Path, packages: list[dict], out: Path) -> str:
                "below.")
     return ("<h2>Packages</h2>"
             f'<p class="dim">{caption}</p>'
+            # Measurement and theory each occupy two cells — a score and the
+            # state behind it — so each gets two headers. One `Measurement`
+            # header over two columns left every header from `Lines` rightward
+            # sitting above the wrong column.
             '<div class="tbl-wrap"><table><thead><tr><th>Package</th><th>Language</th>'
             '<th class="num">Lines</th><th class="num">Score</th><th>Grade</th>'
-            '<th class="num">Findings</th><th>Measurement</th></tr></thead><tbody>'
+            '<th class="num">Findings</th>'
+            '<th class="num">Measurement</th><th>Measurement state</th>'
+            '<th class="num">Theory</th><th>Theory state</th></tr></thead><tbody>'
             + "".join(rows) + "</tbody></table></div>")
 
 

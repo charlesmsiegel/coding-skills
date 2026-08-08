@@ -134,6 +134,28 @@ def test_the_root_portal_lists_every_package(run_script, graded):
     assert "the whole repository" in text
 
 
+def test_the_packages_caption_says_whether_every_package_has_a_health_page(run_script, graded):
+    """A row of em-dashes for a package nobody graded reads as an unexplained
+    hole, so the caption has to say which of the two it is."""
+    graded.write("docs/code-overview.json", json.dumps({
+        "schema": "code-overview/1",
+        "packages": [{"name": "app", "roots": ["src/app"], "docs": "src/app/docs",
+                      "language": "python", "doctor": "python-code-doctor"}],
+    }))
+    out = graded.path / "docs/summary.html"
+    args = ("--root", "--out", out, "--repo", graded.path, "--name", "whole-repo",
+            "--map", graded.path / "docs/code-overview.json")
+
+    run_script(BUILD_SUMMARY, *args)
+    assert "Each package has its own summary, code map, and health page." in out.read_text()
+
+    (graded.path / "src/app/docs/health.html").unlink()
+    run_script(BUILD_SUMMARY, *args)
+    text = out.read_text()
+    assert "has no health page and is therefore ungraded" in text
+    assert "Each package has its own summary, code map, and health page." not in text
+
+
 def test_the_root_portal_omits_a_root_collapsed_package(run_script, repo):
     """Single-package repo: the package's documents *are* the repo's."""
     repo.write("m.py", "x = 1\n")
