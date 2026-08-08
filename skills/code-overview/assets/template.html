@@ -18,6 +18,7 @@
   --warn:#e0b25a; --warn-dim:rgba(224,178,90,0.14);
   --bad:#e06a6a; --bad-dim:rgba(224,106,106,0.15);
   --violet:#a08fd8;
+  --heat-lo:#27405e; --heat-hi:#e0703f;
   --mono:'IBM Plex Mono',ui-monospace,SFMono-Regular,Menlo,monospace;
   --sans:'IBM Plex Sans',system-ui,-apple-system,sans-serif;
 }
@@ -31,6 +32,7 @@
     --warn:#a87418; --warn-dim:rgba(168,116,24,0.12);
     --bad:#bd3f3f; --bad-dim:rgba(189,63,63,0.10);
     --violet:#6a55b0;
+    --heat-lo:#c9d8ec; --heat-hi:#cf5a26;
   }
 }
 *{box-sizing:border-box;margin:0;padding:0}
@@ -48,6 +50,26 @@ h1.doc-title{font-size:30px;font-weight:700;letter-spacing:-.02em;margin-top:8px
 .doc-meta{font-family:var(--mono);font-size:12px;color:var(--text-faint);margin-top:10px}
 main{max-width:1280px;margin:0 auto;padding:26px 28px 80px}
 @media (prefers-reduced-motion: reduce){*{animation:none!important;transition:none!important}}
+
+/* ---------- tabs: code-visualization's contract, so one shell serves all four
+   documents. code-overview forces this template on assemble.py and on
+   build_measurement.py, so the markup those two emit has to fit here. ------- */
+nav.tabs{
+  display:flex;gap:2px;flex-wrap:wrap;max-width:1280px;margin:18px auto 0;
+  padding:0 28px;border-bottom:1px solid var(--border);
+}
+/* summary.html is untabbed and leaves TABS_NAV empty; without this the bar
+   renders as a stray rule under the header. */
+nav.tabs:empty{display:none;border:none}
+nav.tabs button{
+  background:none;border:none;border-bottom:2px solid transparent;color:var(--text-dim);
+  font-family:var(--sans);font-size:14px;padding:9px 14px;cursor:pointer;
+}
+nav.tabs button:hover{color:var(--text)}
+nav.tabs button[aria-selected="true"]{color:var(--accent);border-bottom-color:var(--accent)}
+nav.tabs button:focus-visible{outline:2px solid var(--accent);outline-offset:-2px}
+section.panel{display:none}
+section.panel.active{display:block}
 
 /* ---------- content primitives (shared with code-visualization) ---------- */
 h2{font-size:21px;font-weight:600;letter-spacing:-.01em;margin:30px 0 10px}
@@ -132,7 +154,7 @@ td.cat{white-space:nowrap}
 td code.floc{white-space:nowrap;overflow-wrap:normal}
 footer.doc{max-width:1280px;margin:0 auto;padding:0 28px 34px;color:var(--text-faint);font-family:var(--mono);font-size:11.5px}
 footer.doc a{color:var(--text-dim)}
-@media(max-width:720px){header.doc,main,footer.doc{padding-left:16px;padding-right:16px} h1.doc-title{font-size:24px} .gradecard .letter{font-size:48px;min-width:72px}}
+@media(max-width:720px){header.doc,main,nav.tabs,footer.doc{padding-left:16px;padding-right:16px} h1.doc-title{font-size:24px} .gradecard .letter{font-size:48px;min-width:72px}}
 </style>
 </head>
 <body>
@@ -143,7 +165,19 @@ footer.doc a{color:var(--text-dim)}
   <div class="doc-meta"><!--DOC_META--></div>
 </header>
 <!--DOC_NAV-->
-<main><!--DOC_BODY--></main>
+<nav class="tabs" role="tablist"><!--TABS_NAV--></nav>
+<main><!--TABS_PANELS--><!--DOC_BODY--></main>
 <footer class="doc"><!--DOC_FOOTER--></footer>
+<script>
+(function(){
+  const btns=[...document.querySelectorAll('nav.tabs button')];
+  function activate(id){
+    document.querySelectorAll('section.panel').forEach(p=>p.classList.toggle('active',p.id===id));
+    btns.forEach(b=>b.setAttribute('aria-selected',b.dataset.tab===id?'true':'false'));
+    window.dispatchEvent(new CustomEvent('tab:shown',{detail:{id}}));
+  }
+  btns.forEach(b=>b.addEventListener('click',()=>activate(b.dataset.tab)));
+})();
+</script>
 </body>
 </html>

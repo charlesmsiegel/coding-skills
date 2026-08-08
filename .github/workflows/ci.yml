@@ -70,6 +70,13 @@ jobs:
               || { echo "::error::$f has drifted between the two code-doctor skills"; exit 1; }
           done
 
+      # The four documents in a code overview sit in one nav bar. Their design
+      # tokens and letter bands are copied between skills (each skill directory
+      # has to be installable alone), so the copies are pinned here rather than
+      # trusted to stay aligned.
+      - name: Document tokens and grade bands stay aligned across skills
+        run: pytest tests/test_shared_assets.py -q
+
       - name: Smoke tests (every detector fires on its fixture, quiet on clean code)
         run: pytest -q
 
