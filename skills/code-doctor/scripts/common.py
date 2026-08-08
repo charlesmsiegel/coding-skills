@@ -141,7 +141,7 @@ def gitignored_paths(root: Path) -> set[Path]:
     return {(root / rel.strip()).resolve() for rel in listing.splitlines() if rel.strip()}
 
 
-def walk_paths(root: Path) -> Iterator[Path]:
+def walk_paths(root: Path, *, skip_gitignored: bool = False) -> Iterator[Path]:
     """Yield every non-excluded file path under ``root``, binaries included.
 
     Metadata-only checks (file size, tracking state) need the binary paths that
@@ -165,7 +165,7 @@ def walk_paths(root: Path) -> Iterator[Path]:
     if not root.is_dir():
         raise ScanPathError(f"{root}: no such file or directory")
 
-    ignored = gitignored_paths(root)
+    ignored = gitignored_paths(root) if skip_gitignored else set()
 
     # os.walk with in-place dirnames pruning, NOT rglob-then-filter: rglob
     # descends into node_modules, vendor and target in full and stats every
@@ -192,7 +192,14 @@ def walk_files(root: Path, *, source_only: bool) -> Iterator[Path]:
     whose findings are real in any text file (secrets, merge markers) pass
     False and take the wider set. Binaries are excluded from both.
     """
-    for path in walk_paths(root):
+    # Gitignore pruning applies to the SOURCE walk only. Generated and vendored
+    # trees should not feed the code metrics — but a credential or a merge
+    # marker in a gitignored file is still worth knowing about, and a security
+    # scan that cannot see ignored files is a security scan with a blind spot
+    # anyone can create by editing .gitignore. find_secrets reports those as
+    # candidates rather than committed leaks; it cannot do that if the walk
+    # hides them.
+    for path in walk_paths(root, skip_gitignored=source_only):
         if source_only and not is_source(path.relative_to(root).parts
                                          if root.is_dir() else (path.name,), path):
             continue
