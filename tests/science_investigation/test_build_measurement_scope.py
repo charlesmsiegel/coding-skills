@@ -10,8 +10,6 @@ import json
 import re
 from pathlib import Path
 
-import pytest
-
 SKILL = Path(__file__).resolve().parents[2] / "skills" / "science-investigation"
 SCRIPT = SKILL / "scripts" / "build_measurement.py"
 
