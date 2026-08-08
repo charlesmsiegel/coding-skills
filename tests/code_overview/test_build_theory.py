@@ -162,16 +162,42 @@ def test_the_rehearsals_render_verbatim_with_their_verdicts(repo_with_code, run_
 
 # --- dimensions ------------------------------------------------------------
 
-def test_every_dimension_renders_with_its_step_and_evidence(repo_with_code, run_script,
-                                                            tmp_path):
+def test_every_dimension_renders_its_median_step_weight_and_evidence(repo_with_code,
+                                                                     run_script, tmp_path):
+    # One dimension the whole panel put a rung lower, so the median that
+    # renders is not the same word in every row.
+    files = three(tmp_path, abstraction=0.5)
     panel = panel_of(build(repo_with_code, run_script, tmp_path,
-                           *three(tmp_path)).read_text(encoding="utf-8"), "tab-dimensions")
+                           *files).read_text(encoding="utf-8"), "tab-dimensions")
 
-    for label in ("Absorption", "World-mapping", "Abstraction", "Justification",
-                  "Honest limits"):
-        assert label in panel
-    assert "holds" in panel
-    assert "src/billing/absorption.py:1" in panel
+    rows = dimension_rows(panel)
+    assert set(rows) == {"Absorption", "World-mapping", "Abstraction", "Justification",
+                         "Honest limits"}
+    assert "<td>partial<br>" in rows["Abstraction"], "the median step the rubric computed"
+    for label in ("Absorption", "World-mapping", "Justification", "Honest limits"):
+        assert "<td>holds<br>" in rows[label]
+    assert '<td class="num">30</td>' in rows["Absorption"], "absorption's weight"
+    assert '<td class="num">10</td>' in rows["Honest limits"], "honest limits' weight"
+    assert "src/billing/absorption.py:1" in rows["Absorption"]
+
+
+def test_a_disputed_row_shows_each_judges_step_the_spread_and_their_rationales(
+        repo_with_code, run_script, tmp_path):
+    files = (verdict_file(tmp_path, 0, abstraction=1.0),
+             verdict_file(tmp_path, 1, abstraction=0.25),
+             verdict_file(tmp_path, 2, abstraction=1.0))
+
+    rows = dimension_rows(panel_of(build(repo_with_code, run_script, tmp_path,
+                                         *files).read_text(encoding="utf-8"),
+                                   "tab-dimensions"))
+
+    disputed = rows["Abstraction"]
+    assert "<td>holds<br>" in disputed, "median_low of (holds, strained, holds)"
+    assert "holds, strained, holds" in disputed, "each judge's own step, in panel order"
+    assert "2 rungs apart" in disputed, "the spread, not smoothed away"
+    for judge in range(3):
+        assert f"judge {judge} on abstraction" in disputed, "every judge's rationale"
+    assert "0 rung(s)" in rows["Justification"], "an agreed row still states its spread"
 
 
 # --- disagreement ----------------------------------------------------------
@@ -217,6 +243,21 @@ def test_the_page_says_the_grade_is_a_reading_not_a_measurement(repo_with_code, 
     lowered = panel.lower()
     assert "reading" in lowered
     assert "circular" in lowered, "the panel narrows the circularity; it does not close it"
+
+
+def test_the_grade_tab_names_the_dimensions_the_panel_disagreed_on(repo_with_code,
+                                                                   run_script, tmp_path):
+    """The Disagreement tab is pinned; this is the tab readers land on first."""
+    files = (verdict_file(tmp_path, 0, world_mapping=1.0),
+             verdict_file(tmp_path, 1, world_mapping=0.25),
+             verdict_file(tmp_path, 2, world_mapping=1.0))
+
+    panel = panel_of(build(repo_with_code, run_script, tmp_path,
+                           *files).read_text(encoding="utf-8"), "tab-grade")
+
+    assert "The panel disagreed on:" in panel
+    assert "World-mapping" in panel, "named, so the reader knows which row to go argue with"
+    assert "Disagreement tab" in panel
 
 
 def test_the_model_and_panel_size_are_stamped(repo_with_code, run_script, tmp_path):
