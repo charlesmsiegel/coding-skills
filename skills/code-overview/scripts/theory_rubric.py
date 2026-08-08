@@ -26,8 +26,11 @@ import statistics
 # Imported, not copied: this module ships inside code-overview alongside
 # rubric.py, so the standalone-installability rule that forces a duplicate of
 # these bands into science-investigation does not apply here. A copy would be a
-# fourth thing to keep pinned for no benefit.
-from rubric import GRADE_BANDS, UNGRADED, grade_for  # noqa: F401  (re-exported)
+# fourth thing to keep pinned for no benefit. The bands themselves are not
+# re-exported — `grade_for` already encapsulates them, and nothing reads
+# `tr.GRADE_BANDS`. `UNGRADED` is: build_theory.py reads `tr.UNGRADED` for the
+# roll-up's blank row, hence the noqa.
+from rubric import UNGRADED, grade_for  # noqa: F401  (re-exported)
 
 VERDICT_SCHEMA = "theory-verdict/1"
 DOCUMENT_SCHEMA = "theory/1"
