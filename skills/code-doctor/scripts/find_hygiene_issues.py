@@ -27,15 +27,18 @@ MAX_LINE_LENGTH = 300
 MAX_COMMITTED_BYTES = 10 * 1024 * 1024
 
 # The skill's one concession to language syntax, used only after string
-# literals have been blanked. Five tokens, and no detector branches on which
-# language a file is. A mis-classified line loses a candidate, never invents
-# a finding.
+# literals have been blanked. Four tokens, and no detector branches on which
+# language a file is.
+#
+# None of them is an unambiguous comment opener. `//` is floor division in
+# Python (`result = total // TODO` is not a TODO comment, it's an expression
+# naming a variable TODO), `--` is decrement in C and C++, `#` opens a C
+# preprocessor directive and a Rust attribute, and `;` separates instructions
+# in assembly. Without a parser this detector cannot establish that any of
+# these begins a comment at all — so everything derived from one is a
+# candidate, never a finding, and the record names the operator readings the
+# prefix allows.
 LINE_COMMENT_PREFIXES = ("//", "#", "--", ";")
-# `//` and `--` begin a comment in every language that uses them. `#` and `;`
-# do not: `#` opens a C preprocessor directive and a Rust attribute, `;` is an
-# instruction separator in assembly. A hit on those two supports a candidate,
-# never a finding.
-UNAMBIGUOUS_PREFIXES = ("//", "--")
 
 _STRING_LITERAL = re.compile(r"""(["'`])(?:\\.|(?!\1).)*\1""")
 _TODO = re.compile(r"\b(TODO|FIXME|HACK|XXX)\b")
@@ -60,16 +63,6 @@ def blank_literals(line: str) -> str:
     return _STRING_LITERAL.sub(lambda m: m.group(1) + " " * (len(m.group(0)) - 2) + m.group(1), line)
 
 
-def unambiguous_comment(line: str) -> bool:
-    """Whether this line's comment marker is one no language repurposes."""
-    blanked = blank_literals(line)
-    positions = [(blanked.find(pfx), pfx) for pfx in LINE_COMMENT_PREFIXES]
-    hits = [(index, pfx) for index, pfx in positions if index != -1]
-    if not hits:
-        return False
-    return min(hits)[1] in UNAMBIGUOUS_PREFIXES
-
-
 def comment_body(line: str) -> str | None:
     """The text after a line-comment prefix, or None if there is no comment."""
     blanked = blank_literals(line)
@@ -92,23 +85,18 @@ def check_text_file(path: Path, text: str, report: Reporter,
         body = comment_body(line)
         if body is not None:
             todo = _TODO.search(body)
-            if todo and unambiguous_comment(line):
-                report.finding(
-                    number, "todo_inventory",
-                    f"{todo.group(1)}: {body[:80]}",
-                    "Convert it to a tracked issue or delete it. An undated TODO in the "
-                    "source is a decision nobody owns.",
-                    severity="low", snippet=line.strip()[:120],
-                )
-            elif todo:
-                # `#` and `;` are syntax, not comments, in several languages —
-                # C's `#define TODO 1` is not debt someone forgot to file.
+            if todo:
+                # No prefix here is an unambiguous comment opener, so this is
+                # always a candidate — never a finding. `total // TODO` is
+                # floor division on a variable named TODO, not debt.
                 report.candidate(
                     number, "todo_inventory",
-                    f"{todo.group(1)} on a line whose comment prefix is ambiguous",
+                    f"{todo.group(1)}: {body[:80]}",
                     also_caused_by=[
-                        "a C preprocessor directive or Rust attribute, where `#` is syntax",
-                        "an assembly or ini line, where `;` is not a comment",
+                        "the prefix is an operator, not a comment — `//` is floor "
+                        "division in Python, `--` is decrement in C and C++",
+                        "`#` opens a C preprocessor directive or a Rust attribute; "
+                        "`;` separates assembly instructions",
                         "a literal string that happens to contain the word",
                     ],
                     severity="low", snippet=line.strip()[:120],
@@ -219,13 +207,6 @@ def check_source_file(path: Path, text: str, report: Reporter) -> None:
         body = comment_body(line)
         if body is None or _TODO.search(body):
             continue
-        # Same discipline as the TODO split above: `;` and `#` are statement
-        # separators and preprocessor/attribute syntax in several languages,
-        # not comment openers. Without this gate, ordinary semicolon-
-        # terminated code (`url := "..."; doWork()`) reads as a "comment"
-        # containing a call, which is a false candidate, not a lead.
-        if not unambiguous_comment(line):
-            continue
 
         if _LOOKS_LIKE_CODE.search(body):
             report.candidate(
@@ -233,8 +214,10 @@ def check_source_file(path: Path, text: str, report: Reporter) -> None:
                 "Commented-out line that looks like code",
                 also_caused_by=[
                     "a documentation example shown as a comment",
-                    "a language where this prefix is not a comment "
-                    "(`#` opens a Rust attribute and a C preprocessor directive)",
+                    "the prefix is an operator, not a comment — `//` is floor "
+                    "division in Python, `--` is decrement in C and C++, `#` "
+                    "opens a preprocessor directive or a Rust attribute, `;` "
+                    "separates assembly instructions",
                     "deliberately disabled code with a nearby explanation",
                 ],
                 severity="low", snippet=line.strip()[:120],

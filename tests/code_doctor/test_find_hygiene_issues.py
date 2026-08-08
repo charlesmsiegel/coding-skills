@@ -63,11 +63,19 @@ def test_commented_out_code_is_a_candidate_with_reasons(repo, run_script):
     assert record["also_caused_by"], "a candidate must name the benign explanations"
 
 
-def test_url_in_a_string_is_not_a_comment(repo, run_script):
-    """Literals are blanked before comment prefixes are matched."""
+def test_url_scheme_inside_a_string_is_not_mistaken_for_the_comment_opener(repo, run_script):
+    """Literals are blanked before comment prefixes are matched.
+
+    The `//` inside the URL string must not be what triggers this: blanking
+    removes it, so the `;` statement separator is what's found instead. No
+    prefix is unambiguous without a parser, so `;` still yields a candidate —
+    just not one manufactured out of misreading the URL's own `//`.
+    """
     repo.write("app.go", 'package main\nurl := "https://example.com/a"; doWork()\n')
     result = run_script(SCRIPT, repo.path, "--format", "json")
-    assert "commented_out_code" not in types_in(result)
+    record = records_of(result, "commented_out_code")[0]
+    assert record["kind"] == "candidate"
+    assert record["suggestion"] == ""
 
 
 def test_prose_is_not_scanned_for_commented_out_code(repo, run_script):
@@ -109,6 +117,19 @@ def test_todo_in_a_non_source_text_file_is_inventoried(repo, run_script):
     repo.write("deployment.yaml", "replicas: 1  # TODO: raise before launch\n")
     result = run_script(SCRIPT, repo.path, "--format", "json")
     assert "todo_inventory" in types_in(result)
+
+
+def test_todo_records_are_candidates_not_defects(repo, run_script):
+    """No comment prefix is unambiguous without a parser.
+
+    Python's `total // TODO` is floor division on a variable named TODO, so
+    even `//` cannot support a confirmed finding.
+    """
+    repo.write("app.py", "result = total // TODO\n")
+    result = run_script(SCRIPT, repo.path, "--format", "json")
+    for record in records_of(result, "todo_inventory"):
+        assert record["kind"] == "candidate"
+        assert record["suggestion"] == ""
 
 
 def test_oversized_file_is_reported_once(repo, run_script):

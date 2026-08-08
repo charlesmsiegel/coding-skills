@@ -74,13 +74,17 @@ def has_key_payload(lines: list[str], start: int) -> bool:
 
     A bare `-----BEGIN RSA PRIVATE KEY-----` with nothing after it is what a
     documentation example or a fixture looks like, and the wide walk reaches
-    both. Requiring an END marker or base64 body keeps rotate-and-purge advice
-    attached to something that is actually a key.
+    both. The END marker itself is not payload, though: a doc block of
+    `BEGIN` / `<redacted>` / `END` has both markers and no key, and must not
+    draw rotate-and-purge advice over nothing. Stop scanning at END, then
+    require actual base64 body BETWEEN the markers.
     """
-    window = lines[start:start + 40]
-    if any(KEY_END.search(candidate) for candidate in window):
-        return True
-    return sum(1 for candidate in window if BASE64_LINE.fullmatch(candidate.strip())) >= 2
+    window = []
+    for candidate in lines[start:start + 40]:
+        if KEY_END.search(candidate):
+            break
+        window.append(candidate)
+    return any(BASE64_LINE.fullmatch(candidate.strip()) for candidate in window)
 
 
 def analyze(path: Path, text: str, report: Reporter,

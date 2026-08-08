@@ -23,6 +23,17 @@ def test_private_key_block_with_a_body_is_a_finding(repo, run_script):
     assert record["severity"] == "high"
 
 
+def test_redacted_key_block_is_a_candidate(repo, run_script):
+    """BEGIN / <redacted> / END has both markers and no key."""
+    repo.write("README.md",
+               "Example:\n\n-----BEGIN RSA PRIVATE KEY-----\n"
+               "<redacted>\n-----END RSA PRIVATE KEY-----\n")
+    repo.commit("docs")
+    result = run_script(SCRIPT, repo.path, "--format", "json")
+    record = records_of(result, "private_key_material")[0]
+    assert record["kind"] == "candidate"
+
+
 def test_bare_private_key_header_is_a_candidate(repo, run_script):
     """Documentation examples and fixtures show the header with no key."""
     repo.write("README.md", "Keys look like:\n\n-----BEGIN RSA PRIVATE KEY-----\n")

@@ -15,9 +15,9 @@ import os
 import subprocess
 import sys
 import time
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Iterator
+from typing import Iterator, Sequence
 
 SEVERITY_ICONS = {"high": "🔴", "medium": "🟡", "low": "🟢"}
 SEVERITY_RANK = {"high": 0, "medium": 1, "low": 2}
@@ -108,7 +108,7 @@ def is_source(rel_parts: tuple[str, ...], path: Path) -> bool:
     Not-binary is not the same as is-source: branch counting and duplication
     shingling over a README manufactures findings out of prose.
     """
-    if any(part in DOC_DIR_NAMES for part in rel_parts[:-1]):
+    if any(part.lower() in DOC_DIR_NAMES for part in rel_parts[:-1]):
         return False
     if path.suffix.lower() in NON_CODE_SUFFIXES:
         return False
@@ -250,13 +250,23 @@ class Finding:
     smell_type: str
     description: str
     suggestion: str = ""
-    also_caused_by: list[str] = field(default_factory=list)
+    # Tuples, not lists. `frozen=True` blocks reassignment but not in-place
+    # mutation, so a list here would let `candidate.also_caused_by.clear()`
+    # walk a validated record into a schema-invalid state that
+    # __post_init__ never re-checks — and it would then serialise and emit
+    # like any other record. __post_init__ below coerces any list handed to
+    # the constructor (including one that came back out of json.loads,
+    # which knows nothing about tuples) into a tuple, so the type is
+    # actually enforced, not just annotated.
+    also_caused_by: tuple[str, ...] = ()
     severity: str = "medium"
     kind: str = "finding"
     code_snippet: str = ""
-    related_lines: list[int] = field(default_factory=list)
+    related_lines: tuple[int, ...] = ()
 
     def __post_init__(self) -> None:
+        object.__setattr__(self, "also_caused_by", tuple(self.also_caused_by))
+        object.__setattr__(self, "related_lines", tuple(self.related_lines))
         if self.kind not in VALID_KINDS:
             raise SchemaError(
                 f"{self.smell_type}: kind must be one of {sorted(VALID_KINDS)}, got {self.kind!r}"
@@ -295,21 +305,21 @@ class Reporter:
 
     def finding(self, line: int, smell_type: str, description: str, suggestion: str,
                 severity: str = "medium", snippet: str = "",
-                related: list[int] | None = None) -> None:
+                related: Sequence[int] | None = None) -> None:
         self._add(Finding(
             file=str(self.path), line=line, smell_type=smell_type,
             description=description, suggestion=suggestion, severity=severity,
-            kind="finding", code_snippet=snippet, related_lines=related or [],
+            kind="finding", code_snippet=snippet, related_lines=tuple(related or ()),
         ))
 
     def candidate(self, line: int, smell_type: str, description: str,
-                  also_caused_by: list[str], severity: str = "low",
-                  snippet: str = "", related: list[int] | None = None) -> None:
+                  also_caused_by: Sequence[str], severity: str = "low",
+                  snippet: str = "", related: Sequence[int] | None = None) -> None:
         self._add(Finding(
             file=str(self.path), line=line, smell_type=smell_type,
-            description=description, also_caused_by=also_caused_by,
+            description=description, also_caused_by=tuple(also_caused_by),
             severity=severity, kind="candidate", code_snippet=snippet,
-            related_lines=related or [],
+            related_lines=tuple(related or ()),
         ))
 
     def _add(self, record: Finding) -> None:
