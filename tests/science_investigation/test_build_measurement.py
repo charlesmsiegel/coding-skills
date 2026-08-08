@@ -66,6 +66,24 @@ def meta_of(page: Path) -> dict:
     return json.loads(match.group(1).replace("<\\/", "</"))
 
 
+def panel_of(page: Path, tab_id: str) -> str:
+    """One rendered panel, so "on the Score tab" can actually be asserted.
+
+    Split on the panel boundary rather than the next `</section>`: the grade
+    card is itself a `<section>`, so a lazy match to `</section>` stops short.
+    """
+    for chunk in page.read_text(encoding="utf-8").split('<section class="panel')[1:]:
+        if re.match(rf'[^>]*id="{tab_id}"', chunk):
+            return chunk
+    raise AssertionError(f"no {tab_id} panel on the page")
+
+
+def kpis_of(panel: str) -> dict[str, str]:
+    """The KPI row as {label: number}, read the way a reader reads it."""
+    return {label: number for number, label in
+            re.findall(r'<div class="n">([^<]*)</div><div class="l">([^<]*)</div>', panel)}
+
+
 def build(run_script, tmp_path, *extra, expect_rc=0) -> Path:
     out = tmp_path / "measurement.html"
     run_script(SCRIPT, "--out", out, "--inventory", inventory(tmp_path),
@@ -104,6 +122,57 @@ def test_the_page_carries_the_score_and_the_grade(run_script, tmp_path):
     assert meta["grade"] == "F"
     assert meta["schema"] == "measurement/1"
     assert meta["scope"] == "package"
+
+
+# --- what a reader actually sees ------------------------------------------
+#
+# Every assertion above this line reads meta_of(), the JSON block no reader
+# opens. The whole Score tab could render weight_measured and weight_total the
+# wrong way round — an F page claiming 5.00 of 0 weight measured — and the
+# metadata would still be right, so the suite would still be green. These pin
+# the rendered numbers instead.
+
+def test_the_grade_card_shows_the_letter_and_the_score(run_script, tmp_path):
+    panel = panel_of(build(run_script, tmp_path), "tab-score")
+
+    letter = re.search(r'<div class="letter">([^<]*)</div>', panel)
+    assert letter, "the grade card has no letter"
+    assert letter.group(1) == "F"
+    assert re.search(r'<div class="score">([^<]*)</div>', panel).group(1) == "15.0 / 100"
+    assert 'class="gradecard g-f"' in panel, "the card is coloured by the grade it shows"
+
+
+def test_the_kpi_row_shows_the_numbers_the_score_was_computed_from(run_script, tmp_path):
+    # 3*0.25 + 2*0.0 = 0.75 measured, of 5 total weight, over 2 things.
+    kpis = kpis_of(panel_of(build(run_script, tmp_path), "tab-score"))
+
+    assert kpis["measurable things"] == "2"
+    assert kpis["weight measured"] == "0.75"
+    assert kpis["weight total"] == "5"
+
+
+def test_the_ship_gate_sentence_carries_the_gate_share_not_the_headline(run_script, tmp_path):
+    # 0.75 of 3 gating weight = 25%, which is deliberately not the 15.0 in the
+    # grade card: the headline averages every importance level and this line
+    # does not.
+    panel = panel_of(build(run_script, tmp_path), "tab-score")
+
+    assert "25% of the weight that gates a ship decision is soundly measured" in panel
+
+
+def test_the_by_importance_table_shows_each_levels_weight_and_share(run_script, tmp_path):
+    panel = panel_of(build(run_script, tmp_path), "tab-score")
+
+    table = panel.split("<h3>By importance</h3>")[1]
+    cells = [found for row_html in re.findall(r"<tr>(.*?)</tr>", table, re.S)
+             if (found := re.findall(r"<td[^>]*>([^<]*)</td>", row_html))]
+    assert cells == [
+        ["gates a ship decision", "1", "3", "0.75", "25%"],
+        ["informs a decision", "1", "2", "0.00", "0%"],
+        # No informational rows: a share of nothing is a dash, not 0% and not
+        # 100%, for the same reason an empty unit scores null.
+        ["informational", "0", "0", "0.00", "—"],
+    ]
 
 
 def test_every_tab_is_present(run_script, tmp_path):
