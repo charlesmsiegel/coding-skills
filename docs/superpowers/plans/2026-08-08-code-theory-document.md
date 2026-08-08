@@ -148,15 +148,19 @@ def test_the_median_is_taken_per_dimension_not_over_the_whole_score(tr):
     assert row["step"] == 1.0, "two of three said holds"
 
 
-def test_the_median_never_leaves_the_ladder(tr):
-    # An averaging median of (0.25, 0.5) would invent 0.375, which is no rung at
-    # all and would render as a step the ladder does not define.
+def test_the_chosen_step_is_always_a_real_rung(tr):
+    # A mean of (0.25, 0.5, 1.0) is 0.583..., which is no rung: it has no label
+    # and cannot be rendered. The median is what keeps the chosen step on the
+    # ladder, and averaging is the mutation this pins. (median vs median_low
+    # cannot be distinguished at an odd panel size — they agree — so that is
+    # deliberately not what this test claims to check.)
     result = tr.score_panel(
-        [steps(abstraction=0.25), steps(abstraction=0.5),
-         steps(abstraction=0.5), steps(abstraction=1.0)], BIG)
+        [steps(abstraction=0.25), steps(abstraction=0.5), steps(abstraction=1.0)], BIG)
 
     row = next(d for d in result["dimensions"] if d["key"] == "abstraction")
     assert row["step"] in tr.LADDER
+    assert row["step"] == 0.5
+    assert row["step_label"] == "partial"
 
 
 def test_a_shapeless_package_scores_badly_and_is_not_null(tr):
@@ -530,8 +534,11 @@ def score_panel(verdicts: list[dict], size: dict, *,
     for key in DIMENSION_KEYS:
         entries = [v["dimensions"][key] for v in verdicts]
         steps = [entry["step"] for entry in entries]
-        # median_low, never median: the mean of two adjacent rungs is not a rung,
-        # and a step the ladder does not define cannot be labelled or rendered.
+        # median_low rather than median: at a panel of three the two agree, but
+        # median averages the middle pair on even-length input, and the mean of
+        # two adjacent rungs is not a rung. Using median_low keeps the property
+        # true if PANEL_SIZE ever becomes even, rather than leaving a trap for
+        # whoever changes it.
         chosen = statistics.median_low(steps)
         spread = spread_rungs(steps)
         is_disputed = spread >= DISAGREEMENT_RUNGS
