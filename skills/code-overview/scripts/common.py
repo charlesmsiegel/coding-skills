@@ -630,3 +630,84 @@ def rel_href(from_doc: Path, to_doc: Path) -> str:
     """
     relative = os.path.relpath(Path(to_doc).resolve(), Path(from_doc).resolve().parent)
     return quote(Path(relative).as_posix(), safe="/")
+
+
+# --------------------------------------------------------------------------
+# code-doctor's merged envelope
+# --------------------------------------------------------------------------
+
+MERGE_SCHEMA = "code-doctor-merge/1"
+
+
+def load_merged(path) -> dict:
+    """Unpack code-doctor's merged envelope into this skill's report records.
+
+    The envelope replaces three things this skill used to be told by flag: which
+    doctors ran, what they covered, and which records assert a defect. Every one
+    of those was a place where a wrong answer produced a *confident* grade, so
+    each is read as evidence here rather than declared.
+    """
+    path = Path(path)
+    blank = {"reports": [], "candidates": [], "completeness": {}, "doctor_errors": {},
+             "doctors": [], "coverage_unknown": []}
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError as exc:
+        warn(f"{path}: {exc} — nothing from this envelope is graded")
+        return blank
+    if not text.strip():
+        # Identical to the zero-byte findings rule: a doctor that produced no
+        # output failed, and failure is not a clean bill of health.
+        warn(f"{path} is empty — a merge that produced nothing failed; nothing is graded")
+        return blank
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError as exc:
+        warn(f"{path} is not valid JSON: {exc} — nothing from this envelope is graded")
+        return blank
+    if not isinstance(data, dict) or data.get("schema") != MERGE_SCHEMA:
+        warn(f"{path} is not a {MERGE_SCHEMA} envelope — nothing from it is graded")
+        return blank
+
+    doctors = [str(name) for name in (data.get("doctors_run") or [])]
+    analyzers = data.get("analyzers_run") or {}
+    skipped = data.get("analyzers_skipped") or {}
+    errors = data.get("analyzer_errors") or {}
+    unknown = {str(name) for name in (data.get("coverage_unknown") or [])}
+
+    by_doctor: dict[str, dict] = {}
+    for doctor in doctors:
+        ran = {str(name) for name in (analyzers.get(doctor) or [])}
+        by_doctor[doctor] = {
+            "findings": [],
+            "errors": {str(k): str(v) for k, v in (errors.get(doctor) or {}).items()},
+            "ran": ran,
+            "skipped": {str(name) for name in (skipped.get(doctor) or [])},
+            # A doctor listed with no analyzers_run evidence is exactly the bare
+            # list case: nothing in it distinguishes a full run from one detector
+            # that found nothing, so it grants no coverage profile.
+            "shape": SHAPE_PARTIAL if (doctor in unknown or not ran) else SHAPE_FULL,
+            "empty_artifact": False,
+            "doctor": doctor,
+        }
+
+    for record in data.get("findings") or []:
+        if isinstance(record, dict):
+            record["severity"] = normalize_severity(record.get("severity"))
+            report = by_doctor.get(str(record.get("doctor")))
+            if report is not None:
+                report["findings"].append(record)
+
+    candidates = [record for record in (data.get("candidates") or [])
+                  if isinstance(record, dict)]
+    for record in candidates:
+        record["severity"] = normalize_severity(record.get("severity"))
+
+    return {
+        "reports": list(by_doctor.values()),
+        "candidates": candidates,
+        "completeness": data.get("completeness") or {},
+        "doctor_errors": {str(k): str(v) for k, v in (data.get("doctor_errors") or {}).items()},
+        "doctors": doctors,
+        "coverage_unknown": sorted(unknown),
+    }

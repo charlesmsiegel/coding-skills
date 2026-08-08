@@ -547,7 +547,14 @@ def resolve_coverage(args, reports: list[dict]):
 
 
 def build(args, reports: list[dict], errors: dict[str, str],
-          skipped: set[str]) -> tuple[str, dict]:
+          skipped: set[str], candidates: list[dict] | None = None,
+          doctor_errors: dict[str, str] | None = None,
+          completeness: dict | None = None,
+          doctors: list[str] | None = None) -> tuple[str, dict]:
+    candidates = candidates or []
+    doctor_errors = doctor_errors or {}
+    completeness = completeness or {}
+    doctors = doctors or []
     repo = Path(args.repo).resolve()
     # Read the package roll-up first: at the root, which packages have a graded
     # health page decides which roots may enter the denominator.
@@ -617,6 +624,11 @@ def build(args, reports: list[dict], errors: dict[str, str],
             scoped.append({**report, "findings": kept})
         reports = scoped
 
+        # Candidates are scoped with the same predicate as the findings, so a
+        # candidate about code outside this document is dropped for the same
+        # reason a finding about it would be.
+        candidates = [record for record in candidates if in_scope(record)]
+
     findings, duplicates = common.dedupe(reports)
 
     # Size over what was analyzed, which for a Django package includes its
@@ -631,6 +643,28 @@ def build(args, reports: list[dict], errors: dict[str, str],
         size["files"] = args.files
 
     covered = resolve_coverage(args, reports)
+    if doctors:
+        # Coverage is the union of what the doctors that ran can speak to —
+        # read from the envelope, not declared by --doctor. A doctor with no
+        # analyzers_run evidence contributes nothing, which is why `shape`
+        # gates it here rather than the doctor's name doing so.
+        covered = set()
+        for report in reports:
+            if report["shape"] == common.SHAPE_FULL:
+                covered |= rubric.DOCTOR_COVERAGE.get(report["doctor"], set())
+
+    # A doctor that crashed measured nothing. Only the categories it *alone*
+    # covered become unknown — where a surviving doctor covers the same ground,
+    # that ground was still measured.
+    surviving: set[str] = set()
+    for name in doctors:
+        surviving |= rubric.DOCTOR_COVERAGE.get(name, set())
+    for failed in doctor_errors:
+        covered -= rubric.DOCTOR_COVERAGE.get(failed, set()) - surviving
+
+    for block in completeness.values():
+        covered -= rubric.ungraded_from_completeness(block)
+
     # Nothing to divide by means nothing was examined, whatever the reports say.
     # The LOC floor turns an empty tree into a 1000-line denominator, so a clean
     # report over a root that no longer exists scored a confident A+ for code
@@ -676,6 +710,10 @@ def build(args, reports: list[dict], errors: dict[str, str],
         "findings_by_severity": {sev: sum(1 for f in findings if f.get("severity") == sev)
                                  for sev in SEVERITY_ORDER},
         "top_findings": top_findings(findings, args.top, repo),
+        "doctors": doctors,
+        "doctor_errors": doctor_errors,
+        "completeness": completeness,
+        "candidates_total": len(candidates),
     }
     if packages:
         meta["packages"] = packages
@@ -808,6 +846,9 @@ def main(argv=None) -> int:
                         help="grade every category regardless of which doctor produced the "
                              "findings; without it, an unrecognized --doctor leaves everything "
                              "ungraded rather than scoring an unread language A+")
+    parser.add_argument("--merged", type=Path, default=None,
+                        help="code-doctor's merged envelope (code-doctor-merge/1); "
+                             "supplies doctors, coverage, candidates and completeness at once")
     args = parser.parse_args(argv)
 
     # `--findings` is deliberately optional. The documented answer for a Go or
@@ -819,7 +860,21 @@ def main(argv=None) -> int:
         args.name = Path(args.repo).resolve().name if args.root else "package"
 
     reports, errors, skipped = load_reports(args.findings)
-    page, meta = build(args, reports, errors, skipped)
+
+    merged = common.load_merged(args.merged) if args.merged else None
+    candidates: list[dict] = []
+    doctor_errors: dict[str, str] = {}
+    completeness: dict = {}
+    doctors: list[str] = []
+    if merged:
+        reports.extend(merged["reports"])
+        candidates = merged["candidates"]
+        doctor_errors = merged["doctor_errors"]
+        completeness = merged["completeness"]
+        doctors = merged["doctors"]
+
+    page, meta = build(args, reports, errors, skipped, candidates, doctor_errors,
+                       completeness, doctors)
 
     out = Path(args.out)
     out.parent.mkdir(parents=True, exist_ok=True)
