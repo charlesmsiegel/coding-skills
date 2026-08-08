@@ -22,7 +22,7 @@ from datetime import date
 from pathlib import Path
 
 import theory_rubric as tr
-from common import CODE_EXTENSIONS, esc, json_block, measure, render, warn
+from common import CODE_EXTENSIONS, esc, git_sha, json_block, measure, render, warn
 
 ASSETS = Path(__file__).resolve().parent.parent / "assets"
 
@@ -254,7 +254,11 @@ def build_metadata(scored: dict, verdicts: list[dict], size: dict, args,
         "scope": "repository" if args.root else "package",
         "package": args.name,
         "generated": args.generated or date.today().isoformat(),
-        "commit": args.commit or "",
+        # Resolved, not left blank: --commit is not in the documented
+        # invocation, so `or ""` left theory.html the one graded document in the
+        # set with no revision on it — a letter nobody can tie back to a tree.
+        # build_health.py:967 does the same thing with the same --repo.
+        "commit": args.commit or git_sha(args.repo),
         "model": args.model or "",
         "panel_size": scored["panel_size"],
         "score": scored["score"],
@@ -262,6 +266,10 @@ def build_metadata(scored: dict, verdicts: list[dict], size: dict, args,
         "exempt": scored["exempt"],
         "exempt_reason": scored["exempt_reason"],
         "size": size,
+        # Carried for whatever reads this block, and deliberately not rendered:
+        # the roll-up shows medians and disagreement, and printing the first
+        # judge's wording as *the* package's theory would hand one reading the
+        # authority of a panel. The Theory tab shows all three, attributed.
         "theory": verdicts[0].get("theory", ""),
         "dimensions": scored["dimensions"],
         "disputed": scored["disputed"],

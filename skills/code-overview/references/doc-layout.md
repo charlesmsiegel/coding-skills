@@ -244,8 +244,9 @@ rather than waiting to be told.
 | `exempt`, `exempt_reason` | too small to warrant a theory, and the evidence for that |
 | `panel_size`, `model` | how many judges, and which model — letters from different models are not comparable |
 | `dimensions[]` | per dimension: `key`, `label`, `weight`, `step`, `step_label`, `rung`, `spread`, `disputed`, `steps[]`, `rationales[]`, `evidence[]` |
-| `disputed[]` | dimension keys where the judges were ≥2 rungs apart |
-| `theory` | the first judge's theory statement, for roll-ups |
+| `generated`, `commit` | the date, and the revision judged — `--commit`, else the repo's short SHA, like `health.html` |
+| `disputed[]` | dimension keys where the judges were ≥2 rungs apart; rendered as labels, not keys, everywhere they are shown |
+| `theory` | the first judge's theory statement, verbatim. Carried for whatever reads this block; **nothing in this document set renders it.** It was once described here as being "for roll-ups" — it is not, and should not be: the roll-up shows medians and disagreement, and printing one judge's wording as the package's theory would give a single reading the authority of a panel |
 | `verdicts[]` | all three verdicts verbatim |
 | `packages[]` | root scope only, and only when `--package` was passed |
 

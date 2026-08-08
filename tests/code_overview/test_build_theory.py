@@ -269,6 +269,35 @@ def test_the_model_and_panel_size_are_stamped(repo_with_code, run_script, tmp_pa
     assert meta["panel_size"] == 3
 
 
+def test_the_comparability_cues_are_visible_and_not_only_in_the_metadata(repo_with_code,
+                                                                         run_script, tmp_path):
+    """The page warns that letters from different models are not comparable.
+
+    That warning is only usable if the page states which model and how many
+    judges produced *this* letter, where a reader will see it — in the header
+    stamp and the KPI row, not only inside a JSON block nobody opens.
+    """
+    text = build(repo_with_code, run_script, tmp_path, *three(tmp_path),
+                 extra=("--model", "claude-opus-5")).read_text(encoding="utf-8")
+
+    stamp = doc_meta_line(text)
+    assert "3 judges" in stamp
+    assert "claude-opus-5" in stamp
+    grade = panel_of(text, "tab-grade")
+    assert '<div class="n">3</div><div class="l">independent judges</div>' in grade
+
+
+def test_the_revision_the_panel_judged_is_stamped(repo_with_code, run_script, tmp_path):
+    """theory.html is a graded document; a letter with no revision on it cannot
+    be tied back to a tree. --commit is not in the documented invocation, so the
+    repo's own HEAD has to fill it, as it does on health.html."""
+    page = build(repo_with_code, run_script, tmp_path, *three(tmp_path))
+
+    sha = repo_with_code.sha()
+    assert meta_of(page)["commit"] == sha
+    assert sha in doc_meta_line(page.read_text(encoding="utf-8"))
+
+
 def test_an_exempt_unit_scores_null_and_says_why(repo, run_script, tmp_path):
     repo.write("src/tiny/a.py", "x = 1\n")
     repo.write("src/tiny/b.py", "y = 2\n")
