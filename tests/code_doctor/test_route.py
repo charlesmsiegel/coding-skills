@@ -160,3 +160,52 @@ def route(load_module):
 ])
 def test_requirement_name_takes_the_head_of_the_spec(route, spec, expected):
     assert route.requirement_name(spec) == expected
+
+
+def test_a_js_dependency_named_django_does_not_route_a_python_doctor(repo, run_script):
+    """npm and PyPI are different namespaces, and a name is only meaningful in one.
+
+    npm really does publish a package called `django`. Merged into a single
+    dependency table, declaring it routed this pure-JavaScript repository to
+    python-code-doctor *and* django-code-doctor, citing `package.json` as the
+    evidence — and a Python doctor pointed at a repo with no Python in it
+    reports the missing `pyproject.toml` and the absent `tests/` as findings
+    about a project that was never Python. Over-routing is the direction this
+    router must not be wrong in.
+    """
+    repo.write("package.json", json.dumps({
+        "name": "web", "dependencies": {"django": "^0.1.0", "react": "^18.0.0"}}))
+    repo.write("src/app.js", "export const go = () => 1;\n")
+    repo.commit()
+
+    payload = routes_for(repo, run_script)
+
+    assert skills_in(payload) == [], (
+        "a package.json declares JavaScript dependencies; it is not evidence of a "
+        "Python project, whatever the dependencies happen to be called"
+    )
+    assert payload["raw_only"] is True
+    evidence = [item for route in payload["routes"] for item in route["evidence"]]
+    assert "package.json" not in evidence
+
+
+def test_a_python_dependency_named_typescript_does_not_route_the_ts_doctor(repo, run_script):
+    """The mirror image: PyPI carries a `typescript` distribution too."""
+    repo.write("pyproject.toml",
+               '[project]\nname = "x"\ndependencies = ["typescript"]\n')
+    repo.commit()
+
+    payload = routes_for(repo, run_script)
+
+    assert skills_in(payload) == ["python-code-doctor"]
+
+
+def test_django_declared_in_a_python_manifest_still_routes(repo, run_script):
+    """Splitting the namespaces must not cost the real route its evidence."""
+    repo.write("requirements.txt", "Django>=5.0\n")
+    repo.commit()
+
+    payload = routes_for(repo, run_script)
+
+    assert skills_in(payload) == ["python-code-doctor", "django-code-doctor"]
+    assert payload["routes"][1]["evidence"] == ["requirements.txt"]

@@ -157,18 +157,33 @@ def _gather(root: Path) -> dict[str, list[Path]]:
     return found
 
 
-def _declared_by(found: dict[str, list[Path]]) -> dict[str, list[Path]]:
-    """Dependency name → the manifests that declare it."""
-    table: dict[str, list[Path]] = {}
+def _declared_by(found: dict[str, list[Path]]) -> dict[str, dict[str, list[Path]]]:
+    """Ecosystem → dependency name → the manifests that declare it.
+
+    Two namespaces, kept apart. A package name means something only inside the
+    registry it was published to: npm has packages called `django` and
+    `typescript`, PyPI has a distribution called `typescript`, and neither says
+    anything about the other ecosystem. Merged into one table, a pure-JS repo
+    whose `package.json` happened to list a dependency named `django` routed to
+    python-code-doctor *and* django-code-doctor, citing `package.json` as the
+    evidence — a Python doctor pointed at a repo with no Python in it, which
+    then reports the missing `pyproject.toml` as a finding.
+
+    Over-routing is the direction this router must not be wrong in (see the
+    module docstring): under-routing still leaves the raw layer running and
+    tells a grader which categories nobody measured, while over-routing
+    fabricates findings.
+    """
+    table: dict[str, dict[str, list[Path]]] = {"python": {}, "npm": {}}
     readers = (
-        (found["pyproject"], _pyproject_dependencies),
-        (found["requirements"], _requirements_dependencies),
-        (found["package_json"], _package_json_dependencies),
+        ("python", found["pyproject"], _pyproject_dependencies),
+        ("python", found["requirements"], _requirements_dependencies),
+        ("npm", found["package_json"], _package_json_dependencies),
     )
-    for paths, parse in readers:
+    for ecosystem, paths, parse in readers:
         for path in paths:
             for name in parse(_safe_read(path)):
-                table.setdefault(name, []).append(path)
+                table[ecosystem].setdefault(name, []).append(path)
     return table
 
 
@@ -204,7 +219,10 @@ def detect_routes(root: Path) -> dict:
     notes: list[str] = []
 
     python_manifests = found["pyproject"] + found["setup_py"] + found["requirements"]
-    django_manifests = declared.get("django", [])
+    # Django is a PyPI distribution, so only a Python manifest can declare it.
+    # npm publishes a package called `django` too; a package.json listing it is
+    # evidence about a JavaScript dependency and nothing else.
+    django_manifests = declared["python"].get("django", [])
     settings_hits = _settings_with_installed_apps(found["manage_py"])
     django_evidence = [*django_manifests, *settings_hits]
 
@@ -227,7 +245,10 @@ def detect_routes(root: Path) -> dict:
                   else "manage.py sits beside a settings module defining INSTALLED_APPS")
         routes.append(Route(DJANGO_DOCTOR, reason, rel(django_evidence)))
 
-    typescript_evidence = found["tsconfig"] + declared.get("typescript", [])
+    # Likewise the compiler is an npm package. PyPI carries a `typescript`
+    # distribution of its own, and a Python project that depends on it is still
+    # not a TypeScript project.
+    typescript_evidence = found["tsconfig"] + declared["npm"].get("typescript", [])
     if typescript_evidence:
         routes.append(Route(TYPESCRIPT_DOCTOR,
                             "the repository declares TypeScript",
