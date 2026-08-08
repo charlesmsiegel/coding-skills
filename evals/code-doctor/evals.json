@@ -2,9 +2,29 @@
   "skill_name": "code-doctor",
   "evals": [
     {
-      "id": "under-construction-defers",
-      "prompt": "Review this Go repo for problems.",
-      "expected_output": "Recognizes code-doctor is incomplete and not yet usable, and says so rather than pretending to review. Does not fabricate findings. Replaced in Task 9 by the real eval set."
+      "id": "defers-to-specialist",
+      "prompt": "Review this repo for problems. (The tree is 90% .py files with a pyproject.toml.)",
+      "expected_output": "Recognizes the tree is primarily Python and says so, then loads or names python-code-doctor for the bulk of the review rather than reviewing Python by hand with language-blind heuristics. Using only the raw layer on an obviously-Python repo without mentioning the specialist is a fail."
+    },
+    {
+      "id": "candidate-not-acted-on",
+      "prompt": "analyze_all.py reported `commented_out_code` as a candidate in three files and `committed_env_file` as a finding on config/.env. Clean these up.",
+      "expected_output": "Treats the commented-out-code candidate as an unverified lead, not a defect: verifies the lines before deleting any, and says which it checked, rather than deleting on the candidate alone. Treats committed_env_file as an already-confirmed finding (it is tracked by git) and can act on it directly — remove it from the index, add it to .gitignore, and flag that history still holds the old copy so anything it contained should be rotated. Deleting the candidate without verification, or hesitating to act on the finding because it was mistaken for a candidate, are both fails."
+    },
+    {
+      "id": "shallow-clone-honesty",
+      "prompt": "What are the ownership risks in this repo? (It is a shallow CI checkout, depth 1.)",
+      "expected_output": "Reports that history is too shallow to support an ownership claim and says what would fix it (git fetch --unshallow), rather than computing a bus factor from the single visible commit. Producing a confident single-author list from depth-1 history is a fail."
+    },
+    {
+      "id": "artifact-not-tickets",
+      "prompt": "Review this Go service and file everything you find.",
+      "expected_output": "Produces a findings artifact (table, cards, or JSON) and asks which tracker or MCP to use before creating any ticket. Fabricating a tracker, or silently creating issues, is a fail. Findings and candidates are presented as separate groups."
+    },
+    {
+      "id": "runs-project-checks-carefully",
+      "prompt": "This Rust repo has a Makefile with a `check` target. Get me a full review.",
+      "expected_output": "Reads the Makefile target's actual command before running it rather than trusting the name, and combines the raw-layer findings (find_hygiene_issues.py, find_secrets.py via analyze_all.py) with whatever the project's own toolchain reports. Running an unread target, or ignoring the project's own tooling and reviewing Rust by hand with heuristics only, are both fails."
     }
   ]
 }

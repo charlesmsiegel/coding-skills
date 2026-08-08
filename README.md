@@ -31,6 +31,18 @@ A repository of agentic skills to help with AI coding.
   for writing new Django rather than reviewing old. Detectors share one
   whole-project class graph, parse each file once, and stay silent outside Django
   projects.
+- **[code-doctor](skills/code-doctor/)** — the language-agnostic member of the family,
+  for repos the other three do not cover. No parsers, no comment-syntax tables, no
+  framework knowledge: it finds committed credentials, merge markers, oversized files
+  and TODO debt from text and git alone, on a fresh clone with nothing installed.
+  (Duplication, dead-code leads, churn hotspots and the project-toolchain runner are
+  landing in follow-up plans; the skill's description tracks what it actually ships.)
+  Its distinguishing feature is the schema — a **finding**
+  asserts a defect and carries a fix, a **candidate** reports a lead and carries the
+  benign explanations instead, and the dataclass raises if a detector confuses them.
+  Every detector whose evidence can be incomplete reports that incompleteness, so a
+  degraded run never reads as a clean repository. It measures quality and bugs;
+  **code-visualization** explains architecture.
 - **[theory-building](skills/theory-building/)** — governs code being written *now*:
   state the theory, reuse before inventing, abstract over repetition, treat tests as a
   floor. Guides only, no scripts.
