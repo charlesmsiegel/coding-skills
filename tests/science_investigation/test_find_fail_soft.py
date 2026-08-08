@@ -479,3 +479,31 @@ def test_every_sampling_setting_on_a_minified_line_is_inspected(tmp_path):
     """A zero temperature was examined and the `do_sample` beside it was not."""
     (tmp_path / "c.json").write_text('{"temperature":0,"do_sample":true}\n', encoding="utf-8")
     assert kinds(run(tmp_path), "nondeterminism")
+
+
+# ---- eighth review round ------------------------------------------------------ #
+
+def test_a_stale_comment_does_not_switch_sampling_off(tmp_path):
+    (tmp_path / "gen.yaml").write_text("# do_sample: false\ntemperature: 0.8\n", encoding="utf-8")
+    assert kinds(run(tmp_path), "nondeterminism")
+
+
+def test_an_inline_promise_catch_block_is_reported_once(tmp_path):
+    """Both scanners saw it, so one handler produced two rows and a count of 2."""
+    (tmp_path / "m.ts").write_text(
+        "const s = (r) => judge(r).catch(() => { return 0; });\n", encoding="utf-8"
+    )
+    payload = run(tmp_path)
+    assert len(kinds(payload, "error_becomes_zero")) == 1
+    assert payload["counts"]["candidates_total"] == 1
+
+
+def test_a_live_fractional_setting_is_not_a_component_defaulting_to_off(tmp_path):
+    """`0` matched the head of `0.5`, so a positive knob read as disabled."""
+    (tmp_path / "s.py").write_text("enable_feature_ratio = 0.5\n", encoding="utf-8")
+    assert not kinds(run(tmp_path), "default_off_flag")
+
+
+def test_an_actual_zero_flag_is_still_default_off(tmp_path):
+    (tmp_path / "s.py").write_text("enable_reranker = 0\n", encoding="utf-8")
+    assert kinds(run(tmp_path), "default_off_flag")

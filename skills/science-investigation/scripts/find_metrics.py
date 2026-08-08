@@ -87,6 +87,10 @@ _ASSIGN_RE = re.compile(r"^\s*(?:(?:export|default|const|let|var|final|readonly|
                         r"(?:(?<![=!<>+\-*/])=(?!=)|<-)\s*(.+)$")  # `<-` is R's assignment
 # `"accuracy": 0.81` in JSON/dict, and `accuracy:` in YAML
 _KEY_RE = re.compile(r"^\s*[\"']?([A-Za-z_][\w-]*)[\"']?\s*:\s*(.*)$")
+# `{"accuracy":0.8,"quality_score":0.7}` on one line: the anchored pattern above
+# sees only the first key, or none at all, and a minified metrics.json reported
+# no metric definitions.
+_INLINE_KEY_RE = re.compile(r"[{,]\s*[\"']([A-Za-z_][\w-]*)[\"']\s*:\s*([^,}]+)")
 # `if score >= 0.75`, `while p < 0.05`, and the mirrored `if 0.75 <= score`, which
 # is how a minimum bound is often written and gated exactly the same behaviour.
 # The literal must end atomically: a trailing `\b` let `0.8f` backtrack to `0.`
@@ -123,7 +127,11 @@ _WEIGHTED_SUM_RE = re.compile(r"(?:" + _NUMBER + r"\s*\*\s*[A-Za-z_]|[A-Za-z_][\
 # The trailing `;` is not optional decoration: without it every JS/Java/C/C#
 # `return 0;` in a metric path went unreported.
 _ZERO_RETURN_RE = re.compile(r"\breturn\s+(?:0|0\.0+|0\.)\s*;?\s*(?:(?:#|//).*)?$")
-_ZERO_DEFAULT_RE = re.compile(r"\.get\(\s*[\"'][^\"']+[\"']\s*,\s*(?:0|0\.0+)\s*\)|(?:\bor\s+(?:0|0\.0+))\b")
+_ZERO_DEFAULT_RE = re.compile(
+    r"\.get\(\s*[\"'][^\"']+[\"']\s*,\s*(?:0|0\.0+)\s*\)"
+    r"|\bor\s+(?:0|0\.0+)(?![\d.])"
+    r"|(?:\?\?|\|\|)\s*(?:0|0\.0+)(?![\d.])"          # JS: result.accuracy ?? 0
+)
 
 CONFIRM = {
     "metric_definition": "read the formula and its inputs; then find who consumes the number",
@@ -178,6 +186,7 @@ def named_on(line: str, stripped: str) -> list:
         key = _KEY_RE.match(line)
         if key and "=" not in stripped.split(":")[0]:
             names.append((key.group(1), key.group(2)))
+        names += [(name, value) for name, value in _INLINE_KEY_RE.findall(line)]
     # `const accuracy = function accuracy(rows) {...}` matches both patterns with
     # the same name, which doubled the raw candidate and dead-site counts while
     # the final dedup showed one — a headline disagreeing with its own rows.

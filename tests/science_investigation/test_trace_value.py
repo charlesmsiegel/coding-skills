@@ -204,3 +204,18 @@ def test_a_configured_value_is_not_reported_as_defined_nowhere(tmp_path):
     headline = run("0.7", tmp_path)["headline"]
     assert "configured in c.yaml" in headline
     assert "defined nowhere" not in headline
+
+
+def test_a_value_inside_a_message_gates_nothing(tmp_path):
+    (tmp_path / "s.py").write_text('message = "quality_score > 0.7"\n', encoding="utf-8")
+    payload = run("0.7", tmp_path)
+    assert payload["counts"].get("text") == 1
+    assert "compared against" not in payload["headline"]
+
+
+def test_a_literal_repeated_in_its_own_defining_file_is_still_a_disconnect(tmp_path):
+    (tmp_path / "s.py").write_text(
+        "QUALITY_THRESHOLD = 0.7\nif score > 0.7:\n    pass\n", encoding="utf-8"
+    )
+    headline = run("0.7", tmp_path)["headline"]
+    assert "defined once" in headline and "will not move them" in headline

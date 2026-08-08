@@ -28,8 +28,8 @@ from pathlib import Path
 
 from common import (
     CODE_SUFFIXES, CONFIG_SUFFIXES, DOC_SUFFIXES, add_common_args, candidate,
-    configure_output, emit, envelope, is_config, iter_files, read_source, rel, skipped_note,
-    split_comment,
+    configure_output, emit, envelope, is_config, iter_files, mask_strings, read_source, rel,
+    skipped_note, split_comment,
 )
 
 # Leading-dot and exponent forms count as numbers here too. Without this, tracing
@@ -48,6 +48,9 @@ _TARGET_RE = re.compile(r"^\s*(?::[^=\n]+?)?(?:(?<![=!<>+\-*/])=(?!=)|<-)")
 _DECLARE_RE = re.compile(r"\b(?:def|function|func|fun|fn|sub|class|const|let|var)\s+$")
 
 CONFIRM = {
+    "text":
+        "the value appears inside a string here, so it gates nothing — confirm it is not a "
+        "message that has drifted from the live value it describes",
     "comment":
         "a commented-out site: confirm whether the live value moved on without it",
     "definition": "confirm this is the source of truth, and that the other sites read it rather than repeat it",
@@ -98,7 +101,12 @@ def classify(line: str, display: str, path: Path, span: tuple, numeric: bool = T
     if is_config(path):
         return "config"
 
-    before, after = line[:span[0]], line[span[1]:]
+    # Masked so the operators around the match are read from code, not from a
+    # message: `message = "quality_score > 0.7"` is not a live comparison.
+    scannable = line if is_config(path) else mask_strings(line)
+    if scannable[span[0]:span[1]] != line[span[0]:span[1]]:
+        return "text"     # the match is inside a string literal, not in code
+    before, after = scannable[:span[0]], scannable[span[1]:]
     if _R_ASSIGN_RE.match(after.lstrip()[:2]):
         return "definition"          # `quality_score <- ...`: the needle is the target
     if _R_ASSIGN_RE.search(before[-3:]) and not numeric:
@@ -172,11 +180,12 @@ def headline_for(needle: str, rows: list) -> str:
         return ("'" + needle + "' is compared against in " + str(kinds["comparison"]) + " place(s) and "
                 "defined nowhere — a literal repeated at the point of use has no single meaning to change.")
 
-    elsewhere = [r for r in rows if r["kind"] == "comparison" and r["file"] != definitions[0]["file"]] \
-        if definitions else []
+    # Same file counts too: `QUALITY_THRESHOLD = 0.7` with `if score > 0.7` three
+    # lines below is still a literal that the definition cannot move.
+    elsewhere = [r for r in rows if r["kind"] == "comparison"] if definitions else []
     if elsewhere:
         return ("'" + needle + "' is defined once (" + definitions[0]["file"] + ":" + str(definitions[0]["line"])
-                + ") but written as a literal in " + str(len(elsewhere)) + " comparison(s) in other files ("
+                + ") but written as a literal in " + str(len(elsewhere)) + " comparison(s) ("
                 + ", ".join(sorted({r["file"] for r in elsewhere})[:3])
                 + ") — changing the definition will not move them.")
 
@@ -219,7 +228,7 @@ def main() -> int:
         return 2
 
     rows, skipped = scan(root, pattern, bool(_NUMERIC_RE.match(args.needle)) and not args.regex)
-    order = ["definition", "comparison", "config", "doc", "test", "comment", "other"]
+    order = ["definition", "comparison", "config", "doc", "test", "comment", "text", "other"]
     rows.sort(key=lambda r: (order.index(r["kind"]) if r["kind"] in order else 99, r["file"], r["line"]))
     counts = {"needle": args.needle, "sites": len(rows), "files": len({r["file"] for r in rows}),
               "files_skipped_unread": len(skipped)}

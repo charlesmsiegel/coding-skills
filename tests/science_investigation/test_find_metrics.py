@@ -481,3 +481,33 @@ def test_a_comparison_in_a_config_value_is_still_read(tmp_path):
     """Config quotes hold the value itself, so they are not masked."""
     (tmp_path / "c.yaml").write_text('rule: "quality_score > 0.8"\n', encoding="utf-8")
     assert kinds(run(tmp_path), "threshold")
+
+
+# ---- eighth review round ------------------------------------------------------ #
+
+def test_notebook_code_cells_are_read_as_source(tmp_path):
+    """`.ipynb` is JSON: read raw, its code hides inside quoted strings."""
+    notebook = {
+        "cells": [
+            {"cell_type": "markdown", "source": ["# accuracy notes\n"]},
+            {"cell_type": "code", "source": ["accuracy = 0.8\n", "if accuracy > 0.7:\n", "    pass\n"]},
+        ],
+        "metadata": {}, "nbformat": 4, "nbformat_minor": 5,
+    }
+    (tmp_path / "nb.ipynb").write_text(json.dumps(notebook), encoding="utf-8")
+    payload = run(tmp_path)
+    assert kinds(payload, "metric_definition")
+    assert "No metric definitions" not in payload["headline"]
+
+
+def test_a_minified_json_config_exposes_every_key(tmp_path):
+    (tmp_path / "metrics.json").write_text('{"accuracy":0.8,"quality_score":0.7}\n', encoding="utf-8")
+    found = {row["detail"].split(" ")[0] for row in kinds(run(tmp_path), "metric_definition")}
+    assert found == {"accuracy", "quality_score"}
+
+
+def test_javascript_nullish_zero_defaults_are_flagged(tmp_path):
+    (tmp_path / "m.ts").write_text(
+        "function f(result) { return result.accuracy ?? 0; }\n", encoding="utf-8"
+    )
+    assert kinds(run(tmp_path), "zero_default")

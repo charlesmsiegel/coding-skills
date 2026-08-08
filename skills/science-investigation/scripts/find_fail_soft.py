@@ -91,14 +91,14 @@ _FLAG_NAME = r"[\w.-]*(?:enable|enabled|use|using|with|allow|feature|flag|active
 # key quote sits between the name and the delimiter.
 _ANNOTATED = r"[\"']?\s*(?::\s*[A-Za-z_][\w.\[\]<>| ]*)?\s*[:=]\s*"
 _DEFAULT_OFF_RE = re.compile(
-    r"\b(" + _FLAG_NAME + r")" + _ANNOTATED + r"(?:false|0)\b"
+    r"\b(" + _FLAG_NAME + r")" + _ANNOTATED + r"(?:false\b|0(?![\d.]))"
     r"|\b(" + _FLAG_NAME + r")" + _ANNOTATED + r"[\"'](?:false|off|0|no)[\"']",
     re.IGNORECASE,
 )
 # `disable_reranker: true` is the same configuration written the other way round.
 _DISABLE_NAME = r"[\w.-]*(?:disable|disabled|skip|off|bypass|ignore)[\w-]*"
 _DISABLE_ON_RE = re.compile(
-    r"\b(" + _DISABLE_NAME + r")" + _ANNOTATED + r"(?:true|1)\b"
+    r"\b(" + _DISABLE_NAME + r")" + _ANNOTATED + r"(?:true\b|1(?![\d.]))"
     r"|\b(" + _DISABLE_NAME + r")" + _ANNOTATED + r"[\"'](?:true|on|1|yes)[\"']",
     re.IGNORECASE,
 )
@@ -336,10 +336,13 @@ def scan(root: Path) -> tuple:
             skipped.append((display, reason))
             continue
         read += 1
-        rows += scan_handlers(lines, display)
-        sampling_off = sampling_disabled("\n".join(lines))
+        handled = scan_handlers(lines, display)
+        rows += handled
+        seen_handlers = {(r["kind"], r["line"]) for r in handled}
+        sampling_off = sampling_disabled("\n".join(split_comment(b)[0] for b in lines))
         for lineno, line in enumerate(lines, 1):
-            rows += scan_line(line, display, lineno, sampling_off)
+            rows += [r for r in scan_line(line, display, lineno, sampling_off)
+                     if (r["kind"], r["line"]) not in seen_handlers]
     return rows, read, skipped
 
 
