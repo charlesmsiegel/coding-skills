@@ -234,6 +234,44 @@ def test_an_inventory_with_no_schema_at_all_is_refused(run_script, tmp_path):
     assert "schema" in result.stderr
 
 
+def test_the_inventory_tab_explains_what_each_credit_step_means(run_script, tmp_path):
+    # A bare 0.25 in a Credit column is meaningless to a reader who has not
+    # memorised the ladder, and a row nobody can read is a row nobody disputes.
+    text = build(run_script, tmp_path).read_text(encoding="utf-8")
+
+    for label in ("measured, nothing found against it", "measured, one medium finding",
+                  "measured, one high finding",
+                  # the apostrophe is HTML-escaped on the way out
+                  "not measured, or unmeasurable with today&#x27;s data"):
+        assert label in text, f"the credit legend is missing {label!r}"
+
+
+def test_a_finding_missing_its_optional_prose_never_renders_the_word_None(run_script, tmp_path):
+    # Findings carry no validator, so a half-written one reaches the renderer.
+    # "None" in a title reads as an authored value rather than a missing one.
+    path = inventory(tmp_path)
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    payload["findings"] = [{"id": "small_n", "evidence": []}]
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    out = tmp_path / "measurement.html"
+
+    run_script(SCRIPT, "--out", out, "--inventory", path, "--name", "billing")
+
+    text = out.read_text(encoding="utf-8")
+    assert "<h3>None</h3>" not in text and "<p>None</p>" not in text
+    assert "untitled finding" in text
+    assert ">unrated<" in text
+
+
+def test_optional_strings_fall_back_rather_than_printing_None(load_module):
+    build_measurement = load_module(SKILL / "scripts", "build_measurement")
+
+    assert build_measurement.opt(None) == "—"
+    assert build_measurement.opt("   ") == "—"
+    assert build_measurement.opt(None, "nobody reads it") == "nobody reads it"
+    assert build_measurement.opt("<b>") == "&lt;b&gt;"
+
+
 def test_the_intro_prose_is_placed_on_the_score_tab(run_script, tmp_path):
     intro = tmp_path / "intro.html"
     intro.write_text("<p>Billing scores itself with a judge nobody pinned.</p>",

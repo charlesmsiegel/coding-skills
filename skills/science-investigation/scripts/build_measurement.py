@@ -35,6 +35,20 @@ def esc(value) -> str:
     return html.escape(str(value), quote=True)
 
 
+def opt(value, fallback: str = "—") -> str:
+    """An optional string, escaped, with `None` never reaching the page.
+
+    `esc(entry.get("credit_reason"))` on a row that omits the key renders the
+    literal word "None" in the Why column, which reads as an authored reason
+    rather than a missing one. The validator now requires the fields that
+    matter, but a renderer that turns a hole into confident-looking text is the
+    wrong failure mode for a document whose whole job is not overstating its
+    evidence, so every optional string goes through here.
+    """
+    text = "" if value is None else str(value).strip()
+    return esc(text if text else fallback)
+
+
 def json_block(data) -> str:
     """Serialize for embedding in a <script> block.
 
@@ -206,20 +220,29 @@ def render_inventory_tab(rows: list[dict]) -> str:
             "<tr>"
             f"<td><strong>{esc(entry['name'])}</strong>{formula}</td>"
             f'<td>{esc(rubric.IMPORTANCE_LABELS[int(entry["importance"])])}'
-            f'<br><span class="faint">{esc(entry.get("importance_reason"))}</span></td>'
+            f'<br><span class="faint">{opt(entry.get("importance_reason"))}</span></td>'
             f'<td class="num">{float(entry["credit"]):.2f}</td>'
-            f'<td>{esc(entry.get("credit_reason"))}{finding}</td>'
+            f'<td>{opt(entry.get("credit_reason"))}{finding}</td>'
             f'<td class="num">{n_shown}</td>'
-            f'<td>{esc(entry.get("consumer") or "nobody reads it")}</td>'
+            f'<td>{opt(entry.get("consumer"), "nobody reads it")}</td>'
             f"<td>{citations}</td>"
             "</tr>"
         )
     body = "".join(parts)
+    # The credit column is a bare number to anyone who has not memorised the
+    # ladder, and a reader who cannot tell 0.25 from 0.0 cannot dispute a row —
+    # which is the only thing that makes the score arguable.
+    legend = "".join(
+        f'<li><code class="mono">{step:.2f}</code> — {esc(rubric.CREDIT_LABELS[step])}</li>'
+        for step in rubric.CREDIT_STEPS
+    )
     return (
         '<!-- tab: Inventory -->\n'
         "<p>Every measurable thing this audit found, with the weight and credit that "
         "produced the score. The denominator is a judgment — dispute the rows, not the "
         "letter.</p>"
+        '<p class="dim">Credit is set by the worst confirmed finding against the thing:'
+        f"</p><ul class=\"dim\">{legend}</ul>"
         '<div class="tbl-wrap"><table><thead><tr><th>Thing</th><th>Importance</th>'
         '<th class="num">Credit</th><th>Why</th><th class="num">N</th><th>Consumer</th>'
         f"<th>Evidence</th></tr></thead><tbody>{body}</tbody></table></div>"
@@ -237,9 +260,12 @@ def render_findings_tab(findings: list[dict]) -> str:
     cards = "".join(
         f'<div class="card"><div><span class="badge '
         f'{SEVERITY_CLASS.get(str(item.get("severity")), "neutral")}">'
-        f'{esc(item.get("severity"))}</span> <code>{esc(item.get("id"))}</code></div>'
-        f"<h3>{esc(item.get('title'))}</h3><p>{esc(item.get('detail'))}</p>"
-        f'<p class="dim"><strong>Blast radius:</strong> {esc(item.get("blast_radius") or "not stated")}</p>'
+        f'{opt(item.get("severity"), "unrated")}</span> '
+        f"<code>{opt(item.get('id'), 'unnamed')}</code></div>"
+        f"<h3>{opt(item.get('title'), 'untitled finding')}</h3>"
+        f"<p>{opt(item.get('detail'), 'no detail was written for this finding')}</p>"
+        f'<p class="dim"><strong>Blast radius:</strong> '
+        f'{opt(item.get("blast_radius"), "not stated")}</p>'
         + "".join(f'<code class="floc">{esc(cite)}</code> ' for cite in item.get("evidence") or [])
         + "</div>"
         for item in ranked
@@ -256,7 +282,7 @@ def render_unmeasurable_tab(rows: list[dict]) -> str:
     body = "".join(
         f"<tr><td><strong>{esc(entry['name'])}</strong></td>"
         f'<td>{esc(rubric.IMPORTANCE_LABELS[int(entry["importance"])])}</td>'
-        f"<td>{esc(entry.get('unmeasurable_reason'))}</td></tr>"
+        f"<td>{opt(entry.get('unmeasurable_reason'))}</td></tr>"
         for entry in gaps
     )
     return (
