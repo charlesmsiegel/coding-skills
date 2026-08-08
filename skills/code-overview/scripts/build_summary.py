@@ -31,8 +31,8 @@ import common
 import rubric
 from build_health import (grade_class, headline_badges, render_category_rows,
                           render_package_table, render_top_findings)
-from common import (DOC_TITLES, doc_path, esc, listed_packages, load_map, read_asset,
-                    read_meta, rel_href, render, warn)
+from common import (DOC_TITLES, doc_path, esc, grouped_by_doctor, listed_packages, load_map,
+                    read_asset, read_meta, rel_href, render, warn)
 
 _TITLE_RE = re.compile(r'<h1 class="doc-title">(.*?)</h1>', re.DOTALL)
 _META_RE = re.compile(r'<div class="doc-meta">(.*?)</div>', re.DOTALL)
@@ -275,11 +275,11 @@ def render_caveats(meta: dict) -> str:
         parts.append(f'<div class="callout warn">Ungraded: {listed}. Nothing measured those, '
                      "so the grade covers less than the full rubric.</div>")
     if meta.get("analyzers_skipped"):
-        listed = ", ".join(f"<code>{esc(k)}</code>" for k in meta["analyzers_skipped"])
+        listed = grouped_by_doctor(meta["analyzers_skipped"])
         parts.append(f'<div class="callout warn">Detectors that were not run: {listed}. '
                      "Their categories are ungraded rather than clean.</div>")
     if meta.get("analyzer_errors"):
-        listed = ", ".join(f"<code>{esc(k)}</code>" for k in sorted(meta["analyzer_errors"]))
+        listed = grouped_by_doctor(meta["analyzer_errors"])
         # Partial, not an upper bound — the category is dropped and the weights
         # renormalized, so restoring it could move the score either way.
         parts.append(f'<div class="callout bad">Detectors that did not complete: {listed}. '

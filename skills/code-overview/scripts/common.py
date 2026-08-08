@@ -69,6 +69,22 @@ def esc(value) -> str:
     return html.escape(str(value), quote=True)
 
 
+def grouped_by_doctor(mapping: dict) -> str:
+    """`{doctor: names}` (a list, or a dict keyed by name) as an escaped,
+    doctor-attributed inline list: `doctor: name, name; doctor: name`.
+
+    Shared by build_health.py's own Coverage tab and build_summary.py's portal
+    caveat, which have to say the same thing about the same gap — a detector
+    named with no doctor beside it tells a reader *something* was not run, not
+    who to go re-run.
+    """
+    return "; ".join(
+        f"<strong>{esc(doctor)}</strong>: " +
+        ", ".join(f"<code>{esc(name)}</code>" for name in sorted(mapping[doctor]))
+        for doctor in sorted(mapping)
+    )
+
+
 def json_block(data) -> str:
     """Serialize for embedding in a <script> block.
 

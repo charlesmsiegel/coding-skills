@@ -146,7 +146,9 @@ def test_a_crashed_detector_makes_its_category_ungraded(run_script, sized_repo):
     run_script(BUILD_HEALTH, "--out", out, "--findings", report, "--repo", sized_repo.path,
                "--name", "app", "--root-dir", "src/app", "--doctor", "python-code-doctor")
     meta = read_meta(out)
-    assert meta["analyzer_errors"] == {"duplicates": "boom"}
+    assert meta["analyzer_errors"] == {"python-code-doctor": {"duplicates": "boom"}}, (
+        "an unlabelled report is attributed to --doctor, so its gap is filed there"
+    )
     assert "duplication" in meta["ungraded"], (
         "a zero count from a detector that crashed means unknown, not clean"
     )
@@ -294,9 +296,12 @@ def test_a_skipped_analyzer_is_ungraded_not_clean(run_script, sized_repo):
     run_script(BUILD_HEALTH, "--out", out, "--findings", report, "--repo", sized_repo.path,
                "--name", "app", "--root-dir", "src/app", "--doctor", "python-code-doctor")
     meta = read_meta(out)
-    assert meta["analyzers_skipped"] == ["duplicates"]
+    assert meta["analyzers_skipped"] == {"python-code-doctor": ["duplicates"]}, (
+        "an unlabelled report is attributed to --doctor, so its gap is filed there"
+    )
     assert "duplication" in meta["ungraded"]
     assert "Detectors that were not run" in out.read_text()
+    assert "python-code-doctor" in out.read_text()
 
 
 def test_an_analyzer_missing_from_analyzers_run_counts_as_skipped(run_script, sized_repo):

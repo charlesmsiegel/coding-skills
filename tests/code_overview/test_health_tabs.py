@@ -53,6 +53,25 @@ def page(repo, run_script, tmp_path) -> str:
     return out.read_text(encoding="utf-8")
 
 
+_COVERAGE_PANEL_RE = re.compile(
+    r'<section class="panel(?: active)?" id="tab-coverage"[^>]*>(.*?)</section>', re.DOTALL)
+
+
+def coverage_panel(page: str) -> str:
+    """Just the Coverage tab's own markup — not the whole document.
+
+    `"duplication"` also names the Duplication &amp; Dead Code category, and
+    that label is rendered unconditionally in every category row on the Grade
+    tab, whether or not duplication was ever skipped. A whole-page substring
+    check for it passes on a page where the Coverage tab renders nothing at
+    all — this is what actually caught that, four times over in this project.
+    Scoping to the panel is what makes the check mean what its name says.
+    """
+    match = _COVERAGE_PANEL_RE.search(page)
+    assert match, "no Coverage panel found"
+    return match.group(1)
+
+
 def test_all_four_tabs_are_present(page):
     # Exactly four, not "at least four": the preamble of a body scaffold has
     # already once been split into a fifth, bogus tab that rendered *active* and
@@ -86,17 +105,36 @@ def test_a_candidate_carries_the_benign_explanations(page):
 
 
 def test_the_coverage_tab_names_the_failed_doctor(page):
-    assert "django-code-doctor" in page
-    assert "crashed reading settings" in page
+    panel = coverage_panel(page)
+    assert "django-code-doctor" in panel
+    assert "crashed reading settings" in panel
 
 
 def test_the_coverage_tab_reports_the_thin_graph_rather_than_hiding_it(page):
-    assert "0.31" in page or "31" in page
-    assert "design" in page.lower()
+    # "design" alone would prove nothing: every category row on the Grade tab
+    # names all seven categories regardless of coverage, "Design" among them,
+    # so that word is on the page even with this whole callout deleted. What
+    # is specific to the completeness evidence is the (evidence, verdict,
+    # detail) row: reference_graph's resolution_rate, called out as
+    # incomplete, inside the Coverage panel.
+    panel = coverage_panel(page)
+    assert "reference_graph" in panel
+    assert "incomplete" in panel
+    assert "resolution_rate: 0.31" in panel
 
 
 def test_the_coverage_tab_lists_the_skipped_analyzer(page):
-    assert "duplication" in page.lower()
+    # A skipped analyzer named with no doctor beside it tells a reader
+    # something was not run, not who to go re-run — so the analyzer name has
+    # to appear attributed to the doctor whose report skipped it, not merely
+    # co-occur somewhere on the page (see coverage_panel's docstring: the
+    # bare substring "duplication" is also the Duplication & Dead Code
+    # category label, printed on the Grade tab unconditionally).
+    panel = coverage_panel(page)
+    match = re.search(r"Detectors that were not run:.*?</div>", panel, re.DOTALL)
+    assert match, "no 'detectors that were not run' callout in the Coverage panel"
+    assert "code-doctor" in match.group()
+    assert "duplication" in match.group()
 
 
 def test_a_page_with_no_candidates_says_so_rather_than_showing_an_empty_table(

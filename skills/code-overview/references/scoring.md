@@ -163,12 +163,13 @@ Given that, a category comes back ungraded in five situations:
    empty `--doctor`, or a single-detector report. This is the case that matters
    most: a doctor pointed at a language it cannot parse returns an empty findings
    list, and an empty findings list graded as coverage is an A+.
-3. **A detector crashed.** `meta.analyzer_errors`; a zero count from a crashed
-   detector means *unknown*.
-4. **A detector was skipped or never ran.** `meta.analyzers_skipped`, plus any
-   category absent from `meta.analyzers_run`. `--skip-duplicates` is advertised
-   by the doctors as the way to skip the slowest detector, so being handed a
-   report missing a whole category is normal, not a corruption.
+3. **A detector crashed.** `meta.analyzer_errors`, keyed by the doctor whose
+   report it crashed in; a zero count from a crashed detector means *unknown*.
+4. **A detector was skipped or never ran.** `meta.analyzers_skipped`, keyed the
+   same way, plus any category absent from `meta.analyzers_run`.
+   `--skip-duplicates` is advertised by the doctors as the way to skip the
+   slowest detector, so being handed a report missing a whole category is
+   normal, not a corruption.
 5. **The artifact it needs is absent** — no coverage file, no manifest.
 
 All five land in `ungraded` in the metadata and in a callout on the page. The

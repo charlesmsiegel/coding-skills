@@ -127,8 +127,8 @@ Every `health.html` carries its numbers in machine-readable form:
 | `categories[]` | per category: `key`, `label`, `weight`, `score`, `grade`, `density`, `graded`, `findings{high,medium,low,total}` |
 | `ungraded[]` | category keys that were not measured |
 | `unmapped_types[]` | finding types the rubric has no home for |
-| `analyzer_errors` | detector → error, from the doctor's own report |
-| `analyzers_skipped[]` | detectors the doctor was told not to run, or that never ran |
+| `analyzer_errors` | `{doctor: {detector: error}}` — which doctor's report the crash was in |
+| `analyzers_skipped` | `{doctor: [detector]}` — detectors that doctor was told not to run, or that never ran, and no companion doctor ran either |
 | `findings_out_of_scope` | findings dropped as being about code outside this unit |
 | `duplicates_merged` | same defect reported by two doctors, collapsed to one |
 | `sized_extensions[]` | non-code extensions counted in the denominator (templates the findings reached) |

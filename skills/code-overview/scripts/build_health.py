@@ -35,9 +35,9 @@ from pathlib import Path
 
 import common
 import rubric
-from common import (HEALTH_SCHEMA, doc_path, esc, git_sha, json_block, listed_packages,
-                    load_map, load_reports, measure, read_asset, read_meta, rel_href,
-                    render, warn, within)
+from common import (HEALTH_SCHEMA, doc_path, esc, git_sha, grouped_by_doctor, json_block,
+                    listed_packages, load_map, load_reports, measure, read_asset, read_meta,
+                    rel_href, render, warn, within)
 
 SEVERITY_ORDER = ("high", "medium", "low")
 SEVERITY_ICONS = {"high": "🔴", "medium": "🟡", "low": "🟢"}
@@ -381,9 +381,9 @@ def panels(fragments: list[str]) -> tuple[str, str]:
     return "\n".join(nav), "\n".join(sections)
 
 
-def render_caveats(errors: dict[str, str], skipped: set[str], unmapped: list[str],
-                   ungraded: list[str], notes: list[str], out_of_scope: int,
-                   roots: list[str], duplicates: int = 0) -> str:
+def render_caveats(errors: dict[str, dict[str, str]], skipped: dict[str, list[str]],
+                   unmapped: list[str], ungraded: list[str], notes: list[str],
+                   out_of_scope: int, roots: list[str], duplicates: int = 0) -> str:
     parts = []
     if duplicates:
         parts.append(f'<div class="callout">{duplicates} finding(s) were reported by more than '
@@ -396,7 +396,7 @@ def render_caveats(errors: dict[str, str], skipped: set[str], unmapped: list[str
                      "and the lines they are divided by describing the same code; if some of "
                      "that code should be graded, add it to the package map.</div>")
     if errors:
-        listed = ", ".join(f"<code>{esc(k)}</code>" for k in sorted(errors))
+        listed = grouped_by_doctor(errors)
         # Not "an upper bound": the affected category is dropped and the weights
         # renormalized, so restoring it could move the overall either way —
         # up if it would have scored well, down if badly. Saying "upper bound"
@@ -407,7 +407,7 @@ def render_caveats(errors: dict[str, str], skipped: set[str], unmapped: list[str
                      "partial rather than high or low: the missing categories could have moved "
                      "it either way.</div>")
     if skipped:
-        listed = ", ".join(f"<code>{esc(k)}</code>" for k in sorted(skipped))
+        listed = grouped_by_doctor(skipped)
         parts.append('<div class="callout warn"><strong>Detectors that were not run:</strong> '
                      f"{listed}. Their rubric categories are ungraded rather than clean.</div>")
     if ungraded:
@@ -691,8 +691,40 @@ def resolve_coverage(args, reports: list[dict], trusted: set[str] | None = None)
     return set()
 
 
-def build(args, reports: list[dict], errors: dict[str, str],
-          skipped: set[str], candidates: list[dict] | None = None,
+def analyzer_gaps(reports: list[dict],
+                  default_doctor: str) -> tuple[dict[str, list[str]], dict[str, dict[str, str]]]:
+    """Skipped and crashed analyzers, filed under the doctor whose report named them.
+
+    The merged envelope carries `analyzers_skipped`/`analyzer_errors` per doctor
+    already — `load_merged` puts each one on its own report's `skipped`/`errors`
+    — and `resolve_coverage` reads them per report for exactly that reason. What
+    reached no reader was the name: a flat pool of analyzer names says a gap
+    exists but not whose evidence it undermines, so a reader could not tell
+    which doctor to re-run.
+
+    Skipped stays filtered to *skipped everywhere*, the same set `load_reports`
+    computes and the same one `resolve_coverage`'s per-report union can still
+    leave graded: a detector one companion report skipped and another ran is
+    covered, and reporting it as a gap here — even attributed correctly — would
+    tell the reader a category is unmeasured when it is not. An unlabelled
+    report speaks for `--doctor`, same as everywhere else this rubric attributes
+    one, so its gap is filed there rather than under an empty name.
+    """
+    ran_anywhere = {name for report in reports for name in report.get("ran") or ()}
+    skipped: dict[str, set[str]] = {}
+    errors: dict[str, dict[str, str]] = {}
+    for report in reports:
+        doctor = report.get("doctor") or default_doctor or "(doctor unspecified)"
+        gap = (report.get("skipped") or set()) - ran_anywhere
+        if gap:
+            skipped.setdefault(doctor, set()).update(gap)
+        if report.get("errors"):
+            errors.setdefault(doctor, {}).update(report["errors"])
+    return ({doctor: sorted(names) for doctor, names in skipped.items()},
+            {doctor: dict(messages) for doctor, messages in errors.items()})
+
+
+def build(args, reports: list[dict], candidates: list[dict] | None = None,
           doctor_errors: dict[str, str] | None = None,
           completeness: dict | None = None,
           doctors: list[str] | None = None) -> tuple[str, dict]:
@@ -775,6 +807,16 @@ def build(args, reports: list[dict], errors: dict[str, str],
         candidates = [record for record in candidates if in_scope(record)]
 
     findings, duplicates = common.dedupe(reports)
+
+    # Per doctor, not the flat pool `load_reports` handed `main()` — that pool
+    # is empty on the --merged path entirely (it is built only from
+    # `--findings`), and even on the --findings path it cannot say which
+    # doctor a gap belongs to. `reports` is the merged list by now (`main()`
+    # extends it with `merged["reports"]` before calling `build`), and every
+    # report on it already carries its own `doctor`/`skipped`/`errors` —
+    # the same fields `resolve_coverage` above just used — so this is the
+    # first point both paths have the same evidence in the same shape.
+    skipped_by_doctor, errors_by_doctor = analyzer_gaps(reports, args.doctor)
 
     # Size over what was analyzed, which for a Django package includes its
     # templates. Each override replaces only its own field, so `--files` alone
@@ -878,8 +920,8 @@ def build(args, reports: list[dict], errors: dict[str, str],
         "categories": scored["categories"],
         "ungraded": scored["ungraded"],
         "unmapped_types": scored["unmapped_types"],
-        "analyzer_errors": errors,
-        "analyzers_skipped": sorted(skipped),
+        "analyzer_errors": errors_by_doctor,
+        "analyzers_skipped": skipped_by_doctor,
         "findings_out_of_scope": out_of_scope,
         "duplicates_merged": duplicates,
         "findings_total": len(findings),
@@ -910,7 +952,7 @@ def build(args, reports: list[dict], errors: dict[str, str],
         "FINDINGS_SUMMARY": render_findings_summary(findings),
         "TOP_FINDINGS": render_top_findings(meta["top_findings"]),
         "BY_TYPE": render_by_type(findings),
-        "CAVEATS": render_caveats(errors, skipped, scored["unmapped_types"],
+        "CAVEATS": render_caveats(errors_by_doctor, skipped_by_doctor, scored["unmapped_types"],
                                   scored["ungraded"], args.note, out_of_scope,
                                   relative_roots, duplicates),
         "CANDIDATES": render_candidates(candidates),
@@ -1047,7 +1089,11 @@ def main(argv=None) -> int:
     if not args.name:
         args.name = Path(args.repo).resolve().name if args.root else "package"
 
-    reports, errors, skipped = load_reports(args.findings)
+    # The per-report `errors`/`skipped` this returns (not the flat pool built
+    # from them, which `build()` no longer takes) are what `resolve_coverage`
+    # and `analyzer_gaps` read straight off each report in `reports` below —
+    # this call's job here is reading the files and raising on a bad one.
+    reports, _, _ = load_reports(args.findings)
 
     merged = common.load_merged(args.merged) if args.merged else None
     candidates: list[dict] = []
@@ -1061,8 +1107,7 @@ def main(argv=None) -> int:
         completeness = merged["completeness"]
         doctors = merged["doctors"]
 
-    page, meta = build(args, reports, errors, skipped, candidates, doctor_errors,
-                       completeness, doctors)
+    page, meta = build(args, reports, candidates, doctor_errors, completeness, doctors)
 
     out = Path(args.out)
     out.parent.mkdir(parents=True, exist_ok=True)
