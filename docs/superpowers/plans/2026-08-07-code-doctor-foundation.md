@@ -1597,7 +1597,10 @@ def check_source_file(path: Path, text: str, report: Reporter) -> None:
         if body is None or _TODO.search(body):
             continue
 
-        if _LOOKS_LIKE_CODE.search(body):
+        # Same gate the TODO path uses: `#` and `;` are syntax in several
+        # languages, so a "comment" behind one may be a preprocessor directive
+        # or a statement separator, and the text after it is live code.
+        if _LOOKS_LIKE_CODE.search(body) and unambiguous_comment(line):
             report.candidate(
                 number, "commented_out_code",
                 "Commented-out line that looks like code",
@@ -1672,7 +1675,7 @@ if __name__ == "__main__":
 - [ ] **Step 4: Run the tests to verify they pass**
 
 Run: `python -m pytest tests/code_doctor/test_find_hygiene_issues.py -v`
-Expected: 13 passed.
+Expected: 12 passed.
 
 - [ ] **Step 5: Commit**
 
