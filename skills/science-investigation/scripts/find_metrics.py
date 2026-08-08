@@ -29,8 +29,9 @@ import argparse
 from pathlib import Path
 
 from common import (
-    CODE_SUFFIXES, CONFIG_SUFFIXES, add_common_args, candidate, configure_output,
-    emit, envelope, is_config, iter_files, mask_strings, read_source, rel, skipped_note,
+    CODE_SUFFIXES, CONFIG_SUFFIXES, add_common_args, candidate, configure_output, emit,
+    envelope, is_config, iter_files, mask_strings, read_source, rel, relocate, skipped_note,
+    unpack_source,
 )
 
 # Tokens that make an identifier a measure on their own.
@@ -304,19 +305,22 @@ def scan(root: Path) -> tuple:
     defined: dict = {}
     corpus = {}
     skipped = []
+    notebooks: dict = {}
     for path in files:
-        lines, reason = read_source(path)
+        lines, reason, locations = unpack_source(read_source(path))
         display = rel(path, root)
         if reason:
             skipped.append((display, reason))
             continue
         corpus[display] = lines
+        if locations:
+            notebooks[display] = locations
         for lineno, line in enumerate(lines, 1):
             # A few lines of context, because the aggregate that makes a dropped-None
             # list a composite usually sits on the next line, not this one.
             window = "\n".join(lines[max(0, lineno - 2):lineno + 3])
             found += scan_line(line, display, lineno, defined, window, is_config(path))
-    return found, defined, corpus, skipped
+    return found, defined, corpus, skipped, notebooks
 
 
 def dead_metrics(defined: dict, corpus: dict) -> list:
@@ -467,9 +471,9 @@ def main() -> int:
         print("error: no such path: " + str(root), file=sys.stderr)
         return 2
 
-    rows, defined, corpus, skipped = scan(root)
+    rows, defined, corpus, skipped, notebooks = scan(root)
     rows += dead_metrics(defined, corpus)
-    rows = scope_zero_defaults(rows)
+    rows = relocate(scope_zero_defaults(rows), notebooks)
     shown = dedupe(rows, args.limit)
     counts = {
         "files_scanned": len(corpus),

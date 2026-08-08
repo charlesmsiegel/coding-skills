@@ -27,9 +27,9 @@ import argparse
 from pathlib import Path
 
 from common import (
-    CODE_SUFFIXES, CONFIG_SUFFIXES, DOC_SUFFIXES, add_common_args, candidate,
-    configure_output, emit, envelope, is_config, iter_files, mask_strings, read_source, rel,
-    skipped_note, split_comment,
+    CODE_SUFFIXES, CONFIG_SUFFIXES, DOC_SUFFIXES, add_common_args, candidate, configure_output,
+    emit, envelope, is_config, iter_files, mask_strings, read_source, rel, relocate,
+    skipped_note, split_comment, unpack_source,
 )
 
 # Leading-dot and exponent forms count as numbers here too. Without this, tracing
@@ -139,12 +139,15 @@ def scan(root: Path, pattern: re.Pattern, numeric: bool = True) -> tuple:
     would pad the list an auditor has to read without adding a place to look.
     """
     rows, skipped, seen = [], [], set()
+    notebooks: dict = {}
     for path in iter_files(root, CODE_SUFFIXES | CONFIG_SUFFIXES | DOC_SUFFIXES):
         display = rel(path, root)
-        lines, reason = read_source(path)
+        lines, reason, locations = unpack_source(read_source(path))
         if reason:
             skipped.append((display, reason))
             continue
+        if locations:
+            notebooks[display] = locations
         for lineno, line in enumerate(lines, 1):
             for match in pattern.finditer(line):
                 kind = classify(line, display, path, match.span(),
@@ -153,7 +156,7 @@ def scan(root: Path, pattern: re.Pattern, numeric: bool = True) -> tuple:
                     continue
                 seen.add((display, lineno, kind))
                 rows.append(candidate(kind, display, lineno, kind + " site", CONFIRM[kind], line.strip()))
-    return rows, skipped
+    return relocate(rows, notebooks), skipped
 
 
 def headline_for(needle: str, rows: list) -> str:
