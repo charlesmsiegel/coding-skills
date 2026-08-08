@@ -90,14 +90,25 @@ def render_package_table(packages: list[dict]) -> str:
     rows = []
     for item in packages:
         score = "—" if item["score"] is None else f"{item['score']:.1f}"
+        # Exempt and disputed are not alternatives. Two judges can call a unit
+        # trivial while the panel still splits two rungs on a dimension, and
+        # testing exemption first dropped that disagreement from the row — the
+        # one fact the roll-up exists to surface. Both are said when both hold.
+        #
+        # Labels, not keys: the same dimension reads "World-mapping" inside
+        # theory.html and read `world_mapping` here, so a reader could not tell
+        # they were the same row. .get, because the key came back out of a
+        # document this run did not write.
+        states = []
+        if item["exempt"]:
+            states.append("too small to warrant a theory")
+        if item["disputed"]:
+            states.append("panel disagreed on " + ", ".join(
+                tr.DIMENSION_LABELS.get(str(k), str(k)) for k in item["disputed"]))
         if not item["generated"]:
             state = "not generated"
-        elif item["exempt"]:
-            state = "too small to warrant a theory"
-        elif item["disputed"]:
-            state = "panel disagreed on " + ", ".join(str(k) for k in item["disputed"])
         else:
-            state = "graded"
+            state = "; ".join(states) or "graded"
         rows.append(f"<tr><td>{esc(item['name'])}</td>"
                     f'<td class="num">{score}</td>'
                     f'<td class="num">{esc(item["grade"])}</td>'

@@ -196,7 +196,52 @@ def test_a_disputed_packages_document_is_marked_as_such_in_the_table(
     table = package_table_of(root_page.read_text(encoding="utf-8"))
     assert "billing" in table
     assert "panel disagreed on" in table
-    assert "abstraction" in table
+    assert "Abstraction" in table, (
+        "the dimension is named the same way here as inside theory.html — a reader "
+        "cannot tell `world_mapping` and 'World-mapping' are one row"
+    )
+
+
+# --- exempt and disputed are not alternatives --------------------------------
+
+def test_an_exempt_package_that_also_split_the_panel_keeps_its_disagreement(
+        repo_with_code, run_script, tmp_path):
+    """Two judges can call a unit trivial and the panel still split two rungs.
+
+    Testing exemption first dropped the disagreement from the row — the one
+    thing the roll-up exists to surface.
+    """
+    repo_with_code.write("src/tiny/a.py", "x = 1\n")
+    repo_with_code.write("src/tiny/b.py", "y = 2\n")
+    repo_with_code.commit()
+    files = (verdict_file(tmp_path, 0, unit="tiny", trivial=True, trivial_reason="two constants"),
+             verdict_file(tmp_path, 1, unit="tiny", trivial=True, trivial_reason="two constants"),
+             verdict_file(tmp_path, 2, unit="tiny", abstraction=0.25))
+    package_page = build_package(repo_with_code, run_script, tmp_path / "tiny" / "theory.html",
+                                 "tiny", "src/tiny", files)
+    generated = meta_of(package_page)
+    assert generated["exempt"] is True and generated["disputed"] == ["abstraction"], (
+        "the fixture must be both exempt and disputed, or reading it back proves nothing"
+    )
+
+    root_page = tmp_path / "theory.html"
+    build_root(repo_with_code, run_script, root_page, three(tmp_path, unit="repo"),
+               packages=[f"tiny:{package_page}"])
+
+    table = package_table_of(root_page.read_text(encoding="utf-8"))
+    assert "<td>too small to warrant a theory; panel disagreed on Abstraction</td>" in table
+
+
+def test_the_roll_up_caption_says_an_exempt_package_is_not_a_passing_one(
+        repo_with_code, run_script, tmp_path):
+    root_page = tmp_path / "theory.html"
+    build_root(repo_with_code, run_script, root_page, three(tmp_path, unit="repo"),
+               packages=[f"search:{tmp_path / 'search' / 'theory.html'}"])
+
+    table = package_table_of(root_page.read_text(encoding="utf-8"))
+    assert "too small to warrant a theory is listed as such, not as passing" in table, (
+        "the caption is what stops a null being read as a pass"
+    )
 
 
 # --- the --root guard --------------------------------------------------------
