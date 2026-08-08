@@ -1074,7 +1074,12 @@ and remove `"META_JSON": json_block(meta)` from that dict — the block now trav
 with the panels. Then replace the final page render with:
 
 ```python
-    fragments = [f"<!-- tab:{part}" for part in body.split("<!-- tab:") if part.strip()]
+    # [1:] drops everything before the first marker. The scaffold opens with an
+    # explanatory comment, and treating that as element 0 of the split makes it a
+    # fragment: it becomes tab #1, renders *active*, and hides the grade card
+    # behind a panel with a mangled title. Everything before the first marker is
+    # by definition not a tab.
+    fragments = [f"<!-- tab:{part}" for part in body.split("<!-- tab:")[1:] if part.strip()]
     nav, sections = panels(fragments)
     sections += (f'\n<script type="application/json" id="code-health-meta">'
                  f"{json_block(meta)}</script>")

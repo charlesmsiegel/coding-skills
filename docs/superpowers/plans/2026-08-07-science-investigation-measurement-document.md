@@ -470,7 +470,7 @@ Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>"
 - Produces:
   - `read_inventory(path: Path) -> dict` — parses and validates; raises `InventoryError`
   - `fill(template: str, slots: dict[str, str]) -> str` — replaces `<!--KEY-->` with the value
-  - `build(inventory: dict, *, name: str, scoped_rows, scoped_findings) -> dict` — the `measurement/1` metadata dict
+  - `build_metadata(inventory: dict, scored: dict, name: str, args) -> dict` — the `measurement/1` metadata dict (Task 3 widens it with `out_of_scope` and `packages`)
   - `main(argv=None) -> int` — CLI below
 - Produces the CLI:
 
@@ -1202,7 +1202,11 @@ def main(argv: list[str] | None = None) -> int:
         "TAB_FINDINGS": render_findings_tab(inventory["findings"]),
         "TAB_UNMEASURABLE": render_unmeasurable_tab(inventory["rows"]),
     })
-    fragments = [part for part in body.split("<!-- tab:") if part.strip()]
+    # [1:] drops everything before the first marker. The scaffold opens with an
+    # explanatory comment, and treating that as element 0 makes it a fragment:
+    # it becomes tab #1, renders *active*, and hides the grade card behind a
+    # panel with a mangled title.
+    fragments = [part for part in body.split("<!-- tab:")[1:] if part.strip()]
     nav, sections = panels([f"<!-- tab:{part}" for part in fragments])
 
     meta = build_metadata(inventory, scored, args.name, args)
