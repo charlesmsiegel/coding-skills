@@ -8,6 +8,7 @@ grading decision, and it belongs where the grade is computed.
 """
 
 import json
+import shutil
 from pathlib import Path
 
 SKILL = Path(__file__).resolve().parent.parent.parent / "skills" / "code-doctor"
@@ -281,3 +282,113 @@ def test_every_registered_detector_has_a_rubric_category(load_module):
         f"{unmapped} are code-doctor detector categories with no row in "
         "rubric.DETECTOR_CATEGORIES, so the coverage they report resolves to nothing"
     )
+
+
+def test_a_crashed_detector_and_a_skipped_one_survive_the_merge_hop(run_script, repo, tmp_path):
+    """`categories_skipped`/`categories_failed`, from a real crash, must reach the envelope.
+
+    The producer (test_analyze_all.py) is tested, and the far consumer
+    (code-overview's test_findings_shapes.py) is tested, but the merge hop
+    between them was not: deleting the two lines in `read_report` that copy
+    `completeness.categories_skipped` -> `analyzers_skipped` and
+    `completeness.categories_failed` -> `analyzer_errors` killed no test
+    anywhere in the suite. A crashed detector's error would then silently
+    vanish on the --merged path, and a consumer would grade a category that
+    was never measured.
+
+    The broken detector is a real, deliberately broken copy of
+    find_secrets.py, run as a real subprocess by a real copy of
+    analyze_all.py — not a hand-built completeness dict — so this pins the
+    producer's actual output shape rather than the test author's assumption
+    about it.
+    """
+    scripts_copy = tmp_path / "scripts_copy"
+    shutil.copytree(ANALYZE_ALL.parent, scripts_copy,
+                    ignore=shutil.ignore_patterns("__pycache__"))
+    (scripts_copy / "find_secrets.py").write_text(
+        "import sys\nsys.exit(1)  # deliberately broken for this test\n", encoding="utf-8"
+    )
+
+    repo.write("app.go", "package main\n")
+    repo.commit()
+
+    raw = tmp_path / "raw.json"
+    raw.write_text(
+        run_script(scripts_copy / "analyze_all.py", repo.path,
+                   "--skip", "hygiene", "--format", "json").stdout,
+        encoding="utf-8",
+    )
+
+    envelope = merge(run_script, ("code-doctor", raw))
+
+    assert envelope["analyzers_skipped"]["code-doctor"] == ["hygiene"], (
+        "a category analyze_all deselected must still be visible after the merge"
+    )
+    assert "secrets" in envelope["analyzer_errors"]["code-doctor"], (
+        "a category whose detector crashed must be named in analyzer_errors, not just "
+        "absent from analyzers_run"
+    )
+    assert "find_secrets.py" in envelope["analyzer_errors"]["code-doctor"]["secrets"], (
+        "the crash message itself must survive the merge, not just the category name"
+    )
+
+
+# --------------------------------------------------------------------------
+# the other branches of read_report: which ones would a deletion leave unpinned?
+# --------------------------------------------------------------------------
+#
+# Checked every branch in read_report against the suite by deleting it and
+# re-running test_merge_reports.py:
+#   - path.read_text() OSError            -> pinned (test_a_missing_file_is_a_named_doctor_error)
+#   - empty text                          -> pinned (test_an_empty_file_is_a_failed_doctor_not_a_clean_one)
+#   - json.loads() failure                -> pinned (test_invalid_json_is_a_named_doctor_error)
+#   - isinstance(data, list)              -> pinned (test_a_bare_list_evidences_no_coverage)
+#   - isinstance(data.get("categories"))  -> pinned (test_a_specialist_envelope_keeps_its_coverage_evidence)
+#   - findings-shape categories_run       -> pinned (test_analyze_alls_own_output_resolves_to_coverage)
+#   - findings-shape categories_skipped/  -> was UNPINNED; the test above now pins it
+#     categories_failed
+#   - not isinstance(data, dict)          -> was UNPINNED; deleting it kills 0 tests
+#   - isinstance(data.get("issues"))      -> was UNPINNED; deleting it kills 0 tests
+#   - the final "unrecognised report      -> was UNPINNED; deleting it kills 0 tests
+#     shape" fallback
+#
+# The three below close the last three gaps. They hand-build the input rather
+# than run a producer, because unlike the categories_skipped/categories_failed
+# seam above, no real doctor emits a bare non-dict payload, a bare
+# {"issues": [...]} payload, or a dict with none of findings/categories/issues
+# — these are read_report's own defensive handling of shapes nothing
+# currently produces, so there is no producer to run.
+
+
+def test_a_non_dict_json_payload_is_a_named_doctor_error(run_script, tmp_path):
+    report = tmp_path / "scalar.json"
+    report.write_text(json.dumps(42), encoding="utf-8")
+
+    envelope = merge(run_script, ("code-doctor", report), expect_rc=1)
+
+    assert envelope["doctor_errors"]["code-doctor"] == "unrecognised report shape: int"
+    assert envelope["doctors_run"] == []
+
+
+def test_a_bare_issues_list_is_read_as_records_with_no_coverage_evidence(run_script, tmp_path):
+    report = write_json(tmp_path / "issues.json", {
+        "issues": [{"file": "a.rb", "line": 1, "issue_type": "smell"}],
+    })
+
+    envelope = merge(run_script, ("some-doctor", report))
+
+    assert [f["issue_type"] for f in envelope["findings"]] == ["smell"]
+    assert envelope["coverage_unknown"] == ["some-doctor"], (
+        "an {'issues': [...]} payload carries no analyzers_run evidence, same as a bare list"
+    )
+
+
+def test_a_dict_with_none_of_the_known_keys_is_a_named_doctor_error(run_script, tmp_path):
+    report = write_json(tmp_path / "unknown.json", {"summary": "all clear"})
+
+    envelope = merge(run_script, ("code-doctor", report), expect_rc=1)
+
+    assert envelope["doctor_errors"]["code-doctor"] == (
+        "unrecognised report shape: no findings, categories, or issues"
+    )
+    assert envelope["doctors_run"] == []
