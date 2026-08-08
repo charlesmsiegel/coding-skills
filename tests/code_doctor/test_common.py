@@ -538,27 +538,29 @@ def test_run_file_detector_crash_is_isolated_to_one_file(common, repo, capsys):
 def test_run_file_detector_unreadable_file_surfaces_in_completeness(
     common, repo, capsys, monkeypatch
 ):
-    """Simulates an unreadable file via monkeypatched Path.read_text.
+    """Simulates an unreadable file via monkeypatched Path.read_bytes.
 
     The suite runs as root, where ``chmod 000`` does not deny access (root
     ignores DAC permission bits), so a real permission-denied file would be
     read successfully and this test would pass vacuously. Monkeypatching
-    ``Path.read_text`` to raise ``OSError`` for one specific filename produces
+    ``Path.read_bytes`` to raise ``OSError`` for one specific filename produces
     a genuine, unconditional read failure regardless of the user running the
     suite, while leaving every other file (including git's own reads during
-    the walk) untouched.
+    the walk) untouched. ``read_bytes``, not ``read_text``: ``common.read_text``
+    sniffs a BOM before decoding, so it reads bytes internally rather than
+    calling ``Path.read_text`` directly.
     """
     repo.write("good.go", "package main\n")
     repo.write("unreadable.go", "package main\n")
 
-    original_read_text = pathlib.Path.read_text
+    original_read_bytes = pathlib.Path.read_bytes
 
-    def fake_read_text(self, *args, **kwargs):
+    def fake_read_bytes(self, *args, **kwargs):
         if self.name == "unreadable.go":
             raise OSError("simulated permission denied")
-        return original_read_text(self, *args, **kwargs)
+        return original_read_bytes(self, *args, **kwargs)
 
-    monkeypatch.setattr(pathlib.Path, "read_text", fake_read_text)
+    monkeypatch.setattr(pathlib.Path, "read_bytes", fake_read_bytes)
 
     rc = common.run_file_detector(
         "desc", "clean", _noop_analyze,
@@ -616,3 +618,159 @@ def test_build_parser_rejects_unknown_format(common, capsys):
         parser.parse_args(["--format", "xml"])
     assert excinfo.value.code == 2
     assert "invalid choice" in capsys.readouterr().err
+
+
+# --------------------------------------------------------------------------- #
+# parse_ignore — B2: `--ignore a, b` must strip whitespace on every entry.
+# --------------------------------------------------------------------------- #
+
+def test_parse_ignore_strips_whitespace_around_entries(common):
+    assert common.parse_ignore("a, b") == {"a", "b"}
+    assert common.parse_ignore(" a ,b ,  c") == {"a", "b", "c"}
+
+
+def test_parse_ignore_drops_blank_entries(common):
+    assert common.parse_ignore("") == set()
+    assert common.parse_ignore("a,,b,") == {"a", "b"}
+
+
+def test_run_file_detector_ignore_strips_whitespace(common, repo, capsys):
+    """The second entry of `--ignore "other, smell"` must still suppress it."""
+    repo.write("a.go", "package main\n")
+
+    def analyze(path, text, reporter):
+        reporter.finding(1, "smell", "d", "fix it")
+
+    rc = common.run_file_detector(
+        "desc", "clean", analyze,
+        argv=[str(repo.path), "--format", "json", "--ignore", "other, smell"],
+    )
+    assert rc == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload == []
+
+
+# --------------------------------------------------------------------------- #
+# read_text / is_probably_binary — C2: UTF-16 is NUL-riddled by construction,
+# so a BOM must mark it as text rather than being classified binary.
+# --------------------------------------------------------------------------- #
+
+def test_utf16_bom_file_is_not_classified_binary(common, repo):
+    target = repo.write("app.txt", "placeholder")
+    target.write_bytes("hello world\n".encode("utf-16"))
+    assert common.is_probably_binary(target) is False
+
+
+def test_utf8_bom_file_with_a_nul_byte_is_not_classified_binary(common, repo):
+    """Plain UTF-8 text never contains a NUL byte, so a BOM-less UTF-8 file
+    can never exercise the NUL-sniff branch at all — this embeds one (a
+    legitimate, if unusual, single-byte UTF-8 codepoint) so the BOM check is
+    actually what saves the file from being misclassified as binary."""
+    target = repo.write("app.txt", "placeholder")
+    target.write_bytes(b"\xef\xbb\xbf" + b"hello\x00world\n")
+    assert common.is_probably_binary(target) is False
+
+
+def test_utf16_file_reads_back_correctly(common, repo):
+    """The walk yielding it is not enough — the decode has to actually work.
+
+    Reading UTF-16 bytes with a hardcoded ``utf-8`` + ``errors="replace"``
+    would not raise, but every other byte becomes U+FFFD and the content is
+    gone before any detector sees it.
+    """
+    target = repo.write("app.txt", "placeholder")
+    original = "token: super-secret-value\n"
+    target.write_bytes(original.encode("utf-16"))
+    assert common.read_text(target) == original
+
+
+def test_utf16_be_file_reads_back_correctly(common, repo):
+    target = repo.write("app.txt", "placeholder")
+    original = "<<<<<<< HEAD\nconflict\n"
+    target.write_bytes(b"\xfe\xff" + original.encode("utf-16-be"))
+    assert common.read_text(target) == original
+
+
+def test_utf8_bom_file_reads_back_without_the_bom_character(common, repo):
+    target = repo.write("app.txt", "placeholder")
+    original = "aws_key: AKIA2E0RSCHEMAQ7VXBN\n"
+    target.write_bytes(b"\xef\xbb\xbf" + original.encode("utf-8"))
+    assert common.read_text(target) == original
+
+
+def test_plain_utf8_file_still_reads_normally(common, repo):
+    """No BOM at all must still take the plain UTF-8 path unchanged."""
+    target = repo.write("app.go", "package main\n")
+    assert common.read_text(target) == "package main\n"
+
+
+# --------------------------------------------------------------------------- #
+# git() / gitignored_paths — C3: git permits any non-NUL byte in a filename;
+# the CLI must not raise UnicodeDecodeError before per-file isolation runs.
+# --------------------------------------------------------------------------- #
+
+def test_git_helper_survives_a_locale_invalid_filename(common, repo):
+    """A tracked path with a byte invalid in the locale encoding must not
+    kill the whole `git()` call with UnicodeDecodeError."""
+    bad_name = os.fsdecode(b"bad-\xff-name.txt")
+    (repo.path / bad_name).write_text("content\n", encoding="utf-8")
+    repo.git("add", "-A")
+    repo.git("commit", "-qm", "add a byte-invalid filename")
+    listing = common.git(repo.path, "-c", "core.quotepath=false", "ls-files")
+    assert "bad-" in listing
+
+
+def test_tracked_paths_survives_a_locale_invalid_filename(common, repo):
+    bad_name = os.fsdecode(b"bad-\xff-name.txt")
+    (repo.path / bad_name).write_text("content\n", encoding="utf-8")
+    repo.git("add", "-A")
+    repo.git("commit", "-qm", "add a byte-invalid filename")
+    tracked = common.tracked_paths(repo.path)
+    assert tracked is not None
+
+
+# --------------------------------------------------------------------------- #
+# C1 — a partial scan (some analysis lost) must not print "No problems
+# found".
+# --------------------------------------------------------------------------- #
+
+def test_emit_text_does_not_claim_clean_when_a_file_crashed_the_detector(common, capsys):
+    common.emit([], "text", "no problems found",
+                completeness={"files_detector_failed": "1 file(s) crashed the detector"})
+    out = capsys.readouterr().out
+    assert "no problems found" not in out.lower()
+    assert "incomplete" in out.lower()
+
+
+def test_emit_text_does_not_claim_clean_when_a_file_was_unreadable(common, capsys):
+    common.emit([], "text", "no problems found",
+                completeness={"files_unreadable": "1 file(s) could not be read"})
+    out = capsys.readouterr().out
+    assert "no problems found" not in out.lower()
+    assert "incomplete" in out.lower()
+
+
+def test_emit_text_still_claims_clean_when_completeness_is_scope_only(common, capsys):
+    """`categories_run` (and similar scoping notes) narrow a *claim*, not
+    coverage — they must not block the clean message."""
+    common.emit([], "text", "no problems found",
+                completeness={"categories_run": "hygiene, secrets"})
+    out = capsys.readouterr().out
+    assert "no problems found" in out.lower()
+
+
+def test_run_file_detector_crash_does_not_print_clean_message(common, repo, capsys):
+    """End-to-end: a detector crash on one file must not read as a clean scan."""
+    repo.write("bad.go", "package main\n")
+
+    def analyze(path, text, reporter):
+        raise ValueError("boom")
+
+    rc = common.run_file_detector(
+        "desc", "no problems found", analyze,
+        argv=[str(repo.path), "--format", "text"],
+    )
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "no problems found" not in out.lower()
+    assert "incomplete" in out.lower()

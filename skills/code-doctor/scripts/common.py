@@ -70,6 +70,15 @@ GENERATED_MARKERS = (".min.js", ".min.css", ".bundle.js", "_pb2.py", ".g.dart", 
 
 _BINARY_SNIFF_BYTES = 8192
 
+# UTF-16 is NUL-riddled by construction (every ASCII character is followed by
+# a zero byte in one of the two encodings), which is exactly what the NUL
+# sniff below treats as binary. A byte-order mark is the one cheap, reliable
+# signal that those NUL bytes are text, not a binary format — so it is
+# checked first and short-circuits the NUL check when present.
+_UTF16_LE_BOM = b"\xff\xfe"
+_UTF16_BE_BOM = b"\xfe\xff"
+_UTF8_BOM = b"\xef\xbb\xbf"
+
 
 class ScanPathError(ValueError):
     """The path handed to a detector does not exist.
@@ -91,6 +100,13 @@ def configure_output() -> None:
 def is_probably_binary(path: Path) -> bool:
     """A NUL byte in the first block means this is not text. Cheap and reliable.
 
+    ...except for UTF-16, which is NUL-riddled by construction and would
+    otherwise fail this check on every file, silently hiding credentials and
+    conflict markers in Windows-oriented config, PowerShell, and XML from
+    every text-based detector. A BOM at the very start of the file is checked
+    first and, when present, is treated as proof of text regardless of what
+    the NUL sniff would say.
+
     Propagates OSError rather than swallowing it. "I could not open this" is
     not "this is binary": treating them alike drops an unreadable file out of
     the walk entirely, so the detector's own unreadable-file handling never
@@ -99,7 +115,30 @@ def is_probably_binary(path: Path) -> bool:
     is built to avoid.
     """
     with path.open("rb") as handle:
-        return b"\x00" in handle.read(_BINARY_SNIFF_BYTES)
+        sniff = handle.read(_BINARY_SNIFF_BYTES)
+    if sniff.startswith(_UTF16_LE_BOM) or sniff.startswith(_UTF16_BE_BOM) or sniff.startswith(_UTF8_BOM):
+        return False
+    return b"\x00" in sniff
+
+
+def read_text(path: Path) -> str:
+    """Read a file as text, honouring a UTF-16 or UTF-8 byte-order mark.
+
+    ``is_probably_binary`` lets a BOM-marked UTF-16 file through as text, but
+    reading its bytes with a hardcoded ``encoding="utf-8"`` would not raise —
+    ``errors="replace"`` absorbs the mismatch silently — it would instead turn
+    every other byte into U+FFFD and destroy any credential or conflict
+    marker in the file before a detector ever sees it. Sniffing the walk is
+    not enough; the decode has to match it. Python's ``"utf-16"`` codec
+    detects and strips either byte order's BOM on its own, so both cases
+    share one branch.
+    """
+    data = path.read_bytes()
+    if data.startswith(_UTF16_LE_BOM) or data.startswith(_UTF16_BE_BOM):
+        return data.decode("utf-16", errors="replace")
+    if data.startswith(_UTF8_BOM):
+        return data.decode("utf-8-sig", errors="replace")
+    return data.decode("utf-8", errors="replace")
 
 
 def is_source(rel_parts: tuple[str, ...], path: Path) -> bool:
@@ -131,13 +170,14 @@ def gitignored_paths(root: Path) -> set[Path]:
     wrong one.
     """
     try:
-        listing = subprocess.run(
+        result = subprocess.run(
             ["git", "-C", str(root), "-c", "core.quotepath=false",
              "ls-files", "--others", "--ignored", "--exclude-standard", "--directory"],
-            capture_output=True, text=True, timeout=120, check=True,
-        ).stdout
+            capture_output=True, timeout=120, check=True,
+        )
     except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError):
         return set()
+    listing = _decode_git_output(result.stdout)
     return {(root / rel.strip()).resolve() for rel in listing.splitlines() if rel.strip()}
 
 
@@ -331,13 +371,31 @@ class Reporter:
 # Git, and knowing when not to trust it
 # --------------------------------------------------------------------------- #
 
+def _decode_git_output(data: bytes) -> str:
+    """Decode git's stdout without ever raising on the bytes it can return.
+
+    Git permits any non-NUL byte in a path, and ``core.quotepath=false`` is
+    set everywhere in this module specifically to get those raw bytes instead
+    of a quoted-and-escaped placeholder. ``subprocess.run(..., text=True)``
+    decodes with the locale's encoding and *strict* error handling, so a
+    tracked filename (or, for ``git show``, file content) containing bytes
+    invalid in that encoding would raise ``UnicodeDecodeError`` and kill the
+    CLI before any single-file try/except in a detector's own loop gets a
+    chance to isolate the damage. ``surrogateescape`` maps each invalid byte
+    to a lone surrogate codepoint instead of raising — lossless and always
+    round-trippable back to the original bytes if ever needed, and here it
+    only needs to survive `in`/substring comparisons and printing.
+    """
+    return data.decode("utf-8", errors="surrogateescape")
+
+
 def git(repo: Path, *args: str) -> str:
     """Run a git command in ``repo``, returning stdout. Raises on failure."""
     result = subprocess.run(
         ["git", "-C", str(repo), *args],
-        capture_output=True, text=True, timeout=120, check=True,
+        capture_output=True, timeout=120, check=True,
     )
-    return result.stdout
+    return _decode_git_output(result.stdout)
 
 
 def is_git_repo(repo: Path) -> bool:
@@ -492,6 +550,44 @@ def tracked_paths(root: Path) -> set[Path] | None:
     return {(toplevel / rel.strip()).resolve() for rel in entries if rel.strip()}
 
 
+def committed_or_staged_text(repo: Path, filepath: Path) -> str | None:
+    """The tracked file's staged (index) or last-committed (HEAD) text.
+
+    ``git ls-files`` proves a *path* is tracked; it does not prove that any
+    particular bytes at that path were ever staged or committed. A developer
+    who edits an already-tracked file without running ``git add`` has on-disk
+    bytes git's object store has never seen — reporting that as "committed to
+    the repository, revoke it now" is a false positive with a real cost.
+
+    This fetches what git actually has, so a caller can compare a matched
+    credential against it rather than trusting the path's tracked status as a
+    proxy for the bytes' tracked status. Tries the index first (``git show
+    :path``, i.e. what the last ``git add`` staged — identical to HEAD for a
+    file that has not been touched since checkout) and falls back to HEAD
+    (``git show HEAD:path``) for cases the index lookup can't answer, such as
+    a path with multiple staged versions mid-merge-conflict.
+
+    Returns None when neither can be read: git is unavailable, the path does
+    not resolve under this repository, or (a repository with no commits yet)
+    both lookups fail. Callers must treat None as "could not verify", the
+    same way they treat an unknown tracking state — never as "empty file".
+    """
+    base = git_dir_for(repo)
+    if not is_git_repo(base):
+        return None
+    try:
+        toplevel = Path(git(base, "rev-parse", "--show-toplevel").strip())
+        git_path = filepath.resolve().relative_to(toplevel).as_posix()
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError, ValueError):
+        return None
+    for rev in (":" + git_path, "HEAD:" + git_path):
+        try:
+            return git(base, "show", rev)
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError):
+            continue
+    return None
+
+
 # --------------------------------------------------------------------------- #
 # One CLI, one report
 # --------------------------------------------------------------------------- #
@@ -525,11 +621,42 @@ def build_parser(description: str) -> argparse.ArgumentParser:
     return parser
 
 
+def parse_ignore(value: str) -> set[str]:
+    """Parse ``--ignore``'s comma-separated value into a set of smell types.
+
+    Every entry is stripped of surrounding whitespace: ``--ignore "a, b"`` is
+    a common way to type a two-item list, and without stripping, ``" b"``
+    never equals any real ``smell_type`` a detector emits, so the second
+    entry silently does nothing. Blank entries — an empty string, or one
+    produced by a trailing/doubled comma — are dropped rather than becoming a
+    spurious ignored type that only ever matches on ``smell_type == ""``.
+    """
+    return {item.strip() for item in value.split(",") if item.strip()}
+
+
 def sort_findings(findings: list[Finding]) -> list[Finding]:
     """Findings before candidates, then by severity, then by location."""
     findings.sort(key=lambda f: (f.kind != "finding",
                                  SEVERITY_RANK.get(f.severity, 1), f.file, f.line))
     return findings
+
+
+# Completeness labels that mean analysis was actually lost — as opposed to a
+# label that only narrows the *scope* of a claim (`tracking_state`,
+# `merge_state`, a shallow-history note) or inventories what ran
+# (`categories_run`). Only the former may block the clean-report message: a
+# scan that skipped ownership claims for lack of history is still allowed to
+# say "no problems found" among what it *did* check, but a scan that could
+# not read or analyse some files was never able to check them at all.
+_COVERAGE_LOSS_LABELS = frozenset({"files_unreadable", "files_detector_failed"})
+
+
+def _lost_coverage(completeness: dict | None) -> bool:
+    if not completeness:
+        return False
+    return any(label in _COVERAGE_LOSS_LABELS
+              or label.endswith("_failed") or label.endswith("_rejected")
+              for label in completeness)
 
 
 def _print_report(findings: list[Finding], clean_message: str,
@@ -543,7 +670,15 @@ def _print_report(findings: list[Finding], clean_message: str,
     leads = [f for f in findings if f.kind == "candidate"]
 
     if not findings:
-        print(f"✅ {clean_message}")
+        if _lost_coverage(completeness):
+            # Printing the clean line here would be exactly the contradiction
+            # this skill exists to prevent: files this scan never managed to
+            # read or analyse cannot have been confirmed clean, no matter how
+            # innocent the files that DID get analysed turned out to be.
+            print("⚠️  Scan incomplete — some files could not be analysed (see "
+                  "notes above), so this is NOT a confirmed-clean result.")
+        else:
+            print(f"✅ {clean_message}")
         return
 
     print(f"{len(confirmed)} finding(s), {len(leads)} candidate(s):\n")
@@ -614,7 +749,7 @@ def run_file_detector(description: str, clean_message: str, analyze,
     """
     configure_output()
     args = build_parser(description).parse_args(argv)
-    ignore = set(args.ignore.split(",")) if args.ignore else set()
+    ignore = parse_ignore(args.ignore)
 
     findings: list[Finding] = []
     unreadable: list[str] = []
@@ -625,7 +760,7 @@ def run_file_detector(description: str, clean_message: str, analyze,
         return fail_on_bad_path(exc)
     for filepath in walked:
         try:
-            text = filepath.read_text(encoding="utf-8", errors="replace")
+            text = read_text(filepath)
         except OSError as exc:
             warn_unreadable(filepath, exc)
             unreadable.append(str(filepath))

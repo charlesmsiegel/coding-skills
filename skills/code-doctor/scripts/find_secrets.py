@@ -14,15 +14,18 @@ import re
 import sys
 from pathlib import Path
 
-from common import (Reporter, ScanPathError, build_parser, configure_output,
-                    coverage_gaps, emit, fail_on_bad_path, tracked_paths,
-                    walk_files, warn_detector_error, warn_unreadable)
+from common import (Reporter, ScanPathError, build_parser, committed_or_staged_text,
+                    configure_output, coverage_gaps, emit, fail_on_bad_path, parse_ignore,
+                    read_text, tracked_paths, walk_files, warn_detector_error,
+                    warn_unreadable)
 
 # OpenPGP armor is "PGP PRIVATE KEY BLOCK", not "PGP PRIVATE KEY" — the
-# shorter form matches nothing a real key ever writes.
-KEY_BLOCK = re.compile(r"-----BEGIN (?:RSA |EC |DSA |OPENSSH )?PRIVATE KEY-----"
+# shorter form matches nothing a real key ever writes. "ENCRYPTED PRIVATE
+# KEY" is standard PKCS#8 armor for a password-protected key and is just as
+# much a secret worth rotating as an unencrypted one.
+KEY_BLOCK = re.compile(r"-----BEGIN (?:RSA |EC |DSA |OPENSSH |ENCRYPTED )?PRIVATE KEY-----"
                       r"|-----BEGIN PGP PRIVATE KEY BLOCK-----")
-KEY_END = re.compile(r"-----END (?:RSA |EC |DSA |OPENSSH )?PRIVATE KEY-----"
+KEY_END = re.compile(r"-----END (?:RSA |EC |DSA |OPENSSH |ENCRYPTED )?PRIVATE KEY-----"
                     r"|-----END PGP PRIVATE KEY BLOCK-----")
 BASE64_LINE = re.compile(r"[A-Za-z0-9+/=]{32,}")
 
@@ -57,6 +60,44 @@ SECRET_NAME = re.compile(
 
 MIN_ENTROPY_BITS = 3.5
 
+# also_caused_by prose, shared between the private-key and cloud-credential
+# paths since the underlying tracking states (and the reasoning behind them)
+# are identical — only the header line naming what was found differs.
+_UNTRACKED_REASONS = (
+    "it is gitignored local material that was never pushed",
+    "it is a scratch file outside the repository's history",
+)
+_UNKNOWN_TRACKING_REASONS = (
+    "git is unavailable here, so committed/staged content could not be checked",
+)
+_NOT_YET_COMMITTED_REASONS = (
+    "it was just added to a tracked file and has not yet been staged or committed",
+    "the committed/staged version of this file does not contain this value",
+)
+
+
+class _Lazy:
+    """Calls ``fn`` at most once and caches the result, including a cached None.
+
+    Committed/staged content is only worth fetching from git when a match
+    actually needs verifying — most scanned files contain no credential at
+    all, and spawning a `git show` per tracked file regardless would multiply
+    the walk's subprocess count by the size of the repository for no benefit.
+    """
+
+    __slots__ = ("_fn", "_value", "_done")
+
+    def __init__(self, fn):
+        self._fn = fn
+        self._value = None
+        self._done = False
+
+    def __call__(self):
+        if not self._done:
+            self._value = self._fn()
+            self._done = True
+        return self._value
+
 
 def shannon_entropy(value: str) -> float:
     """Bits of entropy per character. A real key scores well above a placeholder."""
@@ -69,8 +110,8 @@ def shannon_entropy(value: str) -> float:
     return -sum((n / total) * math.log2(n / total) for n in counts.values())
 
 
-def has_key_payload(lines: list[str], start: int) -> bool:
-    """Whether a BEGIN line is followed by a plausible key body.
+def _key_payload_lines(lines: list[str], start: int) -> list[str]:
+    """The base64 body lines between a BEGIN marker (exclusive) and END (exclusive).
 
     A bare `-----BEGIN RSA PRIVATE KEY-----` with nothing after it is what a
     documentation example or a fixture looks like, and the wide walk reaches
@@ -84,34 +125,98 @@ def has_key_payload(lines: list[str], start: int) -> bool:
         if KEY_END.search(candidate):
             break
         window.append(candidate)
-    return any(BASE64_LINE.fullmatch(candidate.strip()) for candidate in window)
+    return [c.strip() for c in window if BASE64_LINE.fullmatch(c.strip())]
 
 
-def analyze(path: Path, text: str, report: Reporter,
-            tracked_here: bool | None = None) -> None:
+def _single_line_key_payload(line: str, header_end: int) -> list[str]:
+    """Base64 body on the SAME physical line as the BEGIN marker.
+
+    Service-account credentials in JSON or env files often put the whole key
+    on one physical line with literal `\\n` escapes standing in for real
+    newlines. `_key_payload_lines` only looks at subsequent physical *lines*,
+    so a complete, committed key in that shape was silently downgraded to a
+    header-only candidate with no remediation. Split the remainder of this
+    line on the literal two-character `\\n` escape to recover the key's
+    logical lines, stop at a same-line END marker the same way
+    `_key_payload_lines` does, and look for a base64 chunk within each piece
+    (`search`, not `fullmatch` — surrounding JSON quoting and a trailing comma
+    are expected here, unlike a real PEM file where each physical line is
+    pure base64).
+    """
+    body = []
+    for piece in line[header_end:].split("\\n"):
+        if KEY_END.search(piece):
+            break
+        body.append(piece)
+    found = []
+    for piece in body:
+        match = BASE64_LINE.search(piece)
+        if match:
+            found.append(match.group(0))
+    return found
+
+
+def _find_credential_matches(line: str) -> list[tuple[tuple[int, int], str, str]]:
+    """Every distinct credential span on the line, across all known patterns.
+
+    A single `break` after the first match leaves every other credential on a
+    minified JSON blob or a multi-token shell line unreported and unrevoked.
+    Every pattern's matches are collected; a span already claimed by an
+    earlier (and therefore, by list order, more specific) pattern is skipped
+    so the same characters are never reported twice under two labels.
+    """
+    found = []
+    claimed: list[tuple[int, int]] = []
+    for pattern, label in CLOUD_CREDENTIALS:
+        for match in pattern.finditer(line):
+            span = match.span()
+            if any(span[0] < end and start < span[1] for start, end in claimed):
+                continue
+            claimed.append(span)
+            found.append((span, match.group(0), label))
+    found.sort(key=lambda item: item[0])
+    return found
+
+
+def _tracking_verdict(tracked_here: bool | None, get_committed_text, needle: str) -> str:
+    """One of 'committed', 'not_yet_committed', 'untracked', or 'unknown'.
+
+    'committed' is the only verdict that may promote to a finding: the
+    matched text must actually appear in git's index or HEAD version of this
+    file — tracked-ness of the *path* (`tracked_here`) is not evidence that
+    these particular *bytes* were ever staged or committed. 'unknown' covers
+    git being unavailable or unable to answer for this file; it gets the same
+    conservative (never-a-finding) treatment as 'untracked'/'not_yet_committed'
+    but is reported with a different, honest reason.
+    """
+    if tracked_here is False:
+        return "untracked"
+    if tracked_here is None:
+        return "unknown"
+    committed_text = get_committed_text()
+    if committed_text is None:
+        return "unknown"
+    return "committed" if needle in committed_text else "not_yet_committed"
+
+
+def _uncertain_reasons(verdict: str) -> tuple[str, ...]:
+    if verdict == "untracked":
+        return _UNTRACKED_REASONS
+    if verdict == "unknown":
+        return _UNKNOWN_TRACKING_REASONS
+    return _NOT_YET_COMMITTED_REASONS  # verdict == "not_yet_committed"
+
+
+def analyze(path: Path, text: str, report: Reporter, tracked_here: bool | None = None,
+           get_committed_text=lambda: None) -> None:
     lines = text.splitlines()
     for index, line in enumerate(lines):
         number = index + 1
-        if KEY_BLOCK.search(line):
-            if has_key_payload(lines, index + 1) and tracked_here is not False:
-                report.finding(
-                    number, "private_key_material",
-                    "Private key block committed to the repository",
-                    "Remove the key, rotate it, and purge it from history. Anyone who has "
-                    "ever cloned this repository has the old copy.",
-                    severity="high",
-                )
-            elif has_key_payload(lines, index + 1):
-                report.candidate(
-                    number, "private_key_material",
-                    "Private key block in a file git does not track",
-                    also_caused_by=[
-                        "it is gitignored local key material that was never pushed",
-                        "it is a scratch file outside the repository's history",
-                    ],
-                    severity="high",
-                )
-            else:
+        key_match = KEY_BLOCK.search(line)
+        if key_match:
+            body = (_key_payload_lines(lines, index + 1)
+                   + _single_line_key_payload(line, key_match.end()))
+            if not body:
                 report.candidate(
                     number, "private_key_material",
                     "Private-key header with no key body following it",
@@ -122,59 +227,75 @@ def analyze(path: Path, text: str, report: Reporter,
                     ],
                     severity="high",
                 )
-            continue
-
-        # One credential must not appear as both a finding and a candidate, so
-        # a recognized pattern ends this line's processing entirely.
-        matched_credential = False
-        for pattern, label in CLOUD_CREDENTIALS:
-            match = pattern.search(line)
-            if not match:
                 continue
-            matched_credential = True
-            if match.group(0) in DOCUMENTED_EXAMPLES:
-                break  # the vendor's own published placeholder
-            if tracked_here is False:
-                report.candidate(
-                    number, "cloud_credential",
-                    f"{label} in a file git does not track",
-                    also_caused_by=[
-                        "it is gitignored local configuration that was never pushed",
-                        "it is a scratch file outside the repository's history",
-                    ],
-                    severity="high", snippet=match.group(0)[:12] + "…",
+            verdict = _tracking_verdict(tracked_here, get_committed_text, body[0])
+            if verdict == "committed":
+                report.finding(
+                    number, "private_key_material",
+                    "Private key block committed to the repository",
+                    "Remove the key, rotate it, and purge it from history. Anyone who has "
+                    "ever cloned this repository has the old copy.",
+                    severity="high",
                 )
             else:
+                report.candidate(
+                    number, "private_key_material",
+                    "Private key block with a body, but not confirmed committed",
+                    also_caused_by=list(_uncertain_reasons(verdict)),
+                    severity="high",
+                )
+            continue
+
+        credential_spans: list[tuple[int, int]] = []
+        for span, value, label in _find_credential_matches(line):
+            credential_spans.append(span)
+            if value in DOCUMENTED_EXAMPLES:
+                continue  # the vendor's own published placeholder
+            verdict = _tracking_verdict(tracked_here, get_committed_text, value)
+            if verdict == "committed":
                 report.finding(
                     number, "cloud_credential",
                     f"{label} committed to the repository",
                     "Revoke it now, then load it from the environment or a secret "
                     "manager. Revoke first — removing the line does not un-leak it.",
-                    severity="high", snippet=match.group(0)[:12] + "…",
+                    severity="high", snippet=value[:12] + "…",
                 )
-            break
-        if matched_credential:
-            continue
+            else:
+                report.candidate(
+                    number, "cloud_credential",
+                    f"{label}, but not confirmed committed",
+                    also_caused_by=list(_uncertain_reasons(verdict)),
+                    severity="high", snippet=value[:12] + "…",
+                )
 
         assignment = SECRET_NAME.search(line)
-        value = (assignment.group(2) or assignment.group(3)) if assignment else ""
-        if assignment and shannon_entropy(value) >= MIN_ENTROPY_BITS:
-            report.candidate(
-                number, "hardcoded_secret_assignment",
-                f"High-entropy value assigned to `{assignment.group(1)}`",
-                also_caused_by=[
-                    "a test fixture or a deliberately fake credential",
-                    "a public identifier (a key ID, a client ID) that is not secret",
-                    "a hash, a checksum, or an encoded non-secret value",
-                ],
-                severity="high", snippet=assignment.group(1) + " = …",
-            )
+        if assignment:
+            group_index = 2 if assignment.group(2) else 3
+            value = assignment.group(group_index)
+            value_span = assignment.span(group_index)
+            # Suppress only when this candidate would restate a credential
+            # already reported (or ruled out as a documented example) above —
+            # a distinct high-entropy value elsewhere on the same line still
+            # deserves its own candidate.
+            overlaps_reported = any(value_span[0] < end and start < value_span[1]
+                                    for start, end in credential_spans)
+            if not overlaps_reported and shannon_entropy(value) >= MIN_ENTROPY_BITS:
+                report.candidate(
+                    number, "hardcoded_secret_assignment",
+                    f"High-entropy value assigned to `{assignment.group(1)}`",
+                    also_caused_by=[
+                        "a test fixture or a deliberately fake credential",
+                        "a public identifier (a key ID, a client ID) that is not secret",
+                        "a hash, a checksum, or an encoded non-secret value",
+                    ],
+                    severity="high", snippet=assignment.group(1) + " = …",
+                )
 
 
 def main() -> int:
     configure_output()
     args = build_parser(__doc__).parse_args()
-    ignore = set(args.ignore.split(",")) if args.ignore else set()
+    ignore = parse_ignore(args.ignore)
     root = Path(args.path)
 
     # Tracking state separates a committed leak from a developer's gitignored
@@ -189,15 +310,22 @@ def main() -> int:
         return fail_on_bad_path(exc)
     for filepath in walked:
         try:
-            text = filepath.read_text(encoding="utf-8", errors="replace")
+            text = read_text(filepath)
         except OSError as exc:
             warn_unreadable(filepath, exc)
             unreadable.append(str(filepath))
             continue
         report = Reporter(filepath, ignore)
         tracked_here = None if tracked is None else (filepath.resolve() in tracked)
+        # Tracked-ness of the path is not tracked-ness of the bytes (A1): a
+        # match only promotes to a finding once the matched text is confirmed
+        # present in git's own index/HEAD content, fetched lazily below so a
+        # file with no matches never pays for a `git show` it doesn't need.
+        get_committed_text = _Lazy(
+            lambda fp=filepath: committed_or_staged_text(root, fp) if tracked_here else None
+        )
         try:
-            analyze(filepath, text, report, tracked_here)
+            analyze(filepath, text, report, tracked_here, get_committed_text)
         except Exception as exc:
             warn_detector_error(filepath, exc)
             failed.append(str(filepath))

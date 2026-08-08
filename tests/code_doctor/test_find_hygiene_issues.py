@@ -148,3 +148,63 @@ def test_ignore_suppresses_a_type(repo, run_script):
     repo.write("app.go", "package main\n// TODO: fix this\n")
     result = run_script(SCRIPT, repo.path, "--format", "json", "--ignore", "todo_inventory")
     assert "todo_inventory" not in types_in(result)
+
+
+# --------------------------------------------------------------------------- #
+# B1 — the `.env.<environment>` family, minus documented templates.
+# --------------------------------------------------------------------------- #
+
+def test_tracked_env_staging_file_is_a_finding(repo, run_script):
+    """`.env.staging` is as credential-bearing as `.env.production`."""
+    repo.write(".env.staging", "API_KEY=abc123\n")
+    repo.commit("oops")
+    result = run_script(SCRIPT, repo.path, "--format", "json")
+    assert "committed_env_file" in types_in(result)
+
+
+def test_tracked_env_development_file_is_a_finding(repo, run_script):
+    repo.write(".env.development", "API_KEY=abc123\n")
+    repo.commit("oops")
+    result = run_script(SCRIPT, repo.path, "--format", "json")
+    assert "committed_env_file" in types_in(result)
+
+
+def test_env_example_template_is_not_reported(repo, run_script):
+    """`.env.example` exists to be a committed, secret-free template."""
+    repo.write(".env.example", "API_KEY=your-key-here\n")
+    repo.commit("template")
+    result = run_script(SCRIPT, repo.path, "--format", "json")
+    assert "committed_env_file" not in types_in(result)
+
+
+def test_env_sample_and_template_names_are_not_reported(repo, run_script):
+    repo.write(".env.sample", "API_KEY=your-key-here\n")
+    repo.write(".env.template", "API_KEY=your-key-here\n")
+    repo.commit("templates")
+    result = run_script(SCRIPT, repo.path, "--format", "json")
+    assert "committed_env_file" not in types_in(result)
+
+
+# --------------------------------------------------------------------------- #
+# B2 — `--ignore a, b` must strip whitespace on every entry.
+# --------------------------------------------------------------------------- #
+
+def test_ignore_strips_whitespace_between_entries(repo, run_script):
+    """`--ignore a, b` must suppress b too, not just a with a leading space
+    nothing ever matches."""
+    repo.write("big.go", "package main\n" + "x" * 305 + "\n")
+    result = run_script(SCRIPT, repo.path, "--format", "json",
+                        "--ignore", "oversized_file, oversized_line")
+    assert "oversized_line" not in types_in(result)
+
+
+# --------------------------------------------------------------------------- #
+# C2 — UTF-16 text was classified binary and skipped entirely.
+# --------------------------------------------------------------------------- #
+
+def test_merge_marker_in_a_utf16_file_is_still_detected(repo, run_script):
+    """UTF-16 is NUL-riddled by construction; a BOM marks it as text anyway."""
+    content = "package main\n<<<<<<< HEAD\nx := 1\n=======\nx := 2\n>>>>>>> other\n"
+    (repo.path / "app.txt").write_bytes(content.encode("utf-16"))
+    result = run_script(SCRIPT, repo.path, "--format", "json")
+    assert "merge_conflict_marker" in types_in(result)
