@@ -58,9 +58,29 @@ def routing_section(text: str | None = None) -> str:
     return document[start:end]
 
 
-def test_the_section_heading_exists_and_is_a_strict_subset_of_the_file():
+def test_the_section_stops_at_the_next_heading():
+    """The slice must end where the next `## ` section begins.
+
+    `0 < len(section) < len(skill_text())` could not fail once
+    `routing_section()`'s own `assert start != -1` passed — the heading is not
+    at offset 0 and the file does not end at it, so both bounds held by
+    construction. What the scoping is actually for is that every other
+    assertion in this file means "documented *here*": a slice that ran past its
+    own heading to EOF would let the reference index and the "When NOT to act"
+    section satisfy them, and deleting the routing section's real content would
+    still pass.
+    """
+    document = skill_text()
     section = routing_section()
-    assert 0 < len(section) < len(skill_text())
+
+    assert document.count(section) == 1
+    body = section[len(SECTION_HEADING):]
+    assert not re.search(r"^## ", body, re.MULTILINE), (
+        "the slice swallowed a later section, so every assertion below is scoped to the "
+        "rest of the file rather than to this section"
+    )
+    tail = document[document.index(section) + len(section):]
+    assert tail.startswith("## "), "a section ends exactly where the next one begins"
 
 
 def test_the_section_names_both_scripts():
