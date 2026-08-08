@@ -540,6 +540,7 @@ def render(template: str, values: dict[str, str]) -> str:
 # --------------------------------------------------------------------------
 
 MEASUREMENT_BLOCK_ID = "measurement-meta"
+THEORY_BLOCK_ID = "theory-meta"
 
 
 def _meta_re(block_id: str) -> re.Pattern:
@@ -571,9 +572,9 @@ def read_meta(path, block_id: str = META_BLOCK_ID) -> dict | None:
 # the package map
 # --------------------------------------------------------------------------
 
-DOC_KINDS = ("summary", "codemap", "health", "measurement")
+DOC_KINDS = ("summary", "codemap", "health", "measurement", "theory")
 DOC_TITLES = {"summary": "Summary", "codemap": "Code Map", "health": "Health",
-              "measurement": "Measurement"}
+              "measurement": "Measurement", "theory": "Theory"}
 
 
 def load_map(path) -> dict:

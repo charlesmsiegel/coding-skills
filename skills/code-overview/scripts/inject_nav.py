@@ -41,7 +41,8 @@ _HEADER_END_RE = re.compile(r"</header>", re.IGNORECASE)
 _BODY_START_RE = re.compile(r"<body[^>]*>", re.IGNORECASE)
 
 HOME_LABELS = {"summary": "Overall Summary", "codemap": "Overall Code Map",
-               "health": "Overall Health", "measurement": "Overall Measurement"}
+               "health": "Overall Health", "measurement": "Overall Measurement",
+               "theory": "Overall Theory"}
 
 STYLE = """<style>
 .co-nav{position:sticky;top:0;z-index:60;max-width:1280px;margin:0 auto;padding:10px 28px;

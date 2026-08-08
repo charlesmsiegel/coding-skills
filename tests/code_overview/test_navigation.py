@@ -399,3 +399,44 @@ def test_check_fails_on_a_measurement_document_deleted_after_injection(repo, run
                         expect_rc=1)
 
     assert "BROKEN LINK" in result.stderr
+
+
+# --- the theory document ---------------------------------------------------
+
+def test_the_across_row_links_all_five_documents(repo, run_script, tmp_path):
+    docs = repo.path / "src" / "app" / "docs"
+    docs.mkdir(parents=True)
+    for kind in ("summary", "codemap", "health", "measurement", "theory"):
+        (docs / f"{kind}.html").write_text("<html><body><header></header></body></html>",
+                                           encoding="utf-8")
+    mapping = repo.path / "docs" / "code-overview.json"
+    mapping.parent.mkdir(parents=True, exist_ok=True)
+    mapping.write_text(json.dumps({"schema": "code-overview/1", "packages": [
+        {"name": "app", "roots": ["src/app"], "docs": "src/app/docs",
+         "language": "python", "doctor": "code-doctor"}]}), encoding="utf-8")
+
+    run_script(INJECT_NAV, "--map", mapping, "--repo", repo.path)
+
+    text = (docs / "summary.html").read_text(encoding="utf-8")
+    assert "theory.html" in text
+    assert "Theory" in text
+
+
+def test_check_fails_on_a_theory_document_deleted_after_injection(repo, run_script, tmp_path):
+    docs = repo.path / "src" / "app" / "docs"
+    docs.mkdir(parents=True)
+    for kind in ("summary", "theory"):
+        (docs / f"{kind}.html").write_text("<html><body><header></header></body></html>",
+                                           encoding="utf-8")
+    mapping = repo.path / "docs" / "code-overview.json"
+    mapping.parent.mkdir(parents=True, exist_ok=True)
+    mapping.write_text(json.dumps({"schema": "code-overview/1", "packages": [
+        {"name": "app", "roots": ["src/app"], "docs": "src/app/docs",
+         "language": "python", "doctor": "code-doctor"}]}), encoding="utf-8")
+    run_script(INJECT_NAV, "--map", mapping, "--repo", repo.path)
+
+    (docs / "theory.html").unlink()
+    result = run_script(INJECT_NAV, "--map", mapping, "--repo", repo.path, "--check",
+                        expect_rc=1)
+
+    assert "BROKEN LINK" in result.stderr

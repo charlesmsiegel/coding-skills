@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import sys
 from datetime import date
 from pathlib import Path
@@ -62,7 +63,53 @@ def panels(fragments: list[str]) -> tuple[str, str]:
 # tabs
 # --------------------------------------------------------------------------
 
-def render_grade_tab(scored: dict, intro: str, size: dict) -> str:
+def read_package_grade(name: str, path: Path) -> dict:
+    """A package row for the root table, read back out of its own document."""
+    blank = {"name": name, "score": None, "grade": tr.UNGRADED,
+             "exempt": False, "disputed": [], "generated": False}
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError:
+        return blank
+    match = re.search(r'id="theory-meta">(.*?)</script>', text, re.S)
+    if not match:
+        return blank
+    try:
+        meta = json.loads(match.group(1).replace("<\\/", "</"))
+    except json.JSONDecodeError:
+        return blank
+    return {"name": name, "score": meta.get("score"),
+            "grade": meta.get("grade", tr.UNGRADED),
+            "exempt": bool(meta.get("exempt")),
+            "disputed": meta.get("disputed") or [], "generated": True}
+
+
+def render_package_table(packages: list[dict]) -> str:
+    if not packages:
+        return ""
+    rows = []
+    for item in packages:
+        score = "—" if item["score"] is None else f"{item['score']:.1f}"
+        if not item["generated"]:
+            state = "not generated"
+        elif item["exempt"]:
+            state = "too small to warrant a theory"
+        elif item["disputed"]:
+            state = "panel disagreed on " + ", ".join(str(k) for k in item["disputed"])
+        else:
+            state = "graded"
+        rows.append(f"<tr><td>{esc(item['name'])}</td>"
+                    f'<td class="num">{score}</td>'
+                    f'<td class="num">{esc(item["grade"])}</td>'
+                    f"<td>{esc(state)}</td></tr>")
+    return ("<h3>Packages</h3><p class=\"dim\">A package too small to warrant a theory is "
+            "listed as such, not as passing.</p>"
+            '<div class="tbl-wrap"><table><thead><tr><th>Package</th>'
+            '<th class="num">Score</th><th class="num">Grade</th><th>State</th>'
+            f"</tr></thead><tbody>{''.join(rows)}</tbody></table></div>")
+
+
+def render_grade_tab(scored: dict, intro: str, size: dict, package_table: str = "") -> str:
     score = scored["score"]
     shown = "—" if score is None else f"{score:.1f}"
 
@@ -111,7 +158,7 @@ def render_grade_tab(scored: dict, intro: str, size: dict) -> str:
         f'<div class="kpi"><div class="n">{size.get("files", 0)}</div>'
         '<div class="l">files</div></div>'
         f'<div class="kpi"><div class="n">{size.get("loc", 0)}</div>'
-        '<div class="l">lines</div></div></div>'
+        '<div class="l">lines</div></div></div>' + package_table
     )
 
 
@@ -200,8 +247,9 @@ def render_disagreement_tab(scored: dict) -> str:
     )
 
 
-def build_metadata(scored: dict, verdicts: list[dict], size: dict, args) -> dict:
-    return {
+def build_metadata(scored: dict, verdicts: list[dict], size: dict, args,
+                   packages: list[dict] | None = None) -> dict:
+    meta = {
         "schema": tr.DOCUMENT_SCHEMA,
         "scope": "repository" if args.root else "package",
         "package": args.name,
@@ -219,6 +267,9 @@ def build_metadata(scored: dict, verdicts: list[dict], size: dict, args) -> dict
         "disputed": scored["disputed"],
         "verdicts": verdicts,
     }
+    if args.root:
+        meta["packages"] = packages or []
+    return meta
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -238,7 +289,12 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--model", default="")
     parser.add_argument("--template", type=Path, default=ASSETS / "template.html")
     parser.add_argument("--body", type=Path, default=ASSETS / "theory-body.html")
+    parser.add_argument("--package", action="append", default=[], dest="packages",
+                        metavar="NAME:PATH")
     args = parser.parse_args(argv)
+
+    if args.packages and not args.root:
+        parser.error("--package builds the repository roll-up table and needs --root")
 
     try:
         verdicts = read_verdicts(args.verdicts)
@@ -267,8 +323,13 @@ def main(argv: list[str] | None = None) -> int:
         except OSError as exc:
             warn(f"{args.intro_file}: {exc}")
 
+    packages = []
+    for spec in args.packages:
+        label, _, location = spec.partition(":")
+        packages.append(read_package_grade(label.strip(), Path(location.strip())))
+
     body = render(args.body.read_text(encoding="utf-8"), {
-        "TAB_GRADE": render_grade_tab(scored, intro, size),
+        "TAB_GRADE": render_grade_tab(scored, intro, size, render_package_table(packages)),
         "TAB_THEORY": render_theory_tab(verdicts),
         "TAB_DIMENSIONS": render_dimensions_tab(scored),
         "TAB_DISAGREEMENT": render_disagreement_tab(scored),
@@ -279,7 +340,7 @@ def main(argv: list[str] | None = None) -> int:
     fragments = [f"<!-- tab:{part}" for part in body.split("<!-- tab:")[1:] if part.strip()]
     nav, sections = panels(fragments)
 
-    meta = build_metadata(scored, verdicts, size, args)
+    meta = build_metadata(scored, verdicts, size, args, packages)
     sections += (f'\n<script type="application/json" id="theory-meta">'
                  f"{json_block(meta)}</script>")
 

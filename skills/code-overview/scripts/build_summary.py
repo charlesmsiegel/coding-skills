@@ -84,6 +84,36 @@ def render_measurement_card(meta: dict | None) -> str:
             "</div></section>")
 
 
+def render_theory_card(meta: dict | None) -> str:
+    """The third grade, read from theory.html rather than passed in.
+
+    Deliberately worded to keep it from being mistaken for the other two: it is
+    a judgment, and a reader comparing three letters side by side needs to know
+    that one of them was produced differently.
+    """
+    if meta is None:
+        return ""
+    score = meta.get("score")
+    if score is None:
+        return ('<div class="callout"><strong>Theory: too small to warrant one.</strong> '
+                f'{esc(meta.get("exempt_reason") or "")} Scored null — not zero, not a pass.'
+                "</div>")
+    grade = str(meta.get("grade", "—"))
+    disputed = meta.get("disputed") or []
+    note = ""
+    if disputed:
+        note = ('<p class="dim"><strong>The panel disagreed</strong> on '
+                + esc(", ".join(str(key) for key in disputed))
+                + " — see the Theory document.</p>")
+    return (f'<section class="gradecard {grade_class(grade)}">'
+            f'<div><div class="letter">{esc(grade)}</div>'
+            f'<div class="score">{score:.1f} / 100</div></div>'
+            '<div class="what"><h2>Theory</h2>'
+            '<p class="dim">Whether the code expresses a coherent theory of its problem, '
+            "judged by a panel of three. A reading, not a measurement — read its evidence "
+            f"rather than this letter.</p>{note}</div></section>")
+
+
 def measurement_cell(meta: dict | None) -> tuple[str, str]:
     """(score, state) as displayed, for one package's measurement document.
 
@@ -185,6 +215,9 @@ def build(args) -> str:
     measurement_path = Path(args.out).parent / "measurement.html"
     measurement = read_meta(measurement_path, common.MEASUREMENT_BLOCK_ID)
 
+    theory_path = Path(args.out).parent / "theory.html"
+    theory = read_meta(theory_path, common.THEORY_BLOCK_ID)
+
     grade = meta.get("grade", rubric.UNGRADED)
     score = meta.get("score")
     categories = meta.get("categories", [])
@@ -209,6 +242,10 @@ def build(args) -> str:
                  "Can the numbers this unit reports be believed? Importance-weighted "
                  "measurement coverage, with the inventory it was computed from.",
                  measurement_path.is_file()),
+        doc_link("theory", "theory.html",
+                 "Does this unit's code express a coherent theory of its problem? A "
+                 "panel of three judges, their evidence, and where they disagreed.",
+                 theory_path.is_file()),
     ))
 
     intro = Path(args.intro_file).read_text(encoding="utf-8") if args.intro_file else ""
@@ -234,6 +271,7 @@ def build(args) -> str:
                                   else ", ".join(meta.get("roots", []) or ["."]))),
         "HEADLINE_BADGES": headline_badges(meta) if meta else "",
         "MEASUREMENT_CARD": render_measurement_card(measurement),
+        "THEORY_CARD": render_theory_card(theory),
         "DOC_LINKS": links,
         "HIGHLIGHTS": render_highlights(args.highlight) + render_codemap_block(
             described, codemap_href, codemap_path.is_file()),
