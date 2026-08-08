@@ -27,6 +27,7 @@ import re
 import sys
 from pathlib import Path
 
+import common
 import rubric
 from build_health import (grade_class, headline_badges, render_category_rows,
                           render_package_table, render_top_findings)
@@ -63,6 +64,42 @@ def doc_link(kind: str, href: str, description: str, exists: bool) -> str:
             f'<div class="d">{esc(note)}</div></a>')
 
 
+def render_measurement_card(meta: dict | None) -> str:
+    """The second grade, read from measurement.html rather than passed in."""
+    if meta is None:
+        return ""
+    score = meta.get("score")
+    if score is None:
+        return ('<div class="callout"><strong>Measurement: no measurement content.</strong> '
+                "Nothing in this unit produces a quality or accuracy number, so there is "
+                "nothing to grade. That is a null, not a pass.</div>")
+    grade = str(meta.get("grade", "—"))
+    return (f'<section class="gradecard {grade_class(grade)}">'
+            f'<div><div class="letter">{esc(grade)}</div>'
+            f'<div class="score">{score:.1f} / 100</div></div>'
+            '<div class="what"><h2>Measurement coverage</h2>'
+            '<p class="dim">How much of what matters here is actually measured — '
+            "importance-weighted measured things over measurable things. A different "
+            "question from the health grade, and often a more uncomfortable one.</p>"
+            "</div></section>")
+
+
+def measurement_cell(meta: dict | None) -> tuple[str, str]:
+    """(score, state) as displayed, for one package's measurement document.
+
+    Three outcomes, deliberately distinct: no document, a document that found
+    nothing measurable, and a graded one. Collapsing the first two into a dash
+    is how a package nobody audited comes to look like a package with nothing
+    to audit.
+    """
+    if meta is None:
+        return "—", "not generated"
+    score = meta.get("score")
+    if score is None:
+        return "—", "no measurement content"
+    return f"{score:.1f}", str(meta.get("grade", "—"))
+
+
 def render_highlights(highlights: list[str]) -> str:
     if not highlights:
         return ""
@@ -79,6 +116,8 @@ def render_package_links(repo: Path, packages: list[dict], out: Path) -> str:
     for package in packages:
         summary = doc_path(repo, package, "summary")
         health = read_meta(doc_path(repo, package, "health"))
+        measurement = read_meta(doc_path(repo, package, "measurement"),
+                                common.MEASUREMENT_BLOCK_ID)
         # No health page is a documented choice ("codemap only" for a language
         # with no doctor). A row of bare em-dashes reads as an unexplained hole,
         # so say which it is.
@@ -89,6 +128,7 @@ def render_package_links(repo: Path, packages: list[dict], out: Path) -> str:
         grade = health.get("grade", rubric.UNGRADED)
         score = health.get("score")
         size = health.get("size", {})
+        m_score, m_state = measurement_cell(measurement)
         name = esc(package["name"])
         label = (f'<a href="{esc(rel_href(out, summary))}">{name}</a>'
                  if summary.is_file() else name)
@@ -102,7 +142,9 @@ def render_package_links(repo: Path, packages: list[dict], out: Path) -> str:
             f'<td class="num">{"—" if score is None else f"{score:.1f}"}</td>'
             f'<td class="{grade_class(grade)}" style="color:var(--grade);font-family:var(--mono);'
             f'font-weight:600">{esc(grade)}</td>'
-            f'<td class="num">{findings}</td></tr>'
+            f'<td class="num">{findings}</td>'
+            f'<td class="num">{esc(m_score)}</td>'
+            f'<td>{esc(m_state)}</td></tr>'
         )
     caption = ("Each package has its own summary, code map, and health page."
                if not ungenerated else
@@ -113,7 +155,7 @@ def render_package_links(repo: Path, packages: list[dict], out: Path) -> str:
             f'<p class="dim">{caption}</p>'
             '<div class="tbl-wrap"><table><thead><tr><th>Package</th><th>Language</th>'
             '<th class="num">Lines</th><th class="num">Score</th><th>Grade</th>'
-            '<th class="num">Findings</th></tr></thead><tbody>'
+            '<th class="num">Findings</th><th>Measurement</th></tr></thead><tbody>'
             + "".join(rows) + "</tbody></table></div>")
 
 
@@ -140,6 +182,9 @@ def build(args) -> str:
     if not meta:
         warn(f"no code-health metadata at {health_path} — the summary will carry no grade")
 
+    measurement_path = Path(args.out).parent / "measurement.html"
+    measurement = read_meta(measurement_path, common.MEASUREMENT_BLOCK_ID)
+
     grade = meta.get("grade", rubric.UNGRADED)
     score = meta.get("score")
     categories = meta.get("categories", [])
@@ -160,6 +205,10 @@ def build(args) -> str:
         doc_link("health", rel_href(out, health_path),
                  f"Graded findings — {meta.get('findings_total', 0)} in total",
                  health_path.is_file()),
+        doc_link("measurement", "measurement.html",
+                 "Can the numbers this unit reports be believed? Importance-weighted "
+                 "measurement coverage, with the inventory it was computed from.",
+                 measurement_path.is_file()),
     ))
 
     intro = Path(args.intro_file).read_text(encoding="utf-8") if args.intro_file else ""
@@ -184,6 +233,7 @@ def build(args) -> str:
                               or ("the whole repository" if args.root
                                   else ", ".join(meta.get("roots", []) or ["."]))),
         "HEADLINE_BADGES": headline_badges(meta) if meta else "",
+        "MEASUREMENT_CARD": render_measurement_card(measurement),
         "DOC_LINKS": links,
         "HIGHLIGHTS": render_highlights(args.highlight) + render_codemap_block(
             described, codemap_href, codemap_path.is_file()),

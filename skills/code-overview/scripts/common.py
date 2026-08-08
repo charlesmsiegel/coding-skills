@@ -453,23 +453,31 @@ def render(template: str, values: dict[str, str]) -> str:
 # the embedded metadata block
 # --------------------------------------------------------------------------
 
-_META_RE = re.compile(
-    r'<script[^>]*id="' + META_BLOCK_ID + r'"[^>]*>(.*?)</script>',
-    re.DOTALL,
-)
+MEASUREMENT_BLOCK_ID = "measurement-meta"
 
 
-def read_meta(path: Path) -> dict | None:
-    """Pull the code-health metadata back out of a generated document."""
-    if not Path(path).is_file():
+def _meta_re(block_id: str) -> re.Pattern:
+    return re.compile(r'<script[^>]*id="' + re.escape(block_id) + r'"[^>]*>(.*?)</script>',
+                      re.DOTALL)
+
+
+def read_meta(path, block_id: str = META_BLOCK_ID) -> dict | None:
+    """Pull a generated document's metadata block back out of it.
+
+    Both document types embed the same way and escape `</` the same way, so one
+    reader serves both — which is what keeps the portal from having to be told a
+    grade it could read.
+    """
+    path = Path(path)
+    if not path.is_file():
         return None
-    match = _META_RE.search(Path(path).read_text(encoding="utf-8"))
+    match = _meta_re(block_id).search(path.read_text(encoding="utf-8"))
     if not match:
         return None
     try:
         return json.loads(match.group(1).replace("<\\/", "</"))
     except json.JSONDecodeError as exc:
-        warn(f"{path} has a code-health block that is not valid JSON: {exc}")
+        warn(f"{path} has a {block_id} block that is not valid JSON: {exc}")
         return None
 
 
