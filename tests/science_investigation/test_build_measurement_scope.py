@@ -66,6 +66,75 @@ def test_a_row_defined_elsewhere_belongs_to_the_package_that_defines_it(run_scri
     assert [r["name"] for r in meta_of(out)["rows"]] == ["billing_judge"]
 
 
+def test_defining_path_without_a_line_number_is_not_truncated(load_module, tmp_path):
+    # Regression: a naive split on the first ":" truncates a Windows absolute
+    # path at its drive letter. A plain relative path with no line number
+    # must come back untouched.
+    build_measurement = load_module(SKILL / "scripts", "build_measurement")
+    entry = {"evidence": ["src/a.py"]}
+    assert build_measurement.defining_path(entry, tmp_path) == "src/a.py"
+
+
+def test_absolute_evidence_inside_the_repo_scopes_to_the_right_package(run_script, tmp_path):
+    repo_dir = tmp_path / "repo"
+    (repo_dir / "src" / "billing").mkdir(parents=True)
+    abs_citation = repo_dir / "src" / "billing" / "metrics.py"
+
+    payload = {
+        "schema": "measurement-inventory/1", "subject": "repo",
+        "rows": [row("billing_accuracy", [f"{abs_citation}:10"])],
+        "findings": [], "not_audited": [],
+    }
+    inv = tmp_path / "abs-inside.json"
+    inv.write_text(json.dumps(payload), encoding="utf-8")
+
+    out = tmp_path / "billing-abs.html"
+    run_script(SCRIPT, "--out", out, "--inventory", inv, "--name", "billing",
+               "--repo", repo_dir, "--root-dir", "src/billing")
+
+    assert [r["name"] for r in meta_of(out)["rows"]] == ["billing_accuracy"]
+
+
+def test_absolute_evidence_outside_the_repo_matches_no_scope(run_script, tmp_path):
+    repo_dir = tmp_path / "repo"
+    repo_dir.mkdir()
+    outside_dir = tmp_path / "elsewhere"
+    outside_dir.mkdir()
+    abs_citation = outside_dir / "metrics.py"
+
+    payload = {
+        "schema": "measurement-inventory/1", "subject": "repo",
+        "rows": [row("outside_metric", [f"{abs_citation}:10"])],
+        "findings": [], "not_audited": [],
+    }
+    inv = tmp_path / "abs-outside.json"
+    inv.write_text(json.dumps(payload), encoding="utf-8")
+
+    out = tmp_path / "billing-abs-outside.html"
+    run_script(SCRIPT, "--out", out, "--inventory", inv, "--name", "billing",
+               "--repo", repo_dir, "--root-dir", "src/billing")
+
+    meta = meta_of(out)
+    assert meta["rows"] == []
+    assert meta["rows_out_of_scope"] == 1
+
+
+def test_backslash_relative_evidence_scopes_to_its_forward_slash_package(run_script, tmp_path):
+    payload = {
+        "schema": "measurement-inventory/1", "subject": "repo",
+        "rows": [row("billing_accuracy", ["src\\billing\\metrics.py:10"])],
+        "findings": [], "not_audited": [],
+    }
+    inv = tmp_path / "backslash.json"
+    inv.write_text(json.dumps(payload), encoding="utf-8")
+
+    out = tmp_path / "billing-backslash.html"
+    run_script(SCRIPT, "--out", out, "--inventory", inv, "--name", "billing",
+               "--repo", tmp_path, "--root-dir", "src/billing")
+
+    assert [r["name"] for r in meta_of(out)["rows"]] == ["billing_accuracy"]
+
+
 def test_a_package_with_no_rows_scores_null_rather_than_vanishing(run_script, tmp_path):
     out = tmp_path / "utils.html"
     run_script(SCRIPT, "--out", out, "--inventory", inventory(tmp_path), "--name", "utils",

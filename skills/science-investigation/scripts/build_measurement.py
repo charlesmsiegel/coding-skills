@@ -270,24 +270,44 @@ def build_metadata(inventory: dict, scored: dict, name: str, args,
     return meta
 
 
-def defining_path(entry: dict) -> str:
+TRAILING_LINE_NUMBER = re.compile(r":\d+$")
+
+
+def defining_path(entry: dict, repo: Path) -> str:
     """Where the measurable thing is *defined* — the first evidence citation.
 
     A metric defined in evals/ that scores a service's output cites both. It
     belongs to whoever defines it: assigning it to the service would give two
     packages the same row and double-count it in the repository denominator.
+
+    The trailing line number is stripped *before* backslash normalization,
+    because a raw split on the first colon truncates a Windows absolute path
+    at its drive letter (`C:\\repo\\src\\billing\\metrics.py:10` -> `"C"`) and
+    the row silently vanishes from every scope. An absolute citation that
+    falls under `repo` is made repo-relative so it can still match; one
+    outside `repo` is left absolute, so it matches no scope instead of being
+    silently mangled into one.
     """
     for citation in entry.get("evidence") or []:
         text = str(citation).strip()
-        if text:
-            return text.split(":", 1)[0].replace("\\", "/").removeprefix("./")
+        if not text:
+            continue
+        text = TRAILING_LINE_NUMBER.sub("", text)
+        text = text.replace("\\", "/").removeprefix("./")
+        try:
+            candidate = Path(text)
+            if candidate.is_absolute():
+                text = str(candidate.resolve().relative_to(repo.resolve())).replace("\\", "/")
+        except (OSError, ValueError):
+            pass  # a malformed or out-of-repo citation is left as-is, not fatal
+        return text
     return ""
 
 
-def in_scope(entry: dict, scopes: list[str]) -> bool:
+def in_scope(entry: dict, scopes: list[str], repo: Path) -> bool:
     if not scopes:
         return True
-    path = defining_path(entry)
+    path = defining_path(entry, repo)
     return any(path == scope or path.startswith(scope.rstrip("/") + "/")
                for scope in scopes)
 
@@ -375,7 +395,7 @@ def main(argv: list[str] | None = None) -> int:
         scopes = [str(s).replace("\\", "/").strip("/")
                   for s in (args.scopes or args.root_dirs)]
         inventory["rows"] = [entry for entry in inventory["rows"]
-                             if in_scope(entry, scopes)]
+                             if in_scope(entry, scopes, args.repo)]
         kept_findings = {str(entry.get("finding")) for entry in inventory["rows"]
                          if entry.get("finding")}
         inventory["findings"] = [f for f in inventory["findings"]
