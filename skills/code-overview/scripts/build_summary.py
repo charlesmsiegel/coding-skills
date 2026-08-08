@@ -244,7 +244,8 @@ def build(args) -> str:
                  measurement_path.is_file()),
         doc_link("theory", "theory.html",
                  "Does this unit's code express a coherent theory of its problem? A "
-                 "panel of three judges, their evidence, and where they disagreed.",
+                 "panel of three judges, their evidence, and any dimension they read "
+                 "differently.",
                  theory_path.is_file()),
     ))
 
