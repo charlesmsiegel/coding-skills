@@ -1,0 +1,339 @@
+#!/usr/bin/env python3
+"""Render an audited inventory into measurement.html.
+
+Every tab comes from the inventory file, so the score in the grade card and the
+table it was computed from cannot disagree — there is no path by which a number
+is typed onto the page by hand.
+
+The Inventory tab is the load-bearing one. This score's denominator is an
+authored judgment: somebody decided which things are measurable and how much
+each matters. A reader who cannot see those rows can only accept or reject the
+letter, and a letter nobody can dispute is a letter nobody should trust. So the
+page ships the whole table — every row with its weight, its credit, the finding
+that set that credit, the N it was computed over, and the file:line it came
+from.
+"""
+
+from __future__ import annotations
+
+import argparse
+import html
+import json
+import sys
+from datetime import date
+from pathlib import Path
+
+import rubric
+
+ASSETS = Path(__file__).resolve().parent.parent / "assets"
+
+SEVERITY_CLASS = {"high": "bad", "medium": "warn", "low": "neutral"}
+
+
+def esc(value) -> str:
+    return html.escape(str(value), quote=True)
+
+
+def json_block(data) -> str:
+    """Serialize for embedding in a <script> block.
+
+    `</` is escaped because a `</script>` inside a JSON string would end the
+    block early and spill the rest of the payload into the document body.
+    """
+    return json.dumps(data, separators=(",", ":"), sort_keys=False).replace("</", "<\\/")
+
+
+def fill(template: str, slots: dict[str, str]) -> str:
+    for key, value in slots.items():
+        template = template.replace(f"<!--{key}-->", value)
+    return template
+
+
+def grade_class(grade: str) -> str:
+    letter = (grade or "").strip()[:1].lower()
+    return f"g-{letter}" if letter in "abcdf" else "g-none"
+
+
+def read_inventory(path: Path) -> dict:
+    data = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(data, dict):
+        raise rubric.InventoryError("inventory must be a JSON object")
+    rows = data.get("rows") or []
+    findings = data.get("findings") or []
+    if not isinstance(rows, list) or not isinstance(findings, list):
+        raise rubric.InventoryError("`rows` and `findings` must both be lists")
+    rubric.validate(rows, findings)
+    return {"subject": str(data.get("subject") or ""), "rows": rows, "findings": findings,
+            "not_audited": data.get("not_audited") or []}
+
+
+# --------------------------------------------------------------------------
+# tabs
+# --------------------------------------------------------------------------
+
+def render_score_tab(scored: dict, rows: list[dict], intro: str, not_audited: list) -> str:
+    score = scored["score"]
+    shown = "—" if score is None else f"{score:.1f}"
+    gates = scored["by_importance"].get("3") or {}
+    gate_share = gates.get("share")
+
+    if score is None:
+        headline = ('<div class="callout warn"><strong>No measurement content here.</strong> '
+                    "Nothing in this unit produces a quality, accuracy or score number, so "
+                    "there is nothing to grade. That is an honest null, not a pass.</div>")
+    else:
+        gate_line = ("no ship-gating numbers were inventoried"
+                     if gate_share is None
+                     else f"{gate_share:.0f}% of the weight that gates a ship decision is "
+                          "soundly measured")
+        headline = (f'<div class="callout"><strong>{esc(gate_line)}.</strong> '
+                    "The headline score averages every importance level; this line is the "
+                    "cut that decides releases.</div>")
+
+    kpis = "".join([
+        f'<div class="kpi accent"><div class="n">{len(rows)}</div>'
+        '<div class="l">measurable things</div></div>',
+        f'<div class="kpi"><div class="n">{scored["weight_measured"]:.2f}</div>'
+        '<div class="l">weight measured</div></div>',
+        f'<div class="kpi"><div class="n">{scored["weight_total"]:.0f}</div>'
+        '<div class="l">weight total</div></div>',
+    ])
+
+    breakdown_parts = []
+    for level, bucket in scored["by_importance"].items():
+        # Precomputed rather than nested inside the f-string: nested same-type
+        # quotes in an f-string expression are a syntax error before 3.12, and
+        # this repo's floor is 3.11.
+        share = "—" if bucket["share"] is None else f"{bucket['share']:.0f}%"
+        breakdown_parts.append(
+            f"<tr><td>{esc(rubric.IMPORTANCE_LABELS[int(level)])}</td>"
+            f'<td class="num">{bucket["rows"]}</td>'
+            f'<td class="num">{bucket["total"]:.0f}</td>'
+            f'<td class="num">{bucket["measured"]:.2f}</td>'
+            f'<td class="num">{share}</td></tr>'
+        )
+    breakdown_rows = "".join(breakdown_parts)
+
+    gaps = ""
+    if not_audited:
+        items = "".join(f"<li>{esc(item)}</li>" for item in not_audited)
+        gaps = ("<h3>Not audited</h3><p class=\"dim\">A silent gap reads as a clean bill of "
+                f"health, so it is listed instead.</p><ul>{items}</ul>")
+
+    return (
+        '<!-- tab: Score -->\n'
+        f'<section class="gradecard {grade_class(scored["grade"])}">'
+        f'<div><div class="letter">{esc(scored["grade"])}</div>'
+        f'<div class="score">{shown} / 100</div></div>'
+        '<div class="what"><h2>Measurement coverage</h2>'
+        '<p class="dim">Importance-weighted measured things over measurable things. '
+        'It says how much of what matters is actually measured — not whether the code '
+        'is correct.</p></div></section>'
+        f"{headline}{intro}"
+        f'<div class="kpis">{kpis}</div>'
+        "<h3>By importance</h3>"
+        '<div class="tbl-wrap"><table><thead><tr><th>Importance</th>'
+        '<th class="num">Things</th><th class="num">Weight</th>'
+        '<th class="num">Measured</th><th class="num">Share</th></tr></thead>'
+        f"<tbody>{breakdown_rows}</tbody></table></div>{gaps}"
+    )
+
+
+def render_inventory_tab(rows: list[dict]) -> str:
+    if not rows:
+        return ('<!-- tab: Inventory -->\n<p class="dim">Nothing measurable was '
+                "inventoried in this unit.</p>")
+
+    parts = []
+    for entry in rows:
+        # Every branch is computed before the f-string. Nested same-type quotes
+        # and backslashes inside f-string expressions are both 3.12+ syntax,
+        # and this repo runs on 3.11.
+        formula = (f'<br><code class="mono">{esc(entry.get("formula"))}</code>'
+                   if entry.get("formula") else "")
+        finding = (f'<br><span class="badge bad">{esc(entry["finding"])}</span>'
+                   if entry.get("finding") else "")
+        n_shown = "—" if entry.get("n") is None else str(entry["n"])
+        if entry.get("n_total") not in (None, ""):
+            n_shown += f" / {esc(entry['n_total'])}"
+        citations = "".join(
+            f'<code class="floc">{esc(item)}</code><br>'
+            for item in entry.get("evidence") or []
+        )
+        parts.append(
+            "<tr>"
+            f"<td><strong>{esc(entry['name'])}</strong>{formula}</td>"
+            f'<td>{esc(rubric.IMPORTANCE_LABELS[int(entry["importance"])])}'
+            f'<br><span class="faint">{esc(entry.get("importance_reason"))}</span></td>'
+            f'<td class="num">{float(entry["credit"]):.2f}</td>'
+            f'<td>{esc(entry.get("credit_reason"))}{finding}</td>'
+            f'<td class="num">{n_shown}</td>'
+            f'<td>{esc(entry.get("consumer") or "nobody reads it")}</td>'
+            f"<td>{citations}</td>"
+            "</tr>"
+        )
+    body = "".join(parts)
+    return (
+        '<!-- tab: Inventory -->\n'
+        "<p>Every measurable thing this audit found, with the weight and credit that "
+        "produced the score. The denominator is a judgment — dispute the rows, not the "
+        "letter.</p>"
+        '<div class="tbl-wrap"><table><thead><tr><th>Thing</th><th>Importance</th>'
+        '<th class="num">Credit</th><th>Why</th><th class="num">N</th><th>Consumer</th>'
+        f"<th>Evidence</th></tr></thead><tbody>{body}</tbody></table></div>"
+    )
+
+
+def render_findings_tab(findings: list[dict]) -> str:
+    if not findings:
+        return ('<!-- tab: Findings -->\n<p class="dim">No confirmed findings against the '
+                "measurement itself. That is not the same as the numbers being right — see "
+                "the Unmeasurable tab for what nothing here could check.</p>")
+
+    order = {"high": 0, "medium": 1, "low": 2}
+    ranked = sorted(findings, key=lambda f: order.get(str(f.get("severity")), 3))
+    cards = "".join(
+        f'<div class="card"><div><span class="badge '
+        f'{SEVERITY_CLASS.get(str(item.get("severity")), "neutral")}">'
+        f'{esc(item.get("severity"))}</span> <code>{esc(item.get("id"))}</code></div>'
+        f"<h3>{esc(item.get('title'))}</h3><p>{esc(item.get('detail'))}</p>"
+        f'<p class="dim"><strong>Blast radius:</strong> {esc(item.get("blast_radius") or "not stated")}</p>'
+        + "".join(f'<code class="floc">{esc(cite)}</code> ' for cite in item.get("evidence") or [])
+        + "</div>"
+        for item in ranked
+    )
+    return ('<!-- tab: Findings -->\n<p>Ranked by likelihood × blast radius on the decisions '
+            f"the number drives, not by how clever the finding is.</p>{cards}")
+
+
+def render_unmeasurable_tab(rows: list[dict]) -> str:
+    gaps = [entry for entry in rows if entry.get("status") == "unmeasurable"]
+    if not gaps:
+        return ('<!-- tab: Unmeasurable -->\n<p class="dim">Nothing was found that today\'s '
+                "data structurally cannot measure.</p>")
+    body = "".join(
+        f"<tr><td><strong>{esc(entry['name'])}</strong></td>"
+        f'<td>{esc(rubric.IMPORTANCE_LABELS[int(entry["importance"])])}</td>'
+        f"<td>{esc(entry.get('unmeasurable_reason'))}</td></tr>"
+        for entry in gaps
+    )
+    return (
+        '<!-- tab: Unmeasurable -->\n'
+        "<p>Structurally unmeasurable with today's data — recall with no gold set, "
+        "calibration with no outcomes, causal effect with no control arm. These are "
+        "<strong>not defects</strong>, and they stay in the denominator on purpose: "
+        "dropping them is how silence gets read as success.</p>"
+        '<div class="tbl-wrap"><table><thead><tr><th>Thing</th><th>Importance</th>'
+        f"<th>What today's data cannot supply</th></tr></thead><tbody>{body}</tbody>"
+        "</table></div>"
+    )
+
+
+def panels(fragments: list[str]) -> tuple[str, str]:
+    """Turn `<!-- tab: Title -->` fragments into code-visualization's markup."""
+    nav, sections = [], []
+    for fragment in fragments:
+        header, _, body = fragment.partition("\n")
+        title = header.removeprefix("<!-- tab:").removesuffix("-->").strip()
+        tab_id = "tab-" + title.lower().replace(" ", "-")
+        selected = "true" if not nav else "false"
+        active = " active" if not sections else ""
+        nav.append(f'<button role="tab" data-tab="{tab_id}" aria-selected="{selected}" '
+                   f'aria-controls="{tab_id}">{esc(title)}</button>')
+        sections.append(f'<section class="panel{active}" id="{tab_id}" role="tabpanel">\n'
+                        f"{body}\n</section>")
+    return "\n".join(nav), "\n".join(sections)
+
+
+def build_metadata(inventory: dict, scored: dict, name: str, args) -> dict:
+    return {
+        "schema": rubric.DOCUMENT_SCHEMA,
+        "scope": "package",
+        "package": name,
+        "generated": args.generated or date.today().isoformat(),
+        "commit": args.commit or "",
+        "score": scored["score"],
+        "grade": scored["grade"],
+        "weight_total": scored["weight_total"],
+        "weight_measured": scored["weight_measured"],
+        "by_importance": scored["by_importance"],
+        "rows": inventory["rows"],
+        "findings": inventory["findings"],
+        "not_audited": inventory["not_audited"],
+    }
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description="Render an audited measurement inventory.")
+    parser.add_argument("--out", required=True, type=Path)
+    parser.add_argument("--inventory", required=True, type=Path)
+    parser.add_argument("--name", required=True)
+    parser.add_argument("--subtitle", default="")
+    parser.add_argument("--intro-file", type=Path, default=None)
+    parser.add_argument("--commit", default="")
+    parser.add_argument("--generated", default="")
+    parser.add_argument("--template", type=Path, default=ASSETS / "template.html")
+    parser.add_argument("--body", type=Path, default=ASSETS / "measurement-body.html")
+    args = parser.parse_args(argv)
+
+    try:
+        inventory = read_inventory(args.inventory)
+    except rubric.InventoryError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    except (OSError, json.JSONDecodeError) as exc:
+        print(f"error: {args.inventory}: {exc}", file=sys.stderr)
+        return 2
+
+    scored = rubric.score_inventory(inventory["rows"])
+
+    intro = ""
+    if args.intro_file:
+        try:
+            intro = args.intro_file.read_text(encoding="utf-8")
+        except OSError as exc:
+            print(f"warning: {args.intro_file}: {exc}", file=sys.stderr)
+    if not intro.strip():
+        intro = ('<div class="callout warn">No written summary was supplied. The prose that '
+                 "says what this unit measures and why is the one part no script can "
+                 "produce, and this page is weaker without it.</div>")
+
+    body = fill(args.body.read_text(encoding="utf-8"), {
+        "TAB_SCORE": render_score_tab(scored, inventory["rows"], intro,
+                                      inventory["not_audited"]),
+        "TAB_INVENTORY": render_inventory_tab(inventory["rows"]),
+        "TAB_FINDINGS": render_findings_tab(inventory["findings"]),
+        "TAB_UNMEASURABLE": render_unmeasurable_tab(inventory["rows"]),
+    })
+    fragments = [part for part in body.split("<!-- tab:") if part.strip()]
+    nav, sections = panels([f"<!-- tab:{part}" for part in fragments])
+
+    meta = build_metadata(inventory, scored, args.name, args)
+    sections += (f'\n<script type="application/json" id="measurement-meta">'
+                 f"{json_block(meta)}</script>")
+
+    page = fill(args.template.read_text(encoding="utf-8"), {
+        "DOC_TITLE": esc(f"{args.name} — Measurement"),
+        "DOC_LABEL": "MEASUREMENT AUDIT",
+        "DOC_SUBTITLE": esc(args.subtitle or
+                            f"Can the numbers {args.name} reports be believed?"),
+        "DOC_META": esc(" · ".join(part for part in (
+            f"generated {meta['generated']}", meta["commit"],
+            f"{len(inventory['rows'])} measurable thing(s)") if part)),
+        "TABS_NAV": nav,
+        "TABS_PANELS": sections,
+        "DOC_BODY": "",
+        "DOC_FOOTER": ("Generated by science-investigation. The score is measurement "
+                       "coverage, not code quality: it says how much of what matters is "
+                       "measured, never whether the code is correct."),
+    })
+
+    args.out.parent.mkdir(parents=True, exist_ok=True)
+    args.out.write_text(page, encoding="utf-8")
+    shown = "—" if scored["score"] is None else f"{scored['score']:.1f}"
+    print(f"wrote {args.out} — {scored['grade']} ({shown})")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
