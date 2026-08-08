@@ -1148,16 +1148,33 @@ def main(argv=None) -> int:
     # this call's job here is reading the files and raising on a bad one.
     reports, _, _ = load_reports(args.findings)
 
-    merged = common.load_merged(args.merged) if args.merged else None
-    candidates: list[dict] = []
-    doctor_errors: dict[str, str] = {}
+    # `normalize_findings` already pulled candidates and a completeness block
+    # out of any code-doctor report handed to `--findings` — that is what makes
+    # `report["candidates"]`/`report["completeness"]` non-empty below. Captured
+    # here, before `reports` gains --merged's own report records, so the two
+    # sources are concatenated rather than counted twice: each report
+    # contributes exactly once, whichever flag supplied it.
+    candidates: list[dict] = [c for report in reports for c in report.get("candidates") or []]
     completeness: dict = {}
+    for report in reports:
+        block = report.get("completeness")
+        if not block:
+            continue
+        # An unlabelled `--findings` report speaks for `--doctor`, the same
+        # fallback `analyzer_gaps` uses for the same reason: a caveat with no
+        # doctor beside it tells a reader something was incomplete but not
+        # whose evidence to distrust.
+        doctor = report.get("doctor") or args.doctor or "(doctor unspecified)"
+        completeness[doctor] = {**completeness.get(doctor, {}), **block}
+
+    merged = common.load_merged(args.merged) if args.merged else None
+    doctor_errors: dict[str, str] = {}
     doctors: list[str] = []
     if merged:
         reports.extend(merged["reports"])
-        candidates = merged["candidates"]
+        candidates += merged["candidates"]
         doctor_errors = merged["doctor_errors"]
-        completeness = merged["completeness"]
+        completeness.update(merged["completeness"])
         doctors = merged["doctors"]
 
     page, meta = build(args, reports, candidates, doctor_errors, completeness, doctors)

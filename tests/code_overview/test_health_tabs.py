@@ -142,6 +142,8 @@ def health_meta(page: str) -> dict:
 
 _COVERAGE_PANEL_RE = re.compile(
     r'<section class="panel(?: active)?" id="tab-coverage"[^>]*>(.*?)</section>', re.DOTALL)
+_CANDIDATES_PANEL_RE = re.compile(
+    r'<section class="panel(?: active)?" id="tab-candidates"[^>]*>(.*?)</section>', re.DOTALL)
 _GRADE_PANEL_RE = re.compile(
     r'<section class="panel(?: active)?" id="tab-grade"[^>]*>(.*?)'
     r'(?=<section class="panel|<script type="application/json" id="code-health-meta">)',
@@ -183,6 +185,18 @@ def coverage_panel(page: str) -> str:
     """
     match = _COVERAGE_PANEL_RE.search(page)
     assert match, "no Coverage panel found"
+    return match.group(1)
+
+
+def candidates_panel(page: str) -> str:
+    """Just the Candidates tab's own markup — not the whole document.
+
+    Same reasoning as `coverage_panel`: the `code-health-meta` block embeds the
+    raw JSON later in the page, `also_caused_by` text and all, so a whole-page
+    substring check would pass even if `render_candidates` produced nothing.
+    """
+    match = _CANDIDATES_PANEL_RE.search(page)
+    assert match, "no Candidates panel found"
     return match.group(1)
 
 
@@ -306,3 +320,85 @@ def test_a_page_with_no_candidates_says_so_rather_than_showing_an_empty_table(
                "--root-dir", "src/app", "--merged", path)
 
     assert "no candidates" in out.read_text(encoding="utf-8").lower()
+
+
+# --------------------------------------------------------------------------
+# `--findings`: code-doctor's own {"completeness": ..., "findings": [...]}
+# shape, carried straight in (no --merged envelope). normalize_findings
+# already reads candidates and a completeness block out of this shape; the
+# bug under test was that main() only ever sourced those two things from
+# --merged, so a --findings-only code-doctor report graded correctly but its
+# Candidates tab rendered empty and its completeness caveats never reached
+# the Coverage tab.
+# --------------------------------------------------------------------------
+
+def doctor_report(tmp_path, *, with_candidate: bool) -> Path:
+    """A hand-built code-doctor report, in code-doctor's own report shape —
+    not code-doctor-merge/1. One asserted defect (kept in both variants, so
+    the score has something to compute), plus one candidate lead that is
+    present only when `with_candidate` is True.
+    """
+    findings = [{"doctor": "code-doctor", "file": "src/app/settings.py", "line": 4,
+                "smell_type": "hardcoded_secret_assignment", "severity": "high",
+                "description": "SECRET_KEY literal", "suggestion": "read from env",
+                "kind": "finding"}]
+    if with_candidate:
+        findings.append({"doctor": "code-doctor", "file": "src/app/legacy.py", "line": 12,
+                         "smell_type": "dead_function_candidate", "severity": "medium",
+                         "description": "identifier occurs once in the tree",
+                         "kind": "candidate",
+                         "also_caused_by": ["a library's public surface has no internal referrer",
+                                            "convention-loaded plugins are never named"]})
+    payload = {
+        "completeness": {"categories_run": ["hygiene", "secrets"], "categories_skipped": [],
+                         "reference_graph": {"adequate": False, "resolution_rate": 0.31}},
+        "findings": findings,
+    }
+    name = "doctor_with_candidate.json" if with_candidate else "doctor_no_candidate.json"
+    path = tmp_path / name
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    return path
+
+
+def _findings_path_page(repo, run_script, tmp_path, out_name: str, *, with_candidate: bool) -> str:
+    out = tmp_path / out_name
+    run_script(SCRIPT, "--out", out, "--repo", repo.path, "--name", "app",
+               "--root-dir", "src/app", "--doctor", "code-doctor",
+               "--findings", f"code-doctor:{doctor_report(tmp_path, with_candidate=with_candidate)}")
+    return out.read_text(encoding="utf-8")
+
+
+def test_a_findings_path_report_renders_its_candidates_without_moving_the_score(
+        repo, run_script, tmp_path):
+    for i in range(12):
+        repo.write(f"src/app/mod{i}.py", "def f():\n    return 1\n" * 20)
+    repo.commit()
+
+    with_page = _findings_path_page(repo, run_script, tmp_path, "with.html",
+                                    with_candidate=True)
+    without_page = _findings_path_page(repo, run_script, tmp_path, "without.html",
+                                       with_candidate=False)
+
+    panel = candidates_panel(with_page)
+    assert "dead_function_candidate" in panel
+    assert "convention-loaded plugins are never named" in panel
+
+    with_meta = health_meta(with_page)
+    without_meta = health_meta(without_page)
+    assert with_meta["score"] is not None, "the fixture's own finding must be graded"
+    assert with_meta["score"] == without_meta["score"], (
+        "a candidate carried by a --findings report must not move the score, exactly like "
+        "one carried by --merged"
+    )
+
+
+def test_a_findings_path_reports_completeness_caveats_on_the_coverage_tab(
+        repo, run_script, tmp_path):
+    for i in range(12):
+        repo.write(f"src/app/mod{i}.py", "def f():\n    return 1\n" * 20)
+    repo.commit()
+    page = _findings_path_page(repo, run_script, tmp_path, "health.html", with_candidate=True)
+    panel = coverage_panel(page)
+    assert "reference_graph" in panel
+    assert "incomplete" in panel
+    assert "resolution_rate: 0.31" in panel
