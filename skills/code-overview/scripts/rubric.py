@@ -181,6 +181,48 @@ SMELL_TYPE_CATEGORIES = {
     smell: category for category, smells in SMELL_TYPES.items() for smell in smells
 }
 
+# code-doctor's own detectors. Language-agnostic and heuristic, which is why so
+# few of them land in Correctness: the raw layer can prove a merge marker in a
+# path git reports as unmerged, and very little else about whether code computes
+# the right answer.
+CODE_DOCTOR_SMELLS = {
+    "correctness": (
+        # Only the git-confirmed unmerged form is a finding; the same marker in
+        # a doc example or a conflict-handling fixture is a candidate, and
+        # candidates are never scored.
+        "merge_conflict_marker",
+    ),
+    "security": (
+        "private_key_material", "cloud_credential", "hardcoded_secret_assignment",
+        "committed_env_file",
+    ),
+    "complexity": (
+        "oversized_file", "oversized_line", "decision_density", "nesting_depth",
+        "long_function", "high_arity",
+    ),
+    "duplication": (
+        "exact_duplicate", "near_duplicate", "zero_inbound_file",
+        "dead_function_candidate", "commented_out_code",
+    ),
+    "design": (
+        "import_cycle", "god_module", "low_directory_cohesion", "change_coupling",
+        "changes_with_everything",
+    ),
+    "tests": (
+        "untested_directory", "low_test_ratio", "test_asserts_nothing",
+    ),
+    "hygiene": (
+        "todo_inventory", "large_committed_binary", "single_author_file",
+        "departed_author", "hotspot",
+    ),
+}
+
+SMELL_TYPE_CATEGORIES.update({
+    smell: category
+    for category, smells in CODE_DOCTOR_SMELLS.items()
+    for smell in smells
+})
+
 # Last resort before the fallback. Matched against the finding's type token at
 # word boundaries — see `keyword_matches`. Ordering is by specificity within a
 # category, but ordering alone cannot keep keywords apart: `test` sits before
@@ -226,6 +268,11 @@ DOCTOR_COVERAGE = {
     # django-code-doctor is a companion to python-code-doctor, not a replacement:
     # it has no general duplication or dead-code detector of its own.
     "django-code-doctor": {"correctness", "security", "tests", "complexity", "design", "hygiene"},
+    # code-doctor buys language-independence by giving up parsing. It can prove
+    # a merge marker in a path git reports as unmerged and essentially nothing
+    # else in the correctness class, so the category is left to a specialist
+    # rather than credited from silence. Everything else it genuinely measures.
+    "code-doctor": set(CATEGORY_KEYS) - {"correctness"},
 }
 
 # Doctors that parse markup as well as code. Their template lines belong in the
@@ -343,3 +390,25 @@ def weighted_overall(scores: dict[str, float | None]) -> float | None:
     if total_weight <= 0:
         return None
     return total / total_weight
+
+
+# A detector that reported its own evidence incomplete has not measured its
+# category, and zero findings from an incomplete look means *unknown*, not
+# *clean*. The adequacy verdict is the producing skill's to make: only the
+# detector knows what resolution rate its own edges need, and a grader
+# inventing a cutoff would silently disagree with the thing that measured it.
+COMPLETENESS_GATES: dict[str, str] = {
+    "reference_graph": "design",
+    "test_classification": "tests",
+    "history": "hygiene",
+}
+
+
+def ungraded_from_completeness(completeness: dict | None) -> set[str]:
+    """Categories to drop because the evidence behind them was incomplete."""
+    dropped: set[str] = set()
+    for key, category in COMPLETENESS_GATES.items():
+        block = (completeness or {}).get(key)
+        if isinstance(block, dict) and block.get("adequate") is False:
+            dropped.add(category)
+    return dropped

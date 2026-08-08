@@ -226,3 +226,77 @@ def test_only_a_known_doctor_prefix_is_read_as_a_label(load_module):
         "django-code-doctor", "dj.json")
     assert common.split_doctor_label("reports/x.json") == ("", "reports/x.json")
     assert common.split_doctor_label("C:/reports/x.json") == ("", "C:/reports/x.json")
+
+
+# --- code-doctor -----------------------------------------------------------
+
+CODE_DOCTOR_TYPES = (
+    "private_key_material", "cloud_credential", "hardcoded_secret_assignment",
+    "committed_env_file", "merge_conflict_marker", "oversized_file", "oversized_line",
+    "todo_inventory", "commented_out_code", "large_committed_binary",
+)
+
+
+@pytest.mark.parametrize("smell_type", CODE_DOCTOR_TYPES)
+def test_every_shipped_code_doctor_type_is_mapped_by_name(rubric, smell_type):
+    assert smell_type in rubric.SMELL_TYPE_CATEGORIES, (
+        f"{smell_type} would fall through to keyword matching or the fallback category, "
+        "where a mis-homed finding is invisible until someone reads unmapped_types"
+    )
+
+
+def test_secrets_and_committed_env_files_are_security(rubric):
+    assert rubric.categorize({"smell_type": "private_key_material"})[0] == "security"
+    assert rubric.categorize({"smell_type": "committed_env_file"})[0] == "security"
+
+
+def test_a_confirmed_merge_marker_is_correctness(rubric):
+    assert rubric.categorize({"smell_type": "merge_conflict_marker"})[0] == "correctness"
+
+
+def test_oversized_files_are_complexity_not_hygiene(rubric):
+    assert rubric.categorize({"smell_type": "oversized_file"})[0] == "complexity"
+
+
+def test_code_doctor_alone_does_not_claim_correctness(rubric):
+    covered = rubric.DOCTOR_COVERAGE["code-doctor"]
+
+    assert "correctness" not in covered, (
+        "a merge marker is the only correctness-class defect the raw layer can prove; "
+        "crediting the category on that is an A+ from silence"
+    )
+    assert {"security", "complexity", "duplication", "hygiene", "tests", "design"} <= covered
+
+
+def test_a_thin_reference_graph_ungrades_design(rubric):
+    dropped = rubric.ungraded_from_completeness(
+        {"reference_graph": {"adequate": False, "resolution_rate": 0.31}})
+
+    assert "design" in dropped
+
+
+def test_an_adequate_reference_graph_grades_design(rubric):
+    dropped = rubric.ungraded_from_completeness(
+        {"reference_graph": {"adequate": True, "resolution_rate": 0.88}})
+
+    assert "design" not in dropped
+
+
+def test_inconclusive_test_classification_ungrades_tests(rubric):
+    dropped = rubric.ungraded_from_completeness(
+        {"test_classification": {"adequate": False,
+                                 "inconclusive_dirs": ["src/rust-core"]}})
+
+    assert "tests" in dropped
+
+
+def test_completeness_this_rubric_does_not_recognise_ungrades_nothing(rubric):
+    assert rubric.ungraded_from_completeness({"weather": {"adequate": False}}) == set()
+
+
+def test_an_absent_adequacy_verdict_is_not_read_as_a_failure(rubric):
+    # The threshold is code-doctor's to set and report. A missing verdict means
+    # the detector said nothing, which is not the same as saying "inadequate" —
+    # inventing a cutoff here would silently disagree with the skill that
+    # measured it.
+    assert rubric.ungraded_from_completeness({"reference_graph": {"resolution_rate": 0.4}}) == set()
