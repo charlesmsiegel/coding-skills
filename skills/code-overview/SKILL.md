@@ -91,10 +91,25 @@ below. Do not pass `--skip`/`--skip-duplicates` unless you mean it: a skipped
 detector leaves its rubric category ungraded (which is correct, and lowers what
 the grade covers).
 
+**Label every report with the doctor that produced it** — `--findings
+<doctor>:<path>` — whenever more than one doctor's findings are passed:
+
+```bash
+--findings python-code-doctor:$WORK/py.json --findings django-code-doctor:$WORK/dj.json
+```
+
+Nothing in a report says who wrote it, and the workflow hands every report to
+every package. An unlabelled report is attributed to `--doctor`, so a TypeScript
+report reaching a Python package's page granted Python coverage nothing had
+measured — an A+ from another language's analysis. The label also decides
+template sizing, so a Django report puts its templates in the denominator even
+when `--doctor` names the Python doctor.
+
 **A Django project deserves both doctors.** `django-code-doctor` has no general
 duplication or dead-code detector, so on its own those categories come back
-ungraded. Run `python-code-doctor` over the repo too, pass both JSON files, and
-use `--doctor python-code-doctor` so the union is credited with full coverage.
+ungraded. Run `python-code-doctor` over the repo too, pass both JSON files
+labelled as above, and use `--doctor python-code-doctor` so the union is
+credited with full coverage.
 
 ## 3. Per package
 

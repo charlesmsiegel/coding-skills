@@ -16,6 +16,7 @@ import re
 import subprocess
 import sys
 from pathlib import Path
+from urllib.parse import quote
 
 import rubric
 
@@ -150,8 +151,14 @@ def normalize_findings(data) -> dict:
                     if isinstance(issue, dict):
                         issue.setdefault("category", name)
                         findings.append(issue)
+            # `analyzers_run` present but *empty* is evidence, not a missing
+            # field: it says nothing ran. Falling back to the category keys on
+            # a falsy value credited a report that had initialized empty
+            # sections and completed no analyzers with having measured all of
+            # them — an A+ from a run that did nothing. Only an absent key
+            # (an older or foreign report shape) falls back.
             listed = meta.get("analyzers_run")
-            ran = ({str(name) for name in listed} if isinstance(listed, list) and listed
+            ran = ({str(name) for name in listed} if isinstance(listed, list)
                    else set(categories))
             # An analyzer that appears as a category but is absent from
             # analyzers_run never produced its section.
@@ -162,8 +169,8 @@ def normalize_findings(data) -> dict:
 
     for finding in findings:
         finding["severity"] = normalize_severity(finding.get("severity"))
-    return {"findings": findings, "errors": errors, "ran": ran,
-            "skipped": skipped, "shape": shape, "empty_artifact": False}
+    return {"findings": findings, "errors": errors, "ran": ran, "skipped": skipped,
+            "shape": shape, "empty_artifact": False, "doctor": ""}
 
 
 def finding_identity(finding: dict) -> tuple:
@@ -240,8 +247,27 @@ def dedupe(reports: list[dict]) -> tuple[list[dict], int]:
     return merged, total - len(merged)
 
 
+def split_doctor_label(raw: str) -> tuple[str, str]:
+    """Split `<doctor>:<path>` into its parts. A bare path keeps an empty label.
+
+    Only a prefix that names a doctor this rubric knows is treated as a label,
+    so an ordinary path is never mangled — `C:/reports/x.json` has no doctor
+    called `C`, and stays a path.
+    """
+    text = str(raw)
+    head, sep, tail = text.partition(":")
+    if sep and head in rubric.DOCTOR_COVERAGE:
+        return head, tail
+    return "", text
+
+
 def load_reports(paths) -> tuple[list[dict], dict[str, str], set[str]]:
     """Read several findings files into per-report records. `-` reads stdin.
+
+    Each path may be written `<doctor>:<path>` to say which doctor produced it.
+    That label is what makes a multi-doctor run safe: without it, a report is
+    attributed to whatever `--doctor` names, and a TypeScript report handed to a
+    Python package's page granted Python coverage it had no evidence for.
 
     Deliberately does **not** merge or deduplicate. The caller scopes each
     report to the unit being documented first, because deduplicating before
@@ -250,7 +276,8 @@ def load_reports(paths) -> tuple[list[dict], dict[str, str], set[str]]:
     """
     reports: list[dict] = []
     errors: dict[str, str] = {}
-    for raw in paths:
+    for entry in paths:
+        doctor, raw = split_doctor_label(entry)
         try:
             text = sys.stdin.read() if str(raw) == "-" else Path(raw).read_text(encoding="utf-8")
         except OSError as exc:
@@ -267,13 +294,14 @@ def load_reports(paths) -> tuple[list[dict], dict[str, str], set[str]]:
                  "created the file?")
             reports.append({"findings": [], "errors": {}, "ran": set(),
                             "skipped": set(), "shape": SHAPE_PARTIAL,
-                            "empty_artifact": True})
+                            "empty_artifact": True, "doctor": doctor})
             continue
         try:
             data = json.loads(text)
         except json.JSONDecodeError as exc:
             raise SystemExit(f"error: {raw} is not valid JSON: {exc}") from exc
         report = normalize_findings(data)
+        report["doctor"] = doctor
         reports.append(report)
         errors.update(report["errors"])
 
@@ -285,18 +313,24 @@ def load_reports(paths) -> tuple[list[dict], dict[str, str], set[str]]:
     return reports, errors, skipped
 
 
-def sizing_extensions(findings: list[dict], extra=(), doctor: str = "") -> frozenset:
+def sizing_extensions(findings: list[dict], extra=(), doctors=()) -> frozenset:
     """Which extensions the denominator should cover.
 
     Code always, plus templates when the analysis reached them. Two signals say
     it did, and both are needed:
 
-    - **The doctor parses markup.** `django-code-doctor` reads templates on
-      every run, so its template lines are in the denominator whether or not
-      any of them was faulty. Findings alone would leave a package of clean
-      templates sized over its Python only — and then a single new template
-      finding would drop every template line into the divisor and *raise* the
-      grade, which is precisely backwards.
+    - **Some contributing doctor parses markup.** `django-code-doctor` reads
+      templates on every run, so its template lines are in the denominator
+      whether or not any of them was faulty. Findings alone would leave a
+      package of clean templates sized over its Python only — and then a single
+      new template finding would drop every template line into the divisor and
+      *raise* the grade, which is precisely backwards.
+
+      `doctors` is every doctor that contributed a report, not just the one
+      named by `--doctor`. The recommended Python+Django merge passes
+      `--doctor python-code-doctor` — that flag caps *coverage*, and reading it
+      as the whole story left a clean Django run's templates out of the divisor
+      in the skill's own documented workflow.
     - **A finding points at one.** This still catches the case the doctor
       profile cannot know about: an unrecognized `--doctor`, or a tool passed
       through `--covers`.
@@ -305,7 +339,7 @@ def sizing_extensions(findings: list[dict], extra=(), doctor: str = "") -> froze
     so it is sized over its code alone, as it should be.
     """
     used = {ext.lower() if ext.startswith(".") else f".{ext.lower()}" for ext in extra}
-    if doctor in rubric.DOCTORS_ANALYZING_TEMPLATES:
+    if any(doctor in rubric.DOCTORS_ANALYZING_TEMPLATES for doctor in doctors):
         used |= set(TEMPLATE_EXTENSIONS)
     for finding in findings:
         suffix = Path(str(finding.get("file", ""))).suffix.lower()
@@ -474,7 +508,26 @@ def load_map(path) -> dict:
                 "they have to be unique; rename one (e.g. to its path)"
             )
         seen.add(package["name"])
+        # `roots` must be a list. `"roots": "src/api"` is a plausible thing to
+        # write by hand and every consumer iterates it, so a string is silently
+        # taken apart character by character: the default docs path became
+        # `s/docs`, and every letter of the path became its own scoring root.
+        # The package is then ungraded and its documents land somewhere absurd,
+        # with nothing anywhere saying why.
+        roots = package["roots"]
+        if (not isinstance(roots, list)
+                or not all(isinstance(root, str) and root.strip() for root in roots)):
+            raise SystemExit(
+                f"error: {path} gives package {package['name']!r} roots {roots!r} — `roots` "
+                "has to be a non-empty list of repo-relative path strings, even for a single "
+                'root (["src/api"], not "src/api"), because every consumer iterates it'
+            )
         package.setdefault("docs", str(Path(package["roots"][0]) / "docs"))
+        if not isinstance(package["docs"], str) or not package["docs"].strip():
+            raise SystemExit(
+                f"error: {path} gives package {package['name']!r} docs {package['docs']!r} — "
+                "`docs` has to be a repo-relative path string"
+            )
         # Every path in the map is documented as repo-relative, and the scripts
         # treat it that way — `repo / path`. An absolute path or a `..` escape
         # silently reaches outside the checkout: sizing would measure someone
@@ -567,6 +620,13 @@ def rel_href(from_doc: Path, to_doc: Path) -> str:
     relpath rather than a URL join because the whole set has to work off
     `file://` — an absolute path would break the moment someone opens it from
     a checkout rather than a server.
+
+    Percent-encoded per segment, because a path is not a URL. A directory named
+    `a#b` produced `../a#b/docs/summary.html`, where a browser reads everything
+    from `#` as a fragment and navigates to the wrong document — while a link
+    checker resolving the literal string against the filesystem found the file
+    and reported the set healthy. `/` is preserved as the separator; `..` and
+    `.` contain nothing that needs encoding.
     """
     relative = os.path.relpath(Path(to_doc).resolve(), Path(from_doc).resolve().parent)
-    return Path(relative).as_posix()
+    return quote(Path(relative).as_posix(), safe="/")
