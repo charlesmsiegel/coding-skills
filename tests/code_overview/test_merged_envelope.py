@@ -106,7 +106,41 @@ def test_code_doctor_alone_leaves_correctness_ungraded(repo_with_code, run_scrip
     assert "correctness" in meta["ungraded"]
 
 
+def test_a_doctor_cannot_be_credited_a_category_its_own_profile_excludes(
+        repo_with_code, run_script, tmp_path):
+    """DOCTOR_COVERAGE["code-doctor"] deliberately excludes Correctness — the raw
+    layer can prove a merge marker and essentially nothing else in that class.
+    A report claiming `mutation_hazards`/`exception_issues` ran anyway (a
+    mislabeled or foreign-shaped analyzer name) must not slip past that cap
+    just because no `--doctor` was given to check it against at the end —
+    each report is capped by its OWN doctor's profile now, not once at the
+    end against a `--doctor` flag the --merged path rarely sets."""
+    claims_correctness = envelope(tmp_path, doctors_run=["code-doctor"],
+                                  analyzers_run={"code-doctor": ["mutation_hazards",
+                                                                 "exception_issues",
+                                                                 "naming_issues"]})
+
+    meta = meta_of(build(repo_with_code, run_script, tmp_path, claims_correctness))
+
+    correctness = next(row for row in meta["categories"] if row["key"] == "correctness")
+    assert correctness["graded"] is False
+    assert correctness["score"] is None
+    assert "correctness" in meta["ungraded"]
+
+
 def test_a_failed_doctor_ungrades_what_it_covered(repo_with_code, run_script, tmp_path):
+    """`correctness` is ungraded here purely because code-doctor's own profile
+    excludes it (resolve_coverage's per-report cap) — python-code-doctor never
+    ran, so nothing ever put `correctness` in `covered` for the failed-doctor
+    subtraction to remove. This test cannot distinguish that subtraction being
+    present from it being deleted outright; it exists to pin `doctor_errors`
+    surfacing in the metadata and the per-report cap, not the subtraction. The
+    subtraction itself — including its `- surviving` term specifically — is
+    pinned by test_a_failed_doctor_does_not_ungrade_what_a_surviving_doctor_
+    also_covers and, in the one context where it is not a mathematical no-op
+    (--assume-full-coverage), by test_assume_full_coverage_yields_to_a_doctor_
+    that_demonstrably_crashed and test_assume_full_coverage_does_not_over_
+    subtract_what_a_survivor_covers."""
     broken = envelope(tmp_path, doctors_run=["code-doctor"],
                       analyzers_run={"code-doctor": ["naming_issues"]},
                       doctor_errors={"python-code-doctor": "crashed reading settings"})
@@ -115,7 +149,8 @@ def test_a_failed_doctor_ungrades_what_it_covered(repo_with_code, run_script, tm
 
     assert meta["doctor_errors"] == {"python-code-doctor": "crashed reading settings"}
     assert "correctness" in meta["ungraded"], (
-        "the surviving report must not score categories the failed doctor was measuring"
+        "code-doctor's own profile excludes correctness, so nothing granted it in the "
+        "first place — this must hold even with no failed doctor at all"
     )
 
 
@@ -208,6 +243,30 @@ def test_assume_full_coverage_yields_to_a_doctor_that_demonstrably_crashed(
 
     assert meta["score"] is None
     assert len(meta["ungraded"]) == 7
+
+
+def test_assume_full_coverage_does_not_over_subtract_what_a_survivor_covers(
+        repo_with_code, run_script, tmp_path):
+    """The failed-doctor subtraction is `profile - surviving`, not `profile`.
+
+    Only meaningful when `covered` starts from something *not* already capped
+    per report — --assume-full-coverage's sentinel is exactly that case, and
+    the one place `- surviving` has anything to protect: with the covered set
+    starting at every category, a bare `covered -= profile` for django's
+    crash would strip `security` even though python-code-doctor actually ran
+    and security is squarely inside its own profile.
+    """
+    partial_failure = envelope(tmp_path, doctors_run=["python-code-doctor"],
+                               analyzers_run={"python-code-doctor": ["security"]},
+                               doctor_errors={"django-code-doctor": "crashed reading settings"})
+
+    out = build(repo_with_code, run_script, tmp_path, partial_failure, "--assume-full-coverage")
+    meta = meta_of(out)
+
+    assert "security" not in meta["ungraded"], (
+        "python-code-doctor's own profile covers everything django's crash could have; "
+        "nothing should be stripped on django's behalf"
+    )
 
 
 def test_a_non_list_findings_field_grades_nothing(repo_with_code, run_script, tmp_path):

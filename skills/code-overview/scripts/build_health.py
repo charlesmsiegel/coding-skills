@@ -592,8 +592,17 @@ def resolve_coverage(args, reports: list[dict], trusted: set[str] | None = None)
     foreign = [r for r in reports
                if r["shape"] == common.SHAPE_FULL and r["doctor"] and r["doctor"] not in trusted]
     if foreign:
-        warn("these reports were produced by a different doctor than "
-             f"{args.doctor or '(none named)'} and contribute findings but no coverage: "
+        # "than {args.doctor}" reads as nonsense once trust can come from a
+        # merged envelope naming several doctors rather than one --doctor
+        # flag — "different doctor than (none named)" beside a page that
+        # trusted three of them. Named singular only when there is one to
+        # name; otherwise the envelope's own trusted set is what to blame.
+        others = trusted - {""}
+        trust_desc = (args.doctor if args.doctor
+                      else (f"the merged envelope's trusted doctors ({', '.join(sorted(others))})"
+                            if others else "(none named)"))
+        warn(f"these reports were produced by a different doctor than {trust_desc} and "
+             "contribute findings but no coverage: "
              f"{', '.join(sorted({r['doctor'] for r in foreign}))}.")
 
     evidenced = [report for report in reports
@@ -624,13 +633,41 @@ def resolve_coverage(args, reports: list[dict], trusted: set[str] | None = None)
             absent = {rubric.DETECTOR_CATEGORIES[name]
                       for name in (report["skipped"] | set(report["errors"]))
                       if name in rubric.DETECTOR_CATEGORIES}
-            covered |= ran - absent
-        # Evidence still cannot exceed what the named doctor is able to detect.
-        # A report claiming a duplication analyzer ran, handed over with
-        # --doctor django-code-doctor, is a mislabeled run rather than a reason
-        # to grade a category that doctor has no detector for.
-        profile = rubric.DOCTOR_COVERAGE.get(args.doctor)
-        return covered & set(profile) if profile is not None else covered
+            resolved = ran - absent
+
+            # Evidence still cannot exceed what the doctor that produced THIS
+            # report is able to detect — capped per report, not once at the
+            # end against a single --doctor. A single end-cap let a merged
+            # envelope's other doctors evade their own profile entirely:
+            # with --doctor typically unset on the --merged path,
+            # `DOCTOR_COVERAGE.get(args.doctor)` resolved to None and applied
+            # no cap at all, so code-doctor — whose raw layer can prove a
+            # merge marker and essentially nothing else in Correctness —
+            # could be credited Correctness off a `mutation_hazards` token it
+            # has no business reporting.
+            #
+            # An unlabelled report (report["doctor"] == "") speaks for
+            # --doctor, same as it always has — capped by --doctor's profile,
+            # or left uncapped when --doctor is itself unset or unrecognized.
+            # That is the existing --findings-only behaviour and must not
+            # change here.
+            #
+            # A *named* report — every merged-envelope report, or a labelled
+            # `--findings <doctor>:<path>` — is capped by its own doctor's
+            # profile instead. A name absent from DOCTOR_COVERAGE is capped
+            # to the empty set rather than left uncapped: a deliberate
+            # decision, not a fallout of `.get(..., set())`. This rubric has
+            # no coverage profile to check an unrecognized doctor's claims
+            # against, and crediting its raw per-detector tokens with no
+            # upper bound at all is exactly the hole being closed here — the
+            # empty set is the safe direction to be wrong in.
+            if report["doctor"]:
+                profile = rubric.DOCTOR_COVERAGE.get(report["doctor"], set())
+                covered |= resolved & profile
+            else:
+                profile = rubric.DOCTOR_COVERAGE.get(args.doctor)
+                covered |= resolved if profile is None else (resolved & profile)
+        return covered
 
     if not reports:
         # The documented "codemap plus an ungraded health page" answer for a
@@ -775,6 +812,21 @@ def build(args, reports: list[dict], errors: dict[str, str],
         # A doctor that crashed measured nothing. Only the categories it
         # *alone* covered become unknown — where a surviving doctor covers the
         # same ground, that ground was still measured.
+        #
+        # This is a no-op whenever `covered` came from resolve_coverage's
+        # ordinary per-report evidenced loop: each report there is already
+        # capped by its OWN doctor's profile, so `covered` can never exceed
+        # the union of every *running* doctor's profile — i.e. it is always a
+        # subset of `surviving`, and subtracting `profile - surviving` from a
+        # set that cannot intersect it changes nothing. It stays load-bearing
+        # for the two paths that are NOT built from per-report-capped
+        # evidence: `--assume-full-coverage` (materialized to every category
+        # above) and `--covers` (an arbitrary human-declared set) — both can
+        # name a category no running doctor's own profile actually reaches,
+        # and only this subtraction pulls a failed doctor's exclusive ground
+        # back out of them. See test_assume_full_coverage_yields_to_a_doctor_
+        # that_demonstrably_crashed and test_assume_full_coverage_does_not_
+        # over_subtract_what_a_survivor_covers in test_merged_envelope.py.
         surviving: set[str] = set()
         for name in doctors:
             surviving |= rubric.DOCTOR_COVERAGE.get(name, set())
