@@ -384,3 +384,31 @@ def test_a_negative_row_cap_is_refused(tmp_path):
     )
     assert result.returncode == 2
     assert "zero or greater" in result.stderr
+
+
+# ---- ninth review round ------------------------------------------------------- #
+
+def test_an_ordinary_object_array_is_not_measurement_data(tmp_path):
+    """`users.json` produced dataset, small-n and missing-ground-truth candidates."""
+    (tmp_path / "users.json").write_text('[{"name":"Ada","role":"admin"}]', encoding="utf-8")
+    payload = run(tmp_path)
+    assert payload["counts"]["datasets"] == 0
+    assert "reference metrics have no inputs" not in payload["headline"]
+
+
+def test_records_under_a_wrapper_key_are_still_a_dataset(tmp_path):
+    """A RECORD_KEYS wrapper is dataset-shaped evidence on its own."""
+    (tmp_path / "fixtures.json").write_text('{"cases":[{"name":"a"}]}', encoding="utf-8")
+    assert run(tmp_path)["counts"]["datasets"] == 1
+
+
+def test_a_header_only_labelled_csv_is_an_empty_eval_set(tmp_path):
+    """The header proves the shape even when no row populates a field."""
+    (tmp_path / "inventory.csv").write_text("expected,input\n", encoding="utf-8")
+    assert kinds(run(tmp_path), "empty_dataset")
+
+
+def test_the_unlabeled_candidate_is_scoped_to_what_was_read(tmp_path):
+    (tmp_path / "eval.jsonl").write_text('{"q":"x"}\n{"gold":"g"}\n', encoding="utf-8")
+    row = kinds(run(tmp_path, "--max-rows", "1"), "no_label_field")[0]
+    assert "1 of 2 record(s) read" in row["detail"]

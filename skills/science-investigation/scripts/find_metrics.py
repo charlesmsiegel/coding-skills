@@ -68,7 +68,7 @@ _DEF_RE = re.compile(
     r"\b(?:def|function|func|fun|fn|sub)\s+(?:\([^)]*\)\s*)?([A-Za-z_][\w]*)\s*\("
     r"|\bdef\s+([A-Za-z_][\w]*[?!]?)\s*$"                  # Ruby: def accuracy
     r"|\bdef\s+([A-Za-z_][\w]*[?!]?)\s+[A-Za-z_]"          # Ruby: def accuracy rows
-    r"|\bAS\s+[\"'`]?([A-Za-z_][\w]*)[\"'`]?\s*(?:,|$|\bFROM\b)"   # SQL: AVG(x) AS accuracy
+    r"|(?i:\bas\s+)[\"'`]?([A-Za-z_][\w]*)[\"'`]?\s*(?:,|$|(?i:\bfrom\b))"   # SQL: AVG(x) AS accuracy
     r"|^\s*(?:(?:public|private|protected|static|final|virtual|override|async|export)\s+)*"
     r"(?:[A-Za-z_][\w:<>,\[\] ]*?[\w>\]])\s+([A-Za-z_][\w]*)\s*\([^;]*\)\s*(?:const\s*)?\{"
 )
@@ -243,7 +243,7 @@ def scan_line(line: str, path_display: str, lineno: int, defined: dict, window: 
               is_config_file: bool = False) -> list:
     """Candidates from one line. `defined` accumulates metric name -> first site."""
     stripped = line.strip()
-    if not stripped or stripped.startswith(("#", "//", "*", "<!--")):
+    if not stripped or stripped.startswith(("#", "//", "*", "<!--", "--")):
         return []
 
     out = name_candidates(line, stripped, path_display, lineno, defined)

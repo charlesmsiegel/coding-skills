@@ -89,17 +89,19 @@ def classify(line: str, display: str, path: Path, span: tuple, numeric: bool = T
     absolute path carries the checkout's own directory names, and a repo cloned
     under ~/tests/ would otherwise report every site as a test.
     """
-    code, comment = split_comment(line)
-    if span[0] >= len(code):
-        return "comment"     # `# QUALITY_THRESHOLD = 0.7` is not a source of truth
-
     lowered = display.lower()
     if re.search(r"(?:^|[/_.-])(?:tests?|spec|specs|__tests__)(?:[/_.-]|$)", lowered):
         return "test"
+    # Docs first: `# Release threshold 0.7` is a Markdown heading, and reading its
+    # `#` as a source comment gave the auditor the wrong thing to confirm.
     if path.suffix in DOC_SUFFIXES:
         return "doc"
     if is_config(path):
         return "config"
+
+    code, comment = split_comment(line)
+    if span[0] >= len(code):
+        return "comment"     # `# QUALITY_THRESHOLD = 0.7` is not a source of truth
 
     # Masked so the operators around the match are read from code, not from a
     # message: `message = "quality_score > 0.7"` is not a live comparison.
@@ -145,7 +147,8 @@ def scan(root: Path, pattern: re.Pattern, numeric: bool = True) -> tuple:
             continue
         for lineno, line in enumerate(lines, 1):
             for match in pattern.finditer(line):
-                kind = classify(line, display, path, match.span(), numeric)
+                kind = classify(line, display, path, match.span(),
+                                numeric or bool(_NUMERIC_RE.match(match.group(0))))
                 if (display, lineno, kind) in seen:
                     continue
                 seen.add((display, lineno, kind))

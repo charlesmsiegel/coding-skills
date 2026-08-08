@@ -219,3 +219,18 @@ def test_a_literal_repeated_in_its_own_defining_file_is_still_a_disconnect(tmp_p
     )
     headline = run("0.7", tmp_path)["headline"]
     assert "defined once" in headline and "will not move them" in headline
+
+
+def test_a_markdown_heading_is_documentation_not_commented_out_code(tmp_path):
+    (tmp_path / "README.md").write_text("# Release threshold 0.7\n", encoding="utf-8")
+    assert run("0.7", tmp_path)["counts"].get("doc") == 1
+
+
+def test_regex_mode_still_classifies_numeric_matches_as_numeric(tmp_path):
+    """`numeric` is a property of the matched text, not of the search syntax."""
+    (tmp_path / "s.py").write_text(
+        "QUALITY_THRESHOLD = 0.7\nif score > 0.7:\n    pass\n", encoding="utf-8"
+    )
+    payload = run(r"0\.7", tmp_path, "--regex")
+    assert payload["counts"].get("definition") == 1
+    assert "defined nowhere" not in payload["headline"]

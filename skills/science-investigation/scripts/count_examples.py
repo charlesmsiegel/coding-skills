@@ -205,6 +205,7 @@ def read_json(path: Path, max_rows: int, data_like: bool = False) -> dict:
         return {"parse_error": "invalid JSON at line " + str(exc.lineno)}
     except (OSError, ValueError) as exc:
         return {"parse_error": type(exc).__name__}
+    wrapped = wrapper_key(payload)
     records = records_from_json(payload, data_like)
     if records is None:
         return {}
@@ -213,7 +214,7 @@ def read_json(path: Path, max_rows: int, data_like: bool = False) -> dict:
     tally(kept, fields)
     bad = sum(1 for record in kept if not isinstance(record, dict))
     return {"rows": len(records), "read": len(kept), "bad_rows": bad, "fields": fields,
-            "truncated": len(kept) < len(records)}
+            "wrapped": wrapped, "truncated": len(kept) < len(records)}
 
 
 def read_delimited(path: Path, max_rows: int) -> dict:
@@ -227,6 +228,7 @@ def read_delimited(path: Path, max_rows: int) -> dict:
             # swallowing the following lines into one record and reporting a
             # confident, wrong N with bad_rows=0.
             reader = csv.DictReader(handle, delimiter=delimiter, strict=True)
+            header = list(reader.fieldnames or [])
             for record in reader:
                 rows += 1
                 if read >= max_rows:
@@ -239,7 +241,11 @@ def read_delimited(path: Path, max_rows: int) -> dict:
                         fields[key] = fields.get(key, 0) + 1
     except (OSError, csv.Error, UnicodeError) as exc:
         return {"parse_error": type(exc).__name__}
-    return {"rows": rows, "read": read, "bad_rows": bad, "fields": fields, "truncated": read < rows}
+    # The header is kept separately: a header-only `expected,input` populates no
+    # field counts, and losing it dropped an empty *labeled* eval set as if it
+    # were an unrelated spreadsheet.
+    return {"rows": rows, "read": read, "bad_rows": bad, "fields": fields,
+            "header": header, "truncated": read < rows}
 
 
 def read_dataset(path: Path, max_rows: int, data_like: bool = False) -> dict:
@@ -254,6 +260,13 @@ def read_dataset(path: Path, max_rows: int, data_like: bool = False) -> dict:
 
 def looks_like_a_record(fields) -> bool:
     return any(str(name).strip().lower() in LABEL_FIELDS for name in fields)
+
+
+def wrapper_key(payload) -> bool:
+    """Whether a dict payload holds its records under a dataset-only wrapper key."""
+    return isinstance(payload, dict) and any(
+        isinstance(payload.get(key), list) for key in RECORD_KEYS
+    )
 
 
 def data_files(root: Path) -> list:
@@ -307,16 +320,19 @@ def blank_summary(display: str) -> dict:
 
 
 def is_measurement_data(path: Path, display: str, stats: dict) -> bool:
-    """A parsed CSV is not automatically measurement data.
+    """Whether a parsed file is plausibly measurement data at all.
 
-    `inventory.csv` with sku,price produced "no recognized ground-truth field:
-    reference metrics have no inputs here" — a measurement conclusion about a
-    spreadsheet. JSON/JSONL keep their existing treatment; only delimited files,
-    which are the format ordinary business data arrives in, need the gate.
+    A parsed file is not automatically a dataset: `inventory.csv` with sku,price
+    and `users.json` with [{"name": ...}] both produced "no recognized
+    ground-truth field: reference metrics have no inputs here" — a measurement
+    conclusion about an unrelated asset. Evidence is a dataset-like name, a
+    recognized ground-truth field, or (for JSON) records under a wrapper key that
+    only datasets use.
     """
-    if path.suffix not in (".csv", ".tsv"):
+    if stats.get("wrapped"):
         return True
-    return looks_like_data(display) or looks_like_a_record(stats["fields"])
+    fields = list(stats.get("fields") or {}) + list(stats.get("header") or [])
+    return looks_like_data(display) or looks_like_a_record(fields)
 
 
 def analyze(root: Path, max_rows: int) -> tuple:
@@ -367,10 +383,15 @@ def analyze(root: Path, max_rows: int) -> tuple:
                 CONFIRM["partial_labels"],
             ))
         if not labels:
+            # Scoped to what was read: with the read capped, an unlabeled prefix
+            # says nothing about the rows past the cap, and claiming the whole
+            # file has no ground truth is a conclusion from rows nobody saw.
+            scope = (str(read) + " of " + str(rows) + " record(s) read"
+                     if stats["truncated"] else str(rows) + " record(s)")
             rows_out.append(candidate(
                 "no_label_field", display, 1,
-                str(rows) + " record(s), no recognized ground-truth field — accuracy, recall, and "
-                "correctness cannot be computed from this file as it stands",
+                scope + ", no recognized ground-truth field in them — accuracy, recall, and "
+                "correctness cannot be computed from what was read",
                 CONFIRM["no_label_field"],
             ))
 
