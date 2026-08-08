@@ -158,10 +158,13 @@ outcomes, causal effect with no control arm. Dropping those rows is how silence
 gets read as success, and it is the single easiest way to make this score a lie.
 
 The builder refuses an inventory that cannot support its own score, and writes
-no document when it does: a credit below 1.0 with no finding named, an aggregate
-with no N, an unmeasurable row carrying credit. Fix the row rather than
-loosening the rule — the whole value of the number is that the table under it
-can be argued with.
+no document when it does: a `schema` that is missing or is not
+`measurement-inventory/1`, a credit below 1.0 with no finding named, a credit
+with no `credit_reason` beside it, an aggregate with no N **or an N of zero** —
+a metric computed over zero examples has not been measured — an unmeasurable
+row carrying credit, and a `true`/`false` where an importance or credit belongs.
+Fix the row rather than loosening the rule — the whole value of the number is
+that the table under it can be argued with.
 
 A unit with nothing measurable scores **null**, not zero and not A+, and says
 "no measurement content here" on the page. Most packages in a typical repo are
@@ -172,6 +175,15 @@ where each thing is *defined*; `--root` with `--package name:path` builds the
 repository roll-up. Run the audit **once from the repository root**: pointed at
 a subdirectory, `find_metrics.py` cannot see `evals/` and reports a
 thoroughly-measured pipeline as having no measurement.
+
+A partitioned page still has to say what it left out, or a package holding one
+measured thing renders A+ next to two unmeasured ones nobody sees. So on a
+scoped page: the count of rows defined elsewhere is printed on the Score tab
+beside the KPI it qualifies; `not_audited` is reprinted in full and headed
+"whole repository", because those gaps belong to no single package and dropping
+them would hide them; and a finding **no row anywhere names** is kept, since it
+is about the measurement setup rather than one row and no scope can be out of
+scope for it.
 
 ## Red flags
 
