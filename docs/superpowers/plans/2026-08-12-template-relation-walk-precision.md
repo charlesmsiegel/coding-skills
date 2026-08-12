@@ -193,6 +193,7 @@ Expected: new cache assertions fail with one additional profile/character query 
 
 **Files:**
 - Modify: `C:\Users\charl\github\tg\core\models.py:49-61`
+- Modify: `C:\Users\charl\github\tg\characters\models\core\character.py:55-69`
 - Modify: `C:\Users\charl\github\tg\accounts\models.py:337-344`
 - Modify: `C:\Users\charl\github\tg\accounts\views.py:235-240`
 - Test: `C:\Users\charl\github\tg\accounts\tests\models\test_models.py`
@@ -208,6 +209,9 @@ Implement exactly:
 
 ```python
 # core.models.ModelQuerySet.pending_approval_for_user
+.select_related("polymorphic_ctype", "chronicle", "owner", "owner__profile")
+
+# characters.models.core.character.CharacterQuerySet.pending_approval_for_user
 .select_related("polymorphic_ctype", "chronicle", "owner", "owner__profile")
 
 # accounts.models.Profile.get_updated_journals
@@ -230,7 +234,7 @@ Expected: new query-cache tests pass and existing tests in both modules remain g
 - [ ] **Step 3: Run static and Django checks**
 
 ```powershell
-.\.venv\Scripts\ruff.exe check core/models.py accounts/models.py accounts/views.py accounts/tests/models/test_models.py accounts/tests/views/test_views.py
+.\.venv\Scripts\ruff.exe check core/models.py characters/models/core/character.py accounts/models.py accounts/views.py accounts/tests/models/test_models.py accounts/tests/views/test_views.py
 .\.venv\Scripts\python.exe manage.py check
 ```
 
@@ -239,7 +243,7 @@ Expected: both commands exit 0.
 - [ ] **Step 4: Commit only application source and tests**
 
 ```powershell
-git add core/models.py accounts/models.py accounts/views.py accounts/tests/models/test_models.py accounts/tests/views/test_views.py
+git add core/models.py characters/models/core/character.py accounts/models.py accounts/views.py accounts/tests/models/test_models.py accounts/tests/views/test_views.py
 git commit -m "perf: eager-load account approval relations"
 ```
 

@@ -32,8 +32,9 @@ obvious false positives. Existing generic positive cases must remain green.
 
 The `tg` fixes will eager-load the relations used by those five candidates:
 
-- Add `owner__profile` to the shared pending-approval queryset used by character,
-  item, and location approval lists.
+- Add `owner__profile` to the shared pending-approval queryset used by items and
+  locations, and to `CharacterQuerySet.pending_approval_for_user()`, whose
+  stricter status rule overrides that shared implementation.
 - Add `owner__profile` to the freebie-character queryset built by
   `ProfileView.get_context_data()`.
 - Add `character` to `Profile.get_updated_journals()` via `select_related`.
