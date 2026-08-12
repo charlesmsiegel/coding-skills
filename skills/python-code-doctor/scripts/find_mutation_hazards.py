@@ -85,12 +85,143 @@ def _is_dunder(name: str) -> bool:
     return name.startswith("__") and name.endswith("__")
 
 
+def _dotted_name(node) -> str | None:
+    if isinstance(node, ast.Name):
+        return node.id
+    if isinstance(node, ast.Attribute):
+        prefix = _dotted_name(node.value)
+        return f"{prefix}.{node.attr}" if prefix else None
+    return None
+
+
+_MIGRATION_CONFIGURATION = {"dependencies", "operations", "replaces", "run_before"}
+
+
+class DjangoClassResolver:
+    """Resolve only classes whose ancestry reaches an imported Django class."""
+
+    def __init__(self, tree: ast.Module, parents: dict[ast.AST, ast.AST]):
+        self.parents = parents
+        self.bindings: dict[str, list[tuple[tuple[int, int], str, object]]] = defaultdict(list)
+        self._families: dict[ast.ClassDef, set[str]] = {}
+        for node in ast.walk(tree):
+            if not self._at_module_scope(node):
+                continue
+            if isinstance(node, ast.Import):
+                for alias in node.names:
+                    local = alias.asname or alias.name.split(".")[0]
+                    target = alias.name if alias.asname else alias.name.split(".")[0]
+                    self._bind(local, node, "import", target)
+            elif isinstance(node, ast.ImportFrom):
+                for alias in node.names:
+                    if alias.name != "*":
+                        if node.level == 0 and node.module:
+                            self._bind(
+                                alias.asname or alias.name,
+                                node,
+                                "import",
+                                f"{node.module}.{alias.name}",
+                            )
+                        else:
+                            self._bind(alias.asname or alias.name, node, "other", None)
+            elif isinstance(node, ast.ClassDef):
+                self._bind(node.name, node, "class", node, use_end=True)
+            elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                self._bind(node.name, node, "other", None, use_end=True)
+            elif isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store):
+                self._bind(node.id, node, "other", None)
+        for events in self.bindings.values():
+            events.sort(key=lambda event: event[0])
+
+    def _bind(self, name: str, node: ast.AST, kind: str, value, use_end=False) -> None:
+        if use_end:
+            position = (
+                getattr(node, "end_lineno", node.lineno),
+                getattr(node, "end_col_offset", node.col_offset),
+            )
+        else:
+            position = (node.lineno, node.col_offset)
+        self.bindings[name].append((position, kind, value))
+
+    def _at_module_scope(self, node: ast.AST) -> bool:
+        parent = self.parents.get(node)
+        while parent is not None and not isinstance(parent, ast.Module):
+            if isinstance(parent, (
+                ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda,
+                ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp,
+            )):
+                return False
+            parent = self.parents.get(parent)
+        return isinstance(parent, ast.Module)
+
+    def _binding_at(self, node: ast.AST) -> tuple[str, object] | None:
+        dotted = _dotted_name(node)
+        if not dotted:
+            return None
+        first, separator, rest = dotted.partition(".")
+        position = (node.lineno, node.col_offset)
+        active = None
+        for event in self.bindings.get(first, ()):
+            if event[0] >= position:
+                break
+            active = event
+        if active is None:
+            return None
+        _event_position, kind, value = active
+        if kind == "import":
+            return kind, value + (separator + rest if separator else "")
+        if kind == "class" and not separator:
+            return kind, value
+        return kind, None
+
+    @staticmethod
+    def _imported_family(canonical: str | None) -> str | None:
+        if not canonical:
+            return None
+        leaf = canonical.rsplit(".", 1)[-1]
+        if canonical.startswith("django.views.") and leaf.endswith("View"):
+            return "view"
+        if canonical.startswith("django.forms.") and leaf == "ModelForm":
+            return "modelform"
+        if canonical.startswith("django.db.migrations.") and leaf == "Migration":
+            return "migration"
+        return None
+
+    def families(self, node: ast.ClassDef, visiting=None) -> set[str]:
+        if node in self._families:
+            return self._families[node]
+        visiting = set() if visiting is None else visiting
+        if node in visiting:
+            return set()
+        visiting.add(node)
+        families = set()
+        for base in node.bases:
+            binding = self._binding_at(base)
+            if binding is None:
+                continue
+            kind, value = binding
+            if kind == "import":
+                imported = self._imported_family(value)
+                if imported:
+                    families.add(imported)
+            elif kind == "class" and isinstance(value, ast.ClassDef):
+                families.update(self.families(value, visiting))
+        visiting.remove(node)
+        self._families[node] = families
+        return families
+
+    def is_family(self, node: ast.ClassDef, family: str) -> bool:
+        return family in self.families(node)
+
+
 class MutationHazardDetector(ast.NodeVisitor):
-    def __init__(self, filename: str, source_lines: list, ignore=None):
+    def __init__(self, filename: str, source_lines: list, parents, django_classes, ignore=None):
         self.filename = filename
         self.source_lines = source_lines
         self.issues = []
         self.ignore = ignore or set()
+        self.parents = parents
+        self.django_classes = django_classes
 
     def _get_line(self, lineno: int) -> str:
         if 0 < lineno <= len(self.source_lines):
@@ -107,11 +238,22 @@ class MutationHazardDetector(ast.NodeVisitor):
         ))
 
     # -- mutable class attribute ------------------------------------------
+    def _is_django_declaration(self, node: ast.ClassDef, name: str) -> bool:
+        if name == "http_method_names" and self.django_classes.is_family(node, "view"):
+            return True
+        if name in _MIGRATION_CONFIGURATION and self.django_classes.is_family(node, "migration"):
+            return True
+        parent = self.parents.get(node)
+        if name == "fields" and node.name == "Meta" and isinstance(parent, ast.ClassDef):
+            return self.django_classes.is_family(parent, "modelform")
+        return False
+
     def visit_ClassDef(self, node: ast.ClassDef):
         for item in node.body:
             if isinstance(item, ast.Assign) and _is_mutable_value(item.value):
                 for target in item.targets:
-                    if isinstance(target, ast.Name) and not _is_dunder(target.id):
+                    if isinstance(target, ast.Name) and not _is_dunder(target.id) \
+                            and not self._is_django_declaration(node, target.id):
                         self._add(item.lineno, "mutable_class_attribute",
                             f"Class attribute '{target.id}' is a mutable value shared by every instance of {node.name}",
                             "Assign it in __init__ instead, or use an immutable constant (tuple/frozenset). "
@@ -119,7 +261,8 @@ class MutationHazardDetector(ast.NodeVisitor):
             elif isinstance(item, ast.AnnAssign) and item.value is not None and _is_mutable_value(item.value):
                 if _annotation_is_classvar_or_final(item.annotation):
                     continue
-                if isinstance(item.target, ast.Name) and not _is_dunder(item.target.id):
+                if isinstance(item.target, ast.Name) and not _is_dunder(item.target.id) \
+                        and not self._is_django_declaration(node, item.target.id):
                     self._add(item.lineno, "mutable_class_attribute",
                         f"Class attribute '{item.target.id}' is a mutable default shared by every instance of {node.name}",
                         "Use dataclasses.field(default_factory=...) in dataclasses, assign in __init__, "
@@ -237,7 +380,13 @@ def analyze_file(filepath: Path, ignore: set) -> list:
         source = filepath.read_text(encoding="utf-8", errors="replace")
         tree = ast.parse(source, filename=str(filepath))
         lines = source.splitlines()
-        detector = MutationHazardDetector(str(filepath), lines, ignore)
+        parents = {
+            child: parent
+            for parent in ast.walk(tree)
+            for child in ast.iter_child_nodes(parent)
+        }
+        django_classes = DjangoClassResolver(tree, parents)
+        detector = MutationHazardDetector(str(filepath), lines, parents, django_classes, ignore)
         detector.visit(tree)
         return detector.issues
     except (SyntaxError, ValueError) as exc:

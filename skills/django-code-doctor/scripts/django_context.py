@@ -469,7 +469,7 @@ def template_files(ctx):
     """
     seen = set()
     for directory in ctx.template_dirs:
-        for pattern in ("*.html", "*.txt", "*.eml"):
+        for pattern in ("*.html", "*.htm", "*.xhtml", "*.txt", "*.eml"):
             for path in directory.rglob(pattern):
                 if path not in seen:
                     seen.add(path)

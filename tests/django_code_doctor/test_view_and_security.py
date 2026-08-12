@@ -222,11 +222,21 @@ def test_the_safe_filter_is_reported(tmp_path):
     assert "safe_filter_in_template" in smells(run_detector("find_django_security.py", project))
 
 
-def test_autoescape_off_is_reported(tmp_path):
+def test_autoescape_off_is_reported_only_for_html_templates(tmp_path):
     project = build_project(tmp_path / "p", {
         "shop/templates/a.html": "{% autoescape off %}{{ body }}{% endautoescape %}\n",
+        "shop/templates/b.htm": "{% autoescape off %}{{ body }}{% endautoescape %}\n",
+        "shop/templates/c.xhtml": "{% autoescape off %}{{ body }}{% endautoescape %}\n",
+        "shop/templates/email.txt": "{% autoescape off %}{{ body }}{% endautoescape %}\n",
     })
-    assert "autoescape_off" in smells(run_detector("find_django_security.py", project))
+    findings = [
+        finding
+        for finding in run_detector("find_django_security.py", project)
+        if finding["smell_type"] == "autoescape_off"
+    ]
+    assert {finding["file"].replace("\\", "/").rsplit("/", 1)[-1] for finding in findings} == {
+        "a.html", "b.htm", "c.xhtml",
+    }
 
 
 def test_an_escaped_template_is_quiet(tmp_path):

@@ -5,13 +5,32 @@ Finds: unused imports, unused variables, unreachable code, unused functions/clas
 """
 
 import ast
+import io
 import json
 import argparse
+import re
+import tokenize
 from pathlib import Path
 from dataclasses import dataclass, asdict
 from typing import Set
 from collections import defaultdict
 from common import configure_output, find_python_files, warn_detector_error, warn_unparseable
+
+
+_NOQA_CODES = re.compile(
+    r"#\s*noqa:\s*([A-Z]+\d+(?:\s*,\s*[A-Z]+\d+)*)",
+    re.IGNORECASE,
+)
+_DJANGO_REGISTRATION_MODULES = {"checks", "signals"}
+
+
+def _dotted_name(node) -> str | None:
+    if isinstance(node, ast.Name):
+        return node.id
+    if isinstance(node, ast.Attribute):
+        prefix = _dotted_name(node.value)
+        return f"{prefix}.{node.attr}" if prefix else None
+    return None
 
 
 @dataclass
@@ -25,9 +44,13 @@ class DeadCodeIssue:
 
 
 class ScopeTracker(ast.NodeVisitor):
-    def __init__(self, filename: str, source_lines: list[str]):
+    def __init__(
+        self,
+        filename: str,
+        parents: dict[ast.AST, ast.AST],
+        comments: dict[int, list[str]],
+    ):
         self.filename = filename
-        self.source_lines = source_lines
         self.issues: list[DeadCodeIssue] = []
         self.imports: dict[str, int] = {}
         self.from_imports: dict[str, int] = {}
@@ -36,16 +59,111 @@ class ScopeTracker(ast.NodeVisitor):
         self.classes: dict[str, int] = {}
         self.called_functions: Set[str] = set()
         self.instantiated_classes: Set[str] = set()
+        self.parents = parents
+        self.comments = comments
+        self.import_origins: dict[str, str] = {}
+        self.current_app_config_names: set[str] = set()
+        self.django_app_config_classes: set[ast.ClassDef] = set()
+        self.function_stack: list[ast.FunctionDef | ast.AsyncFunctionDef] = []
+
+    def _at_module_scope(self, node: ast.AST) -> bool:
+        parent = self.parents.get(node)
+        while parent is not None and not isinstance(parent, ast.Module):
+            if isinstance(parent, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+                return False
+            parent = self.parents.get(parent)
+        return isinstance(parent, ast.Module)
+
+    def _remember_imports(self, node: ast.Import | ast.ImportFrom) -> None:
+        if not self._at_module_scope(node):
+            return
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                local = alias.asname or alias.name.split(".")[0]
+                target = alias.name if alias.asname else alias.name.split(".")[0]
+                self.import_origins[local] = target
+                self.current_app_config_names.discard(local)
+        elif node.module or node.level:
+            for alias in node.names:
+                if alias.name != "*":
+                    local = alias.asname or alias.name
+                    self.current_app_config_names.discard(local)
+                    if node.level == 0 and node.module:
+                        self.import_origins[local] = f"{node.module}.{alias.name}"
+                    else:
+                        self.import_origins.pop(local, None)
+
+    def _canonical_name(self, node: ast.AST) -> str | None:
+        dotted = _dotted_name(node)
+        if not dotted:
+            return None
+        first, separator, rest = dotted.partition(".")
+        imported = self.import_origins.get(first)
+        if not imported:
+            return None
+        return imported + (separator + rest if separator else "")
+
+    def _line_suppresses_f401(self, line: int) -> bool:
+        for comment in self.comments.get(line, ()):
+            match = _NOQA_CODES.search(comment)
+            if match is not None:
+                codes = {code.strip().upper() for code in match.group(1).split(",")}
+                if "F401" in codes:
+                    return True
+        return False
+
+    def _suppresses_f401(self, node: ast.Import | ast.ImportFrom, alias: ast.alias) -> bool:
+        end_line = getattr(node, "end_lineno", node.lineno)
+        closing_line_has_alias = any(
+            candidate.lineno <= end_line
+            <= getattr(candidate, "end_lineno", candidate.lineno)
+            for candidate in node.names
+        )
+        if self._line_suppresses_f401(node.lineno) or (
+            not closing_line_has_alias and self._line_suppresses_f401(end_line)
+        ):
+            return True
+        alias_end = getattr(alias, "end_lineno", alias.lineno)
+        return any(
+            self._line_suppresses_f401(line)
+            for line in range(alias.lineno, alias_end + 1)
+        )
+
+    def _in_appconfig_ready(self) -> bool:
+        if not self.function_stack:
+            return False
+        method = self.function_stack[-1]
+        parent = self.parents.get(method)
+        return method.name == "ready" and isinstance(parent, ast.ClassDef) \
+            and parent in self.django_app_config_classes
+
+    @staticmethod
+    def _is_registration_import(node: ast.Import | ast.ImportFrom, alias: ast.alias) -> bool:
+        if isinstance(node, ast.Import):
+            module = alias.name
+        else:
+            module = node.module or alias.name
+            if module.rsplit(".", 1)[-1] not in _DJANGO_REGISTRATION_MODULES:
+                module = alias.name
+        return module.rsplit(".", 1)[-1] in _DJANGO_REGISTRATION_MODULES
 
     def visit_Import(self, node: ast.Import):
+        self._remember_imports(node)
         for alias in node.names:
+            if self._suppresses_f401(node, alias) or \
+                    (self._in_appconfig_ready() and self._is_registration_import(node, alias)):
+                continue
             name = alias.asname if alias.asname else alias.name.split('.')[0]
             self.imports[name] = node.lineno
         self.generic_visit(node)
 
     def visit_ImportFrom(self, node: ast.ImportFrom):
+        self._remember_imports(node)
         for alias in node.names:
             if alias.name == '*':
+                continue
+            if self._suppresses_f401(node, alias) or \
+                    (self._in_appconfig_ready() and self._is_registration_import(node, alias)):
                 continue
             name = alias.asname if alias.asname else alias.name
             self.from_imports[name] = node.lineno
@@ -54,6 +172,9 @@ class ScopeTracker(ast.NodeVisitor):
     def visit_Name(self, node: ast.Name):
         if isinstance(node.ctx, ast.Load):
             self.used_names.add(node.id)
+        elif isinstance(node.ctx, ast.Store) and self._at_module_scope(node):
+            self.import_origins.pop(node.id, None)
+            self.current_app_config_names.discard(node.id)
         self.generic_visit(node)
 
     def visit_Attribute(self, node: ast.Attribute):
@@ -66,19 +187,46 @@ class ScopeTracker(ast.NodeVisitor):
             self.functions[node.name] = node.lineno
         self._check_unreachable(node)
         self._check_unused_params(node)
-        self.generic_visit(node)
+        self.function_stack.append(node)
+        try:
+            self.generic_visit(node)
+        finally:
+            self.function_stack.pop()
+        if self._at_module_scope(node):
+            self.import_origins.pop(node.name, None)
+            self.current_app_config_names.discard(node.name)
 
     def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef):
         if node.col_offset == 0:
             self.functions[node.name] = node.lineno
         self._check_unreachable(node)
         self._check_unused_params(node)
-        self.generic_visit(node)
+        self.function_stack.append(node)
+        try:
+            self.generic_visit(node)
+        finally:
+            self.function_stack.pop()
+        if self._at_module_scope(node):
+            self.import_origins.pop(node.name, None)
+            self.current_app_config_names.discard(node.name)
 
     def visit_ClassDef(self, node: ast.ClassDef):
         if node.col_offset == 0:
             self.classes[node.name] = node.lineno
+        is_app_config = any(
+            self._canonical_name(base) == "django.apps.AppConfig"
+            or (isinstance(base, ast.Name) and base.id in self.current_app_config_names)
+            for base in node.bases
+        )
+        if is_app_config:
+            self.django_app_config_classes.add(node)
         self.generic_visit(node)
+        if self._at_module_scope(node):
+            self.import_origins.pop(node.name, None)
+            if is_app_config:
+                self.current_app_config_names.add(node.name)
+            else:
+                self.current_app_config_names.discard(node.name)
 
     def visit_Call(self, node: ast.Call):
         if isinstance(node.func, ast.Name):
@@ -209,9 +357,17 @@ def analyze_file(filepath: Path) -> list[DeadCodeIssue]:
     try:
         source = filepath.read_text(encoding='utf-8', errors='replace')
         tree = ast.parse(source, filename=str(filepath))
-        lines = source.splitlines()
+        comments = defaultdict(list)
+        for token in tokenize.generate_tokens(io.StringIO(source).readline):
+            if token.type == tokenize.COMMENT:
+                comments[token.start[0]].append(token.string)
+        parents = {
+            child: parent
+            for parent in ast.walk(tree)
+            for child in ast.iter_child_nodes(parent)
+        }
         
-        tracker = ScopeTracker(str(filepath), lines)
+        tracker = ScopeTracker(str(filepath), parents, comments)
         tracker.visit(tree)
         tracker.finalize()
         

@@ -2874,6 +2874,124 @@ def test_used_import_called_function_and_used_param_are_not_dead(tmp_path):
     assert run_detector("find_dead_code.py", tmp_path) == []
 
 
+def test_f401_noqa_suppresses_only_the_annotated_unused_import(tmp_path):
+    (tmp_path / "sample.py").write_text(
+        "import json  # noqa: PLC0415, F401  (re-exported)\n"
+        "import os; marker = '# noqa: F401'\n"
+        "import sys  # noqa: PLC0415\n"
+    )
+    unused = {
+        finding["name"]
+        for finding in run_detector("find_dead_code.py", tmp_path)
+        if finding["issue_type"] == "unused_import"
+    }
+    assert unused == {"os", "sys"}
+
+
+def test_f401_noqa_on_multiline_import_is_alias_scoped(tmp_path):
+    (tmp_path / "sample.py").write_text(
+        "from os import (\n"
+        "    path,  # noqa: F401\n"
+        "    sep,\n"
+        ")\n"
+        "from os import (\n"
+        "    getcwd as cwd,\n"
+        "    getpid as pid,\n"
+        ")  # noqa: F401\n"
+    )
+    unused = {
+        finding["name"]
+        for finding in run_detector("find_dead_code.py", tmp_path)
+        if finding["issue_type"] == "unused_import"
+    }
+    assert unused == {"sep"}
+
+
+def test_f401_noqa_on_closing_alias_line_suppresses_only_that_alias(tmp_path):
+    (tmp_path / "sample.py").write_text(
+        "from os import (\n"
+        "    path,\n"
+        "    sep)  # noqa: F401\n"
+    )
+    unused = {
+        finding["name"]
+        for finding in run_detector("find_dead_code.py", tmp_path)
+        if finding["issue_type"] == "unused_import"
+    }
+    assert unused == {"path"}
+
+
+def test_appconfig_ready_registration_import_is_not_unused(tmp_path):
+    (tmp_path / "sample.py").write_text(
+        "from django.apps import AppConfig as DjangoAppConfig\n"
+        "\n"
+        "class AccountsConfig(DjangoAppConfig):\n"
+        "    def ready(self):\n"
+        "        import accounts.signals\n"
+        "        import os\n"
+    )
+    unused = {
+        finding["name"]
+        for finding in run_detector("find_dead_code.py", tmp_path)
+        if finding["issue_type"] == "unused_import"
+    }
+    assert unused == {"os"}
+
+
+def test_ready_import_suppression_requires_django_provenance_and_direct_method(tmp_path):
+    (tmp_path / "sample.py").write_text(
+        "class AppConfig:\n"
+        "    pass\n"
+        "\n"
+        "class LocalConfig(AppConfig):\n"
+        "    def ready(self):\n"
+        "        import local.signals\n"
+        "\n"
+        "from django.apps import AppConfig as DjangoAppConfig\n"
+        "\n"
+        "class DjangoConfig(DjangoAppConfig):\n"
+        "    def helper(self):\n"
+        "        def ready():\n"
+        "            import nested.signals\n"
+        "        return ready\n"
+        "\n"
+        "from django.apps import AppConfig as ShadowedConfig\n"
+        "\n"
+        "class ShadowedConfig:\n"
+        "    pass\n"
+        "\n"
+        "class ReboundConfig(ShadowedConfig):\n"
+        "    def ready(self):\n"
+        "        import rebound.signals\n"
+        "\n"
+        "class RepeatedConfig(DjangoAppConfig):\n"
+        "    pass\n"
+        "\n"
+        "class RepeatedConfig:\n"
+        "    def ready(self):\n"
+        "        import repeated.signals\n"
+        "\n"
+        "from django.apps import AppConfig as AssignedConfig\n"
+        "AssignedConfig = type('AssignedConfig', (), {})\n"
+        "\n"
+        "class AssignedLocalConfig(AssignedConfig):\n"
+        "    def ready(self):\n"
+        "        import assigned.signals\n"
+        "\n"
+        "from .django.apps import AppConfig as RelativeAppConfig\n"
+        "\n"
+        "class RelativeConfig(RelativeAppConfig):\n"
+        "    def ready(self):\n"
+        "        import relative.signals\n"
+    )
+    unused = {
+        finding["name"]
+        for finding in run_detector("find_dead_code.py", tmp_path)
+        if finding["issue_type"] == "unused_import"
+    }
+    assert unused == {"assigned", "local", "nested", "rebound", "relative", "repeated"}
+
+
 # ---- find_duplicates ------------------------------------------------------ #
 
 
@@ -2981,6 +3099,165 @@ def test_instance_state_classvar_snapshot_and_rebound_default_are_safe(tmp_path)
         "    return acc\n"
     )
     assert run_detector("find_mutation_hazards.py", tmp_path) == []
+
+
+def test_view_http_method_names_is_configuration_but_plain_list_is_shared(tmp_path):
+    (tmp_path / "sample.py").write_text(
+        "from django.views import View\n"
+        "\n"
+        "class PostOnlyView(View):\n"
+        "    http_method_names = ['post']\n"
+        "\n"
+        "class Bag:\n"
+        "    values = []\n"
+    )
+    findings = [
+        finding
+        for finding in run_detector("find_mutation_hazards.py", tmp_path)
+        if finding["smell_type"] == "mutable_class_attribute"
+    ]
+    assert [finding["code_snippet"] for finding in findings] == ["values = []"]
+
+
+def test_modelform_meta_fields_is_configuration_but_plain_list_is_shared(tmp_path):
+    (tmp_path / "sample.py").write_text(
+        "from django import forms\n"
+        "\n"
+        "class ProfileForm(forms.ModelForm):\n"
+        "    class Meta:\n"
+        "        fields = ['name']\n"
+        "\n"
+        "class Bag:\n"
+        "    values = []\n"
+    )
+    findings = [
+        finding
+        for finding in run_detector("find_mutation_hazards.py", tmp_path)
+        if finding["smell_type"] == "mutable_class_attribute"
+    ]
+    assert [finding["code_snippet"] for finding in findings] == ["values = []"]
+
+
+def test_migration_lists_are_configuration_but_plain_list_is_shared(tmp_path):
+    (tmp_path / "sample.py").write_text(
+        "from django.db import migrations\n"
+        "\n"
+        "class Migration(migrations.Migration):\n"
+        "    dependencies = []\n"
+        "    operations = []\n"
+        "\n"
+        "class Bag:\n"
+        "    values = []\n"
+    )
+    findings = [
+        finding
+        for finding in run_detector("find_mutation_hazards.py", tmp_path)
+        if finding["smell_type"] == "mutable_class_attribute"
+    ]
+    assert [finding["code_snippet"] for finding in findings] == ["values = []"]
+
+
+def test_aliased_django_bases_preserve_declarative_configuration(tmp_path):
+    (tmp_path / "sample.py").write_text(
+        "from django.views import View as Base\n"
+        "from django.forms import ModelForm as FormBase\n"
+        "from django.db.migrations import Migration as MigrationBase\n"
+        "\n"
+        "class PostOnlyView(Base):\n"
+        "    http_method_names = ['post']\n"
+        "\n"
+        "class ProfileForm(FormBase):\n"
+        "    class Meta:\n"
+        "        fields = ['name']\n"
+        "\n"
+        "class InitialMigration(MigrationBase):\n"
+        "    operations = []\n"
+        "\n"
+        "from django.views import View as EarlyBase\n"
+        "\n"
+        "class EarlyView(EarlyBase):\n"
+        "    http_method_names = ['get']\n"
+        "\n"
+        "from acme import EarlyBase\n"
+        "\n"
+        "class Bag:\n"
+        "    values = []\n"
+    )
+    findings = [
+        finding
+        for finding in run_detector("find_mutation_hazards.py", tmp_path)
+        if finding["smell_type"] == "mutable_class_attribute"
+    ]
+    assert [finding["code_snippet"] for finding in findings] == ["values = []"]
+
+
+def test_django_lookalikes_do_not_suppress_mutable_class_attributes(tmp_path):
+    (tmp_path / "sample.py").write_text(
+        "class AuditView:\n"
+        "    pass\n"
+        "\n"
+        "class Cache(AuditView):\n"
+        "    http_method_names = []\n"
+        "\n"
+        "class Migration:\n"
+        "    pass\n"
+        "\n"
+        "class CustomMigration(Migration):\n"
+        "    operations = []\n"
+        "\n"
+        "class ModelForm:\n"
+        "    pass\n"
+        "\n"
+        "class CustomForm(ModelForm):\n"
+        "    class Meta:\n"
+        "        fields = []\n"
+        "\n"
+        "from django.views import View as ShadowedView\n"
+        "\n"
+        "class ShadowedView:\n"
+        "    pass\n"
+        "\n"
+        "class ReboundView(ShadowedView):\n"
+        "    http_method_names = []\n"
+        "\n"
+        "from django.views import View as AssignedBase\n"
+        "AssignedBase = type('AssignedBase', (), {})\n"
+        "\n"
+        "class AssignedView(AssignedBase):\n"
+        "    http_method_names = []\n"
+        "\n"
+        "from .django.views import View as RelativeViewBase\n"
+        "\n"
+        "class RelativeView(RelativeViewBase):\n"
+        "    http_method_names = []\n"
+    )
+    findings = [
+        finding["code_snippet"]
+        for finding in run_detector("find_mutation_hazards.py", tmp_path)
+        if finding["smell_type"] == "mutable_class_attribute"
+    ]
+    assert findings == [
+        "http_method_names = []", "operations = []", "fields = []", "http_method_names = []",
+        "http_method_names = []", "http_method_names = []",
+    ]
+
+
+def test_modelform_meta_must_be_a_direct_nested_class(tmp_path):
+    (tmp_path / "sample.py").write_text(
+        "from django import forms\n"
+        "\n"
+        "class ProfileForm(forms.ModelForm):\n"
+        "    def helper(self):\n"
+        "        class Meta:\n"
+        "            fields = []\n"
+        "        return Meta\n"
+    )
+    findings = [
+        finding["code_snippet"]
+        for finding in run_detector("find_mutation_hazards.py", tmp_path)
+        if finding["smell_type"] == "mutable_class_attribute"
+    ]
+    assert findings == ["fields = []"]
 
 
 # ---- find_naming_issues --------------------------------------------------- #

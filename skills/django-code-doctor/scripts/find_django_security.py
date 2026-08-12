@@ -78,6 +78,7 @@ WEAK_HASHERS = ("MD5PasswordHasher", "UnsaltedMD5PasswordHasher", "SHA1PasswordH
 
 _SAFE_FILTER = re.compile(r"\|\s*safe\b")
 _AUTOESCAPE_OFF = re.compile(r"{%-?\s*autoescape\s+off")
+_HTML_TEMPLATE_SUFFIXES = {".html", ".htm", ".xhtml"}
 
 
 def _is_literal(node):
@@ -262,7 +263,7 @@ def collect(ctx):
                     "with a library before it is stored. |safe on a value you did not construct "
                     "is a decision to trust whoever did.",
                     "high"))
-            if _AUTOESCAPE_OFF.search(line):
+            if path.suffix.lower() in _HTML_TEMPLATE_SUFFIXES and _AUTOESCAPE_OFF.search(line):
                 findings.append(finding(
                     path, number, "autoescape_off",
                     "{% autoescape off %} disables escaping for a whole block, so every variable "
