@@ -136,12 +136,8 @@ def test_scalar_and_file_value_accesses_are_not_relations(tmp_path):
 def test_genuine_nested_model_relations_still_report(tmp_path):
     project = build_project(tmp_path / "p", {
         "shop/templates/a.html":
-            "{% for obj in objects %}\n"
-            "{{ obj.owner.profile.get_absolute_url }}\n"
-            "{% endfor %}\n"
-            "{% for journal in journals %}\n"
-            "{{ journal.character.name }}\n"
-            "{% endfor %}\n",
+            "{% for obj in objects %}{{ obj.owner.profile.get_absolute_url }}{% endfor %}\n"
+            "{% for journal in journals %}{{ journal.character.name }}{% endfor %}\n",
     })
     assert len(relation_walks(run_detector("find_template_issues.py", project))) == 2
 
