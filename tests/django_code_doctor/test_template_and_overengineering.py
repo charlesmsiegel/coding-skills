@@ -142,6 +142,7 @@ def test_genuine_nested_model_relations_still_report(tmp_path):
     hits = relation_walks(run_detector("find_template_issues.py", project))
     assert len(hits) == 2
     assert {hit["kind"] for hit in hits} == {"candidate"}
+    assert all("already loaded" in hit["also_caused_by"][0] for hit in hits)
 
 
 def test_a_clean_template_produces_nothing(tmp_path):

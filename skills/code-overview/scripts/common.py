@@ -164,7 +164,7 @@ def normalize_findings(data, source: str = "a findings file") -> dict:
     shape = SHAPE_PARTIAL
 
     if isinstance(data, list):
-        findings = [item for item in data if isinstance(item, dict)]
+        findings, candidates = _split_kinds(data)
     elif isinstance(data, dict):
         meta = data.get("meta", {}) if isinstance(data.get("meta"), dict) else {}
         errors = {str(k): str(v) for k, v in (meta.get("analyzer_errors") or {}).items()}

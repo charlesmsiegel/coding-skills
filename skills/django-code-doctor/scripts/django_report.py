@@ -39,9 +39,10 @@ def finding(file, line, smell_type, description, suggestion, severity):
     }
 
 
-def candidate(file, line, smell_type, description, suggestion, severity):
+def candidate(file, line, smell_type, description, suggestion, severity, also_caused_by=()):
     record = finding(file, line, smell_type, description, suggestion, severity)
     record["kind"] = "candidate"
+    record["also_caused_by"] = list(also_caused_by)
     return record
 
 

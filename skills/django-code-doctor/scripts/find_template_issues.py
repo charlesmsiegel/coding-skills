@@ -136,7 +136,10 @@ def _scan(path, text):
                     "is prefetched",
                     "select_related/prefetch_related '" + "__".join(relation_parts[:-1]) + "' on "
                     "the queryset the view passes in.",
-                    "high"))
+                    "high",
+                    also_caused_by=(
+                        "the relation is already loaded by select_related() or prefetch_related()",
+                    )))
 
         # ---- forms and CSRF ------------------------------------------------ #
         form_match = _FORM_OPEN_RE.search(line)

@@ -13,6 +13,8 @@ import pytest
 
 SCRIPT = (Path(__file__).resolve().parents[2] / "skills" / "code-overview" /
           "scripts" / "build_health.py")
+DJANGO_ANALYZER = (Path(__file__).resolve().parents[2] / "skills" /
+                   "django-code-doctor" / "scripts" / "analyze_django.py")
 
 
 def envelope(tmp_path) -> Path:
@@ -402,3 +404,34 @@ def test_a_findings_path_reports_completeness_caveats_on_the_coverage_tab(
     assert "reference_graph" in panel
     assert "incomplete" in panel
     assert "resolution_rate: 0.31" in panel
+
+
+def test_raw_django_report_keeps_template_relation_walks_out_of_the_grade(
+        repo, run_script, tmp_path):
+    repo.write("manage.py", "import django\n")
+    repo.write(
+        "app/templates/app/list.html",
+        "{% for obj in objects %}{{ obj.owner.profile.name }}{% endfor %}\n",
+    )
+    repo.write("app/views.py", "def list_view(request):\n    return None\n")
+    repo.commit()
+
+    raw = tmp_path / "django.json"
+    analyzed = run_script(DJANGO_ANALYZER, repo.path, "--format", "json")
+    raw.write_text(analyzed.stdout, encoding="utf-8")
+    empty = tmp_path / "empty.json"
+    empty.write_text("[]", encoding="utf-8")
+
+    def build(report: Path, name: str) -> str:
+        out = tmp_path / name
+        run_script(
+            SCRIPT, "--out", out, "--repo", repo.path, "--name", "app",
+            "--root-dir", "app", "--findings", f"django-code-doctor:{report}",
+            "--covers", "complexity",
+        )
+        return out.read_text(encoding="utf-8")
+
+    with_candidate = build(raw, "with.html")
+    without_candidate = build(empty, "without.html")
+    assert "relation_walk_in_loop" in candidates_panel(with_candidate)
+    assert health_meta(with_candidate)["score"] == health_meta(without_candidate)["score"]
