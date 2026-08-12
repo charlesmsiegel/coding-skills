@@ -16,7 +16,7 @@ import re
 import sys
 
 from django_context import template_files
-from django_report import finding, run
+from django_report import candidate, finding, run
 
 _FOR_RE = re.compile(r"{%-?\s*for\s+(\w+)\s+in\s+([\w.]+)")
 _ENDFOR_RE = re.compile(r"{%-?\s*endfor")
@@ -128,7 +128,7 @@ def _scan(path, text):
                 if len(relation_parts) < 2 or _is_value_access(relation_parts):
                     continue
                 loop_line = next(ln for var, _, ln in stack if var == loop_var)
-                findings.append(finding(
+                findings.append(candidate(
                     path, number, "relation_walk_in_loop",
                     "`{{ " + expression + " }}` walks " + str(len(relation_parts))
                     + " attributes inside "

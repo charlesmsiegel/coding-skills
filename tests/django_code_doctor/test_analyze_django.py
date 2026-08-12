@@ -38,6 +38,14 @@ def run_aggregator(target: Path, *extra: str):
     return json.loads(result.stdout)
 
 
+def run_aggregator_text(target: Path):
+    result = subprocess.run(
+        [sys.executable, str(SCRIPTS_DIR / "analyze_django.py"), str(target)],
+        capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=300)
+    assert result.returncode == 0, result.stderr[:500]
+    return result.stdout
+
+
 PROJECT = {
     "shop/models.py": "from django.db import models\n\n\n"
                       "class Thing(models.Model):\n"
@@ -147,6 +155,16 @@ def test_findings_are_ordered_worst_first(tmp_path):
     rank = {"high": 0, "medium": 1, "low": 2}
     severities = [rank[f["severity"]] for f in findings]
     assert severities == sorted(severities)
+
+
+def test_text_output_does_not_call_relation_walk_candidates_findings(tmp_path):
+    project = build_project(tmp_path / "proj", {
+        "shop/templates/a.html":
+            "{% for obj in objects %}{{ obj.owner.profile.name }}{% endfor %}\n",
+    })
+    output = run_aggregator_text(project)
+    assert "1 candidate(s)" in output
+    assert "[CANDIDATE]" in output
 
 
 def test_output_feeds_python_code_doctors_formatter(tmp_path):

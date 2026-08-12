@@ -128,13 +128,16 @@ def render(findings, stats, target=None):
         lines.append("✅ No findings.")
         return "\n".join(lines)
 
+    proven = [record for record in findings if record.get("kind") != "candidate"]
+    candidates = [record for record in findings if record.get("kind") == "candidate"]
     by_severity = defaultdict(int)
     by_type = defaultdict(int)
-    for f in findings:
+    for f in proven:
         by_severity[f["severity"]] += 1
+    for f in findings:
         by_type[f["smell_type"]] += 1
 
-    lines.append(str(len(findings)) + " finding(s)  (" +
+    lines.append(str(len(proven)) + " finding(s), " + str(len(candidates)) + " candidate(s)  (" +
                  SEVERITY_ICONS["high"] + " " + str(by_severity["high"]) + "  " +
                  SEVERITY_ICONS["medium"] + " " + str(by_severity["medium"]) + "  " +
                  SEVERITY_ICONS["low"] + " " + str(by_severity["low"]) + ")\n")
@@ -143,7 +146,9 @@ def render(findings, stats, target=None):
     lines.append("")
 
     for f in findings[:300]:
-        lines.append(SEVERITY_ICONS[f["severity"]] + " [" + f["severity"].upper() + "] " +
+        marker = ("? [CANDIDATE]" if f.get("kind") == "candidate" else
+                  SEVERITY_ICONS[f["severity"]] + " [" + f["severity"].upper() + "]")
+        lines.append(marker + " " +
                      str(f["file"]) + ":" + str(f["line"]) + "  " + f["smell_type"])
         lines.append("   " + f["description"])
         lines.append("   → " + f["suggestion"])

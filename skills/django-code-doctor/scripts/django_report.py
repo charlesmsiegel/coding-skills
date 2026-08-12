@@ -13,8 +13,9 @@ A detector is:
     if __name__ == "__main__":
         sys.exit(run("find_x", "what it looks for", collect))
 
-Findings match python-code-doctor's shape exactly: file, line, smell_type,
-description, suggestion, severity.
+Records match python-code-doctor's shape exactly: file, line, smell_type,
+description, suggestion, severity. Unproven leads additionally carry
+``kind: candidate`` so code-overview can show them without grading them.
 """
 
 import json
@@ -38,19 +39,28 @@ def finding(file, line, smell_type, description, suggestion, severity):
     }
 
 
+def candidate(file, line, smell_type, description, suggestion, severity):
+    record = finding(file, line, smell_type, description, suggestion, severity)
+    record["kind"] = "candidate"
+    return record
+
+
 def render(title, findings, limit=200):
     lines = [f"\n🎸 {title.upper()}", "=" * 66]
     if not findings:
         lines.append("✅ Nothing found.")
         return "\n".join(lines)
 
+    proven = [record for record in findings if record.get("kind") != "candidate"]
+    candidates = [record for record in findings if record.get("kind") == "candidate"]
     by_severity = defaultdict(int)
     by_type = defaultdict(int)
-    for f in findings:
+    for f in proven:
         by_severity[f["severity"]] += 1
+    for f in findings:
         by_type[f["smell_type"]] += 1
 
-    lines.append(f"{len(findings)} finding(s)  "
+    lines.append(f"{len(proven)} finding(s), {len(candidates)} candidate(s)  "
                  f"({SEVERITY_ICONS['high']} {by_severity['high']}  "
                  f"{SEVERITY_ICONS['medium']} {by_severity['medium']}  "
                  f"{SEVERITY_ICONS['low']} {by_severity['low']})\n")
@@ -59,7 +69,9 @@ def render(title, findings, limit=200):
     lines.append("")
 
     for f in findings[:limit]:
-        lines.append(f"{SEVERITY_ICONS[f['severity']]} [{f['severity'].upper()}] "
+        marker = ("? [CANDIDATE]" if f.get("kind") == "candidate"
+                  else f"{SEVERITY_ICONS[f['severity']]} [{f['severity'].upper()}]")
+        lines.append(f"{marker} "
                      f"{f['file']}:{f['line']}  {f['smell_type']}")
         lines.append(f"   {f['description']}")
         lines.append(f"   → {f['suggestion']}")

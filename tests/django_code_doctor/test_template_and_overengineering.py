@@ -139,7 +139,9 @@ def test_genuine_nested_model_relations_still_report(tmp_path):
             "{% for obj in objects %}{{ obj.owner.profile.get_absolute_url }}{% endfor %}\n"
             "{% for journal in journals %}{{ journal.character.name }}{% endfor %}\n",
     })
-    assert len(relation_walks(run_detector("find_template_issues.py", project))) == 2
+    hits = relation_walks(run_detector("find_template_issues.py", project))
+    assert len(hits) == 2
+    assert {hit["kind"] for hit in hits} == {"candidate"}
 
 
 def test_a_clean_template_produces_nothing(tmp_path):
