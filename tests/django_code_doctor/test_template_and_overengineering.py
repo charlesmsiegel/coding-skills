@@ -3,6 +3,10 @@
 from helpers import build_project, run_detector, smells
 
 
+def relation_walks(findings):
+    return [f for f in findings if f["smell_type"] == "relation_walk_in_loop"]
+
+
 # ---- templates: the new checks ------------------------------------------------ #
 
 def test_a_post_form_without_csrf_token_is_reported(tmp_path):
@@ -102,6 +106,44 @@ def test_include_outside_a_loop_is_fine(tmp_path):
         "shop/templates/a.html": "{% include 'shop/header.html' %}\n",
     })
     assert "include_in_loop" not in smells(run_detector("find_template_issues.py", project))
+
+
+def test_form_wrappers_only_report_nested_domain_relations(tmp_path):
+    project = build_project(tmp_path / "p", {
+        "shop/templates/a.html": "{% for freebie_form in freebie_forms %}\n"
+                                 "{{ freebie_form.character.name }}\n"
+                                 "{{ freebie_form.character.gameline }}\n"
+                                 "{{ freebie_form.character.get_absolute_url }}\n"
+                                 "{{ freebie_form.character.owner.profile.get_absolute_url }}\n"
+                                 "{% endfor %}\n",
+    })
+    hits = relation_walks(run_detector("find_template_issues.py", project))
+    assert [(f["line"], f["suggestion"]) for f in hits] == [
+        (5, "select_related/prefetch_related 'owner__profile' on the queryset the view passes in."),
+    ]
+
+
+def test_scalar_and_file_value_accesses_are_not_relations(tmp_path):
+    project = build_project(tmp_path / "p", {
+        "shop/templates/a.html": "{% for obj in objects %}\n"
+                                 "{{ obj.type.title }}\n"
+                                 "{{ obj.image.url }}\n"
+                                 "{% endfor %}\n",
+    })
+    assert relation_walks(run_detector("find_template_issues.py", project)) == []
+
+
+def test_genuine_nested_model_relations_still_report(tmp_path):
+    project = build_project(tmp_path / "p", {
+        "shop/templates/a.html":
+            "{% for obj in objects %}\n"
+            "{{ obj.owner.profile.get_absolute_url }}\n"
+            "{% endfor %}\n"
+            "{% for journal in journals %}\n"
+            "{{ journal.character.name }}\n"
+            "{% endfor %}\n",
+    })
+    assert len(relation_walks(run_detector("find_template_issues.py", project))) == 2
 
 
 def test_a_clean_template_produces_nothing(tmp_path):

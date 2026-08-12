@@ -32,8 +32,28 @@ _STATIC_URL_VAR_RE = re.compile(r"{{\s*STATIC_URL\s*}}|{{\s*MEDIA_URL\s*}}")
 _HARDCODED_HREF_RE = re.compile(r"""(?:href|action)\s*=\s*["'](/[\w\-/]*)["']""", re.IGNORECASE)
 # Callables that hit the database when a template evaluates them.
 _QUERY_ACCESSORS = ("all", "count", "first", "last", "exists")
+# Attribute pairs whose dotted syntax is value access, not evidence of an ORM
+# relation. Keep this deliberately narrow: the scanner has no runtime types.
+_VALUE_ACCESS_SUFFIXES = {("type", "title"), ("image", "url")}
 # Filters that make a value safe for a script context.
 _SCRIPT_SAFE_FILTERS = ("json_script", "escapejs")
+
+
+def _relation_parts(loop_var, parts):
+    """Return the possible model path beneath a template loop variable.
+
+    Django forms commonly expose their bound domain object as an attribute. The
+    form and that first object attribute are presentation plumbing, not two ORM
+    relations; relation analysis starts beneath the object.
+    """
+    relation_parts = parts[1:]
+    if loop_var.endswith("_form") and relation_parts:
+        relation_parts = relation_parts[1:]
+    return relation_parts
+
+
+def _is_value_access(parts):
+    return len(parts) == 2 and tuple(parts) in _VALUE_ACCESS_SUFFIXES
 
 
 def _scan(path, text):
@@ -139,15 +159,22 @@ def _scan(path, text):
                     "high" if stack else "medium"))
                 continue
 
-            # Reaching two levels deep off a loop variable is the classic N+1.
-            if stack and parts[0] in {var for var, _, _ in stack} and len(parts) >= 3:
-                loop_line = next(ln for var, _, ln in stack if var == parts[0])
+            # Reaching through a possible relation beneath a loop variable is the
+            # classic N+1. Normalize form wrappers and known value-only access
+            # before deciding whether the dotted shape is evidence of a relation.
+            if stack and parts[0] in {var for var, _, _ in stack}:
+                loop_var = parts[0]
+                relation_parts = _relation_parts(loop_var, parts)
+                if len(relation_parts) < 2 or _is_value_access(relation_parts):
+                    continue
+                loop_line = next(ln for var, _, ln in stack if var == loop_var)
                 findings.append(finding(
                     path, number, "relation_walk_in_loop",
-                    "`{{ " + expression + " }}` walks " + str(len(parts) - 1) + " relations inside "
+                    "`{{ " + expression + " }}` walks " + str(len(relation_parts))
+                    + " attributes inside "
                     "the loop opened on line " + str(loop_line) + " — one query per row unless it "
                     "is prefetched",
-                    "select_related/prefetch_related '" + "__".join(parts[1:-1]) + "' on the "
+                    "select_related/prefetch_related '" + "__".join(relation_parts[:-1]) + "' on the "
                     "queryset the view passes in.",
                     "high"))
 
