@@ -24,7 +24,10 @@ from pathlib import Path
 from common import Reporter, load_notes, pdf_page_count
 
 TEXT_SUFFIXES = (".html", ".htm", ".txt", ".tex", ".md", ".json", ".xml")
-HREF_RE = re.compile(r'href="(docs/[^"]+)"')
+# Either quote style. Matching only double quotes meant a fragment written with
+# single ones was not checked at all, and the gate reported zero failures over a
+# report whose links it had never looked at.
+HREF_RE = re.compile(r"""href=["'](docs/[^"']+)["']""")
 
 
 def _normalize(text: str) -> str:

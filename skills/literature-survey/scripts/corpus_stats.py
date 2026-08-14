@@ -62,7 +62,16 @@ def compute(out, current_year: int | None = None) -> dict:
     for row in gap_rows:
         by_status[row["status"]] = by_status.get(row["status"], 0) + 1
 
-    notes = load_notes(out)
+    # "Read in full" is a claim about this corpus, so a note only counts when it
+    # names an artifact the corpus actually holds. Counting every file in notes/
+    # produced "3 read in full of 1 archived" — a ratio above one, in the strip
+    # whose whole job is that its numbers can be checked. Orphans are reported
+    # rather than dropped: a note nothing archived is a reading that will fail the
+    # gate, and silence about it is how it stays unnoticed until then.
+    archived_ids = {a.get("artifact_id") for a in artifacts if a.get("status") == "ok"}
+    all_notes = load_notes(out)
+    notes = [n for n in all_notes if n.artifact_id in archived_ids]
+    orphan_notes = len(all_notes) - len(notes)
 
     candidates_path = out / "candidates.json"
     candidates = []
@@ -89,8 +98,9 @@ def compute(out, current_year: int | None = None) -> dict:
         "papers": by_kind["papers"],
         "web": by_kind["web"],
         "repos": by_kind["repos"],
-        "archived": len([a for a in artifacts if a.get("status") == "ok"]),
+        "archived": len(archived_ids),
         "read_in_full": len(notes),
+        "orphan_notes": orphan_notes,
         "gaps": {"count": len(gap_rows), "by_status": dict(sorted(by_status.items()))},
         "recency": {"recent": len(recent), "dated": len(dated),
                     "undated": len(candidates) - len(dated), "percent": percent,
@@ -168,6 +178,12 @@ def main() -> int:
         str(stats["read_in_full"]) + " read in full of " + str(stats["archived"])
         + " archived; " + str(stats["gaps"]["count"]) + " unobtainable"
     )
+    if stats["orphan_notes"]:
+        reporter.caveat(
+            str(stats["orphan_notes"]) + " note(s) name an artifact the manifest does not "
+            "hold, so they are not counted as read: every claim in them will fail "
+            "verify_locators.py"
+        )
     if stats["read_in_full"] == 0 and stats["archived"] > 0:
         reporter.caveat("nothing has been read: downloads are not readings, and synthesis "
                         "has no notes to work from")

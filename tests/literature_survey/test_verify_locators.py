@@ -238,6 +238,18 @@ def test_a_report_link_that_resolves_to_nothing_on_disk_fails(verify, survey):
     assert "docs/papers/ghost.pdf" in failure["reason"]
 
 
+def test_a_single_quoted_link_is_checked_too(verify, survey):
+    """Matching only double quotes meant the gate reported zero failures over a
+    report whose links it had never looked at."""
+    out = survey.artifact("2401.1", PDF_TWO_PAGES).write()
+    report = out / "summary.html"
+    report.write_text("<a href='docs/papers/ghost.pdf'>read</a>", encoding="utf-8")
+
+    [failure] = verify.run(out, report=report)["failures"]
+
+    assert "docs/papers/ghost.pdf" in failure["reason"]
+
+
 def test_a_deep_link_to_a_page_resolves_to_the_file_it_names(verify, survey):
     """`x.pdf#page=4` is the link the report structure asks for; failing it would have
     the author delete the most useful part of the citation to pass a blocking gate."""

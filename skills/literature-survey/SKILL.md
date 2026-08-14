@@ -85,6 +85,10 @@ hash is already recorded is skipped, and one whose bytes no longer match is
 re-fetched rather than trusted. Anything unobtainable becomes a manifest entry with
 a reason, never an absence.
 
+**A 200 is not a paper.** A PDF URL that answers with HTML is an access wall, not a
+download, and is recorded as a gap rather than archived — otherwise the paywall
+itself gets counted as the work and can be cited.
+
 ## 5. Read
 
 **Dispatch one reader per artifact, independently.** Each gets the artifact and

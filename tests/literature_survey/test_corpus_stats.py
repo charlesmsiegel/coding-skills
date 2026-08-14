@@ -86,6 +86,29 @@ def test_read_in_full_is_measured_against_every_archived_artifact(stats, tmp_pat
     assert "of 2 archived" in strip
 
 
+def test_a_note_for_something_never_archived_does_not_count_as_read(stats, tmp_path):
+    """Counting every file in notes/ produced "3 read in full of 1 archived" — a ratio
+    above one, in the strip whose whole job is that its numbers can be checked."""
+    survey(tmp_path, artifacts=[ok("real")], notes=["real", "ghost1", "ghost2"])
+
+    computed = stats.compute(tmp_path)
+
+    assert computed["read_in_full"] == 1 and computed["archived"] == 1
+    assert computed["orphan_notes"] == 2
+    assert "1 <small>of 1 archived" in stats.meta_strip_html(computed)
+
+
+def test_orphan_notes_are_reported_rather_than_quietly_dropped(stats, tmp_path, monkeypatch,
+                                                                capsys):
+    """A note nothing archived is a reading that will fail the gate later."""
+    out = survey(tmp_path / "survey", artifacts=[ok("real")], notes=["real", "ghost"])
+    monkeypatch.setattr("sys.argv", ["corpus_stats.py", "--out", str(out)])
+
+    stats.main()
+
+    assert "will fail verify_locators.py" in capsys.readouterr().out
+
+
 def test_recency_is_unknown_rather_than_zero_when_nothing_carries_a_year(stats, tmp_path):
     survey(tmp_path, artifacts=[ok("a")], candidates=[{"title": "T"}])
 
