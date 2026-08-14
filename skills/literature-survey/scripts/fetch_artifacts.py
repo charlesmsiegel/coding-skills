@@ -202,6 +202,25 @@ def run(out: Path, http, now=_now, repos=None) -> dict:
             gaps += 1
             continue
 
+        # A 200 is not a paper. Publishers answer a PDF URL with an HTML
+        # interstitial — "sign in through your institution" — and saving that under
+        # .pdf archived the paywall as though it were the work: counted in "papers
+        # archived", absent from the gaps tab, and available to be cited. The gaps
+        # tab exists because "the literature says" and "the reachable literature
+        # says" are different claims, and this was the most common way in this
+        # domain for the difference to disappear. Lenient about where the header
+        # sits, because a strict check belongs at the gate, not here.
+        if kind == "paper" and b"%PDF" not in response.body[:1024]:
+            manifest[aid] = ManifestEntry(
+                artifact_id=aid, kind=kind, url=url, status="paywalled",
+                failure_reason="the server returned "
+                + (getattr(response, "content_type", "") or "a non-PDF body")
+                + " rather than a PDF, which is what an access wall looks like; "
+                "nothing was archived, because a page locator cannot resolve in it",
+            )
+            gaps += 1
+            continue
+
         subdir = "papers" if kind == "paper" else "web"
         rel = "docs/" + subdir + "/" + artifact_filename(candidate, suffix)
         destination = out / rel

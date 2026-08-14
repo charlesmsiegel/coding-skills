@@ -180,6 +180,38 @@ def test_a_candidate_with_nowhere_to_fetch_from_is_a_gap_not_a_silence(fetch, tm
     assert "no retrievable location" in manifest(tmp_path)["10.1_x"]["failure_reason"]
 
 
+def test_an_html_interstitial_served_from_a_pdf_url_is_a_gap_not_an_archived_paper(fetch, tmp_path):
+    """Publishers answer a PDF URL with "sign in through your institution" and a 200.
+    Saving that under .pdf archived the paywall as the work: counted in "papers
+    archived", absent from the gaps tab, and available to be cited."""
+    write_candidates(tmp_path, paper())
+    http = FakeHttp({"https://x/p.pdf": b"<html><body>Access denied. Sign in.</body></html>"})
+
+    result = fetch.run(tmp_path, http, now=clock())
+
+    entry = manifest(tmp_path)["2401.00001"]
+    assert result == {"fetched": 0, "skipped": 0, "gaps": 1, "cloned": 0, "selected": 1}
+    assert entry["status"] == "paywalled" and "rather than a PDF" in entry["failure_reason"]
+    assert not (tmp_path / "docs" / "papers").exists(), "an access wall is not an artifact"
+
+
+def test_a_pdf_whose_header_is_not_at_byte_zero_is_still_a_paper(fetch, tmp_path):
+    """Real files carry junk before the header; a strict check belongs at the gate."""
+    write_candidates(tmp_path, paper())
+    http = FakeHttp({"https://x/p.pdf": b"\r\n   %PDF-1.7\nbody"})
+
+    assert fetch.run(tmp_path, http, now=clock())["fetched"] == 1
+
+
+def test_a_landing_page_is_not_held_to_the_pdf_check(fetch, tmp_path):
+    write_candidates(tmp_path, {"title": "Thread", "external_ids": {"doi": "10.1/x"},
+                                "landing_url": "https://x/page", "status": "selected"})
+
+    result = fetch.run(tmp_path, FakeHttp({"https://x/page": b"<html>text</html>"}), now=clock())
+
+    assert result["fetched"] == 1
+
+
 def test_a_robots_disallowed_page_is_recorded_and_never_fetched(fetch, tmp_path):
     write_candidates(tmp_path, {"title": "Forum thread", "external_ids": {"doi": "10.1/x"},
                                 "landing_url": "https://x/private/thread", "status": "selected"})
