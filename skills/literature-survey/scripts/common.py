@@ -326,6 +326,14 @@ def load_notes(out) -> list[Note]:
 # the same prefix and must not be counted.
 _PDF_PAGE_RE = re.compile(rb"/Type\s*/Page(?![s])")
 
+# The page tree declares its own total. Both key orders occur, and the match is
+# anchored on /Type /Pages so an outline dictionary's /Count is not mistaken for
+# a page total.
+_PDF_COUNT_RES = (
+    re.compile(rb"/Type\s*/Pages\b[^>]{0,400}?/Count\s+(\d+)", re.DOTALL),
+    re.compile(rb"/Count\s+(\d+)[^>]{0,400}?/Type\s*/Pages\b", re.DOTALL),
+)
+
 
 def pdf_page_count(data: bytes) -> int | None:
     """How many pages a PDF has, or None when it cannot be determined.
@@ -334,10 +342,21 @@ def pdf_page_count(data: bytes) -> int | None:
     used for is rejecting a citation to page 40 of a 12-page paper. None means
     unknown, and an unknown count must make a page check *unverifiable* rather
     than passing — see verify_locators.py.
+
+    The declared /Count wins over the number of page objects visible in the
+    bytes, and the larger of the two wins over either. Since PDF 1.5 a producer
+    may pack page objects into compressed object streams, and pdfTeX does: a
+    30-page paper can show three uncompressed `/Type /Page` objects. Counting
+    only those told the gate the document was three pages long, and the gate is
+    blocking — so a correct citation to page 12 failed the run, and the skill's
+    own instruction ("fix the claim, not the check") would have had the author
+    weaken a true claim to satisfy a miscount. Erring high costs only the
+    detection of a page number past the end; erring low breaks true claims.
     """
     if not data.startswith(b"%PDF"):
         return None
-    count = len(_PDF_PAGE_RE.findall(data))
+    declared = [int(m.group(1)) for pattern in _PDF_COUNT_RES for m in pattern.finditer(data)]
+    count = max([len(_PDF_PAGE_RE.findall(data))] + declared)
     return count or None
 
 
@@ -385,6 +404,13 @@ class Http:
             request = urllib.request.Request(
                 url, headers={"User-Agent": self.user_agent, "Accept": accept}
             )
+            # Stamped before the call, so a request that fails still holds the host's
+            # place in the queue. Stamping only on success meant a host answering 404
+            # was never throttled at all: thirty dead links went out back to back with
+            # no interval between them, which is precisely the traffic pattern the
+            # etiquette section promises not to generate — and it happened only when a
+            # server was already unhappy.
+            self._last_call[host] = self._monotonic()
             try:
                 with self._opener(request, timeout=self.timeout) as response:
                     body = response.read()
@@ -396,10 +422,12 @@ class Http:
                     return Response(url=url, body=body, content_type=content_type)
             except urllib.error.HTTPError as exc:
                 last_error = exc
+                self._last_call[host] = self._monotonic()
                 if exc.code not in RETRYABLE_STATUS:
                     raise FetchError("HTTP " + str(exc.code) + " for " + url) from exc
             except (urllib.error.URLError, TimeoutError, OSError) as exc:
                 last_error = exc
+                self._last_call[host] = self._monotonic()
             if attempt < self.max_attempts:
                 self._sleep(self.backoff_base * (2 ** (attempt - 1)))
         raise FetchError("gave up on " + url + " after " + str(self.max_attempts)

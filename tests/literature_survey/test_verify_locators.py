@@ -189,6 +189,42 @@ def test_a_quote_in_a_binary_artifact_is_unverifiable_rather_than_assumed(verify
     assert "binary artifact" in result["unverifiable"][0]["reason"]
 
 
+def test_a_section_only_locator_into_a_pdf_is_unverifiable_not_passing(verify, survey):
+    """It used to exit 0 and be counted as checked, so the cheapest locator to
+    fabricate was also the only one nothing resolved."""
+    out = (survey.artifact("2401.1", PDF_TWO_PAGES)
+           .note("2401.1", loc("2401.1", section="Section 12: The Nonexistent Results")).write())
+
+    result = verify.run(out)
+
+    assert result["failures"] == []
+    assert "section-only locator" in result["unverifiable"][0]["reason"]
+
+
+def test_a_section_that_is_not_in_a_text_artifact_fails(verify, survey):
+    out = (survey.artifact("w1", b"<h2>3. Results</h2>", suffix=".html")
+           .note("w1", loc("w1", section="12. The Nonexistent Results")).write())
+
+    [failure] = verify.run(out)["failures"]
+
+    assert "not found in" in failure["reason"]
+
+
+def test_a_section_that_is_in_the_text_resolves(verify, survey):
+    out = (survey.artifact("w1", b"<h2>3.2 Ablations</h2><p>...</p>", suffix=".html")
+           .note("w1", loc("w1", section="3.2 Ablations")).write())
+
+    assert verify.run(out) == {"checked": 1, "failures": [], "unverifiable": []}
+
+
+def test_a_section_beside_a_page_is_left_to_the_page_check(verify, survey):
+    """Belt and braces would report the stronger locator as unverifiable."""
+    out = (survey.artifact("2401.1", PDF_TWO_PAGES)
+           .note("2401.1", loc("2401.1", page=2, section="Results")).write())
+
+    assert verify.run(out) == {"checked": 1, "failures": [], "unverifiable": []}
+
+
 # --- the report's own links ---------------------------------------------
 
 def test_a_report_link_that_resolves_to_nothing_on_disk_fails(verify, survey):
@@ -200,6 +236,17 @@ def test_a_report_link_that_resolves_to_nothing_on_disk_fails(verify, survey):
     [failure] = verify.run(out, report=report)["failures"]
 
     assert "docs/papers/ghost.pdf" in failure["reason"]
+
+
+def test_a_deep_link_to_a_page_resolves_to_the_file_it_names(verify, survey):
+    """`x.pdf#page=4` is the link the report structure asks for; failing it would have
+    the author delete the most useful part of the citation to pass a blocking gate."""
+    out = survey.artifact("2401.1", PDF_TWO_PAGES).write()
+    report = out / "summary.html"
+    report.write_text('<a href="docs/papers/2401.1.pdf#page=2">the ablation table</a>',
+                      encoding="utf-8")
+
+    assert verify.run(out, report=report)["failures"] == []
 
 
 def test_a_report_that_has_not_been_built_yet_is_not_a_failure(verify, survey):

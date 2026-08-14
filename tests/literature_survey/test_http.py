@@ -146,14 +146,28 @@ def test_time_already_spent_counts_against_the_interval(common):
     assert clock.slept == [pytest.approx(0.75)]
 
 
-def test_a_failed_call_does_not_start_the_clock_for_the_next_one(common):
-    """Only a completed fetch records a last-call time; a 404 must not license a burst."""
-    client, clock = http(common, Opener(http_error(404)), min_interval=1.0)
+def test_a_failed_call_still_holds_the_hosts_place_in_the_queue(common):
+    """A dead link is a request the server saw, so it counts against the interval."""
+    client, clock = http(common, Opener(http_error(404), http_error(404)), min_interval=1.0)
 
-    with pytest.raises(common.FetchError):
-        client.get("https://export.arxiv.org/a")
+    for path in ("a", "b"):
+        with pytest.raises(common.FetchError):
+            client.get("https://export.arxiv.org/" + path)
 
-    assert clock.slept == []
+    assert clock.slept == [1.0]
+
+
+def test_a_host_answering_nothing_but_errors_is_still_throttled(common):
+    """Stamping the clock only on success meant thirty dead links went out back to
+    back with no interval at all — the exact traffic pattern that gets a client
+    banned, generated only when a server was already unhappy."""
+    client, clock = http(common, Opener(*[http_error(404)] * 30), min_interval=1.0)
+
+    for index in range(30):
+        with pytest.raises(common.FetchError):
+            client.get("https://dead-mirror.example.org/paper%d.pdf" % index)
+
+    assert clock.now == pytest.approx(29.0), "29 gaps between 30 requests to one host"
 
 
 # --- request shape -------------------------------------------------------

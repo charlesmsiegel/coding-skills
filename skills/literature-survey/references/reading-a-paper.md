@@ -69,10 +69,15 @@ reformatting, the quote proves you read the sentence. Only claims the paper
 actually establishes, not claims it repeats from its own citations.
 
 **`locators`** — `artifact_id` plus a `page`, a `section`, or a `quote`.
-`verify_locators.py` checks pages against the PDF's page count and quotes
-literally, whitespace-normalized, in text artifacts. **A quote must be verbatim.**
-Paraphrasing into the quote field is worse than leaving it empty, because it makes
-a check that looks like it passed.
+`verify_locators.py` checks pages against the PDF's page count, and quotes and
+section names literally, whitespace-normalized, in text artifacts. **A quote must
+be verbatim.** Paraphrasing into the quote field is worse than leaving it empty,
+because it makes a check that looks like it passed.
+
+A **section name on its own, in a PDF, cannot be resolved** and is reported
+*unverifiable* — the gate will not fail your run over it, and it will not certify
+it either. So a section is a good companion to a page and a poor substitute for
+one: it says where in the argument you were, not that you opened the document.
 
 **`leads`** — things the paper suggests but does not establish. Each needs
 `also_explained_by`: the benign readings. A lead **must not** carry locators —

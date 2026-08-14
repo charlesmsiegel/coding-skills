@@ -148,6 +148,18 @@ def test_a_403_is_recorded_as_a_paywall_rather_than_a_generic_failure(fetch, tmp
     assert not entry["path"] and not entry["sha256"]
 
 
+def test_a_timeout_on_a_url_containing_403_is_not_called_a_paywall(fetch, tmp_path):
+    """The reason string carries the URL, so a substring test put a PLOS paper whose
+    DOI happens to contain 403 in the gaps tab as deliberately inaccessible."""
+    url = "https://journals.plos.org/article/file?id=10.1371/journal.pone.0040312"
+    write_candidates(tmp_path, paper(pdf=url))
+    http = FakeHttp(errors={url: OSError("gave up on " + url + " after 4 attempts: timed out")})
+
+    fetch.run(tmp_path, http, now=clock())
+
+    assert manifest(tmp_path)["2401.00001"]["status"] == "failed"
+
+
 def test_a_transport_failure_is_recorded_as_a_gap_with_its_reason(fetch, tmp_path):
     write_candidates(tmp_path, paper())
     http = FakeHttp(errors={"https://x/p.pdf": OSError("gave up after 4 attempts")})

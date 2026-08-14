@@ -93,7 +93,8 @@ def compute(out, current_year: int | None = None) -> dict:
         "read_in_full": len(notes),
         "gaps": {"count": len(gap_rows), "by_status": dict(sorted(by_status.items()))},
         "recency": {"recent": len(recent), "dated": len(dated),
-                    "undated": len(candidates) - len(dated), "percent": percent},
+                    "undated": len(candidates) - len(dated), "percent": percent,
+                    "window_from": year - 1},
         "saturation": saturation,
         "candidates": len(candidates),
     }
@@ -126,8 +127,12 @@ def meta_strip_html(stats: dict) -> str:
     if recency["percent"] is None:
         cells.append(_cell("Corpus recency", "unknown", "no publication dates"))
     else:
+        # The window is part of the number. "67% recent" with no definition is a
+        # statistic the reader cannot check, in the strip whose entire purpose is
+        # that every figure on it can be checked.
         cells.append(_cell("Corpus recency", str(recency["percent"]) + "%",
-                           "of " + str(recency["dated"]) + " dated"))
+                           "published " + str(recency["window_from"]) + " or later, of "
+                           + str(recency["dated"]) + " dated"))
     saturation = stats["saturation"]
     if saturation["stopped_because"] == "cap_reached":
         detail = "stopped at the cap, not saturated"

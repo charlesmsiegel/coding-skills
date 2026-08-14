@@ -221,3 +221,28 @@ def test_the_pages_tree_node_is_not_counted_as_a_page(common):
 
 def test_a_pdf_with_no_page_objects_is_unknown_rather_than_zero(common):
     assert common.pdf_page_count(b"%PDF-1.4\ngarbage\n") is None
+
+
+def test_a_declared_count_beats_the_page_objects_left_uncompressed(common):
+    """Since PDF 1.5 a producer may pack page objects into compressed streams, and
+    pdfTeX does. Counting only what is visible said a 30-page paper had 3 pages,
+    and the gate is blocking — so a correct citation to page 12 failed the run."""
+    data = (b"%PDF-1.5\n1 0 obj\n<< /Type /Pages /Count 30 /Kids [] >>\nendobj\n"
+            + b"2 0 obj\n<< /Type /Page /Parent 1 0 R >>\nendobj\n" * 3
+            + b"4 0 obj\n<< /Type /ObjStm /N 27 >>\nstream\n...\nendstream\n%%EOF\n")
+
+    assert common.pdf_page_count(data) == 30
+
+
+def test_the_count_may_be_written_before_the_type(common):
+    data = b"%PDF-1.5\n1 0 obj\n<< /Count 12 /Kids [] /Type /Pages >>\nendobj\n"
+
+    assert common.pdf_page_count(data) == 12
+
+
+def test_an_outlines_count_is_not_mistaken_for_a_page_total(common):
+    """A bookmark tree carries /Count too; reading it as pages would weaken the check."""
+    data = (b"%PDF-1.4\n1 0 obj\n<< /Type /Outlines /Count 900 >>\nendobj\n"
+            + b"2 0 obj\n<< /Type /Page >>\nendobj\n" * 2)
+
+    assert common.pdf_page_count(data) == 2

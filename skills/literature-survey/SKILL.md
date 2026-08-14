@@ -154,8 +154,10 @@ bytes no longer match, a page beyond the document's length, a quote that is not 
 the file, or a report link that resolves to nothing on disk. Fix the claim, not the
 check.
 
-A page in a PDF whose page count cannot be determined is reported *unverifiable*
-rather than passing. Unverifiable is not clean.
+A check it cannot perform is reported *unverifiable* rather than passing: a page in
+a PDF whose page count cannot be determined, a quote in a binary artifact, a
+section name with no page or quote beside it. **Unverifiable is not clean** —
+prefer a page *and* a quote, and read the caveats, not only the exit code.
 
 ## Acquisition etiquette
 
