@@ -273,9 +273,27 @@ def _richer(a, b):
     return a
 
 
+# Selected beats dropped beats new. Triage is hand-edited by design, so two rows
+# for one work can carry opposite verdicts — dropping one of them as "duplicate of
+# the Salas paper" is the natural thing to write while triaging, and the merge is
+# the act of recognising that duplicate. Taking `a`'s status and `a or b`'s reason
+# produced selected-with-a-drop_reason, which the Candidate invariant rejects: the
+# whole search stage died on a ValueError about a dataclass field, naming neither
+# of the two rows that disagreed. Reading one paper too many is the cheap error.
+_STATUS_RANK = {"selected": 2, "dropped": 1, "new": 0}
+
+
+def _resolve_status(a: Candidate, b: Candidate) -> tuple[str, str]:
+    winner = a if _STATUS_RANK[a.status] >= _STATUS_RANK[b.status] else b
+    if winner.status != "dropped":
+        return winner.status, ""
+    return "dropped", winner.drop_reason or a.drop_reason or b.drop_reason
+
+
 def _merge(a: Candidate, b: Candidate) -> Candidate:
     ids = dict(a.external_ids)
     ids.update({k: v for k, v in b.external_ids.items() if v})
+    status, drop_reason = _resolve_status(a, b)
     return Candidate(
         title=_richer(a.title, b.title),
         external_ids=ids,
@@ -287,8 +305,8 @@ def _merge(a: Candidate, b: Candidate) -> Candidate:
         pdf_url=_richer(a.pdf_url, b.pdf_url),
         landing_url=_richer(a.landing_url, b.landing_url),
         sources=sorted(set(a.sources) | set(b.sources)),
-        status=a.status if a.status != "new" else b.status,
-        drop_reason=a.drop_reason or b.drop_reason,
+        status=status,
+        drop_reason=drop_reason,
     )
 
 

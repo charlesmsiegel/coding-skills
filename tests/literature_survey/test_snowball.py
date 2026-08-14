@@ -216,6 +216,15 @@ def test_snowballing_before_anything_is_read_refuses_to_bank_a_barren_round(snow
     assert not (tmp_path / "snowball.json").exists()
 
 
+def test_a_missing_candidates_file_names_the_stage_that_was_skipped(snowball, tmp_path):
+    """It used to be a bare FileNotFoundError, unlike every other stage here."""
+    (tmp_path / "docs" / "notes").mkdir(parents=True)
+    (tmp_path / "docs" / "notes" / "W1.json").write_text('{"artifact_id": "W1"}', encoding="utf-8")
+
+    with pytest.raises(SystemExit, match="run search_sources.py first"):
+        snowball.run(tmp_path, FakeHttp(), round_number=1)
+
+
 def test_every_round_is_recorded_for_the_masthead(snowball, tmp_path):
     survey(tmp_path)
     snowball.run(tmp_path, FakeHttp({"W1": [work("W2", "A citer")]}), round_number=1)

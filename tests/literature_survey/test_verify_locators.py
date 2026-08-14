@@ -312,6 +312,19 @@ def test_a_gate_with_nothing_to_check_says_it_proved_nothing(survey):
     assert "this gate proves nothing" in result.stdout
 
 
+def test_an_unparseable_note_stops_the_gate_with_a_message_not_a_traceback(survey):
+    """A traceback out of a blocking gate reads as the gate breaking rather than as
+    the run having a bad note in it, and that decides whether anyone fixes the note."""
+    out = survey.artifact("2401.1", PDF_TWO_PAGES).write()
+    (out / "docs" / "notes" / "2401.1.json").write_text("{oops", encoding="utf-8")
+
+    result = run_cli(out)
+
+    assert result.returncode != 0
+    assert "Traceback" not in result.stderr
+    assert "the gate did not run" in result.stderr and "did not parse" in result.stderr
+
+
 def test_a_survey_with_no_manifest_is_an_error_rather_than_a_pass(survey, tmp_path):
     result = run_cli(tmp_path / "empty")
 

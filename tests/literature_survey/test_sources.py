@@ -266,6 +266,47 @@ def test_a_triage_decision_survives_a_merge(sources):
     assert merged[0].drop_reason == "wrong field"
 
 
+def test_opposite_triage_verdicts_on_one_work_resolve_instead_of_crashing(sources):
+    """Triage is hand-edited, and "dropped: duplicate of the Salas paper" beside the
+    row it duplicates is the natural thing to write. Carrying `a`'s status with
+    `a or b`'s reason made a selected candidate with a drop_reason, which the
+    invariant rejects — so the whole search stage died on a dataclass error that
+    named neither of the two rows that disagreed."""
+    merged = sources.dedupe([
+        sources.Candidate(title="Team cognition", year=2001, external_ids={"doi": "10.1/y"},
+                          status="selected"),
+        sources.Candidate(title="Team cognition", year=2001, external_ids={"doi": "10.1/y"},
+                          status="dropped", drop_reason="duplicate of the Salas paper"),
+    ])
+
+    assert len(merged) == 1
+    assert merged[0].status == "selected", "reading one paper too many is the cheap error"
+    assert merged[0].drop_reason == ""
+
+
+def test_the_verdict_order_does_not_depend_on_which_row_came_first(sources):
+    def verdict(first, second):
+        return sources.dedupe([first, second])[0].status
+
+    selected = dict(title="T", year=2001, external_ids={"doi": "10.1/y"}, status="selected")
+    dropped = dict(title="T", year=2001, external_ids={"doi": "10.1/y"}, status="dropped",
+                   drop_reason="off-topic")
+
+    assert verdict(sources.Candidate(**selected), sources.Candidate(**dropped)) == "selected"
+    assert verdict(sources.Candidate(**dropped), sources.Candidate(**selected)) == "selected"
+
+
+def test_a_dropped_row_still_beats_an_untriaged_one_and_keeps_its_reason(sources):
+    """A re-run's fresh `new` record must not undo a triage decision."""
+    merged = sources.dedupe([
+        sources.Candidate(title="T", year=2001, external_ids={"doi": "10.1/y"},
+                          status="dropped", drop_reason="wrong discipline"),
+        sources.Candidate(title="T", year=2001, external_ids={"doi": "10.1/y"}),
+    ])
+
+    assert merged[0].status == "dropped" and merged[0].drop_reason == "wrong discipline"
+
+
 def test_dedupe_preserves_first_seen_order(sources):
     """search_sources.py slices `merged[known_count:]` to find what is new; order is load-bearing."""
     merged = sources.dedupe([
