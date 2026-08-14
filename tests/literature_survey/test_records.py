@@ -156,6 +156,15 @@ def test_a_title_of_pure_punctuation_still_yields_a_filename(common):
     assert common.slugify("!!! ???") == "untitled"
 
 
+def test_an_old_style_arxiv_id_cannot_turn_into_a_directory(common):
+    """It names `docs/notes/<id>.json`, and load_notes and snowball both glob one level:
+    a note written into a subdirectory is a paper that reads as never read."""
+    candidate = common.Candidate(title="t", external_ids={"arxiv": "cond-mat/0509127"})
+
+    assert "/" not in common.artifact_id(candidate)
+    assert "/" not in common.artifact_filename(candidate, ".pdf")
+
+
 def test_artifact_id_prefers_arxiv_then_doi_then_openalex(common):
     both = common.Candidate(title="t", external_ids={"arxiv": "2401.00001", "doi": "10.1/x"})
     doi_only = common.Candidate(title="t", external_ids={"doi": "10.1145/3411764.3445092"})

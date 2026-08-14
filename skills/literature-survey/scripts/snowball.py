@@ -28,6 +28,23 @@ from sources import dedupe, parse_openalex
 
 OPENALEX_WORK = "https://api.openalex.org/works"
 
+# OpenAlex's maximum page size. Asking for more is refused, so this is the walk's
+# real per-work ceiling and the number the caveat has to name.
+PAGE_SIZE = 100
+
+
+def _declared_total(body: bytes) -> int | None:
+    """How many neighbours OpenAlex says exist, or None if it did not say."""
+    try:
+        count = (json.loads(body.decode("utf-8")).get("meta") or {}).get("count")
+    except (json.JSONDecodeError, UnicodeDecodeError, AttributeError):
+        return None
+    return count if isinstance(count, int) else None
+
+
+def _direction(url: str) -> str:
+    return "references" if "cited_by:" in url else "citers"
+
 
 def _read_ids(out: Path) -> list[str]:
     notes = out / "docs" / "notes"
@@ -108,7 +125,20 @@ def run(out: Path, http, round_number: int, cap: int = 250) -> dict:
             continue
         for url in _neighbour_urls(work_id):
             try:
-                discovered.extend(parse_openalex(http.get(url).body))
+                body = http.get(url).body
+                discovered.extend(parse_openalex(body))
+                # OpenAlex reports how many neighbours exist; we ask for one page of
+                # them. A heavily-cited paper has thousands, and taking the first
+                # hundred without saying so is the same silent truncation the cap
+                # rule exists to prevent one level up — the round would report
+                # "barren" over a graph it never finished walking.
+                total = _declared_total(body)
+                if total is not None and total > PAGE_SIZE:
+                    caveats.append(
+                        "only the first " + str(PAGE_SIZE) + " of " + str(total)
+                        + " neighbours of " + artifact + " were walked (" + _direction(url)
+                        + "): this round is bounded by page size, not by the graph"
+                    )
             except Exception as exc:  # noqa: BLE001 - one dead neighbour is not a dead round
                 caveats.append("neighbours of " + artifact + " partly unavailable: " + str(exc))
 

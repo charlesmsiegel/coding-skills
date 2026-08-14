@@ -37,24 +37,31 @@ def run(topic: str, subtopics: list[str], out: Path, http, limit: int = 50) -> d
     queries = [topic] + list(subtopics)
 
     found: list[Candidate] = []
-    failed: dict[str, str] = {}
-    searched = 0
+    # Per source: how many of its queries failed, and why. Counting rather than
+    # keeping one flag matters — a source that answered the topic query and timed
+    # out on two subtopics used to be counted as searched *and* listed as failed,
+    # so the headline said "4 of 4 sources" over a file that said arXiv was never
+    # searched. Half a source's queries silently not running is exactly the kind of
+    # partial coverage this skill refuses to let read as complete.
+    failures: dict[str, list[str]] = {}
+    succeeded: dict[str, int] = {}
     for name, (build_url, parse) in PARSERS.items():
-        ok = False
         for query in queries:
             try:
                 response = http.get(build_url(query, limit=limit))
                 found.extend(parse(response.body))
-                ok = True
+                succeeded[name] = succeeded.get(name, 0) + 1
             except Exception as exc:  # noqa: BLE001 - any source failure is a caveat
-                failed[name] = str(exc)
-        if ok:
-            searched += 1
+                failures.setdefault(name, []).append(query + ": " + str(exc))
 
-    if searched == 0:
+    searched = sorted(succeeded)
+    dead = sorted(set(PARSERS) - set(succeeded))
+    partial = sorted(name for name in failures if name in succeeded)
+
+    if not searched:
         raise SystemExit(
             "every source failed, so this is a connectivity problem rather than an empty "
-            "literature: " + json.dumps(failed, indent=2)
+            "literature: " + json.dumps({k: v for k, v in sorted(failures.items())}, indent=2)
         )
 
     merged = dedupe(_load_existing(out / "candidates.json") + found)
@@ -62,16 +69,27 @@ def run(topic: str, subtopics: list[str], out: Path, http, limit: int = 50) -> d
         json.dumps({
             "topic": topic,
             "subtopics": list(subtopics),
-            "sources_searched": sorted(set(PARSERS) - set(failed)),
-            "sources_failed": sorted(failed),
+            "queries_per_source": len(queries),
+            "sources_searched": searched,
+            "sources_failed": dead,
+            "sources_partial": {name: len(failures[name]) for name in partial},
+            "query_failures": {name: rows for name, rows in sorted(failures.items())},
             "candidates": [c.to_dict() for c in merged],
         }, indent=2),
         encoding="utf-8",
     )
+    caveats = [name + " failed on every query: " + failures[name][0] for name in dead]
+    caveats += [
+        name + " answered " + str(succeeded[name]) + " of " + str(len(queries))
+        + " queries; the rest were not run, so its coverage of this topic is partial: "
+        + failures[name][0]
+        for name in partial
+    ]
     return {
-        "searched": searched,
+        "searched": len(searched),
+        "complete": len(searched) - len(partial),
         "candidates": len(merged),
-        "caveats": [name + " failed: " + reason for name, reason in sorted(failed.items())],
+        "caveats": caveats,
     }
 
 
@@ -90,7 +108,8 @@ def main() -> int:
     reporter = Reporter("search_sources")
     reporter.headline(
         str(result["candidates"]) + " distinct candidates from "
-        + str(result["searched"]) + " of " + str(len(PARSERS)) + " sources"
+        + str(result["searched"]) + " of " + str(len(PARSERS)) + " sources ("
+        + str(result["complete"]) + " answered every query)"
     )
     for caveat in result["caveats"]:
         reporter.caveat(caveat)
