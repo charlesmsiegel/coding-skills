@@ -90,6 +90,16 @@ def test_the_gate_is_described_as_blocking():
     assert "Fix the claim, not the check" in text
 
 
+def test_unverifiable_is_documented_as_distinct_from_clean():
+    """A green exit code over checks that could not be performed is the shape of a
+    laundered result, so the body has to say the caveats are part of the verdict."""
+    text = prose()
+
+    assert "Unverifiable is not clean" in text
+    for case in ("page count cannot be determined", "binary artifact", "section name"):
+        assert case in text, f"the gate's unverifiable cases do not mention {case}"
+
+
 def test_the_masthead_numbers_are_forbidden_to_be_written_by_hand():
     text = prose()
 

@@ -18,6 +18,7 @@ import argparse
 import datetime as _dt
 import hashlib
 import json
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -49,9 +50,17 @@ def _now() -> str:
     return _dt.datetime.now(_dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+# Anchored on the status Http reports, not on the digits appearing anywhere in the
+# string. The reason carries the URL, and a bare substring test called a timeout on
+# https://.../10.1371/journal.pone.0040312 a paywall — which puts a paper in the
+# gaps tab as deliberately inaccessible when the network merely flaked, and sends
+# whoever reads that tab looking for institutional access they already have.
+_PAYWALL_RE = re.compile(r"HTTP (401|403)\b")
+
+
 def _classify_failure(reason: str) -> str:
     """A 401/403 is a paywall; anything else is just a failure. Both are gaps."""
-    if "401" in reason or "403" in reason:
+    if _PAYWALL_RE.search(reason):
         return "paywalled"
     return "failed"
 

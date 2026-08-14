@@ -104,8 +104,19 @@ def test_recency_is_a_share_of_the_dated_candidates_only(stats, tmp_path):
 
     computed = stats.compute(tmp_path, current_year=2026)
 
-    assert computed["recency"] == {"recent": 2, "dated": 3, "undated": 1, "percent": 67}
+    assert computed["recency"] == {"recent": 2, "dated": 3, "undated": 1, "percent": 67,
+                                   "window_from": 2025}
     assert "of 3 dated" in stats.meta_strip_html(computed)
+
+
+def test_the_recency_window_is_stated_beside_the_percentage(stats, tmp_path):
+    """A bare "67% recent" is a statistic the reader cannot check, on the one strip
+    whose entire purpose is that every figure on it can be."""
+    survey(tmp_path, artifacts=[ok("a")], candidates=[{"title": "A", "year": 2026}])
+
+    strip = stats.meta_strip_html(stats.compute(tmp_path, current_year=2026))
+
+    assert "published 2025 or later" in strip
 
 
 def test_a_cap_stop_is_reported_as_a_cap_stop(stats, tmp_path):

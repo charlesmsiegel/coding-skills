@@ -14,6 +14,7 @@ Each API is awkward differently, and the awkwardness is load-bearing:
 """
 
 import json
+import re
 import xml.etree.ElementTree as ET
 from urllib.parse import urlencode
 
@@ -65,6 +66,20 @@ def crossref_query_url(query: str, limit: int = 50, offset: int = 0) -> str:
     return CROSSREF_API + "?" + params
 
 
+def _arxiv_id(raw_id: str) -> str:
+    """The citable id, from the abs URL, minus only its version suffix.
+
+    Both halves matter. Splitting on the first "v" and keeping the last path
+    segment turned `abs/cond-mat/0509127v1` into `0509127` — which drops the
+    archive prefix, so `cond-mat/0509127` and `hep-th/0509127` became one key and
+    `dedupe` merged two unrelated papers into one candidate under whichever title
+    was longer. Old-style ids ran until 2007 and are cited constantly, and a
+    result deleted this way is invisible to every later stage.
+    """
+    tail = raw_id.split("/abs/", 1)[-1] if "/abs/" in raw_id else raw_id.rsplit("/", 1)[-1]
+    return re.sub(r"v\d+$", "", tail)
+
+
 def parse_arxiv(payload: bytes) -> list[Candidate]:
     try:
         root = ET.fromstring(payload)
@@ -73,9 +88,7 @@ def parse_arxiv(payload: bytes) -> list[Candidate]:
     out = []
     for entry in root.findall(ATOM + "entry"):
         raw_id = _text(entry.find(ATOM + "id"))
-        bare = raw_id.rsplit("/", 1)[-1]
-        arxiv_id = bare.split("v")[0] if "v" in bare else bare
-        ids = {"arxiv": arxiv_id}
+        ids = {"arxiv": _arxiv_id(raw_id)}
         doi = _text(entry.find(ARXIV_NS + "doi"))
         if doi:
             ids["doi"] = doi

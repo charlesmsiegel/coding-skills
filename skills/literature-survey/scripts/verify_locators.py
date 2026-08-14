@@ -98,12 +98,37 @@ def run(out, report=None) -> dict:
                     else:
                         unverifiable.append({**context, "reason": "quote cannot be checked in "
                                              "a binary artifact (" + path.suffix + ")"})
+                if locator.section and not locator.quote and locator.page is None:
+                    # A section name is a locator SKILL.md offers on equal terms with a
+                    # page and a quote, and it used to be the only one nothing resolved:
+                    # "Section 12: The Nonexistent Results" against a two-page paper
+                    # exited 0 and was counted as checked. The cheapest locator to
+                    # fabricate must not also be the one that always passes, so it is
+                    # searched where that is possible and declared unverifiable where it
+                    # is not. Unverifiable is not clean.
+                    if path.suffix.lower() in TEXT_SUFFIXES:
+                        haystack = _normalize(_strip_tags(body.decode("utf-8", "replace")))
+                        if _normalize(locator.section) not in haystack:
+                            failures.append({**context, "reason": "section "
+                                             + repr(locator.section) + " not found in "
+                                             + entry["path"]})
+                            continue
+                    else:
+                        unverifiable.append({**context, "reason": "a section-only locator "
+                                             "cannot be resolved in a binary artifact ("
+                                             + path.suffix + "); cite a page or a quote to "
+                                             "make this claim checkable"})
 
     if report is not None:
         report_path = Path(report)
         if report_path.is_file():
             for href in HREF_RE.findall(report_path.read_text(encoding="utf-8")):
-                if not (out / href).exists():
+                # `docs/papers/x.pdf#page=4` names the same file as `docs/papers/x.pdf`.
+                # A deep link to the page a claim cites is exactly what the report
+                # structure asks for, and failing it would have the author delete the
+                # most useful thing in the citation to get past a blocking gate.
+                target = href.split("#", 1)[0].split("?", 1)[0]
+                if not target or not (out / target).exists():
                     failures.append({"note": "-", "claim": "-", "artifact": href,
                                      "reason": "report links to " + href
                                      + " which is not on disk"})

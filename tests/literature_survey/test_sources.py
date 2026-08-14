@@ -43,6 +43,36 @@ def test_the_arxiv_version_suffix_is_stripped_from_the_id(sources):
     assert candidate.external_ids["arxiv"] == "2401.00001"
 
 
+OLD_STYLE_FEED = b"""<?xml version="1.0"?><feed xmlns="http://www.w3.org/2005/Atom">
+  <entry><id>http://arxiv.org/abs/cond-mat/0509127v1</id><title>A condensed matter paper</title>
+    <published>2005-09-06T00:00:00Z</published></entry>
+  <entry><id>http://arxiv.org/abs/hep-th/0509127v2</id>
+    <title>A completely different string theory paper</title>
+    <published>2005-09-06T00:00:00Z</published></entry>
+</feed>"""
+
+
+def test_an_old_style_arxiv_id_keeps_its_archive_prefix(sources):
+    """`cond-mat/0509127` truncated to `0509127` is not a citable id, and worse it is
+    the same key as `hep-th/0509127` — a different paper entirely."""
+    first, second = sources.parse_arxiv(OLD_STYLE_FEED)
+
+    assert first.external_ids["arxiv"] == "cond-mat/0509127"
+    assert second.external_ids["arxiv"] == "hep-th/0509127"
+
+
+def test_two_old_style_papers_from_different_archives_are_not_merged(sources):
+    """The merge kept whichever title was longer, so one paper left the corpus under
+    the other's name — invisible to every stage downstream."""
+    assert len(sources.dedupe(sources.parse_arxiv(OLD_STYLE_FEED))) == 2
+
+
+def test_only_a_trailing_version_suffix_is_stripped(sources):
+    assert sources._arxiv_id("http://arxiv.org/abs/2401.00001v12") == "2401.00001"
+    assert sources._arxiv_id("http://arxiv.org/abs/2401.00001") == "2401.00001"
+    assert sources._arxiv_id("http://arxiv.org/abs/math.GT/0309136v1") == "math.GT/0309136"
+
+
 def test_an_arxiv_title_wrapped_across_lines_is_rejoined(sources):
     [candidate] = sources.parse_arxiv(ARXIV_FEED)
 
