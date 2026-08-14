@@ -147,7 +147,13 @@ def main() -> int:
     ap.add_argument("--format", choices=["text", "json"], default="text")
     args = ap.parse_args()
 
-    result = run(args.out, report=args.report)
+    try:
+        result = run(args.out, report=args.report)
+    except ValueError as exc:
+        # A note that will not parse is a real stop, but a traceback out of a
+        # blocking gate reads as the gate breaking rather than as the run having a
+        # bad note in it — and the difference decides whether anyone fixes the note.
+        raise SystemExit("the gate did not run: " + str(exc)) from exc
 
     reporter = Reporter("verify_locators")
     reporter.headline(

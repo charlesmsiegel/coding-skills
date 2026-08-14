@@ -106,6 +106,12 @@ def run(out: Path, http, round_number: int, cap: int = 250) -> dict:
         )
 
     candidates_path = out / "candidates.json"
+    if not candidates_path.is_file():
+        raise SystemExit(
+            "no candidates.json in " + str(out) + " — run search_sources.py first; the "
+            "snowball subtracts what is already known, and with nothing known every "
+            "neighbour would re-enter triage as a discovery"
+        )
     payload = json.loads(candidates_path.read_text(encoding="utf-8"))
     known = [Candidate.from_dict(c) for c in payload.get("candidates", [])]
     known_count = len(known)
