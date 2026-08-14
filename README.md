@@ -92,6 +92,24 @@ mechanical.
 - **[fix-pr](skills/fix-pr/)** — work through review feedback.
   `fetch_pr_feedback.py` pulls inline threads with their resolved state, which
   `gh pr view` cannot show. Complying with a wrong suggestion counts as a failure.
+- **[literature-survey](skills/literature-survey/)** — the only skill here whose subject
+  is not this checkout. Researches an external body of knowledge and leaves two things: a
+  corpus on disk and a report whose every claim points into it. Discovery across arXiv,
+  Semantic Scholar, OpenAlex and Crossref (one dead source is a caveat, all four dead is
+  an error — an unreachable network must never render as an empty literature), hash-pinned
+  download of every artifact, one reader per artifact with no reader shown another's notes,
+  and citation snowballing that reports *cap reached* and *saturated* as the different
+  facts they are. The failure it exists to prevent is fluent synthesis over unread
+  abstracts, and downloading the PDFs does not prevent it — so a claim carries a locator
+  (page, section or verbatim quote) and `verify_locators.py` re-resolves every one against
+  the manifest before the report may stand. It is a **blocking** gate: a locator whose
+  file changed, whose page is past the end of the document or whose quote is not in the
+  text fails the run, and a check that could not be performed comes back *unverifiable*
+  rather than clean. Every masthead number is computed by `corpus_stats.py` from the
+  manifest, the notes and the snowball state — a hand-typed count would be an unverified
+  claim in the one place whose job is to establish the report's numbers can be trusted.
+  Rate-limited, `robots.txt`-respecting, and paywalls are recorded as gaps rather than
+  circumvented.
 - **[science-investigation](skills/science-investigation/)** — audits whether a system's
   numbers can be believed: is the right thing measured, on enough real data, with sound
   statistics, and does the reported score mean what the dashboard claims. A system can be
@@ -143,7 +161,7 @@ python tools/validate_skills.py     # frontmatter, naming, description limit, ev
 ```
 
 `tools/validate_skills.py` is the single definition of a structurally valid skill:
-CI runs it over all eleven on every pull request, and the release job runs it on the
+CI runs it over all fourteen on every pull request, and the release job runs it on the
 one skill it is about to package. It is stdlib-only, like the detectors, so it runs
 wherever the skills do. Its own rules are tested against deliberately-invalid skills
 in `tests/test_validate_skills.py` — a validator that cannot fail reads as coverage
@@ -156,10 +174,18 @@ references — templates, prompts, embedded data), and `llmops.py` (LLM call sit
 models, prompt lineage). The copies are byte-identical and CI
 enforces it — a skill directory has to be self-contained to be zipped and installed
 on its own, so the duplication is deliberate, not drift. `assemble.py` is identical
-except for one line (the `--label` default), also CI-checked. Two files differ on
+except for one line (the `--label` default) across *three* skills — those two and
+literature-survey, which assembles its report with the same fragment protocol — and
+CI checks all three copies against each other. Two files differ on
 purpose and are NOT synced: `assets/template.html` (each skill has its own theme;
 the renderers and placeholders match, which a test pins) and
 `references/llm-tabs.md` (different tab sets).
+
+literature-survey ships a `common.py` of its own that is **not** a copy of anybody's:
+same filename, entirely different subject (HTTP transport, the corpus records, the
+reporter). It is the reason its masthead goes in through `inject_masthead.py` at a
+marker rather than through a raw-HTML flag on `assemble.py` — a flag one skill needs
+is how three copies of a file start to drift.
 
 django-code-doctor ships its own copies of python-code-doctor's `common.py` and
 `format_findings.py`, byte-identical and CI-enforced, for the same reason: a skill has
