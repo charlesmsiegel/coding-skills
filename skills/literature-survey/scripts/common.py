@@ -170,7 +170,12 @@ def artifact_id(candidate: Candidate) -> str:
     """
     ids = candidate.external_ids
     if ids.get("arxiv"):
-        return ids["arxiv"]
+        # Old-style ids carry an archive prefix (cond-mat/0509127), and this id names
+        # files: the artifact, and `docs/notes/<id>.json`. Left as a slash it becomes a
+        # directory — where `load_notes` and `snowball._read_ids`, both non-recursive
+        # globs, cannot see the note at all, so the paper reads as never read and its
+        # claims are never put to the gate.
+        return ids["arxiv"].replace("/", "_")
     if ids.get("doi"):
         return ids["doi"].replace("/", "_")
     if ids.get("openalex"):

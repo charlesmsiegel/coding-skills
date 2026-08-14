@@ -81,6 +81,54 @@ def test_one_dead_source_is_a_caveat_not_a_crash(search, tmp_path):
     assert read_candidates(tmp_path)["sources_failed"] == ["semantic_scholar"]
 
 
+class FlakyArxiv(FakeHttp):
+    """arXiv answers the topic query and times out on the subtopic."""
+
+    def __init__(self):
+        super().__init__()
+        self.arxiv_calls = 0
+
+    def get(self, url, accept="*/*"):
+        if url.split("/")[2] == "export.arxiv.org":
+            self.arxiv_calls += 1
+            if self.arxiv_calls == 2:
+                raise OSError("timed out")
+        return super().get(url, accept)
+
+
+def test_a_source_that_answered_only_some_queries_is_not_reported_as_complete(search, tmp_path):
+    """It used to count as searched *and* be listed as failed, so the headline claimed
+    4 of 4 sources over a file that said arXiv was never searched."""
+    result = search.run("team knowledge", ["transactive memory"], tmp_path, FlakyArxiv())
+
+    assert result["searched"] == 4
+    assert result["complete"] == 3
+    assert any("arxiv answered 1 of 2 queries" in c for c in result["caveats"])
+
+
+def test_a_partly_failed_source_is_still_listed_as_searched(search, tmp_path):
+    """Its results are in the corpus; pretending otherwise misstates provenance."""
+    search.run("team knowledge", ["transactive memory"], tmp_path, FlakyArxiv())
+
+    payload = read_candidates(tmp_path)
+    assert "arxiv" in payload["sources_searched"]
+    assert payload["sources_failed"] == []
+    assert payload["sources_partial"] == {"arxiv": 1}
+    assert payload["queries_per_source"] == 2
+    assert payload["query_failures"]["arxiv"][0].startswith("transactive memory: ")
+
+
+def test_the_cli_headline_says_how_many_sources_answered_everything(search, tmp_path,
+                                                                    monkeypatch, capsys):
+    monkeypatch.setattr(search, "Http", FlakyArxiv)
+    monkeypatch.setattr("sys.argv", ["search_sources.py", "--topic", "team knowledge",
+                                     "--subtopic", "transactive memory", "--out", str(tmp_path)])
+
+    search.main()
+
+    assert "from 4 of 4 sources (3 answered every query)" in capsys.readouterr().out
+
+
 def test_every_source_failing_is_an_error_not_an_empty_literature(search, tmp_path):
     with pytest.raises(SystemExit, match="connectivity problem"):
         search.run("team knowledge", [], tmp_path, FakeHttp(dead=BY_HOST))

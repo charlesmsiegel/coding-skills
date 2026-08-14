@@ -32,6 +32,11 @@ class FakeHttp:
         self.fail = set(fail)
         self.urls: list[str] = []
 
+    def __call_meta(self, results):
+        return {"count": self.total if self.total is not None else len(results)}
+
+    total = None
+
     def get(self, url, accept="*/*"):
         self.urls.append(url)
         if any(token in url for token in self.fail):
@@ -40,7 +45,8 @@ class FakeHttp:
         for token, works in self.neighbours.items():
             if token in url:
                 results = works
-        return type("R", (), {"body": json.dumps({"results": results}).encode(), "content_type": ""})()
+        payload = {"meta": self.__call_meta(results), "results": results}
+        return type("R", (), {"body": json.dumps(payload).encode(), "content_type": ""})()
 
 
 def survey(out: Path, read_ids=("W1",), candidates=None) -> None:
@@ -126,6 +132,29 @@ def test_the_cap_is_never_reported_as_saturation(snowball, tmp_path):
     assert result["new_candidates"] == [], "nothing is banked from a round the cap truncated"
     assert state(tmp_path)["stopped_because"] == "cap_reached"
     assert any("bounded by budget" in c for c in result["caveats"])
+
+
+def test_a_neighbour_list_longer_than_one_page_is_declared_truncated(snowball, tmp_path):
+    """A heavily-cited paper has thousands of citers and the walk fetches one page.
+    Taking the first hundred quietly is the silent truncation the cap rule forbids
+    one level up — and it would let a round report 'barren' over an unfinished graph."""
+    survey(tmp_path)
+    http = FakeHttp({"W1": [work("W2", "A citer")]})
+    http.total = 4200
+
+    result = snowball.run(tmp_path, http, round_number=1)
+
+    assert any("only the first 100 of 4200 neighbours" in c for c in result["caveats"])
+    assert any("citers" in c for c in result["caveats"])
+    assert any("references" in c for c in result["caveats"])
+
+
+def test_a_neighbour_list_that_fits_in_one_page_says_nothing(snowball, tmp_path):
+    survey(tmp_path)
+
+    result = snowball.run(tmp_path, FakeHttp({"W1": [work("W2", "A citer")]}), round_number=1)
+
+    assert not any("bounded by page size" in c for c in result["caveats"])
 
 
 def test_an_unresolvable_artifact_is_a_caveat_about_coverage(snowball, tmp_path):

@@ -55,6 +55,11 @@ error, because an empty corpus caused by an unreachable network must never rende
 as "the literature is empty". Semantic Scholar rate-limits without an API key, so
 "3 of 4 sources" is normal.
 
+The headline distinguishes sources that answered **every** query from sources that
+answered some — each subtopic is a separate query per source, and a source that
+timed out on two of three covers this topic partially. **Read the caveats.** "4 of
+4 sources" over half-run queries is the coverage claim the report would inherit.
+
 ## 3. Triage
 
 **Read `references/triage-and-selection.md`.** This stage is pure judgment and no
@@ -105,6 +110,11 @@ References and citers of what has been read, minus everything already seen, plus
 verdict. New candidates re-enter triage. Stop on two consecutive barren rounds, or
 on the cap — **and if the cap stopped it, the report says so.** Silent truncation
 reads as coverage.
+
+The same rule applies one level down: the graph is walked one page per direction
+per work, so a heavily-cited paper's neighbours are truncated and the round says
+by how much. A "barren" verdict over a graph that was never finished is a claim
+about the budget, not about the literature.
 
 ## 7. Synthesize, then attack
 
