@@ -52,9 +52,16 @@ jobs:
                    resources.py llmops.py; do
             cmp "$CV/$f" "$PR/$f" || { echo "::error::$f has drifted between the two skills"; exit 1; }
           done
-          # assemble.py differs in exactly one line: the --label default.
+          # assemble.py differs in exactly one line: the --label default. Three
+          # skills ship it — literature-survey assembles its report with the same
+          # fragment protocol — so all three copies are compared, not just two.
+          LS=skills/literature-survey/scripts
           if ! diff <(sed 's/PULL REQUEST REVIEW/CODEBASE ATLAS/' "$PR/assemble.py") "$CV/assemble.py"; then
-            echo "::error::assemble.py copies differ beyond the --label default"
+            echo "::error::assemble.py copies differ beyond the --label default (pr-visualization)"
+            exit 1
+          fi
+          if ! diff <(sed 's/LITERATURE SURVEY/CODEBASE ATLAS/' "$LS/assemble.py") "$CV/assemble.py"; then
+            echo "::error::assemble.py copies differ beyond the --label default (literature-survey)"
             exit 1
           fi
 

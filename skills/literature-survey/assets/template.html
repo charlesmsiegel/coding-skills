@@ -1,0 +1,217 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title><!--DOC_TITLE--></title>
+<style>
+/* Design tokens follow the knowledge-extraction reference run: IBM Plex, a slate
+   base with rust/teal/crimson/gold accents, and a full dark-mode override. The
+   masthead is the part the atlas header does not have — it tells the reader what
+   was actually consumed before any navigation happens. */
+:root{
+  --font-body:'IBM Plex Sans','Helvetica Neue',system-ui,sans-serif;
+  --font-mono:'IBM Plex Mono','SF Mono',Consolas,monospace;
+  --font-serif:'IBM Plex Serif',Georgia,serif;
+
+  --bg:#eef1f4;
+  --paper:#fbfcfd;
+  --surface:#ffffff;
+  --surface2:#f2f5f8;
+  --border:rgba(30,58,95,0.14);
+  --border-bright:rgba(30,58,95,0.28);
+  --text:#16233a;
+  --text-dim:#5c6b81;
+  --text-faint:#8b98a9;
+
+  --slate:#1e3a5f;      --slate-dim:rgba(30,58,95,0.09);
+  --rust:#b4530a;       --rust-dim:rgba(180,83,10,0.10);
+  --teal:#0f6e6b;       --teal-dim:rgba(15,110,107,0.10);
+  --crimson:#9f1239;    --crimson-dim:rgba(159,18,57,0.09);
+  --gold:#a07800;       --gold-dim:rgba(160,120,0,0.11);
+  --accent:var(--slate);
+}
+@media (prefers-color-scheme:dark){
+  :root{
+    --bg:#0e141c;
+    --paper:#131b25;
+    --surface:#161f2b;
+    --surface2:#1b2634;
+    --border:rgba(146,180,214,0.14);
+    --border-bright:rgba(146,180,214,0.30);
+    --text:#dce6f0;
+    --text-dim:#93a3b6;
+    --text-faint:#6b7a8d;
+
+    --slate:#7aa7d4;      --slate-dim:rgba(122,167,212,0.13);
+    --rust:#e08c46;       --rust-dim:rgba(224,140,70,0.13);
+    --teal:#4ec3ba;       --teal-dim:rgba(78,195,186,0.13);
+    --crimson:#e8738f;    --crimson-dim:rgba(232,115,143,0.13);
+    --gold:#d9b23c;       --gold-dim:rgba(217,178,60,0.13);
+  }
+}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--text);font-family:var(--font-body);
+     font-size:15px;line-height:1.65}
+.wrap{max-width:1180px;margin:0 auto;padding:28px 22px 80px}
+a{color:var(--slate)}
+code,.mono{font-family:var(--font-mono);font-size:.92em}
+.nowrap{white-space:nowrap}
+.dim{color:var(--text-dim)}
+
+/* ---------------------------------------------------------------- masthead */
+.masthead{border:1px solid var(--border-bright);background:var(--paper);
+          padding:34px 38px 30px;position:relative;margin-bottom:26px}
+.stamp{font-family:var(--font-mono);font-size:11px;letter-spacing:.14em;
+       text-transform:uppercase;color:var(--text-faint)}
+h1{font-family:var(--font-serif);font-size:clamp(28px,4.4vw,46px);line-height:1.07;
+   margin:14px 0 6px;font-weight:600;letter-spacing:-.02em}
+h1 em{font-style:italic;color:var(--slate)}
+.dek{font-size:17px;color:var(--text-dim);max-width:74ch;margin:12px 0 0;line-height:1.6}
+.meta-strip{display:flex;flex-wrap:wrap;gap:0;margin-top:26px;
+            border-top:1px solid var(--border);padding-top:18px}
+.meta-strip>div{padding:0 26px 0 0;margin-right:26px;border-right:1px solid var(--border);
+                display:flex;flex-direction:column;gap:3px}
+.meta-strip>div:last-child{border-right:0}
+.meta-strip .k{font-family:var(--font-mono);font-size:10.5px;letter-spacing:.1em;
+               text-transform:uppercase;color:var(--text-faint)}
+.meta-strip .v{font-size:19px;font-weight:600;font-family:var(--font-serif)}
+.meta-strip .v small{font-size:12px;font-weight:400;color:var(--text-dim);
+                     font-family:var(--font-body)}
+
+/* -------------------------------------------------------------------- tabs */
+nav.tabs{display:flex;flex-wrap:wrap;gap:2px;border-bottom:1px solid var(--border-bright);
+         margin-bottom:24px}
+nav.tabs button{appearance:none;background:transparent;border:1px solid transparent;
+  border-bottom:0;padding:10px 16px;font-family:var(--font-mono);font-size:11.5px;
+  letter-spacing:.08em;text-transform:uppercase;color:var(--text-dim);cursor:pointer}
+nav.tabs button:hover{color:var(--text);background:var(--surface2)}
+nav.tabs button[aria-selected="true"]{color:var(--text);background:var(--paper);
+  border-color:var(--border-bright);position:relative;top:1px}
+.panel{display:none}
+.panel.active{display:block}
+
+/* -------------------------------------------------------- section headings */
+.sec-head{display:flex;align-items:baseline;gap:14px;margin:38px 0 14px;
+          border-bottom:1px solid var(--border);padding-bottom:8px}
+.sec-head .n{font-family:var(--font-mono);font-size:12px;color:var(--text-faint)}
+.sec-head h2{font-family:var(--font-serif);font-size:24px;margin:0;font-weight:600}
+.sec-sub{color:var(--text-dim);font-size:14px;margin:-6px 0 16px}
+h3{font-family:var(--font-serif);font-size:19px;margin:26px 0 8px}
+h4{font-size:15.5px;margin:0 0 6px}
+.lead{font-size:16.5px;line-height:1.7;color:var(--text)}
+.pullquote{border-left:3px solid var(--slate);margin:20px 0;padding:4px 0 4px 18px;
+           font-family:var(--font-serif);font-size:18px;color:var(--text-dim)}
+.term{font-family:var(--font-mono);font-size:.9em;background:var(--slate-dim);
+      padding:1px 5px;border-radius:2px}
+
+/* -------------------------------------------------------------- components */
+.finding{display:flex;gap:16px;border:1px solid var(--border);background:var(--surface);
+         padding:18px 20px;margin:14px 0}
+.finding .fnum{font-family:var(--font-serif);font-size:26px;color:var(--slate);
+               line-height:1;min-width:26px}
+.finding .fbody{flex:1}
+.finding .fbody p:last-child{margin-bottom:0}
+
+.kpis{display:flex;flex-wrap:wrap;gap:12px;margin:16px 0}
+.kpi{flex:1 1 160px;border:1px solid var(--border);background:var(--surface);padding:14px 16px}
+.kpi .kl{font-family:var(--font-mono);font-size:10.5px;letter-spacing:.1em;
+         text-transform:uppercase;color:var(--text-faint);display:block}
+.kpi .kc{font-size:24px;font-weight:600;font-family:var(--font-serif)}
+.kpi.good{border-left:3px solid var(--teal)}
+.kpi.warn{border-left:3px solid var(--gold)}
+.kpi.bad{border-left:3px solid var(--crimson)}
+.kpi.neutral{border-left:3px solid var(--slate)}
+
+.callout{border:1px solid var(--border);border-left:3px solid var(--slate);
+         background:var(--slate-dim);padding:14px 18px;margin:16px 0}
+.callout.crim{border-left-color:var(--crimson);background:var(--crimson-dim)}
+.callout.teal{border-left-color:var(--teal);background:var(--teal-dim)}
+.callout.gold{border-left-color:var(--gold);background:var(--gold-dim)}
+.callout .ct{font-family:var(--font-mono);font-size:10.5px;letter-spacing:.1em;
+             text-transform:uppercase;color:var(--text-faint);display:block;margin-bottom:6px}
+
+.bar{height:8px;background:var(--slate);border-radius:2px}
+.bar.warn{background:var(--gold)}
+.bar.bad{background:var(--crimson)}
+.chart{display:flex;flex-direction:column;gap:8px;margin:16px 0}
+
+.ve-card{border:1px solid var(--border);background:var(--surface);padding:16px 18px;
+         border-top:3px solid var(--slate);margin:12px 0}
+.ve-card.bt-crim{border-top-color:var(--crimson)}
+.ve-card.bt-teal{border-top-color:var(--teal)}
+.ve-card.bt-rust{border-top-color:var(--rust)}
+.ve-card__label{font-family:var(--font-mono);font-size:10.5px;letter-spacing:.1em;
+                text-transform:uppercase;color:var(--text-faint)}
+
+.grid{display:grid;gap:14px;margin:16px 0}
+.grid.g2{grid-template-columns:repeat(auto-fit,minmax(280px,1fr))}
+.grid.g3{grid-template-columns:repeat(auto-fit,minmax(220px,1fr))}
+
+.tablewrap{overflow-x:auto;margin:16px 0}
+table{border-collapse:collapse;width:100%;font-size:13.5px}
+th,td{text-align:left;padding:7px 10px;border-bottom:1px solid var(--border);
+      vertical-align:top}
+th{font-family:var(--font-mono);font-size:10.5px;letter-spacing:.08em;
+   text-transform:uppercase;color:var(--text-faint);white-space:nowrap}
+
+.bibgroup{margin:22px 0}
+.bibgroup .bibname{font-family:var(--font-serif);font-size:17px;margin-bottom:4px}
+.bibgroup .bibblurb{color:var(--text-dim);font-size:13.5px;margin-bottom:8px}
+.bibcount{color:var(--text-faint)}
+.bibtable td:first-child{white-space:nowrap;font-family:var(--font-mono);font-size:12px}
+
+.tag{display:inline-block;font-family:var(--font-mono);font-size:10.5px;
+     letter-spacing:.06em;padding:1px 7px;border-radius:2px;text-transform:uppercase}
+.tag.t-yes{background:var(--teal-dim);color:var(--teal)}
+.tag.t-part{background:var(--gold-dim);color:var(--gold)}
+.tag.t-no{background:var(--crimson-dim);color:var(--crimson)}
+
+footer{margin-top:44px;padding-top:16px;border-top:1px solid var(--border);
+       color:var(--text-faint);font-size:12.5px}
+@media print{nav.tabs{display:none}.panel{display:block!important}}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<header class="masthead">
+  <div class="stamp"><!--DOC_LABEL--></div>
+  <h1><!--DOC_TITLE--></h1>
+  <p class="dek"><!--DOC_SUBTITLE--></p>
+  <!--META_STRIP-->
+</header>
+
+<nav class="tabs" role="tablist"><!--TABS_NAV--></nav>
+<main><!--TABS_PANELS--></main>
+
+<footer><!--DOC_FOOTER--><!--DOC_META--></footer>
+<!--SURVEY_META_JSON-->
+</div>
+<script>
+// Tab switching. Deliberately tiny and dependency-free: the report has to open
+// from a file:// URL years from now with no network and no build step.
+document.querySelectorAll('nav.tabs button').forEach(function (button) {
+  button.addEventListener('click', function () {
+    document.querySelectorAll('nav.tabs button').forEach(function (other) {
+      other.setAttribute('aria-selected', other === button ? 'true' : 'false');
+    });
+    var target = button.getAttribute('data-tab');
+    document.querySelectorAll('.panel').forEach(function (panel) {
+      panel.classList.toggle('active', panel.id === target);
+    });
+    if (window.location.hash !== '#' + target) {
+      history.replaceState(null, '', '#' + target);
+    }
+  });
+});
+// Deep links: open the tab named in the fragment, so a citation can point at one.
+(function () {
+  var wanted = window.location.hash.replace('#', '');
+  if (!wanted) { return; }
+  var button = document.querySelector('nav.tabs button[data-tab="' + wanted + '"]');
+  if (button) { button.click(); }
+})();
+</script>
+</body>
+</html>
