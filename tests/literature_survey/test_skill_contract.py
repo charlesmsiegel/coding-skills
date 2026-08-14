@@ -178,6 +178,42 @@ def test_the_non_cs_source_landscape_is_read_before_searching():
     assert text.index("references/source-landscape.md") < text.index("search_sources.py")
 
 
+# --- the note schema readers follow is the one the loader reads ----------
+
+def documented_note() -> dict:
+    """The worked example from the reading guide, parsed as a reader would copy it."""
+    text = (REFERENCES / "reading-a-paper.md").read_text(encoding="utf-8")
+    block = text.split("```json", 1)[1].split("```", 1)[0]
+    return json.loads(block)
+
+
+def test_the_worked_example_is_valid_json():
+    """It is fenced as json and is the thing a reader copies; a wrapped string value
+    made it fail to parse, so the first note of every run started from a syntax error."""
+    assert documented_note()["artifact_id"]
+
+
+def test_every_documented_note_field_is_a_field_the_loader_reads(load_module):
+    """Note.from_dict ignores what it does not recognise, so a guide that drifts from
+    the dataclass costs each reader a field that silently never reaches synthesis."""
+    import dataclasses
+
+    common = load_module(SCRIPTS, "common")
+    known = {f.name for f in dataclasses.fields(common.Note)}
+
+    assert set(documented_note()) - known == set()
+
+
+def test_the_worked_example_loads_into_the_records_it_documents(load_module):
+    common = load_module(SCRIPTS, "common")
+
+    note = common.Note.from_dict(documented_note())
+
+    assert note.claims and note.claims[0].locators, "a claim must carry its evidence"
+    assert note.leads and note.leads[0].also_explained_by, "a lead must carry its benign readings"
+    assert note.limitations_unstated, "the field the reader is there to fill"
+
+
 # --- the evals cover the judgment the tests cannot reach -----------------
 
 def test_the_evals_exercise_the_stages_pytest_cannot():

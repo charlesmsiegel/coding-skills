@@ -54,8 +54,7 @@ id, which is also the note's filename.
   "data_and_n": "CoNLL04 (1441 sentences), NYT (56k), WebNLG (13k). No CIs reported.",
   "baselines": "Supervised SpERT and a rule-based extractor. No human ceiling.",
   "limitations_stated": "English only; no nested entities.",
-  "limitations_unstated": "Single seed, so the 1.2 F1 gap may be noise. Test-set
-    contamination not addressed for a model trained after the dataset's release.",
+  "limitations_unstated": "Single seed, so the 1.2 F1 gap may be noise. Contamination not addressed for a model trained after the dataset's release.",
   "artifacts": ["https://github.com/example/repo"],
   "prose": "The interesting move is that they hold the schema fixed..."
 }
