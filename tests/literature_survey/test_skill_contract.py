@@ -178,6 +178,25 @@ def test_the_non_cs_source_landscape_is_read_before_searching():
     assert text.index("references/source-landscape.md") < text.index("search_sources.py")
 
 
+def test_every_flag_the_docs_use_is_a_flag_some_cli_accepts():
+    """A documented flag that no parser knows is a command the agent cannot run, and
+    it fails at the point of use — mid-run, after the corpus has been paid for."""
+    import subprocess
+    import sys
+
+    text = skill_text() + " ".join(p.read_text(encoding="utf-8")
+                                   for p in REFERENCES.glob("*.md"))
+    cited = set(re.findall(r"(--[a-z][a-z-]{2,})", text))
+    accepted = " ".join(
+        subprocess.run([sys.executable, str(script), "--help"],
+                       capture_output=True, text=True, timeout=60).stdout
+        for script in sorted(SCRIPTS.glob("*.py"))
+    )
+
+    unknown = sorted(flag for flag in cited if flag not in accepted)
+    assert not unknown, f"documented flags no CLI accepts: {unknown}"
+
+
 # --- the note schema readers follow is the one the loader reads ----------
 
 def documented_note() -> dict:
