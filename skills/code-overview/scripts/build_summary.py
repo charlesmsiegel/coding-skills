@@ -30,8 +30,8 @@ from pathlib import Path
 import common
 import rubric
 import theory_rubric as tr
-from build_health import (grade_class, headline_badges, render_category_rows,
-                          render_package_table, render_top_findings)
+from health_render import (grade_class, headline_badges, render_category_rows,
+                           render_package_table, render_top_findings)
 from common import (DOC_TITLES, doc_path, esc, grouped_by_doctor, listed_packages, load_map,
                     read_asset, read_meta, rel_href, render, warn)
 
