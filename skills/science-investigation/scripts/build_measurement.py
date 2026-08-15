@@ -17,6 +17,7 @@ from.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import html
 import json
 import re
@@ -360,12 +361,16 @@ def defining_path(entry: dict, repo: Path) -> str:
             continue
         text = TRAILING_LINE_NUMBER.sub("", text)
         text = text.replace("\\", "/").removeprefix("./")
-        try:
+        # Ignoring is the intended behaviour, not an oversight: a citation that
+        # is malformed (`OSError` — a null byte or an over-long name) or that
+        # resolves outside `repo` (`ValueError` from `relative_to`) is left
+        # exactly as it arrived. It then matches no scope, which is the honest
+        # outcome; mangling it into a repo-relative path would file it under a
+        # scope it does not belong to.
+        with contextlib.suppress(OSError, ValueError):
             candidate = Path(text)
             if candidate.is_absolute():
                 text = str(candidate.resolve().relative_to(repo.resolve())).replace("\\", "/")
-        except (OSError, ValueError):
-            pass  # a malformed or out-of-repo citation is left as-is, not fatal
         return text
     return ""
 
