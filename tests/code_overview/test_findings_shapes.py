@@ -28,6 +28,7 @@ ROOT = Path(__file__).resolve().parents[2]
 BUILD_HEALTH = ROOT / "skills" / "code-overview" / "scripts" / "build_health.py"
 SCRIPTS = BUILD_HEALTH.parent
 ANALYZE_ALL = ROOT / "skills" / "code-doctor" / "scripts" / "analyze_all.py"
+PYTHON_ANALYZE_ALL = ROOT / "skills" / "python-code-doctor" / "scripts" / "analyze_all.py"
 
 KEY_BODY = "MIIEowIBAAKCAQEAvQ8Z1kQyBmT3xN0pLrWc7HgYdFvJqR2sKtBnM4eXhAoGBAJ9x\n" * 3
 
@@ -117,6 +118,67 @@ def test_candidates_are_kept_out_of_the_findings(load_module, doctor_report):
     assert all(record.get("kind") != "candidate" for record in report["findings"])
     kinds = {record.get("kind") for record in report["findings"]}
     assert kinds == {"finding"}
+
+
+@pytest.fixture
+def python_doctor_report(repo, run_script, tmp_path) -> Path:
+    """A genuine python-code-doctor report over a repo with one lead in it.
+
+    A dynamic-table PRAGMA is the lead: PRAGMA accepts no bound parameters, so
+    interpolation is the only way to write one, and the detector says so by
+    emitting `kind: candidate` rather than asserting injection.
+    """
+    repo.write("src/app/db.py",
+               "import sqlite3\n\n\n"
+               "def describe(conn, table):\n"
+               '    return conn.execute(f"PRAGMA table_info({table})").fetchall()\n')
+    repo.commit()
+
+    raw = tmp_path / "python-raw.json"
+    raw.write_text(run_script(PYTHON_ANALYZE_ALL, repo.path, "--format", "json",
+                              "--skip-duplicates").stdout,
+                   encoding="utf-8")
+    return raw
+
+
+def test_a_candidate_inside_a_categories_envelope_is_kept_out_of_the_findings(
+        load_module, python_doctor_report):
+    """The `categories` shape splits on `kind` too — it is the same promise.
+
+    Only the bare list and code-doctor's own `findings` array were split, and a
+    language specialist reports neither: `analyze_all.py` emits a `categories`
+    envelope. So every candidate python-code-doctor raised — a PRAGMA that can
+    only be written by interpolation, a public function no single file can
+    prove dead — was read as an asserted defect and charged to the grade, which
+    penalises code for being hard to analyse rather than for being wrong.
+    """
+    common = load_module(SCRIPTS, "common")
+    payload = json.loads(python_doctor_report.read_text(encoding="utf-8"))
+    assert payload["categories"]["security"]["issues"], "the fixture must contain the lead"
+
+    report = common.normalize_findings(payload)
+
+    raised = {(record["category"], record.get("smell_type") or record.get("issue_type"))
+              for record in report["candidates"]}
+    assert ("security", "sql_injection") in raised, "the PRAGMA lead"
+    assert ("dead_code", "unused_function") in raised, (
+        "one file cannot prove a public function dead — another module may import it"
+    )
+    assert all(record.get("kind") != "candidate" for record in report["findings"])
+
+
+def test_a_candidate_inside_a_bare_detector_envelope_is_kept_out_of_the_findings(load_module):
+    """`{"issues": [...]}` is one detector's report, and it splits too."""
+    common = load_module(SCRIPTS, "common")
+
+    report = common.normalize_findings({"issues": [
+        {"file": "a.py", "line": 1, "smell_type": "hardcoded_secret", "severity": "high"},
+        {"file": "b.py", "line": 2, "smell_type": "sql_injection", "severity": "high",
+         "kind": "candidate"},
+    ]})
+
+    assert [record["smell_type"] for record in report["findings"]] == ["hardcoded_secret"]
+    assert [record["smell_type"] for record in report["candidates"]] == ["sql_injection"]
 
 
 def test_the_completeness_block_is_coverage_evidence(load_module, doctor_report):

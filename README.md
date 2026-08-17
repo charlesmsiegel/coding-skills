@@ -8,7 +8,11 @@ A repository of agentic skills to help with AI coding.
   Python code: deterministic AST detectors (`scripts/`) plus judgment guides
   (`references/`). `run_external_tools.py` also drives the real tools when they are
   installed — ruff, mypy, black, isort, bandit, flake8, plus pip-audit (dependency
-  advisories) and coverage (code that never executes).
+  advisories) and coverage (code that never executes). It reports in the
+  finding/candidate schema below: what a single file can prove is a finding with a
+  fix, and what it can only suspect — a public function no importer is visible from
+  here, a PRAGMA that has no parameterized spelling — is a `kind: "candidate"` lead
+  that no grade is charged for.
 - **[typescript-code-doctor](skills/typescript-code-doctor/)** — the same idea for
   TypeScript, and fully standalone: it ships its own TS/TSX scanner (strings,
   template literals, regex-vs-division, JSX text, bracket matching) so the

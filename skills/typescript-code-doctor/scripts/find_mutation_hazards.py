@@ -77,6 +77,13 @@ def _check_imported_mutation(file: TsFile, report: Reporter) -> None:
     for index, token in enumerate(file.tokens):
         if token.kind != "name" or token.value not in imported or index + 3 >= len(file):
             continue
+        # `const x: api.Foo = { … }` reads token-for-token like `api.Foo = …`,
+        # but the imported name is the *type* of a declaration, not the target of
+        # the assignment — the `=` initializes `x`. Only a real assignment target
+        # (`api.Foo = …` or `api.Foo.bar = …` as a statement) is a mutation, and
+        # a target is never inside a recorded type-annotation span.
+        if file.in_type_position(index):
+            continue
         if not file.tokens[index + 1].is_op("."):
             continue
         member, operator = file.tokens[index + 2], file.tokens[index + 3]

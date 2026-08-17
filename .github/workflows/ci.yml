@@ -90,6 +90,11 @@ jobs:
       # The ratchet (skills/python-code-doctor/references/messy-repo-runbook.md, Phase 5):
       # every bug-class detector is currently clean on this repo's own code, and it
       # stays that way. If one reports anything, a real defect class has crept back in.
+      #
+      # Findings only. A record marked `kind: "candidate"` is a lead a detector
+      # could not prove from one file — a PRAGMA that has no parameterized
+      # spelling, say — and failing the build on one would mean the only way to
+      # get green is to rewrite correct code or suppress the detector.
       - name: Ratchet — bug-class detectors stay clean on our own code
         run: |
           set -e
@@ -105,7 +110,7 @@ jobs:
                    find_duplicate_definitions find_unawaited_coroutines \
                    find_local_imports find_import_cycles find_dependency_issues; do
             for target in $targets; do
-              n=$(python "$DETECTORS/$s.py" "$target" --format json | python -c "import sys,json;print(len(json.load(sys.stdin)))")
+              n=$(python "$DETECTORS/$s.py" "$target" --format json | python -c "import sys,json;print(sum(1 for r in json.load(sys.stdin) if r.get('kind') != 'candidate'))")
               if [ "$n" != "0" ]; then
                 echo "::error::$s reports $n finding(s) on $target — the ratchet only tightens"
                 python "$DETECTORS/$s.py" "$target"

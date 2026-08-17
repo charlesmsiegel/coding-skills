@@ -116,6 +116,21 @@ def relativize(value: str, repo: Path) -> str:
     return str(value).replace(prefix, "").replace(str(repo), ".")
 
 
+def displayable_candidates(candidates: list[dict], repo: Path) -> list[dict]:
+    """Candidates with the sandbox path cut off, exactly like findings.
+
+    `top_findings` relativizes on its way out, so only the Candidates tab ever
+    showed a raw `file`. That stayed invisible while the only candidates
+    reaching a page came from hand-written fixtures and from code-doctor,
+    whose paths are already repo-relative; a language specialist is run with an
+    absolute path and echoes it back, and the column became 80% machine path.
+    """
+    return [{**record,
+             "file": relativize(record.get("file", ""), repo),
+             "description": relativize(str(record.get("description", "")), repo)}
+            for record in candidates]
+
+
 def top_findings(findings: list[dict], limit: int, repo: Path) -> list[dict]:
     ranked = sorted(
         findings,
@@ -693,7 +708,7 @@ def build(args, reports: list[dict], candidates: list[dict] | None = None,
         "CAVEATS": render_caveats(errors_by_doctor, skipped_by_doctor, scored["unmapped_types"],
                                   scored["ungraded"], args.note, out_of_scope,
                                   relative_roots, duplicates),
-        "CANDIDATES": render_candidates(candidates),
+        "CANDIDATES": render_candidates(displayable_candidates(candidates, repo)),
         "COVERAGE": render_coverage(meta),
     })
 

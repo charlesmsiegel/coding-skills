@@ -602,6 +602,43 @@ def test_yaml_load_with_positional_safe_loader_not_flagged(tmp_path):
     assert len(findings) == 1 and findings[0]["line"] == 4
 
 
+def test_a_dynamic_pragma_is_a_candidate_not_an_injection_finding(tmp_path):
+    """PRAGMA takes no bound parameters, so a dynamic-table PRAGMA has one spelling.
+
+    `execute("PRAGMA table_info(?)", (name,))` is not a query SQLite will run.
+    Calling the only legal spelling an injection is a false positive; the record
+    is a lead that names what to confirm instead, and it carries no fix because
+    there is no other way to write it.
+    """
+    (tmp_path / "sample.py").write_text(
+        "def describe(conn, table):\n"
+        '    return conn.execute(f"PRAGMA table_info({table})").fetchall()\n'
+    )
+    findings = [f for f in run_detector("find_security_issues.py", tmp_path)
+                if f["smell_type"] == "sql_injection"]
+
+    assert [f["kind"] for f in findings] == ["candidate"]
+    assert "PRAGMA" in findings[0]["description"]
+
+
+@pytest.mark.parametrize("statement", [
+    'f"SELECT * FROM {table}"',
+    '"SELECT * FROM " + table',
+    '"SELECT * FROM {}".format(table)',
+])
+def test_a_dynamic_query_is_still_a_scored_finding(tmp_path, statement):
+    """The downgrade is keyed on the leading keyword, not on interpolation itself."""
+    (tmp_path / "sample.py").write_text(
+        "def rows(conn, table):\n"
+        f"    return conn.execute({statement}).fetchall()\n"
+    )
+    findings = [f for f in run_detector("find_security_issues.py", tmp_path)
+                if f["smell_type"] == "sql_injection"]
+
+    assert len(findings) == 1
+    assert "kind" not in findings[0], "a scored defect carries no kind key at all"
+
+
 def test_weak_hash_usedforsecurity_false_not_flagged(tmp_path):
     (tmp_path / "sample.py").write_text(
         "import hashlib\n\ndef f(b):\n    return hashlib.md5(b, usedforsecurity=False).hexdigest()\n"
@@ -2992,6 +3029,133 @@ def test_ready_import_suppression_requires_django_provenance_and_direct_method(t
     assert unused == {"assigned", "local", "nested", "rebound", "relative", "repeated"}
 
 
+# ---- find_dead_code: what one file can prove, and what it only suspects ---- #
+#
+# A detector that reads one file at a time cannot see cross-module use, so a
+# public module-level name it finds no caller for is a *lead*, not a defect.
+# Saying otherwise is how live code gets deleted, so those records carry
+# `kind: "candidate"` and the graders downstream keep them out of the score.
+
+
+def kinds_by_name(findings: list[dict], issue_type: str) -> dict[str, str | None]:
+    return {f["name"]: f.get("kind") for f in findings if f["issue_type"] == issue_type}
+
+
+def test_a_public_module_level_name_is_a_candidate_not_a_finding(tmp_path):
+    (tmp_path / "sample.py").write_text(
+        "def exported():\n"
+        "    return 1\n"
+        "\n"
+        "class Exported:\n"
+        "    pass\n"
+    )
+    findings = run_detector("find_dead_code.py", tmp_path)
+
+    assert kinds_by_name(findings, "unused_function") == {"exported": "candidate"}
+    assert kinds_by_name(findings, "unused_class") == {"Exported": "candidate"}
+
+
+def test_an_unused_import_stays_a_finding(tmp_path):
+    """The one dead-code claim a single file *can* prove: nothing here uses it."""
+    (tmp_path / "sample.py").write_text("import os\n")
+
+    assert kinds_by_name(run_detector("find_dead_code.py", tmp_path), "unused_import") == {"os": None}
+
+
+def test_dunder_all_re_export_is_neither_a_finding_nor_a_lead(tmp_path):
+    """`__all__` names the public API. A name listed there is used by definition."""
+    (tmp_path / "sample.py").write_text(
+        "import os\n"
+        "\n"
+        "__all__ = [\"os\", \"helper\", \"Helper\"]\n"
+        "\n"
+        "def helper():\n"
+        "    return 1\n"
+        "\n"
+        "class Helper:\n"
+        "    pass\n"
+    )
+
+    assert run_detector("find_dead_code.py", tmp_path) == []
+
+
+def test_a_decorated_definition_is_not_reported_at_all(tmp_path):
+    """A route, a hook, a registry entry: the decorator is the caller."""
+    (tmp_path / "sample.py").write_text(
+        "import functools\n"
+        "\n"
+        "app = functools\n"
+        "\n"
+        "@app.wraps\n"
+        "def handler():\n"
+        "    return 1\n"
+        "\n"
+        "@app.wraps\n"
+        "class Plugin:\n"
+        "    pass\n"
+    )
+    reported = {f["name"] for f in run_detector("find_dead_code.py", tmp_path)}
+
+    assert "handler" not in reported
+    assert "Plugin" not in reported
+
+
+def test_pytest_collects_test_functions_fixtures_and_classes(tmp_path):
+    """Nothing in a test file calls a test. pytest does, by name and by fixture."""
+    (tmp_path / "test_sample.py").write_text(
+        "import pytest\n"
+        "\n"
+        "@pytest.fixture\n"
+        "def client():\n"
+        "    return object()\n"
+        "\n"
+        "def test_it(client):\n"
+        "    assert client\n"
+        "\n"
+        "class TestGroup:\n"
+        "    def test_more(self):\n"
+        "        assert True\n"
+    )
+
+    assert run_detector("find_dead_code.py", tmp_path) == []
+
+
+def test_an_underscore_prefixed_parameter_is_deliberately_unused(tmp_path):
+    (tmp_path / "sample.py").write_text(
+        "def handle(event, _context):\n"
+        "    return event\n"
+    )
+
+    assert kinds_by_name(run_detector("find_dead_code.py", tmp_path), "unused_parameter") == {}
+
+
+def test_only_a_free_function_owns_its_signature(tmp_path):
+    """An override or a callback is handed its parameters; a free function picks them.
+
+    So an unused parameter is a provable defect in the second case only. The
+    first two are leads — a base class or the caller that receives the callback
+    dictates the shape, and neither is visible from this file.
+    """
+    (tmp_path / "sample.py").write_text(
+        "def standalone(used, spare):\n"
+        "    return used\n"
+        "\n"
+        "class Handler:\n"
+        "    def handle(self, used, spare):\n"
+        "        return used\n"
+        "\n"
+        "def outer():\n"
+        "    def callback(used, spare):\n"
+        "        return used\n"
+        "    return callback\n"
+    )
+    kinds = {(f["name"], f["line"]): f.get("kind")
+             for f in run_detector("find_dead_code.py", tmp_path)
+             if f["issue_type"] == "unused_parameter"}
+
+    assert kinds == {("spare", 1): None, ("spare", 5): "candidate", ("spare", 9): "candidate"}
+
+
 # ---- find_duplicates ------------------------------------------------------ #
 
 
@@ -3479,6 +3643,74 @@ def test_format_findings_min_severity_filters_low_findings():
     out = _run_formatter("--min-severity", "high", stdin_text=json.dumps(FORMAT_FIXTURE))
     assert "bare_except" in out
     assert "range_len_loop" not in out
+
+
+CANDIDATE_FIXTURE = [
+    {"file": "src/sample.py", "line": 3, "smell_type": "bare_except",
+     "description": "Bare except catches everything",
+     "suggestion": "Catch a specific exception type", "severity": "high"},
+    {"file": "src/legacy.py", "line": 11, "issue_type": "unused_function",
+     "description": "Function 'render' appears unused in this file",
+     "severity": "low", "kind": "candidate",
+     "also_caused_by": ["another module imports it"]},
+]
+
+
+def test_a_candidate_is_filed_as_investigate_not_refactor(tmp_path):
+    """A ticket says what to do. For a lead, that is *confirm it* — not *fix it*.
+
+    Rendered as "[Refactor] unused_function … Proposed fix: delete it", a
+    single-file guess about a public function becomes a work item whose only
+    acceptance criterion is deleting live code.
+    """
+    src = tmp_path / "findings.json"
+    src.write_text(json.dumps(CANDIDATE_FIXTURE))
+
+    cards = _run_formatter(str(src), "--format", "cards")
+    assert "[Investigate] unused_function" in cards
+    assert "[Refactor] bare_except" in cards
+    assert "Also caused by: another module imports it" in cards
+    assert "closed as not a defect" in cards, "rejecting a lead must be a way to close it"
+
+    tickets = json.loads(_run_formatter(str(src), "--format", "json"))
+    by_smell = {ticket["smell"]: ticket for ticket in tickets}
+    assert by_smell["unused_function"]["kind"] == "candidate"
+    assert "kind:candidate" in by_smell["unused_function"]["labels"]
+    assert "kind" not in by_smell["bare_except"], "a defect carries no kind key"
+
+
+def test_the_list_marks_a_candidate_instead_of_ranking_it_by_severity():
+    out = _run_formatter(stdin_text=json.dumps(CANDIDATE_FIXTURE))
+
+    assert "1 finding(s), 1 candidate(s)" in out
+    assert "❓ candidate |" in out, "the severity cell says candidate, not 🟢 low"
+    assert "Unverified lead" in out
+
+
+def test_analyze_all_counts_candidates_and_lists_them_separately(tmp_path):
+    """The two surfaces a person actually reads, on a repo whose only security
+    record is a PRAGMA that cannot be written any other way."""
+    (tmp_path / "db.py").write_text(
+        "def describe(conn, table):\n"
+        '    return conn.execute(f"PRAGMA table_info({table})").fetchall()\n'
+    )
+
+    report = json.loads(subprocess.run(
+        [sys.executable, str(SCRIPTS_DIR / "analyze_all.py"), str(tmp_path),
+         "--format", "json", "--skip-duplicates"],
+        capture_output=True, text=True, timeout=300, check=True).stdout)
+    assert report["summary"]["total_candidates"] == 2, "the PRAGMA and the uncalled function"
+
+    text = subprocess.run(
+        [sys.executable, str(SCRIPTS_DIR / "analyze_all.py"), str(tmp_path),
+         "--skip-duplicates"],
+        capture_output=True, text=True, timeout=300, check=True).stdout
+    high, _, candidates = text.partition("❓ CANDIDATES")
+    assert "sql_injection" in candidates
+    assert "sql_injection" not in high, "a lead must not be listed among the defects"
+    assert "Address security risks" not in text, (
+        "the recommendation tells someone to fix eval/exec and shell=True; nothing found one"
+    )
 
 
 # run_external_tools lives in tests/python_code_doctor/test_external_tools.py —
