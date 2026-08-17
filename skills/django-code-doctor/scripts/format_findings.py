@@ -29,6 +29,18 @@ from common import SEVERITY_ICONS, configure_output
 _SEV_RANK = {"high": 0, "medium": 1, "low": 2}
 _ICON = SEVERITY_ICONS
 
+# What a reader must not have to infer. A record carrying `kind: "candidate"` is
+# an unverified lead — a public function no single file can prove dead, a PRAGMA
+# that cannot be written without interpolation — and every renderer here would
+# otherwise turn it into a refactoring ticket with a proposed fix attached. That
+# is how someone deletes live code on a tool's say-so.
+_CANDIDATE_NOTE = ("Unverified lead, not a confirmed defect — confirm it before acting. "
+                   "Graders exclude candidates from the score.")
+
+
+def _is_candidate(issue):
+    return issue.get("kind") == "candidate"
+
 
 def _flatten(data):
     """Normalise either report shape into a flat list of issue dicts."""
@@ -62,7 +74,12 @@ def _size_for(severity):
 
 
 def _render_list(issues):
-    lines = [f"# Findings — {len(issues)} item(s)", "",
+    confirmed = sum(1 for i in issues if not _is_candidate(i))
+    leads = len(issues) - confirmed
+    heading = f"# Findings — {confirmed} finding(s)"
+    if leads:
+        heading += f", {leads} candidate(s)"
+    lines = [heading, "",
              "| Severity | Type | Location | Description |",
              "|---|---|---|---|"]
     for i in issues:
@@ -71,7 +88,13 @@ def _render_list(issues):
         desc = (i.get("description", "") or "").replace("|", "\\|")
         if len(desc) > 100:
             desc = desc[:97] + "..."
-        lines.append(f"| {_ICON.get(sev, '')} {sev} | {_type_of(i)} | `{loc}` | {desc} |")
+        # The severity column, not the description: a candidate's severity says
+        # how bad it would be *if* confirmed, and reading it as a ranking beside
+        # asserted defects is the misreading worth spending a cell on.
+        rank = "❓ candidate" if _is_candidate(i) else f"{_ICON.get(sev, '')} {sev}"
+        lines.append(f"| {rank} | {_type_of(i)} | `{loc}` | {desc} |")
+    if leads:
+        lines += ["", f"❓ **candidate** — {_CANDIDATE_NOTE}"]
     return "\n".join(lines)
 
 
@@ -81,27 +104,45 @@ def _render_cards(issues):
         sev = i.get("severity", "medium")
         typ = _type_of(i)
         category = i.get("category", "")
-        labels = ["lang:python", f"smell:{typ}", f"size:{_size_for(sev)}", f"priority:{sev}"]
+        lead = _is_candidate(i)
+        labels = ["lang:python", f"smell:{typ}", f"size:{_size_for(sev)}",
+                  "priority:candidate" if lead else f"priority:{sev}"]
         if category:
             labels.append(f"area:{category}")
-        out.append(f"### [Refactor] {typ} — {Path(str(i.get('file', '?'))).name}:{i.get('line', '?')}")
+        # A candidate is work to *confirm*, not work to do. Filing it as
+        # "[Refactor] … Proposed fix: …" hands someone a ticket whose acceptance
+        # criterion is a change that may not be warranted at all.
+        out.append(f"### [{'Investigate' if lead else 'Refactor'}] {typ} — "
+                   f"{Path(str(i.get('file', '?'))).name}:{i.get('line', '?')}")
         out.append("")
         out.append(f"**Labels:** {'  '.join(labels)}")
         out.append("")
         out.append(f"**Location:** `{i.get('file', '?')}:{i.get('line', '?')}`")
         out.append("")
         out.append(f"**Smell:** {i.get('description', '')}")
+        if lead:
+            out.append("")
+            out.append(f"**Candidate:** {_CANDIDATE_NOTE}")
+            for reason in i.get("also_caused_by") or []:
+                out.append(f"- Also caused by: {reason}")
         if _suggestion(i):
             out.append("")
-            out.append(f"**Proposed fix:** {_suggestion(i)}")
+            out.append(f"**{'What to confirm' if lead else 'Proposed fix'}:** {_suggestion(i)}")
         out.append("")
         out.append("**Standard:** (link the relevant coding-standard or rule)")
         out.append("")
         out.append("**Definition of Done:**")
-        out.append("- [ ] Behavior unchanged (existing + new tests green)")
-        out.append("- [ ] Lint + type check clean")
-        out.append("- [ ] No new duplication")
-        out.append("- [ ] Enforcement rule added if this closes a smell class")
+        if lead:
+            # Rejecting a lead is a finished ticket. Without that line the only
+            # way to close one is to change the code it points at.
+            out.append("- [ ] Confirmed against the benign explanations above, "
+                       "or closed as not a defect")
+            out.append("- [ ] If confirmed, refiled as a finding with a fix")
+        else:
+            out.append("- [ ] Behavior unchanged (existing + new tests green)")
+            out.append("- [ ] Lint + type check clean")
+            out.append("- [ ] No new duplication")
+            out.append("- [ ] Enforcement rule added if this closes a smell class")
         out.append("")
     return "\n".join(out)
 
@@ -109,15 +150,25 @@ def _render_cards(issues):
 def _render_json(issues):
     tickets = []
     for i in issues:
-        tickets.append({
-            "title": f"[Refactor] {_type_of(i)} in {Path(str(i.get('file', '?'))).name}:{i.get('line', '?')}",
+        lead = _is_candidate(i)
+        ticket = {
+            "title": f"[{'Investigate' if lead else 'Refactor'}] {_type_of(i)} in "
+                     f"{Path(str(i.get('file', '?'))).name}:{i.get('line', '?')}",
             "severity": i.get("severity", "medium"),
             "smell": _type_of(i),
             "location": f"{i.get('file', '?')}:{i.get('line', '?')}",
             "description": i.get("description", ""),
             "proposed_fix": _suggestion(i),
             "labels": ["lang:python", f"smell:{_type_of(i)}"],
-        })
+        }
+        if lead:
+            # A ticket importer reads fields, not prose, so the distinction has
+            # to survive as one. `proposed_fix` on a candidate is what to check,
+            # not what to change — `kind` is what says which.
+            ticket["kind"] = "candidate"
+            ticket["also_caused_by"] = list(i.get("also_caused_by") or [])
+            ticket["labels"].append("kind:candidate")
+        tickets.append(ticket)
     return json.dumps(tickets, indent=2)
 
 

@@ -41,6 +41,11 @@ class DeadCodeIssue:
     name: str
     description: str
     confidence: int
+    # A scored defect by default. Set to "candidate" for a lead the downstream
+    # merge must NOT score: cross-module use is invisible to this file-local
+    # analysis, so a public module-level name cannot be *proven* dead here. The
+    # key is stripped from JSON when None so a finding stays a plain finding.
+    kind: str | None = None
 
 
 class ScopeTracker(ast.NodeVisitor):
@@ -55,8 +60,9 @@ class ScopeTracker(ast.NodeVisitor):
         self.imports: dict[str, int] = {}
         self.from_imports: dict[str, int] = {}
         self.used_names: Set[str] = set()
-        self.functions: dict[str, int] = {}
-        self.classes: dict[str, int] = {}
+        self.functions: dict[str, ast.FunctionDef | ast.AsyncFunctionDef] = {}
+        self.classes: dict[str, ast.ClassDef] = {}
+        self.dunder_all: Set[str] = set()
         self.called_functions: Set[str] = set()
         self.instantiated_classes: Set[str] = set()
         self.parents = parents
@@ -73,6 +79,50 @@ class ScopeTracker(ast.NodeVisitor):
                 return False
             parent = self.parents.get(parent)
         return isinstance(parent, ast.Module)
+
+    def _is_test_file(self) -> bool:
+        base = Path(self.filename).name
+        return base.startswith("test_") or base.endswith("_test.py") or base == "conftest.py"
+
+    @staticmethod
+    def _decorator_name(decorator: ast.AST) -> str | None:
+        target = decorator.func if isinstance(decorator, ast.Call) else decorator
+        if isinstance(target, ast.Attribute):
+            return target.attr
+        if isinstance(target, ast.Name):
+            return target.id
+        return None
+
+    def _is_decorated(self, node: ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef) -> bool:
+        return bool(node.decorator_list)
+
+    def _is_fixture(self, node: ast.FunctionDef | ast.AsyncFunctionDef) -> bool:
+        return any(self._decorator_name(d) == "fixture" for d in node.decorator_list)
+
+    @staticmethod
+    def _is_test_function_name(name: str) -> bool:
+        # pytest collects functions named test* by default.
+        return name.startswith("test")
+
+    def _collect_dunder_all(self, node: ast.Assign | ast.AugAssign) -> None:
+        if not self._at_module_scope(node):
+            return
+        targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+        if not any(isinstance(t, ast.Name) and t.id == "__all__" for t in targets):
+            return
+        value = node.value
+        if isinstance(value, (ast.List, ast.Tuple, ast.Set)):
+            for elt in value.elts:
+                if isinstance(elt, ast.Constant) and isinstance(elt.value, str):
+                    self.dunder_all.add(elt.value)
+
+    def visit_Assign(self, node: ast.Assign):
+        self._collect_dunder_all(node)
+        self.generic_visit(node)
+
+    def visit_AugAssign(self, node: ast.AugAssign):
+        self._collect_dunder_all(node)
+        self.generic_visit(node)
 
     def _remember_imports(self, node: ast.Import | ast.ImportFrom) -> None:
         if not self._at_module_scope(node):
@@ -184,7 +234,7 @@ class ScopeTracker(ast.NodeVisitor):
 
     def visit_FunctionDef(self, node: ast.FunctionDef):
         if node.col_offset == 0:
-            self.functions[node.name] = node.lineno
+            self.functions[node.name] = node
         self._check_unreachable(node)
         self._check_unused_params(node)
         self.function_stack.append(node)
@@ -198,7 +248,7 @@ class ScopeTracker(ast.NodeVisitor):
 
     def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef):
         if node.col_offset == 0:
-            self.functions[node.name] = node.lineno
+            self.functions[node.name] = node
         self._check_unreachable(node)
         self._check_unused_params(node)
         self.function_stack.append(node)
@@ -212,7 +262,7 @@ class ScopeTracker(ast.NodeVisitor):
 
     def visit_ClassDef(self, node: ast.ClassDef):
         if node.col_offset == 0:
-            self.classes[node.name] = node.lineno
+            self.classes[node.name] = node
         is_app_config = any(
             self._canonical_name(base) == "django.apps.AppConfig"
             or (isinstance(base, ast.Name) and base.id in self.current_app_config_names)
@@ -251,64 +301,96 @@ class ScopeTracker(ast.NodeVisitor):
     def _check_unused_params(self, node):
         if node.name.startswith('_'):
             return
-        
+        # pytest collects test functions and injects fixtures by name; their
+        # parameters are the framework's business, not dead code.
+        if self._is_fixture(node) or (self._is_test_file() and self._is_test_function_name(node.name)):
+            return
+
+        # Only a free, module-level function chooses its own signature, so an
+        # unused parameter there is a provable defect. A method (overrides,
+        # ABC/Protocol conformance) or a nested callback/stub (its signature is
+        # dictated by the caller it is passed to, e.g. monkeypatch targets) must
+        # accept parameters it need not use — those are unscored leads.
+        kind = None if self._at_module_scope(node) else "candidate"
+
+        # A leading underscore is the conventional mark of a deliberately unused
+        # parameter; honoring it keeps the detector aligned with every linter.
         params = set()
         for arg in node.args.args:
-            if arg.arg not in ('self', 'cls'):
+            if arg.arg not in ('self', 'cls') and not arg.arg.startswith('_'):
                 params.add(arg.arg)
         for arg in node.args.kwonlyargs:
-            params.add(arg.arg)
-        
+            if not arg.arg.startswith('_'):
+                params.add(arg.arg)
+
         used = set()
         for child in ast.walk(node):
             if isinstance(child, ast.Name) and isinstance(child.ctx, ast.Load):
                 used.add(child.id)
-        
+
         for param in params - used:
             self.issues.append(DeadCodeIssue(
                 file=self.filename, line=node.lineno,
                 issue_type="unused_parameter", name=param,
                 description=f"Parameter '{param}' in {node.name}() is never used",
-                confidence=80
+                confidence=80, kind=kind
             ))
 
     def finalize(self):
+        # An unused import IS provable inside one file — unless the name is
+        # re-exported via __all__, in which case it is part of the public API.
         for name, line in self.imports.items():
-            if name not in self.used_names:
+            if name not in self.used_names and name not in self.dunder_all:
                 self.issues.append(DeadCodeIssue(
                     file=self.filename, line=line,
                     issue_type="unused_import", name=name,
                     description=f"Import '{name}' is never used",
                     confidence=90
                 ))
-        
+
         for name, line in self.from_imports.items():
-            if name not in self.used_names:
+            if name not in self.used_names and name not in self.dunder_all:
                 self.issues.append(DeadCodeIssue(
                     file=self.filename, line=line,
                     issue_type="unused_import", name=name,
                     description=f"Import '{name}' is never used",
                     confidence=90
                 ))
-        
-        for name, line in self.functions.items():
-            if name not in self.called_functions and not name.startswith('_'):
-                self.issues.append(DeadCodeIssue(
-                    file=self.filename, line=line,
-                    issue_type="unused_function", name=name,
-                    description=f"Function '{name}' appears unused in this file",
-                    confidence=60
-                ))
-        
-        for name, line in self.classes.items():
-            if name not in self.instantiated_classes and name not in self.used_names:
-                if not name.startswith('_'):
-                    self.issues.append(DeadCodeIssue(
-                        file=self.filename, line=line,
-                        issue_type="unused_class", name=name,
-                        description=f"Class '{name}' appears unused in this file",
-                        confidence=60
-                    ))
+
+        # A public module-level function or class cannot be *proven* dead by
+        # reading one file: any other module may import and use it. So these are
+        # never scored findings.
+        for name, node in self.functions.items():
+            if name in self.called_functions or name.startswith('_'):
+                continue
+            if name in self.dunder_all:
+                continue  # re-exported: part of the public API, definitely used
+            if self._is_test_file() and (self._is_test_function_name(name) or self._is_fixture(node)):
+                continue  # collected/injected by pytest — not dead, not a lead
+            if self._is_decorated(node):
+                continue  # registered or dispatched by its decorator (route, hook, ...)
+            self.issues.append(DeadCodeIssue(
+                file=self.filename, line=node.lineno,
+                issue_type="unused_function", name=name,
+                description=f"Function '{name}' appears unused in this file",
+                confidence=60, kind="candidate"
+            ))
+
+        for name, node in self.classes.items():
+            if name in self.instantiated_classes or name in self.used_names:
+                continue
+            if name.startswith('_') or name in self.dunder_all:
+                continue
+            if self._is_test_file() and name.startswith("Test"):
+                continue  # pytest test class — collected, not dead
+            if self._is_decorated(node):
+                continue  # registered/dispatched by its decorator
+            self.issues.append(DeadCodeIssue(
+                file=self.filename, line=node.lineno,
+                issue_type="unused_class", name=name,
+                description=f"Class '{name}' appears unused in this file",
+                confidence=60, kind="candidate"
+            ))
 
 
 class RedundantCodeDetector(ast.NodeVisitor):
@@ -404,10 +486,19 @@ def main():
     if args.format == 'json':
         # severity travels with the finding so standalone output renders the
         # same as analyze_all's aggregation (confidence maps onto severity).
-        print(json.dumps([
-            {**asdict(i), 'severity': 'high' if i.confidence >= 90 else ('medium' if i.confidence >= 70 else 'low')}
-            for i in all_issues
-        ], indent=2))
+        # `kind` is stripped unless set to "candidate", so a scored finding
+        # carries no key and the downstream merge scores it as a defect.
+        def _record(issue: DeadCodeIssue) -> dict:
+            record = asdict(issue)
+            if record.get('kind') is None:
+                record.pop('kind', None)
+            record['severity'] = (
+                'high' if issue.confidence >= 90
+                else ('medium' if issue.confidence >= 70 else 'low')
+            )
+            return record
+
+        print(json.dumps([_record(i) for i in all_issues], indent=2))
     else:
         if not all_issues:
             print("✅ No dead code found!")

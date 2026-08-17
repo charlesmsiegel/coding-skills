@@ -38,6 +38,12 @@ class CodeSmell:
     suggestion: str
     severity: str
     code_snippet: str = ""
+    # A scored defect by default. Set to "candidate" for a lead the downstream
+    # merge must NOT score. Stripped from JSON when None so a genuine finding
+    # stays a plain finding. Used for interpolation that is not provably unsafe
+    # here: a PRAGMA takes no bound parameters, so a dynamic-table PRAGMA can
+    # only be written by interpolation and is not, on its own, injection.
+    kind: str | None = None
 
 
 # Names whose assignment to a plain string literal suggests a hardcoded secret
@@ -128,6 +134,44 @@ def _is_dynamic_string(node) -> bool:
     return False
 
 
+def _leading_sql_literal(node) -> str | None:
+    """The static leading text of a dynamically built SQL string, if any.
+
+    For each shape ``_is_dynamic_string`` recognizes, return the literal prefix
+    the interpolation is appended to. The leading SQL keyword is fixed even when
+    a later value is interpolated, which is how a PRAGMA is told from a SELECT.
+    """
+    if isinstance(node, ast.JoinedStr):
+        first = node.values[0] if node.values else None
+        if isinstance(first, ast.Constant) and isinstance(first.value, str):
+            return first.value
+        return None
+    if isinstance(node, ast.BinOp):
+        if isinstance(node.left, ast.Constant) and isinstance(node.left.value, str):
+            return node.left.value
+        return None
+    if isinstance(node, ast.Call):
+        func = node.func
+        if (isinstance(func, ast.Attribute) and func.attr == "format"
+                and isinstance(func.value, ast.Constant)
+                and isinstance(func.value.value, str)):
+            return func.value.value
+    return None
+
+
+def _is_pragma_sql(node) -> bool:
+    """True when the executed SQL text begins with the PRAGMA keyword.
+
+    SQLite PRAGMA statements accept no bound parameters — an identifier such as
+    a table name cannot be passed as a ``?`` placeholder — so interpolation is
+    the only way to write a dynamic-table PRAGMA. Flagging that as injection is
+    a false positive when the interpolated value is not attacker-controlled, so
+    the caller downgrades it to an unscored lead rather than a scored finding.
+    """
+    prefix = _leading_sql_literal(node)
+    return prefix is not None and prefix.lstrip().lower().startswith("pragma")
+
+
 _SQL_EXECUTE_ATTRS = {"execute", "executemany", "executescript", "raw", "mogrify"}
 
 _SUBPROCESS_FUNCS = {"run", "call", "check_call", "check_output", "Popen"}
@@ -136,10 +180,10 @@ _SUBPROCESS_FUNCS = {"run", "call", "check_call", "check_output", "Popen"}
 def detect(tree, filename, lines, ignore):
     issues = []
 
-    def add(line, st, desc, sug, sev):
+    def add(line, st, desc, sug, sev, kind=None):
         if st in ignore:
             return
-        issues.append(CodeSmell(filename, line, st, desc, sug, sev, _get_line(lines, line)))
+        issues.append(CodeSmell(filename, line, st, desc, sug, sev, _get_line(lines, line), kind))
 
     for node in ast.walk(tree):
 
@@ -163,11 +207,22 @@ def detect(tree, filename, lines, ignore):
                   and func.attr in _SQL_EXECUTE_ATTRS
                   and node.args
                   and _is_dynamic_string(node.args[0])):
-                add(node.lineno, "sql_injection",
-                    f"Call to .{func.attr}() passes a dynamically built SQL string",
-                    "Use parameterized queries — pass parameters as the second argument "
-                    "(e.g. execute(sql, params)); never interpolate values into SQL.",
-                    "high")
+                if _is_pragma_sql(node.args[0]):
+                    # PRAGMA takes no bound parameters, so a dynamic-table PRAGMA
+                    # must be interpolated. Keep it as an unscored lead rather
+                    # than a scored SQL-injection finding.
+                    add(node.lineno, "sql_injection",
+                        f"Call to .{func.attr}() interpolates a value into a PRAGMA statement",
+                        "PRAGMA accepts no bound parameters, so a dynamic identifier can only be "
+                        "interpolated. Confirm the interpolated value is not attacker-controlled "
+                        "(e.g. validate a table name against a known set).",
+                        "high", kind="candidate")
+                else:
+                    add(node.lineno, "sql_injection",
+                        f"Call to .{func.attr}() passes a dynamically built SQL string",
+                        "Use parameterized queries — pass parameters as the second argument "
+                        "(e.g. execute(sql, params)); never interpolate values into SQL.",
+                        "high")
 
             # ---------------------------------------------------------------- #
             # command_injection — subprocess/os.* with a dynamic command string
@@ -377,7 +432,15 @@ def main():
     all_issues.sort(key=lambda x: (x.severity != "high", x.severity != "medium", x.file, x.line))
 
     if args.format == "json":
-        print(json.dumps([asdict(i) for i in all_issues], indent=2))
+        # `kind` is stripped unless set to "candidate", so a scored finding
+        # carries no key and the downstream merge scores it as a defect.
+        def _record(issue: CodeSmell) -> dict:
+            record = asdict(issue)
+            if record.get("kind") is None:
+                record.pop("kind", None)
+            return record
+
+        print(json.dumps([_record(i) for i in all_issues], indent=2))
     else:
         if not all_issues:
             print("✅ No security issues found!")

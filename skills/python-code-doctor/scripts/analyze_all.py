@@ -93,6 +93,13 @@ def generate_report(path: str, skip: set | None = None) -> dict:
         },
         'summary': {
             'total_issues': 0,
+            # How many of `total_issues` are unverified leads rather than
+            # asserted defects — records a detector marked `kind: "candidate"`
+            # because one file cannot prove them. The other counts keep their
+            # meaning ("what was reported"); this one says how much of it is
+            # unproven, so a consumer that scores can subtract rather than
+            # having to re-derive the split from the records.
+            'total_candidates': 0,
             'by_severity': {'high': 0, 'medium': 0, 'low': 0},
             'by_category': {}
         },
@@ -123,6 +130,8 @@ def generate_report(path: str, skip: set | None = None) -> dict:
 
         report['categories'][category] = {'issues': normalized, 'count': len(normalized)}
         report['summary']['total_issues'] += len(normalized)
+        report['summary']['total_candidates'] += sum(1 for i in normalized
+                                                     if i.get('kind') == 'candidate')
         report['summary']['by_category'][category] = len(normalized)
 
         for issue in normalized:
@@ -147,6 +156,9 @@ def print_text_report(report: dict):
     print("📈 SUMMARY")
     print("-" * 40)
     print(f"Total issues found: {summary['total_issues']}")
+    candidate_count = summary.get('total_candidates', 0)
+    if candidate_count:
+        print(f"  ❓ of which {candidate_count} are candidates — unverified leads, not defects")
     print()
 
     severity_icons = SEVERITY_ICONS
@@ -181,31 +193,63 @@ def print_text_report(report: dict):
     print("🔴 HIGH SEVERITY ISSUES")
     print("=" * 70)
 
+    def _describe(issue):
+        file_loc = f"{issue.get('file', '?')}:{issue.get('line', '?')}"
+        print(f"\n📍 {file_loc}")
+        print(f"   [{issue['category']}] {issue.get('issue_type', issue.get('smell_type', issue.get('pattern_type', '?')))}")
+        if 'description' in issue:
+            print(f"   {issue['description']}")
+        if 'suggestion' in issue:
+            print(f"   → {issue['suggestion']}")
+
+    # A candidate is kept out of this list on purpose. It is printed under its
+    # own heading below with what to check, because listing a lead among the
+    # high-severity defects is how a reader acts on one without confirming it.
     high_issues = []
+    candidates = []
     for cat, data in report['categories'].items():
         for issue in data['issues']:
-            if issue.get('severity') == 'high':
+            if issue.get('kind') == 'candidate':
+                candidates.append(issue)
+            elif issue.get('severity') == 'high':
                 high_issues.append(issue)
 
     if not high_issues:
         print("None found!")
     else:
         for issue in high_issues[:20]:
-            file_loc = f"{issue.get('file', '?')}:{issue.get('line', '?')}"
-            print(f"\n📍 {file_loc}")
-            print(f"   [{issue['category']}] {issue.get('issue_type', issue.get('smell_type', issue.get('pattern_type', '?')))}")
-            if 'description' in issue:
-                print(f"   {issue['description']}")
-            if 'suggestion' in issue:
-                print(f"   → {issue['suggestion']}")
+            _describe(issue)
 
         if len(high_issues) > 20:
             print(f"\n... and {len(high_issues) - 20} more high severity issues")
 
     print()
+
+    if candidates:
+        print("=" * 70)
+        print("❓ CANDIDATES — leads to confirm, not defects")
+        print("=" * 70)
+        print("Each names something one file cannot prove. Rule out the benign")
+        print("explanation before changing anything, and note that graders")
+        print("exclude these from a code-health score.")
+        for issue in candidates[:20]:
+            _describe(issue)
+        if len(candidates) > 20:
+            print(f"\n... and {len(candidates) - 20} more candidates")
+        print()
     print("=" * 70)
     print("💡 RECOMMENDATIONS")
     print("=" * 70)
+
+    # Recommendations are instructions to change code, so they are counted off
+    # the asserted defects only. `by_category` deliberately counts everything
+    # reported — telling someone to "address security risks: eval/exec,
+    # shell=True" because a PRAGMA lead was raised is advice about a defect
+    # nothing found.
+    summary = {**summary, 'by_category': {
+        category: sum(1 for issue in data['issues'] if issue.get('kind') != 'candidate')
+        for category, data in report['categories'].items()
+    }}
 
     recommendations = []
     if summary['by_category'].get('complexity', 0) > 5:

@@ -675,3 +675,36 @@ def test_test_files_get_a_lighter_standard(tmp_path):
     test = write(tmp_path / "spec", {"a.test.ts": source})
     assert any(f["severity"] == "high" for f in run_detector("find_type_gaps.py", product))
     assert all(f["severity"] == "low" for f in run_detector("find_type_gaps.py", test))
+
+
+def test_an_imported_type_annotation_is_not_a_mutated_import(tmp_path):
+    """`const x: api.Foo = {…}` reads token-for-token like `api.Foo = …`.
+
+    The imported name is the *type* of the declaration; the `=` initializes `x`,
+    which is local. Flagging it said an import was being mutated at exactly the
+    place a codebase is being careful about its types — and the second file here
+    proves the fix did not simply switch the detector off: a real assignment
+    onto an imported object is still reported.
+    """
+    root = write(tmp_path / "src", {
+        "annotated.ts": (
+            'import * as api from "./api";\n'
+            "\n"
+            "export function make(): api.Config {\n"
+            "  const config: api.Config = { retries: 1 };\n"
+            "  return config;\n"
+            "}\n"
+        ),
+        "mutated.ts": (
+            'import { defaults } from "./api";\n'
+            "\n"
+            "export function bump(): void {\n"
+            "  defaults.retries = 2;\n"
+            "}\n"
+        ),
+    })
+
+    reported = [f for f in run_detector("find_mutation_hazards.py", root)
+                if f["smell_type"] == "mutates_imported_object"]
+
+    assert [Path(f["file"]).name for f in reported] == ["mutated.ts"]

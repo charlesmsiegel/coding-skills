@@ -15,6 +15,8 @@ SCRIPT = (Path(__file__).resolve().parents[2] / "skills" / "code-overview" /
           "scripts" / "build_health.py")
 DJANGO_ANALYZER = (Path(__file__).resolve().parents[2] / "skills" /
                    "django-code-doctor" / "scripts" / "analyze_django.py")
+PYTHON_ANALYZER = (Path(__file__).resolve().parents[2] / "skills" /
+                   "python-code-doctor" / "scripts" / "analyze_all.py")
 
 
 def envelope(tmp_path) -> Path:
@@ -435,3 +437,68 @@ def test_raw_django_report_keeps_template_relation_walks_out_of_the_grade(
     without_candidate = build(empty, "without.html")
     assert "relation_walk_in_loop" in candidates_panel(with_candidate)
     assert health_meta(with_candidate)["score"] == health_meta(without_candidate)["score"]
+
+
+def test_raw_python_report_keeps_a_pragma_out_of_the_grade(repo, run_script, tmp_path):
+    """The same promise as the Django case, for the shape a specialist emits.
+
+    `analyze_all.py` reports `categories`, not a bare list, and that branch did
+    not split on `kind` — so python-code-doctor's leads were graded as defects.
+    A dynamic-table PRAGMA is the sharpest example: PRAGMA accepts no bound
+    parameters, so interpolation is the only way to write one, and grading it as
+    SQL injection charges the score for a query that cannot be written any other
+    way.
+    """
+    repo.write("app/db.py",
+               "import sqlite3\n\n\n"
+               "def describe(conn, table):\n"
+               '    return conn.execute(f"PRAGMA table_info({table})").fetchall()\n')
+    repo.commit()
+
+    raw = tmp_path / "python.json"
+    raw.write_text(run_script(PYTHON_ANALYZER, repo.path, "--format", "json",
+                              "--skip-duplicates").stdout, encoding="utf-8")
+    empty = tmp_path / "empty.json"
+    empty.write_text("[]", encoding="utf-8")
+
+    def build(report: Path, name: str) -> str:
+        out = tmp_path / name
+        run_script(SCRIPT, "--out", out, "--repo", repo.path, "--name", "app",
+                   "--root-dir", "app", "--findings", f"python-code-doctor:{report}",
+                   "--covers", "complexity")
+        return out.read_text(encoding="utf-8")
+
+    with_candidate = build(raw, "with.html")
+    without_candidate = build(empty, "without.html")
+
+    panel = candidates_panel(with_candidate)
+    assert "sql_injection" in panel
+    assert health_meta(with_candidate)["score"] == health_meta(without_candidate)["score"]
+
+
+def test_a_candidates_location_is_repo_relative_like_a_findings(repo, run_script, tmp_path):
+    """`top_findings` relativizes; the Candidates tab did not.
+
+    A doctor is run with an absolute path and echoes it back, so the location
+    column filled up with the path of the machine that generated the document —
+    in a document meant to be committed.
+    """
+    repo.write("app/db.py",
+               "import sqlite3\n\n\n"
+               "def describe(conn, table):\n"
+               '    return conn.execute(f"PRAGMA table_info({table})").fetchall()\n')
+    repo.commit()
+
+    raw = tmp_path / "python.json"
+    raw.write_text(run_script(PYTHON_ANALYZER, repo.path, "--format", "json",
+                              "--skip-duplicates").stdout, encoding="utf-8")
+    out = tmp_path / "health.html"
+    run_script(SCRIPT, "--out", out, "--repo", repo.path, "--name", "app",
+               "--root-dir", "app", "--findings", f"python-code-doctor:{raw}",
+               "--covers", "complexity")
+
+    panel = candidates_panel(out.read_text(encoding="utf-8"))
+    locations = re.findall(r'<code class="floc">([^<]+)</code>', panel)
+    assert locations, "the fixture raises at least one candidate"
+    assert all(location.startswith("app/") for location in locations), locations
+    assert str(repo.path) not in panel

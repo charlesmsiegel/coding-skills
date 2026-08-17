@@ -149,6 +149,24 @@ conservative (false negatives over false positives) so the output stays
 trustworthy; a file that fails to parse or crashes a detector is named on stderr
 rather than silently reported clean.
 
+**Findings and candidates.** Most records assert a defect and carry the fix. A
+record that instead carries `"kind": "candidate"` is an *unverified lead* — it
+names what was observed, not what is wrong, because the detector reads one file
+at a time and the evidence is elsewhere:
+
+| Candidate | Why one file cannot settle it |
+|---|---|
+| `unused_function` / `unused_class` on a public name | any other module may import it |
+| `unused_parameter` on a method or a nested callback | the base class or the caller that receives it dictates the signature |
+| `sql_injection` on a `PRAGMA` statement | PRAGMA accepts no bound parameters, so a dynamic identifier has no parameterized spelling |
+
+Confirm one before acting on it — deleting a "dead" public function on a
+single-file verdict deletes live code. `format_findings.py` files candidates as
+*Investigate*, not *Refactor*; `analyze_all.py` counts them in
+`summary.total_candidates` and lists them under their own heading; and
+**code-overview excludes them from a code-health score**, so a candidate never
+costs a grade.
+
 ## Use the repo's own tools when they exist
 
 The detectors above are stdlib-only on purpose, but if the target repo's environment

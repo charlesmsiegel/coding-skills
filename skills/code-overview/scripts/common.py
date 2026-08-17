@@ -177,7 +177,14 @@ def normalize_findings(data, source: str = "a findings file") -> dict:
                 for issue in issues:
                     if isinstance(issue, dict):
                         issue.setdefault("category", name)
-                        findings.append(issue)
+                # The split belongs here too. A language specialist emits this
+                # shape and nothing else, so reading the section wholesale put
+                # every lead it raised — a PRAGMA that can only be written by
+                # interpolation, a public function one file cannot prove dead —
+                # into the score as an asserted defect.
+                section, section_candidates = _split_kinds(issues)
+                findings.extend(section)
+                candidates.extend(section_candidates)
             # `analyzers_run` present but *empty* is evidence, not a missing
             # field: it says nothing ran. Falling back to the category keys on
             # a falsy value credited a report that had initialized empty
@@ -205,7 +212,7 @@ def normalize_findings(data, source: str = "a findings file") -> dict:
             if isinstance(completeness.get("categories_run"), list):
                 shape = SHAPE_FULL
         elif isinstance(data.get("issues"), list):
-            findings = [item for item in data["issues"] if isinstance(item, dict)]
+            findings, candidates = _split_kinds(data["issues"])
         else:
             warn(f"{source} matched no known report shape (no `categories`, `findings` or "
                  "`issues` key), so nothing in it could be read. It contributes no findings "
