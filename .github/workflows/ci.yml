@@ -38,6 +38,13 @@ jobs:
       - name: Validate skill structure
         run: python tools/validate_skills.py
 
+      # Output styles have their own frontmatter vocabulary and their own
+      # silent failure: a style that omits `keep-coding-instructions` drops
+      # Claude Code's built-in software engineering instructions, and nothing
+      # at runtime says so.
+      - name: Validate output style structure
+        run: python tools/validate_styles.py
+
       # The two visualization skills each ship their own copy of the shared
       # scripts (a skill directory must be self-contained to be zipped alone).
       # README declares the copies byte-identical; this makes that invariant
