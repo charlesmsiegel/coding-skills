@@ -128,9 +128,48 @@ def cached_source(filepath: Path) -> str:
     return _PARSE_CACHE.source(filepath)
 
 
+def sort_findings(findings: list) -> list:
+    """The order a report is read in: severity first, then file, then line.
+
+    Every detector but one sorts this way, and each used to spell the key out in
+    its own main(). One copy, so the runner and a detector's own CLI cannot
+    drift into ordering the same findings differently.
+    """
+    findings.sort(key=lambda f: (f.severity != "high", f.severity != "medium",
+                                 f.file, f.line))
+    return findings
+
+
+class _SaidOnce:
+    """Remembers what has already been said, so it is not said again.
+
+    The runner asks every detector about one file, and without this each of them
+    announces the same unreadable file: one broken file produced 28 identical
+    lines and buried the report under them. A detector run on its own sees each
+    file once, so its output is unchanged either way.
+    """
+
+    def __init__(self) -> None:
+        self._said: set[str] = set()
+
+    def first_time(self, key: str) -> bool:
+        if key in self._said:
+            return False
+        self._said.add(key)
+        return True
+
+
+_UNPARSEABLE_ANNOUNCED = _SaidOnce()
+
+
 def warn_unparseable(filepath: Path, exc: Exception) -> None:
-    """Note a file that will not parse — expected for broken or non-Python files."""
-    print(f"⚠️  {filepath}: skipped, does not parse ({exc})", file=sys.stderr)
+    """Note a file that will not parse — expected for broken or non-Python files.
+
+    Said once per file per process, however many detectors trip over it. Which
+    detector noticed first is not information; that the file was skipped is.
+    """
+    if _UNPARSEABLE_ANNOUNCED.first_time(str(filepath)):
+        print(f"⚠️  {filepath}: skipped, does not parse ({exc})", file=sys.stderr)
 
 
 def warn_detector_error(filepath: Path, exc: Exception) -> None:

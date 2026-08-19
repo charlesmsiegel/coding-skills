@@ -194,3 +194,70 @@ def test_a_skipped_category_is_absent_rather_than_empty(project):
     report = analyze_all(project, "--skip", "duplicates")
     assert "duplicates" not in report["categories"]
     assert report["meta"]["analyzers_skipped"] == ["duplicates"]
+
+
+# --------------------------------------------------------------------------- #
+# Degrading
+# --------------------------------------------------------------------------- #
+
+def test_one_unparseable_file_is_named_once_not_once_per_detector(project, tmp_path):
+    """~28 detectors trip over the same broken file; the reader needs one line."""
+    (project / "broken.py").write_text("def (:\n", encoding="utf-8")
+    result = subprocess.run(
+        [sys.executable, str(SCRIPTS_DIR / "analyze_all.py"), str(project),
+         "--format", "json", "--jobs", "1"],
+        capture_output=True, text=True, timeout=600,
+    )
+    assert result.returncode == 0, result.stderr[-2000:]
+    named = [line for line in result.stderr.splitlines() if "does not parse" in line]
+    assert len(named) == 1, f"said it {len(named)} times:\n" + "\n".join(named[:5])
+    assert "broken.py" in named[0]
+
+
+def test_a_dead_worker_falls_back_instead_of_crashing(project, monkeypatch):
+    """A worker killed by the OOM reaper must not read as a clean repository."""
+    import concurrent.futures
+    sys.path.insert(0, str(SCRIPTS_DIR))
+    try:
+        runner = __import__("runner")
+        broken = concurrent.futures.process.BrokenProcessPool("worker died")
+
+        class DeadFuture:
+            def result(self):
+                raise broken
+
+        class DeadPool:
+            def __init__(self, *a, **k): pass
+            def __enter__(self): return self
+            def __exit__(self, *a): return False
+            def submit(self, *a, **k): return DeadFuture()
+
+        monkeypatch.setattr(runner, "ProcessPoolExecutor", DeadPool)
+        results = runner.run_detectors(
+            str(project), [("code_smells", "find_code_smells")], [], jobs=4)
+    finally:
+        sys.path.remove(str(SCRIPTS_DIR))
+        for name in _WANTED:
+            sys.modules.pop(name, None)
+
+    assert results["code_smells"], "fell back to nothing — a dead pool read as a clean repo"
+
+
+def test_the_sort_the_runner_uses_is_the_one_the_detectors_use(runner_modules, tmp_path):
+    """Two spellings of one order is how a pooled run and a CLI drift apart."""
+    common, runner = runner_modules["common"], runner_modules["runner"]
+
+    class Rec:
+        def __init__(self, severity, file, line):
+            self.severity, self.file, self.line = severity, file, line
+        def as_dict(self):
+            return {"severity": self.severity, "file": self.file, "line": self.line}
+
+    # Within a severity, file order and line order must disagree, or the test
+    # cannot tell (severity, file, line) from (severity, line, file).
+    records = [Rec("low", "b.py", 1), Rec("low", "a.py", 9),
+               Rec("high", "b.py", 2), Rec("high", "a.py", 8),
+               Rec("medium", "b.py", 3), Rec("medium", "a.py", 7)]
+    by_detector = [r.as_dict() for r in common.sort_findings(list(records))]
+    by_runner = sorted((r.as_dict() for r in records), key=runner._standard_key)
+    assert by_detector == by_runner

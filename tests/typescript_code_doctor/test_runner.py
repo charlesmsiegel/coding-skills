@@ -43,15 +43,25 @@ def project(tmp_path: Path) -> Path:
     return root
 
 
+_WANTED = ("common", "runner", "tsproject", "find_dead_code", "find_duplicates",
+           "find_module_issues")
+
+
 @pytest.fixture
-def ts_runner(monkeypatch):
-    sys.modules.pop("runner", None)
-    sys.modules.pop("common", None)
+def ts_modules(monkeypatch):
+    """The skill's scripts, imported once so they share one `tsproject`."""
+    for name in _WANTED:
+        sys.modules.pop(name, None)
     monkeypatch.syspath_prepend(str(SCRIPTS_DIR))
-    module = importlib.import_module("runner")
-    yield module
-    sys.modules.pop("runner", None)
-    sys.modules.pop("common", None)
+    loaded = {name: importlib.import_module(name) for name in _WANTED}
+    yield loaded
+    for name in _WANTED:
+        sys.modules.pop(name, None)
+
+
+@pytest.fixture
+def ts_runner(ts_modules):
+    return ts_modules["runner"]
 
 
 def analyze_all(target: Path, *extra: str) -> dict:
@@ -95,3 +105,42 @@ def test_a_skipped_category_is_absent_rather_than_empty(project):
     report = analyze_all(project, "--skip", "duplicates")
     assert "duplicates" not in report["categories"]
     assert report["meta"]["analyzers_skipped"] == ["duplicates"]
+
+
+# --------------------------------------------------------------------------- #
+# The shared project
+# --------------------------------------------------------------------------- #
+
+def test_load_project_is_built_once_per_root(ts_modules, project):
+    """Six of the seven tree detectors call load_project for themselves.
+
+    Without this they each re-parse the whole tree, which was ~93% of the
+    TypeScript run's critical path.
+    """
+    load_project = ts_modules["tsproject"].load_project
+    assert load_project(project) is load_project(project)
+
+
+def test_load_project_rebuilds_for_a_different_root(ts_modules, project, tmp_path):
+    load_project = ts_modules["tsproject"].load_project
+    other = tmp_path / "other"
+    (other / "src").mkdir(parents=True)
+    (other / "src" / "a.ts").write_text("export const a = 1;\n", encoding="utf-8")
+
+    first = load_project(project)
+    assert load_project(other) is not first
+
+
+def test_tree_detectors_do_not_mutate_the_project_they_share(ts_modules, project):
+    """They now get the same object, so one that rewrote it would corrupt the rest."""
+    tsproject = ts_modules["tsproject"]
+    shared = tsproject.load_project(project)
+    before = (sorted(map(str, shared.files)), sorted(map(str, shared.failed)),
+              {path: len(tsfile.tokens) for path, tsfile in shared.files.items()})
+
+    for name in ("find_dead_code", "find_duplicates", "find_module_issues"):
+        ts_modules[name].analyze(project, set(), None)
+
+    after = (sorted(map(str, shared.files)), sorted(map(str, shared.failed)),
+             {path: len(tsfile.tokens) for path, tsfile in shared.files.items()})
+    assert after == before

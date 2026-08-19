@@ -21,7 +21,7 @@ import re
 from pathlib import Path
 from dataclasses import dataclass, asdict
 from collections import defaultdict
-from common import SEVERITY_ICONS, configure_output, find_python_files, warn_detector_error, warn_unparseable
+from common import sort_findings, SEVERITY_ICONS, configure_output, find_python_files, warn_detector_error, warn_unparseable
 
 # tomllib is stdlib on 3.11+. On older interpreters we simply skip pyproject.toml
 # parsing rather than depend on a third-party backport (this skill is stdlib-only).
@@ -483,7 +483,7 @@ def analyze(root: Path, ignore: set) -> list[CodeSmell]:
 def analyze_tree(path: Path, ignore: set) -> list:
     """Findings for the whole tree, ordered as main() orders them."""
     findings = analyze(Path(path), ignore)
-    findings.sort(key=lambda x: (x.severity != "high", x.severity != "medium", x.file, x.line))
+    sort_findings(findings)
     return findings
 
 
@@ -498,7 +498,7 @@ def main():
 
     root = Path(args.path)
     all_issues = analyze(root, ignore)
-    all_issues.sort(key=lambda x: (x.severity != "high", x.severity != "medium", x.file, x.line))
+    sort_findings(all_issues)
 
     if args.format == "json":
         print(json.dumps([asdict(i) for i in all_issues], indent=2))
