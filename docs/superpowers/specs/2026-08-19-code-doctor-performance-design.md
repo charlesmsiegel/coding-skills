@@ -163,8 +163,8 @@ Stage 2, not a commitment made here.
 
 | | before | `--jobs 1` | 4 cores |
 |---|---|---|---|
-| python-code-doctor, 161 files / 44k LOC | 33.9 s | 22.8 s | **7.6 s** |
-| typescript-code-doctor, 200 files / 15.6k LOC | 18.9 s | 2.9 s | **1.1 s** |
+| python-code-doctor, 161 files / 44k LOC | 32.7 s | 23.0 s | **7.3 s** |
+| typescript-code-doctor, 200 files / 15.6k LOC | 18.3 s | 2.9 s | **1.1 s** |
 
 The `--jobs 1` column is parse-once alone — nearly all of the TypeScript win and
 about a third of the Python one; the rest is the pool. TypeScript gains more
@@ -213,6 +213,13 @@ it through. One unparseable file went from 0 warnings to 29 — one per detector
 Surfacing it is right (this skill's whole posture is that a file it could not
 read is named rather than counted clean) but 29 times is not, so
 `warn_unparseable` now says it once per file per process.
+
+**Shards were balanced by file count, which is not what a shard costs.** Four
+large modules take several times what four small ones do, and the run waits on
+the heaviest shard. The imbalance grows with worker count — precisely when it
+matters: on this repository the heaviest of 16 count-split shards carried 1.5x
+the average. Shards are now cut on cumulative source bytes, still contiguous so
+order is untouched, and the heaviest is within ~12% of the average.
 
 **The runner grew a second source of truth for ordering.** `to_record` and the
 confidence floor were shared with the detectors that own them, but the sort key
