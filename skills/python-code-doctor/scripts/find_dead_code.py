@@ -470,6 +470,21 @@ def analyze_file(filepath: Path, ignore: set[str] = frozenset()) -> list[DeadCod
         return []
 
 
+def sort_key(record: dict):
+    """This detector ranks by confidence, not severity — main() and the runner
+    both order through this, so neither can drift from the other."""
+    return (-record.get("confidence", 0), record.get("file", ""), record.get("line", 0))
+
+
+def default_filter(records: list[dict]) -> list[dict]:
+    """The confidence floor `find_dead_code.py <path>` applies unless told otherwise.
+
+    The runner applies it too; without that, a pooled report would carry
+    low-confidence leads this detector's own CLI never shows.
+    """
+    return [r for r in records if r.get("confidence", 0) >= DEFAULT_MIN_CONFIDENCE]
+
+
 def to_record(issue: "DeadCodeIssue") -> dict:
     """The JSON shape this detector emits. Shared with the runner so a pooled
     run and a `find_dead_code.py <path>` run produce the same records.
@@ -503,7 +518,9 @@ def main():
         all_issues.extend(analyze_file(filepath, ignore))
 
     all_issues = [i for i in all_issues if i.confidence >= args.min_confidence]
-    all_issues.sort(key=lambda x: (-x.confidence, x.file, x.line))
+    # Same key the runner orders a pooled report by; it reads it off this module.
+    all_issues.sort(key=lambda i: sort_key({"confidence": i.confidence,
+                                            "file": i.file, "line": i.line}))
 
     if args.format == 'json':
         # severity travels with the finding so standalone output renders the

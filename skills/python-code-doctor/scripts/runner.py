@@ -36,25 +36,15 @@ from common import (
     warn_detector_error,
 )
 
-# The one detector that does not sort by severity ranks by confidence instead,
-# so the runner has to know that much. Everything else goes through
-# common.sort_findings, which is the same function the detectors' own main()
-# calls — one definition, so a pooled run and a lone CLI cannot order the same
-# findings differently.
-SORT_KEYS = {
-    "dead_code": lambda r: (-r.get("confidence", 0), r.get("file", ""), r.get("line", 0)),
-}
-
-# Report-level filters a detector's own CLI applies by default. Without this one,
-# a pooled run would report low-confidence dead code that `find_dead_code.py .`
-# never shows. The floor itself lives in the detector.
-POST_FILTERS = {
-    "dead_code": lambda r, floor: r.get("confidence", 0) >= floor,
-}
-
-
 def _standard_key(record: dict):
-    """common.sort_findings' key, over records that are already dicts."""
+    """common.sort_findings' key, over records that are already dicts.
+
+    A detector that orders its report differently says so with a module-level
+    `sort_key`, and one that filters by default with a `default_filter` — the
+    same arrangement as `to_record`. Asking the module means the runner holds no
+    opinion about any particular detector, and a detector cannot change how its
+    CLI reports without the pooled run following.
+    """
     return (record.get("severity") != "high", record.get("severity") != "medium",
             record.get("file", ""), record.get("line", 0))
 
@@ -263,19 +253,19 @@ def _absorb(results: dict, part: dict) -> None:
 
 def _finish(results: dict, file_specs, tree_specs) -> dict:
     """Filter and order each category exactly as its own main() would."""
-    floors = {}
-    if "dead_code" in dict(file_specs):
-        floors["dead_code"] = importlib.import_module("find_dead_code").DEFAULT_MIN_CONFIDENCE
-
-    for category, _ in file_specs:
+    for category, module_name in file_specs:
         found = results.setdefault(category, [])
         if not isinstance(found, list):
-            continue
-        keep = POST_FILTERS.get(category)
-        if keep is not None:
-            found = [record for record in found if keep(record, floors[category])]
+            continue  # an error dict, whose category has no records to order
+        # Reaching here means a worker already imported this module successfully,
+        # so the import cannot fail: a module that would not import left the error
+        # dict skipped just above.
+        module = importlib.import_module(module_name)
+        default_filter = getattr(module, "default_filter", None)
+        if default_filter is not None:
+            found = default_filter(found)
             results[category] = found
-        found.sort(key=SORT_KEYS.get(category, _standard_key))
+        found.sort(key=getattr(module, "sort_key", _standard_key))
     for category, _ in tree_specs:
         results.setdefault(category, [])  # already ordered by its analyze_tree
     return results
