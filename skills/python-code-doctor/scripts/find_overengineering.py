@@ -11,7 +11,7 @@ import argparse
 from pathlib import Path
 from dataclasses import dataclass, asdict
 from collections import defaultdict
-from common import (SEVERITY_ICONS, configure_output, find_python_files,
+from common import (sort_findings, SEVERITY_ICONS, configure_output, find_python_files,
                     warn_detector_error, warn_unparseable)
 
 
@@ -224,7 +224,7 @@ def analyze_tree(path: Path, ignore: set) -> list:
         analyzer.analyze_file(filepath)
     analyzer.detect_issues()
     findings = [i for i in analyzer.issues if i.issue_type not in ignore]
-    findings.sort(key=lambda x: (x.severity != 'high', x.severity != 'medium', x.file, x.line))
+    sort_findings(findings)
     return findings
 
 
@@ -244,7 +244,7 @@ def main():
     analyzer.detect_issues()
 
     issues = [i for i in analyzer.issues if i.issue_type not in ignore]
-    issues.sort(key=lambda x: (x.severity != 'high', x.severity != 'medium', x.file, x.line))
+    sort_findings(issues)
 
     if args.format == 'json':
         # Flat findings list, like every other detector (stats live in the

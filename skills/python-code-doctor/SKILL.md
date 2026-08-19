@@ -47,7 +47,12 @@ reports the ones that are missing rather than failing, and no detector depends o
 across as many processes as there are cores. On a large repository that is the
 difference between minutes and seconds, and it changes nothing about what is
 reported. `--jobs N` sets the worker count; `--jobs 1` runs everything in one
-process, which is what to use when a crash needs a clean traceback.
+process, which is what to use when a crash needs a clean traceback, or when a
+tree is large enough that N workers will not fit in memory.
+
+Detectors share one parsed tree per file, so **a detector must not mutate the
+tree it is handed** — `find_duplicates` normalises identifiers in the trees it
+hashes, which is exactly why it parses for itself instead.
 
 ```bash
 python "$SKILL/scripts/analyze_all.py" .                   # all cores

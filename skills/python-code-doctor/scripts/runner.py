@@ -24,7 +24,9 @@ and every sort here is the detector's own, which is stable.
 
 import importlib
 import os
+import sys
 from concurrent.futures import ProcessPoolExecutor
+from concurrent.futures.process import BrokenProcessPool
 from dataclasses import asdict, is_dataclass
 from pathlib import Path
 
@@ -34,28 +36,27 @@ from common import (
     warn_detector_error,
 )
 
-# The order almost every detector's main() sorts by. Categories that sort
-# differently name their own key in SORT_KEYS below.
-def _standard_key(record: dict):
-    return (record.get("severity") != "high", record.get("severity") != "medium",
-            record.get("file", ""), record.get("line", 0))
-
-
+# The one detector that does not sort by severity ranks by confidence instead,
+# so the runner has to know that much. Everything else goes through
+# common.sort_findings, which is the same function the detectors' own main()
+# calls — one definition, so a pooled run and a lone CLI cannot order the same
+# findings differently.
 SORT_KEYS = {
     "dead_code": lambda r: (-r.get("confidence", 0), r.get("file", ""), r.get("line", 0)),
 }
 
-def _confident_enough(record: dict) -> bool:
-    floor = importlib.import_module("find_dead_code").DEFAULT_MIN_CONFIDENCE
-    return record.get("confidence", 0) >= floor
-
-
 # Report-level filters a detector's own CLI applies by default. Without this one,
 # a pooled run would report low-confidence dead code that `find_dead_code.py .`
-# never shows.
+# never shows. The floor itself lives in the detector.
 POST_FILTERS = {
-    "dead_code": _confident_enough,
+    "dead_code": lambda r, floor: r.get("confidence", 0) >= floor,
 }
+
+
+def _standard_key(record: dict):
+    """common.sort_findings' key, over records that are already dicts."""
+    return (record.get("severity") != "high", record.get("severity") != "medium",
+            record.get("file", ""), record.get("line", 0))
 
 
 def default_jobs() -> int:
@@ -123,23 +124,26 @@ def run_file_shard(paths: list[Path], specs: list[tuple[str, str]],
             for category, found in out.items()}
 
 
-def run_tree_task(path: Path, specs: list[tuple[str, str]],
-                  ignore: set[str]) -> dict[str, object]:
-    """Run the whole-tree detectors, each of which walks the tree for itself.
+def run_tree_detector(path: Path, category: str, module_name: str,
+                      ignore: set[str]) -> dict[str, object]:
+    """Run one whole-tree detector.
 
-    Their `analyze_tree` returns records already in the order their own main()
-    prints, so nothing downstream re-sorts them — they come from this one task,
-    with no shard merge to disturb.
+    One task per detector rather than one task for all of them, because these
+    six share nothing: each walks the tree with its own passes, and the parse
+    cache holds one file, so running them back to back in a single process only
+    serialises them. Bundling them made the bundle the floor the whole run
+    could not go below — 6.5s of a 9.0s run before this was split.
+
+    `analyze_tree` returns records already in the order its own main() prints,
+    so nothing downstream re-sorts them: one detector, one task, no shard merge
+    to disturb the order.
     """
     configure_output()
-    out: dict[str, object] = {}
-    for category, module_name in specs:
-        try:
-            module = importlib.import_module(module_name)
-            out[category] = _records(module.analyze_tree(path, ignore), module)
-        except Exception as exc:  # one failing detector must not sink the report
-            out[category] = {"issues": [], "error": f"{type(exc).__name__}: {exc}"}
-    return out
+    try:
+        module = importlib.import_module(module_name)
+        return {category: _records(module.analyze_tree(path, ignore), module)}
+    except Exception as exc:  # one failing detector must not sink the report
+        return {category: {"issues": [], "error": f"{type(exc).__name__}: {exc}"}}
 
 
 # --------------------------------------------------------------------------- #
@@ -164,27 +168,39 @@ def run_detectors(path: str, file_specs: list[tuple[str, str]],
     if jobs == 1:
         for shard in shards:
             _absorb(results, run_file_shard(shard, file_specs, ignore))
-        if not shards:
-            _absorb(results, run_file_shard([], file_specs, ignore))
-        if tree_specs:
-            _absorb(results, run_tree_task(root, tree_specs, ignore))
+        for category, module_name in tree_specs:
+            _absorb(results, run_tree_detector(root, category, module_name, ignore))
         return _finish(results, file_specs, tree_specs)
 
+    # More workers than tasks just costs process startup.
+    workers = min(jobs, max(1, len(shards) + len(tree_specs)))
     try:
-        with ProcessPoolExecutor(max_workers=jobs) as pool:
-            # The tree task is the long pole — start it before the shards queue up.
-            tree_future = pool.submit(run_tree_task, root, tree_specs, ignore) if tree_specs else None
-            shard_futures = [pool.submit(run_file_shard, shard, file_specs, ignore)
-                             for shard in shards]
-            for future in shard_futures:  # in submission order: chunk order is finding order
-                _absorb(results, future.result())
-            if not shard_futures:
-                _absorb(results, run_file_shard([], file_specs, ignore))
-            if tree_future is not None:
-                _absorb(results, tree_future.result())
-    except (OSError, NotImplementedError, ImportError):
+        pool = ProcessPoolExecutor(max_workers=workers)
+    except (OSError, NotImplementedError, ImportError, ValueError):
         # A sandbox with no working process pool. Same work, one process.
         return run_detectors(path, file_specs, tree_specs, jobs=1, ignore=ignore)
+
+    # File shards are the longest tasks, so they are queued first: a worker that
+    # finishes one picks up a tree detector rather than the other way round.
+    with pool:
+        shard_futures = [pool.submit(run_file_shard, shard, file_specs, ignore)
+                         for shard in shards]
+        tree_futures = [pool.submit(run_tree_detector, root, category, module_name, ignore)
+                        for category, module_name in tree_specs]
+        try:
+            for future in shard_futures:  # in submission order: chunk order is finding order
+                _absorb(results, future.result())
+            for future in tree_futures:
+                _absorb(results, future.result())
+        except BrokenProcessPool as exc:
+            # A worker died outright — killed by the OOM reaper on a big tree, or
+            # taken down by a detector that called sys.exit or crashed a C
+            # extension. Redo the work in this process rather than reporting the
+            # categories it was holding as clean.
+            print(f"⚠️  a worker process died ({exc}); re-running single-process. "
+                  "Pass --jobs 1 to skip the wasted attempt, or use --skip to drop "
+                  "a category that cannot finish.", file=sys.stderr)
+            return run_detectors(path, file_specs, tree_specs, jobs=1, ignore=ignore)
 
     return _finish(results, file_specs, tree_specs)
 
@@ -202,13 +218,17 @@ def _absorb(results: dict, part: dict) -> None:
 
 def _finish(results: dict, file_specs, tree_specs) -> dict:
     """Filter and order each category exactly as its own main() would."""
+    floors = {}
+    if "dead_code" in dict(file_specs):
+        floors["dead_code"] = importlib.import_module("find_dead_code").DEFAULT_MIN_CONFIDENCE
+
     for category, _ in file_specs:
         found = results.setdefault(category, [])
         if not isinstance(found, list):
             continue
         keep = POST_FILTERS.get(category)
         if keep is not None:
-            found = [record for record in found if keep(record)]
+            found = [record for record in found if keep(record, floors[category])]
             results[category] = found
         found.sort(key=SORT_KEYS.get(category, _standard_key))
     for category, _ in tree_specs:

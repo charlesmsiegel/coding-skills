@@ -110,8 +110,49 @@ def _load_aliases(root: Path) -> dict[str, list[Path]]:
     return aliases
 
 
+class _ProjectCache:
+    """The last project built, held only until a different root is asked for.
+
+    Six of the seven tree detectors call load_project for themselves. Running
+    them in one process without this means six full parses of the tree to ask
+    six questions — the very thing the runner exists to stop doing, and ~93% of
+    what the whole-tree half of a run used to cost.
+
+    One entry, like common's parse cache: a run asks about one project, and
+    holding a second tree costs what the first one cost.
+    """
+
+    def __init__(self) -> None:
+        self._key: tuple | None = None
+        self._project: "Project | None" = None
+
+    def get(self, key: tuple) -> "Project | None":
+        return self._project if key == self._key else None
+
+    def put(self, key: tuple, project: "Project") -> None:
+        self._key, self._project = key, project
+
+
+_PROJECTS = _ProjectCache()
+
+
 def load_project(root: Path, *, quiet: bool = False) -> Project:
-    """Parse every TypeScript file under ``root`` once."""
+    """Parse every TypeScript file under ``root`` once.
+
+    Repeated calls for the same root return the same Project. Treat it as
+    read-only: a detector that rewrote it would change what every later
+    detector sees.
+    """
+    key = (str(Path(root).resolve()), quiet)
+    cached = _PROJECTS.get(key)
+    if cached is not None:
+        return cached
+    project = _build_project(Path(root), quiet)
+    _PROJECTS.put(key, project)
+    return project
+
+
+def _build_project(root: Path, quiet: bool) -> Project:
     root = root.resolve()
     project = Project(root=root, aliases=_load_aliases(root) if root.is_dir() else {})
     for path in find_ts_files(root):

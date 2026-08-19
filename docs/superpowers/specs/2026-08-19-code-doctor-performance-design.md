@@ -129,10 +129,20 @@ those tests must keep passing untouched.
 `--jobs 1` runs everything in-process with no pool — still parse-once, and the
 fallback when `ProcessPoolExecutor` is unavailable in a restricted sandbox.
 
-One behaviour is deliberately dropped: the per-detector `subprocess` timeout
-(300 s in Python, 900 s in TypeScript). In-process detectors have no equivalent.
-A timeout firing today *adds* an error record, so losing it can only make a
-report more complete, never less — but it is a real change and is named here.
+Two behaviours change, and neither is free:
+
+**The per-detector timeout is gone** (300 s in Python, 900 s in TypeScript).
+In-process detectors have no equivalent. Where a detector merely runs long this
+is an improvement — a timeout firing replaces findings with an error record. But
+a detector that *hangs* used to be killed and reported; now it hangs the run.
+That is strictly worse, and the earlier framing of this as "can only make a
+report more complete" was wrong.
+
+**A worker can die where a subprocess used to fail alone.** A detector calling
+`sys.exit`, a crashing C extension, or the OOM reaper on a large tree takes down
+a worker rather than one category. `BrokenProcessPool` is caught and the run
+redone in-process, so this costs time rather than correctness — but a run that
+cannot fit in memory at N workers needs `--jobs 1`, and says so.
 
 ## Stages
 
@@ -153,11 +163,13 @@ Stage 2, not a commitment made here.
 
 | | before | `--jobs 1` | 4 cores |
 |---|---|---|---|
-| python-code-doctor, 161 files / 44k LOC | 34.2 s | 23.5 s | **9.0 s** |
-| typescript-code-doctor, 200 files / 15.6k LOC | 18.4 s | 6.2 s | **4.5 s** |
+| python-code-doctor, 161 files / 44k LOC | 33.9 s | 22.8 s | **7.6 s** |
+| typescript-code-doctor, 200 files / 15.6k LOC | 18.9 s | 2.9 s | **1.1 s** |
 
-The `--jobs 1` column is parse-once alone, which is most of the TypeScript win
-and about a third of the Python one; the rest is the pool.
+The `--jobs 1` column is parse-once alone — nearly all of the TypeScript win and
+about a third of the Python one; the rest is the pool. TypeScript gains more
+because its hand-written scanner is the expensive part, and because six of its
+tree detectors were each parsing the whole tree.
 
 Stages 3 and 4 resolved by measurement rather than by writing code:
 
@@ -175,3 +187,35 @@ Stages 3 and 4 resolved by measurement rather than by writing code:
   a fixture corpus and this repository, at `--jobs 1` and `--jobs 4`.
 - `pytest tests/` passes unchanged.
 - Before/after wall clock recorded for both doctors on the same corpora.
+
+## What the review caught
+
+The first implementation of this design was wrong in ways worth recording,
+because each was a claim made in prose that the code did not honour.
+
+**The TypeScript memo was documented and never written.** The design says the
+tree detectors "share one `load_project()`". They did not: all six still built
+their own project, serially, in one task. Measured after the fact, one
+`load_project` was 0.69 s and the whole tree task 4.20 s of a 4.5 s run — so
+~93% of the TypeScript critical path was the redundant parsing this design
+exists to remove. With the memo the tree task is 0.86 s.
+
+**One tree task was a floor, not a plan.** Bundling the whole-tree detectors
+together was justified by sharing, which in Python does not exist — they walk
+the tree independently and the parse cache holds one file. The bundle was 6.5 s
+of a 9.0 s run and no number of cores could go below it. Python now runs one
+task per tree detector. TypeScript keeps them bundled, because after the memo
+they genuinely do share.
+
+**"Output is unchanged" was true only of stdout.** The old `analyze_all`
+captured each subprocess's stderr and discarded it on success; the new one lets
+it through. One unparseable file went from 0 warnings to 29 — one per detector.
+Surfacing it is right (this skill's whole posture is that a file it could not
+read is named rather than counted clean) but 29 times is not, so
+`warn_unparseable` now says it once per file per process.
+
+**The runner grew a second source of truth for ordering.** `to_record` and the
+confidence floor were shared with the detectors that own them, but the sort key
+was re-spelled in the runner. Python gained `common.sort_findings` — which
+TypeScript already had — and the detectors and the runner now sort through one
+definition.

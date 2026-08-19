@@ -33,7 +33,7 @@ from pathlib import Path
 from dataclasses import dataclass, asdict, field
 from typing import Iterator
 from collections import defaultdict
-from common import (cached_parse, SEVERITY_ICONS, configure_output, find_python_files,
+from common import (sort_findings, cached_parse, SEVERITY_ICONS, configure_output, find_python_files,
                     warn_detector_error, warn_unparseable)
 
 
@@ -775,7 +775,7 @@ def main():
     for filepath in find_python_files(Path(args.path)):
         all_issues.extend(analyze_file(filepath, ignore))
 
-    all_issues.sort(key=lambda x: (x.severity != 'high', x.severity != 'medium', x.file, x.line))
+    sort_findings(all_issues)
 
     if args.format == 'json':
         print(json.dumps([asdict(i) for i in all_issues], indent=2))

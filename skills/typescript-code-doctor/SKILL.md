@@ -112,7 +112,13 @@ through that tool — never assume or fabricate a tracker.
 tree, across as many processes as there are cores — the parser here is a
 hand-written scanner, so re-parsing per detector was most of the runtime on a
 large repository. `--jobs N` sets the worker count; `--jobs 1` runs everything in
-one process, which is what to use when a crash needs a clean traceback.
+one process, which is what to use when a crash needs a clean traceback or a
+large tree will not fit in memory at N workers.
+
+`tsproject.load_project` returns the same `Project` for a repeated root, which
+is how the whole-tree detectors avoid parsing the tree once each. **Treat it as
+read-only** — a detector that rewrote it would change what every later detector
+sees.
 
 ```bash
 python "$SKILL/scripts/analyze_all.py" /path           # Run everything, unified report

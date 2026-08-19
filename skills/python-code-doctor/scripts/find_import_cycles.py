@@ -16,7 +16,7 @@ from pathlib import Path
 from dataclasses import dataclass, asdict
 from typing import Dict, List, Set, Optional
 from collections import defaultdict
-from common import (SEVERITY_ICONS, configure_output, find_python_files,
+from common import (sort_findings, SEVERITY_ICONS, configure_output, find_python_files,
                     warn_detector_error, warn_unparseable)
 
 
@@ -469,7 +469,7 @@ def analyze_tree(path: Path, ignore: set) -> list:
     if root.is_file():
         root = root.parent
     findings = analyze(root.resolve(), ignore)
-    findings.sort(key=lambda x: (x.severity != "high", x.severity != "medium", x.file, x.line))
+    sort_findings(findings)
     return findings
 
 
@@ -488,7 +488,7 @@ def main():
     root = root.resolve()
 
     all_issues = analyze(root, ignore)
-    all_issues.sort(key=lambda x: (x.severity != "high", x.severity != "medium", x.file, x.line))
+    sort_findings(all_issues)
 
     if args.format == "json":
         print(json.dumps([asdict(i) for i in all_issues], indent=2))
