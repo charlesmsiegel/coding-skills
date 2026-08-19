@@ -29,6 +29,7 @@ from concurrent.futures import ProcessPoolExecutor
 from concurrent.futures.process import BrokenProcessPool
 from dataclasses import asdict, is_dataclass
 from pathlib import Path
+from typing import Callable
 
 from common import (
     configure_output,
@@ -57,7 +58,8 @@ def default_jobs() -> int:
     return max(1, os.cpu_count() or 1)
 
 
-def chunk(items: list, count: int, weight=None) -> list[list]:
+def chunk(items: list, count: int,
+          weight: Callable[[object], int] | None = None) -> list[list]:
     """Split into at most ``count`` contiguous slices of near-equal weight.
 
     Slices stay **contiguous** because that is what preserves finding order: the

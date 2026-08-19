@@ -31,6 +31,7 @@ from concurrent.futures import ProcessPoolExecutor
 from concurrent.futures.process import BrokenProcessPool
 from dataclasses import asdict
 from pathlib import Path
+from typing import Callable
 from types import SimpleNamespace
 
 from common import (
@@ -59,7 +60,8 @@ def _sort_records(records: list[dict]) -> list[dict]:
     return records
 
 
-def chunk(items: list, count: int, weight=None) -> list[list]:
+def chunk(items: list, count: int,
+          weight: Callable[[object], int] | None = None) -> list[list]:
     """Split into at most ``count`` contiguous slices of near-equal weight.
 
     Slices stay **contiguous** because that is what preserves finding order: the
