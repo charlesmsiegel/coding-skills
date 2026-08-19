@@ -1,6 +1,7 @@
 # coding-skills
 
-A repository of agentic skills to help with AI coding.
+A repository of agentic skills to help with AI coding, plus a set of Claude Code
+output styles that change how the agent talks while it uses them.
 
 ## Skills
 
@@ -130,6 +131,27 @@ mechanical.
   documentation skill. `check_doc_staleness.py` checks citations against the tree and
   infers missing coverage from churn.
 
+## Output styles
+
+Seven [output styles](styles/) — `blunt`, `peer`, `debug`, `decide`, `reference`,
+`teach`, `plain` — split by context rather than intensity. All push toward shorter,
+flatter, less ornamented output. A style is appended to Claude Code's system prompt,
+so it applies every turn and survives compaction; that is what separates it from
+`CLAUDE.md` (a user message) and from a skill (loaded on demand).
+
+The five used while coding set `keep-coding-instructions: true`. Without that key a
+custom style *replaces* Claude Code's built-in software engineering instructions,
+which is the easy way to ship a "better coding style" that quietly deletes the
+coding instructions. `tools/validate_styles.py` fails the build on a misspelled or
+non-boolean value, because nothing at runtime reports it.
+
+Neither Kiro nor Codex has output styles. Kiro gets the closest thing —
+`install.sh --kiro --styles` writes each one into `.kiro/steering/` as
+`style-<name>.md` with `inclusion: manual`, so it is pulled in with
+`#style-<name>`. Codex has no equivalent and the installer says so rather than
+installing something that half works; `styles/README.md` records the three
+near-misses and why none of them ships.
+
 ## Layout
 
 ```
@@ -141,7 +163,10 @@ skills/<skill-name>/     one directory per skill — exactly what ships
 tests/<skill_name>/      that skill's tests (underscored, so it's importable)
 tests/conftest.py        shared fixtures: throwaway git repos, script runners
 evals/<skill-name>/      judgment-half eval prompts (evals.json + fixtures)
+styles/<style-name>.md   one file per output style — flat, no directory
+styles/README.md         what each style is for, and the cross-agent story
 tools/validate_skills.py structural validation, run by CI and by the release job
+tools/validate_styles.py the same for styles (shares the frontmatter parser)
 pyproject.toml           shared dev tooling config (pytest, ruff)
 .github/workflows/       CI (lint + tests + ratchet) and per-skill releases
 ```
@@ -214,14 +239,27 @@ assertion that the wrong behavior is correct; check its reason before "fixing" i
 
 ## Installing locally
 
+Pick at least one target (`--claude`, `--codex`, `--kiro`) and at least one kind
+of content (`--skills`, `--styles`). Bare installs everything of that kind; a
+comma-separated list installs only those.
+
 ```bash
-./install.sh --claude              # ~/.claude/skills/
-./install.sh --claude --codex      # both ~/.claude/skills/ and ~/.codex/skills/
-./install.sh --kiro --dest ~/proj  # ~/proj/.kiro/skills/ (per-project install)
+./install.sh --claude --skills --styles        # skills + styles, for Claude Code
+./install.sh --claude --skills                 # ~/.claude/skills/
+./install.sh --claude --styles 'blunt,peer'    # ~/.claude/output-styles/, two of them
+./install.sh --claude --codex --skills         # both ~/.claude/ and ~/.codex/
+./install.sh --kiro --skills --dest ~/proj     # ~/proj/.kiro/skills/ (per-project)
 ```
+
+`./install.sh --help` has the full flag list and where each kind of content lands.
 
 Each skill is replaced wholesale on re-install (stale files removed) and the
 copy mirrors the release artifact: skill directory plus LICENSE, minus caches.
+A name that does not exist is an error before anything is copied, so a typo in a
+list cannot half-install it.
+
+`--skills` is required to install skills: `./install.sh --claude` on its own now
+prints usage and exits rather than guessing.
 
 ## Releasing a skill
 
