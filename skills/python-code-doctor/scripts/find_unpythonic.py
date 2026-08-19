@@ -10,7 +10,7 @@ import argparse
 from pathlib import Path
 from dataclasses import dataclass, asdict
 from collections import defaultdict
-from common import SEVERITY_ICONS, configure_output, find_python_files, warn_detector_error, warn_unparseable
+from common import cached_parse, SEVERITY_ICONS, configure_output, find_python_files, warn_detector_error, warn_unparseable
 
 
 @dataclass
@@ -145,14 +145,13 @@ class UnpythonicDetector(ast.NodeVisitor):
         self.generic_visit(node)
 
 
-def analyze_file(filepath: Path) -> list[UnpythonicPattern]:
+def analyze_file(filepath: Path, ignore: set[str] = frozenset()) -> list[UnpythonicPattern]:
     try:
-        source = filepath.read_text(encoding='utf-8', errors='replace')
-        tree = ast.parse(source, filename=str(filepath))
+        source, tree = cached_parse(filepath)
         lines = source.splitlines()
         detector = UnpythonicDetector(str(filepath), lines)
         detector.visit(tree)
-        return detector.issues
+        return [i for i in detector.issues if i.pattern_type not in ignore]
     except (SyntaxError, ValueError) as exc:
         warn_unparseable(filepath, exc)
         return []
@@ -173,7 +172,7 @@ def main():
 
     all_issues = []
     for filepath in find_python_files(Path(args.path)):
-        all_issues.extend(i for i in analyze_file(filepath) if i.pattern_type not in ignore)
+        all_issues.extend(analyze_file(filepath, ignore))
 
     all_issues.sort(key=lambda x: (x.severity != 'high', x.severity != 'medium', x.file, x.line))
     

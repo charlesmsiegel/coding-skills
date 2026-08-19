@@ -14,6 +14,11 @@ from collections import defaultdict
 from common import configure_output, find_python_files, warn_detector_error, warn_unparseable
 
 
+# Shortest block worth reporting as a duplicate. Shared with the runner so both
+# entry points use the same floor.
+DEFAULT_MIN_LINES = 5
+
+
 @dataclass
 class DuplicateGroup:
     hash: str
@@ -182,12 +187,24 @@ def to_findings(duplicates: list[DuplicateGroup]) -> list[dict]:
     return findings
 
 
+def analyze_tree(path: Path, ignore: set, min_lines: int = DEFAULT_MIN_LINES) -> list:
+    """Findings for the whole tree, ordered as main() orders them.
+
+    This detector normalises identifiers in the trees it hashes, so it parses
+    for itself rather than sharing the runner's cached tree — a shared tree it
+    rewrote would corrupt every other detector's view of the file.
+    """
+    if "duplicate_code" in ignore:
+        return []
+    return to_findings(find_duplicates(Path(path), min_lines))
+
+
 def main():
     configure_output()
     parser = argparse.ArgumentParser(description="Detect duplicate code in Python")
     parser.add_argument('path', nargs='?', default='.', help='File or directory')
     parser.add_argument('--format', choices=['text', 'json'], default='text')
-    parser.add_argument('--min-lines', type=int, default=5)
+    parser.add_argument('--min-lines', type=int, default=DEFAULT_MIN_LINES)
     parser.add_argument('--ignore', type=str, default='', help='Comma-separated smell types to ignore')
 
     args = parser.parse_args()

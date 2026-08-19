@@ -108,6 +108,11 @@ def detect(path: Path, ignore: set):
     return issues
 
 
+def analyze_tree(path: Path, ignore: set) -> list:
+    """Findings for the whole tree. detect() already orders them."""
+    return detect(Path(path), ignore)
+
+
 def main():
     configure_output()
     parser = argparse.ArgumentParser(description="Detect data clumps (recurring parameter groups)")

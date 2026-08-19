@@ -217,6 +217,17 @@ class ClassCollector(ast.NodeVisitor):
                     self.analyzer.thin_wrappers.append((node.name, self.filename, node.lineno, wrapped_attr))
 
 
+def analyze_tree(path: Path, ignore: set) -> list:
+    """Findings for the whole tree, ordered as main() orders them."""
+    analyzer = ProjectAnalyzer()
+    for filepath in find_python_files(Path(path)):
+        analyzer.analyze_file(filepath)
+    analyzer.detect_issues()
+    findings = [i for i in analyzer.issues if i.issue_type not in ignore]
+    findings.sort(key=lambda x: (x.severity != 'high', x.severity != 'medium', x.file, x.line))
+    return findings
+
+
 def main():
     configure_output()
     parser = argparse.ArgumentParser(description="Detect over-engineering patterns")

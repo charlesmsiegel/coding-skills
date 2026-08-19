@@ -480,6 +480,13 @@ def analyze(root: Path, ignore: set) -> list[CodeSmell]:
     return issues
 
 
+def analyze_tree(path: Path, ignore: set) -> list:
+    """Findings for the whole tree, ordered as main() orders them."""
+    findings = analyze(Path(path), ignore)
+    findings.sort(key=lambda x: (x.severity != "high", x.severity != "medium", x.file, x.line))
+    return findings
+
+
 def main():
     configure_output()
     parser = argparse.ArgumentParser(description="Detect dependency management issues in Python")

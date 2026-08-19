@@ -19,7 +19,7 @@ import argparse
 from pathlib import Path
 from dataclasses import dataclass, asdict
 from collections import defaultdict
-from common import SEVERITY_ICONS, configure_output, find_python_files, warn_detector_error, warn_unparseable
+from common import cached_parse, SEVERITY_ICONS, configure_output, find_python_files, warn_detector_error, warn_unparseable
 
 
 @dataclass
@@ -129,8 +129,7 @@ def analyze_file(filepath: Path, ignore: set) -> list:
     if _is_test_file(filepath):
         return []
     try:
-        source = filepath.read_text(encoding="utf-8", errors="replace")
-        tree = ast.parse(source, filename=str(filepath))
+        source, tree = cached_parse(filepath)
         return detect(tree, str(filepath), source.splitlines(), ignore)
     except (SyntaxError, ValueError) as exc:
         warn_unparseable(filepath, exc)

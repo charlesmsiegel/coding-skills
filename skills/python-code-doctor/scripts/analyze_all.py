@@ -7,79 +7,71 @@ import io
 import sys
 import json
 import argparse
-import subprocess
 from pathlib import Path
 from datetime import datetime
 from common import SEVERITY_ICONS, configure_output
+from runner import default_jobs, run_detectors
 
 
-def run_analyzer(script_name: str, path: str) -> dict:
-    script_path = Path(__file__).parent / script_name
-    if not script_path.exists():
-        return {'issues': [], 'error': f'Script not found: {script_name}'}
+# category -> (module, progress label, kind). One row per detector analyze_all
+# runs; find_redundant_comments and find_parameter_objects' diff lens are opt-in
+# only. `kind` is how the row is scheduled, not what it looks for: a FILE
+# detector answers from one parsed file and is sharded across the pool, a TREE
+# detector needs the whole tree at once and runs in a task of its own.
+FILE, TREE = "file", "tree"
 
-    cmd = [sys.executable, str(script_path), path, '--format', 'json']
-    try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
-        if result.returncode == 0 and result.stdout.strip():
-            return json.loads(result.stdout)
-        return {'issues': [], 'error': result.stderr[:200] if result.stderr else 'No output'}
-    except subprocess.TimeoutExpired:
-        return {'issues': [], 'error': 'Analysis timed out'}
-    except json.JSONDecodeError as e:
-        return {'issues': [], 'error': f'JSON parse error: {e}'}
-    except Exception as e:
-        return {'issues': [], 'error': str(e)[:200]}
-
-
-# category -> (script, progress label). One row per detector analyze_all runs;
-# find_redundant_comments and find_parameter_objects' diff lens are opt-in only.
 ANALYZERS = [
-    ('complexity', 'analyze_complexity.py', 'Analyzing complexity'),
-    ('code_smells', 'find_code_smells.py', 'Finding code smells'),
-    ('overengineering', 'find_overengineering.py', 'Detecting over-engineering'),
-    ('design_smells', 'find_design_smells.py', 'Finding classic design smells'),
-    ('pattern_issues', 'find_pattern_issues.py', 'Finding design-pattern issues'),
-    ('dead_code', 'find_dead_code.py', 'Finding dead code'),
-    ('unpythonic', 'find_unpythonic.py', 'Detecting unpythonic patterns'),
-    ('coupling', 'find_coupling_issues.py', 'Analyzing coupling/cohesion'),
-    ('mutation_hazards', 'find_mutation_hazards.py', 'Finding mutation hazards'),
-    ('exception_issues', 'find_exception_issues.py', 'Finding exception issues'),
-    ('global_state', 'find_global_state.py', 'Finding global state'),
-    ('parameter_objects', 'find_parameter_objects.py', 'Finding data clumps'),
-    ('boolean_params', 'find_boolean_params.py', 'Finding boolean-flag parameters'),
-    ('return_issues', 'find_return_issues.py', 'Finding return-statement problems'),
-    ('loop_simplifications', 'find_loop_simplifications.py', 'Finding loop simplifications'),
-    ('naming_issues', 'find_naming_issues.py', 'Finding naming issues'),
-    ('comment_smells', 'find_comment_smells.py', 'Finding comment smells'),
-    ('resource_leaks', 'find_resource_leaks.py', 'Finding resource leaks'),
-    ('security', 'find_security_issues.py', 'Finding security issues'),
-    ('import_cycles', 'find_import_cycles.py', 'Finding import cycles / god modules'),
-    ('debug_leftovers', 'find_debug_leftovers.py', 'Finding debug leftovers'),
-    ('outdated_idioms', 'find_outdated_idioms.py', 'Finding outdated idioms'),
-    ('missing_docstrings', 'find_missing_docstrings.py', 'Finding missing docstrings'),
-    ('type_gaps', 'find_type_gaps.py', 'Finding type-annotation gaps'),
-    ('dependency_issues', 'find_dependency_issues.py', 'Checking dependency hygiene'),
-    ('untested_modules', 'find_untested_modules.py', 'Finding untested modules'),
-    ('test_smells', 'find_test_smells.py', 'Finding test smells'),
-    ('ai_scaffolding', 'find_ai_scaffolding.py', 'Finding AI scaffolding/placeholders'),
-    ('duplicate_definitions', 'find_duplicate_definitions.py', 'Finding duplicate definitions / merge artifacts'),
-    ('unawaited_coroutines', 'find_unawaited_coroutines.py', 'Finding unawaited coroutines'),
-    ('local_imports', 'find_local_imports.py', 'Finding non-top-level imports'),
-    ('duplicates', 'find_duplicates.py', 'Finding duplicates'),
+    ('complexity', 'analyze_complexity', 'Analyzing complexity', FILE),
+    ('code_smells', 'find_code_smells', 'Finding code smells', FILE),
+    ('overengineering', 'find_overengineering', 'Detecting over-engineering', TREE),
+    ('design_smells', 'find_design_smells', 'Finding classic design smells', FILE),
+    ('pattern_issues', 'find_pattern_issues', 'Finding design-pattern issues', FILE),
+    ('dead_code', 'find_dead_code', 'Finding dead code', FILE),
+    ('unpythonic', 'find_unpythonic', 'Detecting unpythonic patterns', FILE),
+    ('coupling', 'find_coupling_issues', 'Analyzing coupling/cohesion', FILE),
+    ('mutation_hazards', 'find_mutation_hazards', 'Finding mutation hazards', FILE),
+    ('exception_issues', 'find_exception_issues', 'Finding exception issues', FILE),
+    ('global_state', 'find_global_state', 'Finding global state', FILE),
+    ('parameter_objects', 'find_parameter_objects', 'Finding data clumps', TREE),
+    ('boolean_params', 'find_boolean_params', 'Finding boolean-flag parameters', FILE),
+    ('return_issues', 'find_return_issues', 'Finding return-statement problems', FILE),
+    ('loop_simplifications', 'find_loop_simplifications', 'Finding loop simplifications', FILE),
+    ('naming_issues', 'find_naming_issues', 'Finding naming issues', FILE),
+    ('comment_smells', 'find_comment_smells', 'Finding comment smells', FILE),
+    ('resource_leaks', 'find_resource_leaks', 'Finding resource leaks', FILE),
+    ('security', 'find_security_issues', 'Finding security issues', FILE),
+    ('import_cycles', 'find_import_cycles', 'Finding import cycles / god modules', TREE),
+    ('debug_leftovers', 'find_debug_leftovers', 'Finding debug leftovers', FILE),
+    ('outdated_idioms', 'find_outdated_idioms', 'Finding outdated idioms', FILE),
+    ('missing_docstrings', 'find_missing_docstrings', 'Finding missing docstrings', FILE),
+    ('type_gaps', 'find_type_gaps', 'Finding type-annotation gaps', FILE),
+    ('dependency_issues', 'find_dependency_issues', 'Checking dependency hygiene', TREE),
+    ('untested_modules', 'find_untested_modules', 'Finding untested modules', TREE),
+    ('test_smells', 'find_test_smells', 'Finding test smells', FILE),
+    ('ai_scaffolding', 'find_ai_scaffolding', 'Finding AI scaffolding/placeholders', FILE),
+    ('duplicate_definitions', 'find_duplicate_definitions', 'Finding duplicate definitions / merge artifacts', FILE),
+    ('unawaited_coroutines', 'find_unawaited_coroutines', 'Finding unawaited coroutines', FILE),
+    ('local_imports', 'find_local_imports', 'Finding non-top-level imports', FILE),
+    ('duplicates', 'find_duplicates', 'Finding duplicates', TREE),
 ]
 
-CATEGORIES = [category for category, _, _ in ANALYZERS]
+CATEGORIES = [category for category, _, _, _ in ANALYZERS]
 
 
-def generate_report(path: str, skip: set | None = None) -> dict:
+def generate_report(path: str, skip: set | None = None, jobs: int | None = None) -> dict:
     skip = skip or set()
-    results = {}
-    for category, script, label in ANALYZERS:
-        if category in skip:
-            continue
+    scheduled = [row for row in ANALYZERS if row[0] not in skip]
+    for _, _, label, _ in scheduled:
         print(f"🔍 {label}...", file=sys.stderr)
-        results[category] = run_analyzer(script, path)
+
+    results = run_detectors(
+        path,
+        [(category, module) for category, module, _, kind in scheduled if kind == FILE],
+        [(category, module) for category, module, _, kind in scheduled if kind == TREE],
+        jobs=jobs,
+    )
+    # Report in the table's order, not the order the pool happened to finish in.
+    results = {category: results[category] for category, _, _, _ in scheduled}
 
     report = {
         'meta': {
@@ -367,6 +359,7 @@ Examples:
   %(prog)s .                    # Analyze current directory
   %(prog)s myproject/           # Analyze specific project
   %(prog)s . --format json      # JSON output for CI
+  %(prog)s . --jobs 1           # analyze in this process, no pool
         """
     )
     parser.add_argument('path', nargs='?', default='.', help='File or directory')
@@ -376,16 +369,21 @@ Examples:
                              f"(choices: {', '.join(CATEGORIES)})")
     parser.add_argument('--skip-duplicates', action='store_true',
                         help='Shorthand for --skip duplicates (the slowest analyzer)')
+    parser.add_argument('--jobs', '-j', type=int, default=None,
+                        help='Worker processes to analyze with '
+                             f'(default: {default_jobs()}; 1 runs in this process)')
     parser.add_argument('--output', '-o', type=str, help='Output file')
 
     args = parser.parse_args()
+    if args.jobs is not None and args.jobs < 1:
+        parser.error('--jobs must be at least 1')
     skip = set(args.skip.split(',')) if args.skip else set()
     if args.skip_duplicates:
         skip.add('duplicates')
     unknown = skip - set(CATEGORIES)
     if unknown:
         parser.error(f"--skip names unknown categories: {', '.join(sorted(unknown))}")
-    report = generate_report(args.path, skip=skip)
+    report = generate_report(args.path, skip=skip, jobs=args.jobs)
 
     if args.format == 'json':
         output = json.dumps(report, indent=2)

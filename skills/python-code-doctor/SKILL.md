@@ -43,6 +43,18 @@ nothing to install. `run_external_tools.py` additionally drives ruff, mypy, blac
 isort, bandit, flake8, pip-audit, and coverage *when they are already installed*; it
 reports the ones that are missing rather than failing, and no detector depends on it.
 
+`analyze_all.py` parses each file once and asks every detector about that one tree,
+across as many processes as there are cores. On a large repository that is the
+difference between minutes and seconds, and it changes nothing about what is
+reported. `--jobs N` sets the worker count; `--jobs 1` runs everything in one
+process, which is what to use when a crash needs a clean traceback.
+
+```bash
+python "$SKILL/scripts/analyze_all.py" .                   # all cores
+python "$SKILL/scripts/analyze_all.py" . --jobs 1          # one process
+python "$SKILL/scripts/analyze_all.py" . --skip duplicates # drop the slowest category
+```
+
 ## Workflow
 
 **Cleaning up a whole poorly-written repo from cold?** The steps below assume the

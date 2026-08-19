@@ -22,7 +22,7 @@ import argparse
 from pathlib import Path
 from dataclasses import dataclass, asdict
 from collections import defaultdict
-from common import (SEVERITY_ICONS, configure_output, find_python_files,
+from common import (cached_parse, cached_source, SEVERITY_ICONS, configure_output, find_python_files,
                     warn_unparseable)
 
 
@@ -213,7 +213,7 @@ def _walk_scopes(tree, filename, lines, ignore):
 
 def analyze_file(filepath: Path, ignore: set) -> list:
     try:
-        source = filepath.read_text(encoding="utf-8", errors="replace")
+        source = cached_source(filepath)
     except OSError as exc:
         warn_unparseable(filepath, exc)
         return []
@@ -226,7 +226,7 @@ def analyze_file(filepath: Path, ignore: set) -> list:
 
     # Attempt AST parse; if it fails, return only conflict findings
     try:
-        tree = ast.parse(source, filename=filename)
+        _, tree = cached_parse(filepath)
     except (SyntaxError, ValueError) as exc:
         if not conflict_issues:  # conflict markers already explain the parse failure
             warn_unparseable(filepath, exc)
