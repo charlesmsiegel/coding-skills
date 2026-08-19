@@ -261,3 +261,35 @@ def test_the_sort_the_runner_uses_is_the_one_the_detectors_use(runner_modules, t
     by_detector = [r.as_dict() for r in common.sort_findings(list(records))]
     by_runner = sorted((r.as_dict() for r in records), key=runner._standard_key)
     assert by_detector == by_runner
+
+
+def test_weighted_chunks_stay_contiguous_and_lose_nothing(runner_modules):
+    """Contiguity is what preserves finding order — a reordered split reorders the report."""
+    import random
+    chunk = runner_modules["runner"].chunk
+    random.seed(20260819)
+    for _ in range(500):
+        items = list(range(random.randint(0, 40)))
+        weights = {i: random.choice([0, 1, 1, 5, 100, 10_000]) for i in items}
+        count = random.randint(1, 12)
+        shards = chunk(items, count, weight=lambda i: weights[i])
+        assert [x for shard in shards for x in shard] == items
+        assert all(shard for shard in shards), "an empty shard wastes a worker"
+        assert len(shards) <= max(1, min(count, len(items)))
+
+
+def test_weighting_by_size_balances_better_than_by_count(runner_modules):
+    """Equal file counts is the wrong split: the run waits on the heaviest shard."""
+    chunk = runner_modules["runner"].chunk
+    # The big modules cluster at the front, as they do when a package's core
+    # sorts before its helpers. Splitting eight-and-eight puts all of them in
+    # one shard and the run waits on it.
+    sizes = [1000] * 4 + [100] * 12
+    items = list(range(len(sizes)))
+
+    def heaviest(shards):
+        return max(sum(sizes[i] for i in shard) for shard in shards)
+
+    by_count = heaviest(chunk(items, 2))
+    by_size = heaviest(chunk(items, 2, weight=lambda i: sizes[i]))
+    assert by_size < by_count, f"by_size={by_size} did not beat by_count={by_count}"
