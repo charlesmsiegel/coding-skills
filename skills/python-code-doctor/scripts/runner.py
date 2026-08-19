@@ -32,7 +32,6 @@ from common import (
     configure_output,
     find_python_files,
     warn_detector_error,
-    warn_unparseable,
 )
 
 # The order almost every detector's main() sorts by. Categories that sort

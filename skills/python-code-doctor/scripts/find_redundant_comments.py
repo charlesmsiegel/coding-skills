@@ -15,7 +15,6 @@ Finds:
   - redundant_comment : a # comment that restates the code on the same or next line
 """
 
-import ast
 import re
 import io
 import json
