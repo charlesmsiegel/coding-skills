@@ -176,3 +176,25 @@ def test_weighting_by_size_balances_better_than_by_count(ts_runner):
     by_count = heaviest(chunk(items, 2))
     by_size = heaviest(chunk(items, 2, weight=lambda i: sizes[i]))
     assert by_size < by_count, f"by_size={by_size} did not beat by_count={by_count}"
+
+
+def test_a_dead_worker_falls_back_instead_of_crashing(ts_modules, project, monkeypatch):
+    """A worker killed by the OOM reaper must not read as a clean repository."""
+    import concurrent.futures
+    runner = ts_modules["runner"]
+    broken = concurrent.futures.process.BrokenProcessPool("worker died")
+
+    class DeadFuture:
+        def result(self):
+            raise broken
+
+    class DeadPool:
+        def __init__(self, *a, **k): pass
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+        def submit(self, *a, **k): return DeadFuture()
+
+    monkeypatch.setattr(runner, "ProcessPoolExecutor", DeadPool)
+    results = runner.run_detectors(
+        str(project), [("code_smells", "find_code_smells")], [], jobs=4)
+    assert results["code_smells"], "fell back to nothing — a dead pool read as a clean repo"
