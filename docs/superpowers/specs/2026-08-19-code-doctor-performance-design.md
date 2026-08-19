@@ -1,6 +1,6 @@
 # Code Doctor Performance: Parse Once, Run in Parallel
 
-**Status:** design
+**Status:** implemented
 **Date:** 2026-08-19
 
 ## Problem
@@ -148,6 +148,26 @@ report more complete, never less — but it is a real change and is named here.
 `django-code-doctor` already shares its context. Whether its 15 sequential
 `collect(ctx)` calls are worth parallelising is a measurement to take after
 Stage 2, not a commitment made here.
+
+## Outcome
+
+| | before | `--jobs 1` | 4 cores |
+|---|---|---|---|
+| python-code-doctor, 161 files / 44k LOC | 34.2 s | 23.5 s | **9.0 s** |
+| typescript-code-doctor, 200 files / 15.6k LOC | 18.4 s | 6.2 s | **4.5 s** |
+
+The `--jobs 1` column is parse-once alone, which is most of the TypeScript win
+and about a third of the Python one; the rest is the pool.
+
+Stages 3 and 4 resolved by measurement rather than by writing code:
+
+- **code-doctor** was left alone. Its two detectors read text and never parse,
+  they finish a 161-file tree in 1.4 s, and the subprocess isolation its
+  docstring argues for is worth more than the ~0.6 s a pool would save.
+- **django-code-doctor** was left alone. It already builds its context once, and
+  it analyses a synthetic 282-file project in 0.6 s. Parallelising fifteen
+  `collect(ctx)` calls that total half a second would mean pickling a large
+  context to workers to save nothing.
 
 ## Verification
 
