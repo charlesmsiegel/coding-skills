@@ -6,43 +6,48 @@ Run every detector over a TypeScript project and merge the output into one repor
 import argparse
 import io
 import json
-import subprocess
 import sys
 from datetime import datetime
 from pathlib import Path
 
 from common import SEVERITY_ICONS, configure_output
+from runner import default_jobs, run_detectors
 
-# category -> (script, progress label). One row per detector analyze_all runs.
+# category -> (module, progress label, kind). One row per detector analyze_all
+# runs. `kind` is how the row is scheduled, not what it looks for: FILE detectors
+# answer from a single parsed file and are sharded across the pool, TREE
+# detectors need the whole project at once and share one load of it.
+FILE, TREE = "file", "tree"
+
 ANALYZERS = [
-    ("tsconfig", "find_tsconfig_issues.py", "Auditing tsconfig strictness"),
-    ("type_gaps", "find_type_gaps.py", "Finding type-safety escape hatches"),
-    ("async_issues", "find_async_issues.py", "Finding promise bugs"),
-    ("complexity", "analyze_complexity.py", "Measuring complexity"),
-    ("code_smells", "find_code_smells.py", "Finding code smells"),
-    ("encapsulation", "find_encapsulation_issues.py", "Finding encapsulation failures"),
-    ("mutation_hazards", "find_mutation_hazards.py", "Finding mutation hazards"),
-    ("exception_issues", "find_exception_issues.py", "Finding error-handling problems"),
-    ("resource_leaks", "find_resource_leaks.py", "Finding resource leaks"),
-    ("security", "find_security_issues.py", "Finding security risks"),
-    ("design_smells", "find_design_smells.py", "Finding design smells"),
-    ("coupling", "find_coupling_issues.py", "Analyzing coupling/cohesion"),
-    ("overengineering", "find_overengineering.py", "Detecting over-engineering"),
-    ("loop_simplifications", "find_loop_simplifications.py", "Finding loop simplifications"),
-    ("outdated_idioms", "find_outdated_idioms.py", "Finding outdated idioms"),
-    ("naming_issues", "find_naming_issues.py", "Finding naming issues"),
-    ("comment_smells", "find_comment_smells.py", "Finding comment smells"),
-    ("debug_leftovers", "find_debug_leftovers.py", "Finding debug leftovers"),
-    ("ai_scaffolding", "find_ai_scaffolding.py", "Finding unfinished scaffolding"),
-    ("module_issues", "find_module_issues.py", "Finding import cycles / barrels"),
-    ("dependency_issues", "find_dependency_issues.py", "Reconciling package.json"),
-    ("dead_code", "find_dead_code.py", "Finding dead code"),
-    ("untested_modules", "find_untested_modules.py", "Finding untested modules"),
-    ("test_smells", "find_test_smells.py", "Finding test smells"),
-    ("duplicates", "find_duplicates.py", "Finding duplication"),
+    ("tsconfig", "find_tsconfig_issues", "Auditing tsconfig strictness", TREE),
+    ("type_gaps", "find_type_gaps", "Finding type-safety escape hatches", FILE),
+    ("async_issues", "find_async_issues", "Finding promise bugs", FILE),
+    ("complexity", "analyze_complexity", "Measuring complexity", FILE),
+    ("code_smells", "find_code_smells", "Finding code smells", FILE),
+    ("encapsulation", "find_encapsulation_issues", "Finding encapsulation failures", FILE),
+    ("mutation_hazards", "find_mutation_hazards", "Finding mutation hazards", FILE),
+    ("exception_issues", "find_exception_issues", "Finding error-handling problems", FILE),
+    ("resource_leaks", "find_resource_leaks", "Finding resource leaks", FILE),
+    ("security", "find_security_issues", "Finding security risks", FILE),
+    ("design_smells", "find_design_smells", "Finding design smells", FILE),
+    ("coupling", "find_coupling_issues", "Analyzing coupling/cohesion", FILE),
+    ("overengineering", "find_overengineering", "Detecting over-engineering", TREE),
+    ("loop_simplifications", "find_loop_simplifications", "Finding loop simplifications", FILE),
+    ("outdated_idioms", "find_outdated_idioms", "Finding outdated idioms", FILE),
+    ("naming_issues", "find_naming_issues", "Finding naming issues", FILE),
+    ("comment_smells", "find_comment_smells", "Finding comment smells", FILE),
+    ("debug_leftovers", "find_debug_leftovers", "Finding debug leftovers", FILE),
+    ("ai_scaffolding", "find_ai_scaffolding", "Finding unfinished scaffolding", FILE),
+    ("module_issues", "find_module_issues", "Finding import cycles / barrels", TREE),
+    ("dependency_issues", "find_dependency_issues", "Reconciling package.json", TREE),
+    ("dead_code", "find_dead_code", "Finding dead code", TREE),
+    ("untested_modules", "find_untested_modules", "Finding untested modules", TREE),
+    ("test_smells", "find_test_smells", "Finding test smells", FILE),
+    ("duplicates", "find_duplicates", "Finding duplication", TREE),
 ]
 
-CATEGORIES = [category for category, _, _ in ANALYZERS]
+CATEGORIES = [category for category, _, _, _ in ANALYZERS]
 
 # Advice keyed by category, printed when that category has any finding.
 RECOMMENDATIONS = {
@@ -74,33 +79,20 @@ RECOMMENDATIONS = {
 }
 
 
-def run_analyzer(script_name: str, path: str) -> dict:
-    script_path = Path(__file__).parent / script_name
-    if not script_path.exists():
-        return {"issues": [], "error": f"Script not found: {script_name}"}
-
-    command = [sys.executable, str(script_path), path, "--format", "json"]
-    try:
-        result = subprocess.run(command, capture_output=True, text=True, timeout=900)
-        if result.returncode == 0 and result.stdout.strip():
-            return json.loads(result.stdout)
-        return {"issues": [], "error": result.stderr[-300:] if result.stderr else "No output"}
-    except subprocess.TimeoutExpired:
-        return {"issues": [], "error": "Analysis timed out"}
-    except json.JSONDecodeError as exc:
-        return {"issues": [], "error": f"JSON parse error: {exc}"}
-    except (OSError, subprocess.SubprocessError) as exc:
-        return {"issues": [], "error": str(exc)[:200]}
-
-
-def generate_report(path: str, skip: set | None = None) -> dict:
+def generate_report(path: str, skip: set | None = None, jobs: int | None = None) -> dict:
     skip = skip or set()
-    results = {}
-    for category, script, label in ANALYZERS:
-        if category in skip:
-            continue
+    scheduled = [row for row in ANALYZERS if row[0] not in skip]
+    for _, _, label, _ in scheduled:
         print(f"🔍 {label}...", file=sys.stderr)
-        results[category] = run_analyzer(script, path)
+
+    results = run_detectors(
+        path,
+        [(category, module) for category, module, _, kind in scheduled if kind == FILE],
+        [(category, module) for category, module, _, kind in scheduled if kind == TREE],
+        jobs=jobs,
+    )
+    # Report in the table's order, not the order the pool happened to finish in.
+    results = {category: results[category] for category, _, _, _ in scheduled}
 
     report = {
         "meta": {
@@ -235,6 +227,7 @@ Examples:
   %(prog)s .                      # analyze the current project
   %(prog)s src/ --format json     # JSON for tooling
   %(prog)s . --skip duplicates    # drop the slowest category
+  %(prog)s . --jobs 1             # analyse in this process, no pool
         """,
     )
     parser.add_argument("path", nargs="?", default=".", help="File or directory")
@@ -244,8 +237,14 @@ Examples:
                              f"(choices: {', '.join(CATEGORIES)})")
     parser.add_argument("--skip-duplicates", action="store_true",
                         help="Shorthand for --skip duplicates (the slowest analyzer)")
+    parser.add_argument("--jobs", "-j", type=int, default=None,
+                        help="Worker processes to analyse with "
+                             f"(default: {default_jobs()}; 1 runs in this process)")
     parser.add_argument("--output", "-o", type=str, help="Output file")
     args = parser.parse_args()
+
+    if args.jobs is not None and args.jobs < 1:
+        parser.error("--jobs must be at least 1")
 
     skip = set(args.skip.split(",")) if args.skip else set()
     if args.skip_duplicates:
@@ -254,7 +253,7 @@ Examples:
     if unknown:
         parser.error(f"--skip names unknown categories: {', '.join(sorted(unknown))}")
 
-    report = generate_report(args.path, skip=skip)
+    report = generate_report(args.path, skip=skip, jobs=args.jobs)
 
     if args.format == "json":
         output = json.dumps(report, indent=2)
