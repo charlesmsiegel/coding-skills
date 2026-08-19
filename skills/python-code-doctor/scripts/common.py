@@ -51,43 +51,62 @@ def find_python_files(path: Path) -> Iterator[Path]:
                 yield p
 
 
-# The last file read, as {path: (source, tree, error)}. Exactly one entry;
-# see cached_parse. `source` is None when the read itself failed, `tree` is None
-# when the file did not parse, and `error` carries whichever failure happened.
-_LAST_PARSE: dict[str, tuple] = {}
-
-
-def _read_and_parse(filepath: Path) -> tuple:
-    key = str(filepath)
-    try:
-        source = filepath.read_text(encoding="utf-8", errors="replace")
-    except Exception as exc:
-        return (None, None, exc)
-    try:
-        return (source, ast.parse(source, filename=key), None)
-    except Exception as exc:
-        return (source, None, exc)
-
-
-def _cached(filepath: Path) -> tuple:
-    """The one cached entry for ``filepath``, reading it if this is the first ask.
+class _ParseCache:
+    """The last file read, held only until a different one is asked for.
 
     Every detector used to read and parse every file for itself, so running the
-    whole suite parsed each file once per detector. The runner instead asks all
-    of them about one file before moving to the next, which makes the second and
-    later callers for a file free.
+    whole suite parsed each file once per detector — on a large repository, most
+    of the runtime. The runner instead asks every detector about one file before
+    moving to the next, so the second and later callers for a file get the
+    first one's work.
 
-    The cache deliberately holds **one** file. Keeping every tree would cost
-    gigabytes on a large repository, and file-major order means nothing older is
-    ever wanted again. A detector run on its own — one file at a time, all files
-    — is therefore no worse than before, just no better.
+    Holding **one** file is the whole design, not a limitation. Keeping every
+    tree would cost gigabytes on a large repository, and file-major order never
+    wants an older one back. A detector run on its own — one file at a time,
+    all files — is therefore no worse than it was, just no better.
+
+    A read or parse failure is remembered alongside the text so it can be
+    re-raised rather than retried, and so `source()` can still answer for a file
+    that will not parse.
     """
-    key = str(filepath)
-    if key not in _LAST_PARSE:
-        entry = _read_and_parse(filepath)
-        _LAST_PARSE.clear()
-        _LAST_PARSE[key] = entry
-    return _LAST_PARSE[key]
+
+    def __init__(self) -> None:
+        self._path: str | None = None
+        self._source: str | None = None
+        self._tree = None
+        self._error: Exception | None = None
+
+    def _load(self, filepath: Path) -> None:
+        key = str(filepath)
+        if key == self._path:
+            return
+        self._path, self._source, self._tree, self._error = key, None, None, None
+        try:
+            self._source = filepath.read_text(encoding="utf-8", errors="replace")
+        except Exception as exc:  # re-raised by whichever accessor was asked
+            self._error = exc
+            return
+        try:
+            self._tree = ast.parse(self._source, filename=key)
+        except Exception as exc:
+            self._error = exc
+
+    def parse(self, filepath: Path) -> tuple[str, "ast.AST"]:
+        """``(source, tree)``, re-raising exactly what a direct parse would raise."""
+        self._load(filepath)
+        if self._error is not None:
+            raise self._error
+        return self._source, self._tree
+
+    def source(self, filepath: Path) -> str:
+        """The text alone. Raises only when the *read* failed."""
+        self._load(filepath)
+        if self._source is None:
+            raise self._error
+        return self._source
+
+
+_PARSE_CACHE = _ParseCache()
 
 
 def cached_parse(filepath: Path) -> tuple[str, "ast.AST"]:
@@ -97,22 +116,16 @@ def cached_parse(filepath: Path) -> tuple[str, "ast.AST"]:
     ``ast.parse`` would have raised it, so a caller's own ``except SyntaxError``
     still classifies the file the same way.
     """
-    source, tree, error = _cached(filepath)
-    if error is not None:
-        raise error
-    return source, tree
+    return _PARSE_CACHE.parse(filepath)
 
 
 def cached_source(filepath: Path) -> str:
     """The text of ``filepath``, for detectors that read rather than parse.
 
-    Raises only when the *read* failed. A file that will not parse still has
-    text, and a detector that only needs the text must still see it.
+    A file that will not parse still has text, and a detector that only needs
+    the text must still see it.
     """
-    source, _, error = _cached(filepath)
-    if source is None:
-        raise error
-    return source
+    return _PARSE_CACHE.source(filepath)
 
 
 def warn_unparseable(filepath: Path, exc: Exception) -> None:

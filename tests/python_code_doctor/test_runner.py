@@ -100,10 +100,11 @@ def test_cached_parse_holds_only_one_file(runner_modules, tmp_path):
     first.write_text("a = 1\n", encoding="utf-8")
     second.write_text("b = 2\n", encoding="utf-8")
 
-    common.cached_parse(first)
+    _, first_tree = common.cached_parse(first)
     common.cached_parse(second)
+    _, first_again = common.cached_parse(first)
 
-    assert list(common._LAST_PARSE) == [str(second)]
+    assert first_again is not first_tree, "the first file was still being held"
 
 
 def test_cached_parse_reraises_a_syntax_error_like_ast_parse(runner_modules, tmp_path):
