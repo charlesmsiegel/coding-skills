@@ -12,6 +12,7 @@ does not change a single finding.
 import ast
 import importlib
 import json
+import pathlib
 import subprocess
 import sys
 from pathlib import Path
@@ -241,6 +242,35 @@ def test_a_dead_worker_falls_back_instead_of_crashing(project, monkeypatch):
             sys.modules.pop(name, None)
 
     assert results["code_smells"], "fell back to nothing — a dead pool read as a clean repo"
+
+
+def test_the_runner_holds_no_opinion_about_any_one_detector(runner_modules):
+    """A detector that reports differently must be able to say so itself.
+
+    The alternative — the runner keeping a table of which detector is special —
+    is a second source of truth, and the pooled run and the CLI drift the first
+    time someone edits only one of them.
+    """
+    runner = runner_modules["runner"]
+    source = pathlib.Path(runner.__file__).read_text(encoding="utf-8")
+    for detector in ("dead_code", "find_dead_code", "security", "duplicates"):
+        assert detector not in source, (
+            f"runner.py names {detector!r}; ask the module for `sort_key`, "
+            "`default_filter` or `to_record` instead")
+
+
+def test_dead_codes_own_floor_and_order_are_what_the_runner_applies(runner_modules):
+    """The one detector that reports unlike the others owns both differences."""
+    module = runner_modules["find_dead_code"]
+    records = [{"confidence": 100, "file": "b.py", "line": 1},
+               {"confidence": 59, "file": "a.py", "line": 1},
+               {"confidence": 80, "file": "a.py", "line": 2}]
+
+    kept = module.default_filter(records)
+    assert [r["confidence"] for r in kept] == [100, 80], "the CLI's floor was not applied"
+
+    kept.sort(key=module.sort_key)
+    assert [r["confidence"] for r in kept] == [100, 80], "confidence ranks, not severity"
 
 
 def test_the_sort_the_runner_uses_is_the_one_the_detectors_use(runner_modules, tmp_path):

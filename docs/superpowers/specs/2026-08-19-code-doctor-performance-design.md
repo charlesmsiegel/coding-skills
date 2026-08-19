@@ -223,6 +223,9 @@ order is untouched, and the heaviest is within ~12% of the average.
 
 **The runner grew a second source of truth for ordering.** `to_record` and the
 confidence floor were shared with the detectors that own them, but the sort key
-was re-spelled in the runner. Python gained `common.sort_findings` — which
-TypeScript already had — and the detectors and the runner now sort through one
-definition.
+was re-spelled in the runner, and the runner kept a table naming which detector
+was special. Python gained `common.sort_findings` — which TypeScript already
+had — and a detector that reports unlike the others now says so itself, with a
+module-level `sort_key` or `default_filter` the runner asks for by name, exactly
+as it already asked for `to_record`. `runner.py` no longer mentions any
+individual detector, and a test keeps it that way.
