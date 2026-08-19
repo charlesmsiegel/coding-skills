@@ -20,7 +20,7 @@ import argparse
 from pathlib import Path
 from dataclasses import dataclass, asdict
 from collections import defaultdict
-from common import (SEVERITY_ICONS, configure_output, find_python_files,
+from common import (cached_source, SEVERITY_ICONS, configure_output, find_python_files,
                     warn_detector_error, warn_unparseable)
 
 
@@ -120,7 +120,7 @@ def detect(source: str, filename: str, ignore: set):
 
 def analyze_file(filepath: Path, ignore: set) -> list:
     try:
-        source = filepath.read_text(encoding="utf-8", errors="replace")
+        source = cached_source(filepath)
         return detect(source, str(filepath), ignore)
     except (SyntaxError, ValueError, OSError) as exc:
         warn_unparseable(filepath, exc)

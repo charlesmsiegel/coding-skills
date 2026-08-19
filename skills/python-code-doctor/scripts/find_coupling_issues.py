@@ -11,7 +11,7 @@ from pathlib import Path
 from dataclasses import dataclass, asdict
 from typing import Set
 from collections import defaultdict
-from common import SEVERITY_ICONS, configure_output, find_python_files, warn_detector_error, warn_unparseable
+from common import cached_parse, SEVERITY_ICONS, configure_output, find_python_files, warn_detector_error, warn_unparseable
 
 
 @dataclass
@@ -182,14 +182,13 @@ class ClassAnalyzer(ast.NodeVisitor):
                 ))
 
 
-def analyze_file(filepath: Path) -> list[CouplingIssue]:
+def analyze_file(filepath: Path, ignore: set[str] = frozenset()) -> list[CouplingIssue]:
     try:
-        source = filepath.read_text(encoding='utf-8', errors='replace')
-        tree = ast.parse(source, filename=str(filepath))
+        source, tree = cached_parse(filepath)
         lines = source.splitlines()
         analyzer = ClassAnalyzer(str(filepath), lines)
         analyzer.visit(tree)
-        return analyzer.issues
+        return [i for i in analyzer.issues if i.issue_type not in ignore]
     except (SyntaxError, ValueError) as exc:
         warn_unparseable(filepath, exc)
         return []
@@ -210,7 +209,7 @@ def main():
 
     all_issues = []
     for filepath in find_python_files(Path(args.path)):
-        all_issues.extend(i for i in analyze_file(filepath) if i.issue_type not in ignore)
+        all_issues.extend(analyze_file(filepath, ignore))
     
     all_issues.sort(key=lambda x: (x.severity != 'high', x.severity != 'medium', x.file, x.line))
     

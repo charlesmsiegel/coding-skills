@@ -14,7 +14,7 @@ from pathlib import Path
 from dataclasses import dataclass, asdict
 from typing import Set
 from collections import defaultdict
-from common import configure_output, find_python_files, warn_detector_error, warn_unparseable
+from common import cached_parse, configure_output, find_python_files, warn_detector_error, warn_unparseable
 
 
 _NOQA_CODES = re.compile(
@@ -31,6 +31,11 @@ def _dotted_name(node) -> str | None:
         prefix = _dotted_name(node.value)
         return f"{prefix}.{node.attr}" if prefix else None
     return None
+
+
+# Issues below this confidence are noise by default. Shared with the runner so
+# both entry points apply the same floor.
+DEFAULT_MIN_CONFIDENCE = 60
 
 
 @dataclass
@@ -435,10 +440,9 @@ class RedundantCodeDetector(ast.NodeVisitor):
         self.generic_visit(node)
 
 
-def analyze_file(filepath: Path) -> list[DeadCodeIssue]:
+def analyze_file(filepath: Path, ignore: set[str] = frozenset()) -> list[DeadCodeIssue]:
     try:
-        source = filepath.read_text(encoding='utf-8', errors='replace')
-        tree = ast.parse(source, filename=str(filepath))
+        source, tree = cached_parse(filepath)
         comments = defaultdict(list)
         for token in tokenize.generate_tokens(io.StringIO(source).readline):
             if token.type == tokenize.COMMENT:
@@ -456,7 +460,8 @@ def analyze_file(filepath: Path) -> list[DeadCodeIssue]:
         redundant = RedundantCodeDetector(str(filepath))
         redundant.visit(tree)
         
-        return tracker.issues + redundant.issues
+        return [i for i in tracker.issues + redundant.issues
+                if i.issue_type not in ignore]
     except (SyntaxError, ValueError) as exc:
         warn_unparseable(filepath, exc)
         return []
@@ -465,12 +470,29 @@ def analyze_file(filepath: Path) -> list[DeadCodeIssue]:
         return []
 
 
+def to_record(issue: "DeadCodeIssue") -> dict:
+    """The JSON shape this detector emits. Shared with the runner so a pooled
+    run and a `find_dead_code.py <path>` run produce the same records.
+
+    `kind` is dropped when unset rather than serialised as null, and severity is
+    derived from confidence, which is what this detector ranks by.
+    """
+    record = asdict(issue)
+    if record.get('kind') is None:
+        record.pop('kind', None)
+    record['severity'] = (
+        'high' if issue.confidence >= 90
+        else ('medium' if issue.confidence >= 70 else 'low')
+    )
+    return record
+
+
 def main():
     configure_output()
     parser = argparse.ArgumentParser(description="Detect dead and unused code")
     parser.add_argument('path', nargs='?', default='.', help='File or directory')
     parser.add_argument('--format', choices=['text', 'json'], default='text')
-    parser.add_argument('--min-confidence', type=int, default=60)
+    parser.add_argument('--min-confidence', type=int, default=DEFAULT_MIN_CONFIDENCE)
     parser.add_argument('--ignore', type=str, default='', help='Comma-separated issue types to ignore')
 
     args = parser.parse_args()
@@ -478,7 +500,7 @@ def main():
 
     all_issues = []
     for filepath in find_python_files(Path(args.path)):
-        all_issues.extend(i for i in analyze_file(filepath) if i.issue_type not in ignore)
+        all_issues.extend(analyze_file(filepath, ignore))
 
     all_issues = [i for i in all_issues if i.confidence >= args.min_confidence]
     all_issues.sort(key=lambda x: (-x.confidence, x.file, x.line))
@@ -488,17 +510,7 @@ def main():
         # same as analyze_all's aggregation (confidence maps onto severity).
         # `kind` is stripped unless set to "candidate", so a scored finding
         # carries no key and the downstream merge scores it as a defect.
-        def _record(issue: DeadCodeIssue) -> dict:
-            record = asdict(issue)
-            if record.get('kind') is None:
-                record.pop('kind', None)
-            record['severity'] = (
-                'high' if issue.confidence >= 90
-                else ('medium' if issue.confidence >= 70 else 'low')
-            )
-            return record
-
-        print(json.dumps([_record(i) for i in all_issues], indent=2))
+        print(json.dumps([to_record(i) for i in all_issues], indent=2))
     else:
         if not all_issues:
             print("✅ No dead code found!")

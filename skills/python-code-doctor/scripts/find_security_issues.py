@@ -26,7 +26,7 @@ import argparse
 from pathlib import Path
 from dataclasses import dataclass, asdict
 from collections import defaultdict
-from common import SEVERITY_ICONS, configure_output, find_python_files, warn_detector_error, warn_unparseable
+from common import cached_parse, SEVERITY_ICONS, configure_output, find_python_files, warn_detector_error, warn_unparseable
 
 
 @dataclass
@@ -406,8 +406,7 @@ def detect(tree, filename, lines, ignore):
 
 def analyze_file(filepath: Path, ignore: set) -> list:
     try:
-        source = filepath.read_text(encoding="utf-8", errors="replace")
-        tree = ast.parse(source, filename=str(filepath))
+        source, tree = cached_parse(filepath)
         return detect(tree, str(filepath), source.splitlines(), ignore)
     except (SyntaxError, ValueError) as exc:
         warn_unparseable(filepath, exc)
@@ -415,6 +414,18 @@ def analyze_file(filepath: Path, ignore: set) -> list:
     except Exception as exc:
         warn_detector_error(filepath, exc)
         return []
+
+
+def to_record(issue: "CodeSmell") -> dict:
+    """The JSON shape this detector emits, shared with the runner.
+
+    `kind` is dropped when unset rather than serialised as null: a null there
+    would read as "this record was classified and came back neither".
+    """
+    record = asdict(issue)
+    if record.get("kind") is None:
+        record.pop("kind", None)
+    return record
 
 
 def main():
@@ -434,13 +445,7 @@ def main():
     if args.format == "json":
         # `kind` is stripped unless set to "candidate", so a scored finding
         # carries no key and the downstream merge scores it as a defect.
-        def _record(issue: CodeSmell) -> dict:
-            record = asdict(issue)
-            if record.get("kind") is None:
-                record.pop("kind", None)
-            return record
-
-        print(json.dumps([_record(i) for i in all_issues], indent=2))
+        print(json.dumps([to_record(i) for i in all_issues], indent=2))
     else:
         if not all_issues:
             print("✅ No security issues found!")

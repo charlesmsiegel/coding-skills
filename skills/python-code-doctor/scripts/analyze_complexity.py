@@ -10,7 +10,7 @@ import json
 import argparse
 from pathlib import Path
 from dataclasses import dataclass, asdict
-from common import SEVERITY_ICONS, configure_output, find_python_files, warn_detector_error
+from common import cached_parse, SEVERITY_ICONS, configure_output, find_python_files, warn_detector_error
 
 
 @dataclass
@@ -212,14 +212,14 @@ class ComplexityVisitor(ast.NodeVisitor):
         self.current_class = old_class
 
 
-def analyze_file(filepath: Path, config: Config) -> list[ComplexityIssue]:
+def analyze_file(filepath: Path, ignore: set[str] = frozenset(),
+                 config: Config | None = None) -> list[ComplexityIssue]:
     try:
-        source = filepath.read_text(encoding='utf-8', errors='replace')
-        tree = ast.parse(source, filename=str(filepath))
+        source, tree = cached_parse(filepath)
         lines = source.splitlines()
-        visitor = ComplexityVisitor(str(filepath), lines, config)
+        visitor = ComplexityVisitor(str(filepath), lines, config or Config())
         visitor.visit(tree)
-        return visitor.issues
+        return [i for i in visitor.issues if i.issue_type not in ignore]
     except SyntaxError as e:
         return [ComplexityIssue(
             file=str(filepath), line=e.lineno or 0, name="<parse>",
@@ -254,7 +254,7 @@ def main():
 
     all_issues = []
     for filepath in find_python_files(Path(args.path)):
-        all_issues.extend(i for i in analyze_file(filepath, config) if i.issue_type not in ignore)
+        all_issues.extend(analyze_file(filepath, ignore, config))
     
     all_issues.sort(key=lambda x: (x.severity != 'high', x.severity != 'medium', x.file, x.line))
     

@@ -7,6 +7,7 @@ do when a file will not parse or a detector crashes. These were copy-pasted
 per script; this module is the single copy.
 """
 
+import ast
 import contextlib
 import sys
 from pathlib import Path
@@ -48,6 +49,70 @@ def find_python_files(path: Path) -> Iterator[Path]:
         for p in path.rglob("*.py"):
             if EXCLUDE_DIRS.isdisjoint(p.relative_to(path).parts):
                 yield p
+
+
+# The last file read, as {path: (source, tree, error)}. Exactly one entry;
+# see cached_parse. `source` is None when the read itself failed, `tree` is None
+# when the file did not parse, and `error` carries whichever failure happened.
+_LAST_PARSE: dict[str, tuple] = {}
+
+
+def _read_and_parse(filepath: Path) -> tuple:
+    key = str(filepath)
+    try:
+        source = filepath.read_text(encoding="utf-8", errors="replace")
+    except Exception as exc:
+        return (None, None, exc)
+    try:
+        return (source, ast.parse(source, filename=key), None)
+    except Exception as exc:
+        return (source, None, exc)
+
+
+def _cached(filepath: Path) -> tuple:
+    """The one cached entry for ``filepath``, reading it if this is the first ask.
+
+    Every detector used to read and parse every file for itself, so running the
+    whole suite parsed each file once per detector. The runner instead asks all
+    of them about one file before moving to the next, which makes the second and
+    later callers for a file free.
+
+    The cache deliberately holds **one** file. Keeping every tree would cost
+    gigabytes on a large repository, and file-major order means nothing older is
+    ever wanted again. A detector run on its own — one file at a time, all files
+    — is therefore no worse than before, just no better.
+    """
+    key = str(filepath)
+    if key not in _LAST_PARSE:
+        entry = _read_and_parse(filepath)
+        _LAST_PARSE.clear()
+        _LAST_PARSE[key] = entry
+    return _LAST_PARSE[key]
+
+
+def cached_parse(filepath: Path) -> tuple[str, "ast.AST"]:
+    """``(source, tree)`` for ``filepath``, sharing the runner's parse of it.
+
+    A read or parse failure is re-raised exactly as a direct ``read_text`` or
+    ``ast.parse`` would have raised it, so a caller's own ``except SyntaxError``
+    still classifies the file the same way.
+    """
+    source, tree, error = _cached(filepath)
+    if error is not None:
+        raise error
+    return source, tree
+
+
+def cached_source(filepath: Path) -> str:
+    """The text of ``filepath``, for detectors that read rather than parse.
+
+    Raises only when the *read* failed. A file that will not parse still has
+    text, and a detector that only needs the text must still see it.
+    """
+    source, _, error = _cached(filepath)
+    if source is None:
+        raise error
+    return source
 
 
 def warn_unparseable(filepath: Path, exc: Exception) -> None:

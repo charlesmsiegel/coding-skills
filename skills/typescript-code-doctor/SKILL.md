@@ -108,9 +108,16 @@ through that tool — never assume or fabricate a tracker.
 
 ## Deterministic scripts
 
+`analyze_all.py` parses each file once and asks every detector about that one
+tree, across as many processes as there are cores — the parser here is a
+hand-written scanner, so re-parsing per detector was most of the runtime on a
+large repository. `--jobs N` sets the worker count; `--jobs 1` runs everything in
+one process, which is what to use when a crash needs a clean traceback.
+
 ```bash
 python "$SKILL/scripts/analyze_all.py" /path           # Run everything, unified report
 python "$SKILL/scripts/analyze_all.py" . --format json > report.json
+python "$SKILL/scripts/analyze_all.py" . --jobs 1      # one process, for a clean traceback
 
 # The type system (start here — this is what makes it TypeScript)
 python "$SKILL/scripts/find_tsconfig_issues.py" .      # strict, noUncheckedIndexedAccess, suppressions

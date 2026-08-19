@@ -459,6 +459,20 @@ def analyze(root: Path, ignore: Set[str]) -> List[CodeSmell]:
     return issues
 
 
+def analyze_tree(path: Path, ignore: set) -> list:
+    """Findings for the whole tree, ordered as main() orders them.
+
+    The runner calls this instead of re-entering main(); both go through the
+    same analyze() so neither can drift from the other.
+    """
+    root = Path(path)
+    if root.is_file():
+        root = root.parent
+    findings = analyze(root.resolve(), ignore)
+    findings.sort(key=lambda x: (x.severity != "high", x.severity != "medium", x.file, x.line))
+    return findings
+
+
 def main():
     configure_output()
     parser = argparse.ArgumentParser(description="Detect import-graph structural problems in Python projects")

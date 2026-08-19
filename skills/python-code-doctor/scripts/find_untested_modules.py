@@ -319,6 +319,16 @@ def analyze(root: Path, ignore: Set[str]) -> List[CodeSmell]:
     return issues
 
 
+def analyze_tree(path: Path, ignore: set) -> list:
+    """Findings for the whole tree, ordered as main() orders them."""
+    root = Path(path)
+    if root.is_file():
+        root = root.parent
+    findings = analyze(root.resolve(), ignore)
+    findings.sort(key=lambda x: (x.severity != "high", x.severity != "medium", x.file, x.line))
+    return findings
+
+
 def main():
     configure_output()
     parser = argparse.ArgumentParser(
