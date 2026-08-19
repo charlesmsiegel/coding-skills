@@ -221,12 +221,13 @@ def run_detectors(path: str, file_specs: list[tuple[str, str]],
 
     # File shards are the longest tasks, so they are queued first: a worker that
     # finishes one picks up a tree detector rather than the other way round.
+    died = None
     with pool:
-        shard_futures = [pool.submit(run_file_shard, shard, file_specs, ignore)
-                         for shard in shards]
-        tree_futures = [pool.submit(run_tree_detector, root, category, module_name, ignore)
-                        for category, module_name in tree_specs]
         try:
+            shard_futures = [pool.submit(run_file_shard, shard, file_specs, ignore)
+                             for shard in shards]
+            tree_futures = [pool.submit(run_tree_detector, root, category, module_name, ignore)
+                            for category, module_name in tree_specs]
             for future in shard_futures:  # in submission order: chunk order is finding order
                 _absorb(results, future.result())
             for future in tree_futures:
@@ -234,12 +235,17 @@ def run_detectors(path: str, file_specs: list[tuple[str, str]],
         except BrokenProcessPool as exc:
             # A worker died outright — killed by the OOM reaper on a big tree, or
             # taken down by a detector that called sys.exit or crashed a C
-            # extension. Redo the work in this process rather than reporting the
-            # categories it was holding as clean.
-            print(f"⚠️  a worker process died ({exc}); re-running single-process. "
-                  "Pass --jobs 1 to skip the wasted attempt, or use --skip to drop "
-                  "a category that cannot finish.", file=sys.stderr)
-            return run_detectors(path, file_specs, tree_specs, jobs=1, ignore=ignore)
+            # extension. `submit` raises this too once the pool is broken, so it
+            # is inside the guard with the waiting.
+            died = exc
+
+    # Outside the `with`, so the dead pool is shut down before the retry rather
+    # than held open for the length of a second full run.
+    if died is not None:
+        print(f"⚠️  a worker process died ({died}); re-running single-process. "
+              "Pass --jobs 1 to skip the wasted attempt, or --skip to drop a "
+              "category that cannot finish.", file=sys.stderr)
+        return run_detectors(path, file_specs, tree_specs, jobs=1, ignore=ignore)
 
     return _finish(results, file_specs, tree_specs)
 

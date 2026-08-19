@@ -26,7 +26,9 @@ to the sort is the one the sequential runner produced, and the sort is stable.
 
 import importlib
 import os
+import sys
 from concurrent.futures import ProcessPoolExecutor
+from concurrent.futures.process import BrokenProcessPool
 from dataclasses import asdict
 from pathlib import Path
 from types import SimpleNamespace
@@ -145,7 +147,12 @@ def run_file_shard(paths: list[Path], specs: list[tuple[str, str]],
 
 def run_tree_task(root: Path, specs: list[tuple[str, str]],
                   ignore: set[str]) -> dict[str, list[dict]]:
-    """Run the whole-tree detectors, which share this process's one parse."""
+    """Run the whole-tree detectors, which share this process's one parse.
+
+    One task for all of them, where python-code-doctor gives each its own: six of
+    the seven go through `tsproject.load_project`, which returns the same Project
+    for a repeated root. Splitting them across processes would buy parallelism at
+    the price of a full tree parse each — the very cost this is here to avoid."""
     configure_output()
     # run_tree_detector hands its detectors the parsed argv; none of them read it.
     args = SimpleNamespace(path=str(root), format="json", ignore="")
@@ -182,26 +189,41 @@ def run_detectors(path: str, file_specs: list[tuple[str, str]],
     if jobs == 1:
         for shard in shards:
             _absorb(results, run_file_shard(shard, file_specs, ignore))
-        if not shards:
-            _absorb(results, run_file_shard([], file_specs, ignore))
         if tree_specs:
             _absorb(results, run_tree_task(root, tree_specs, ignore))
         return _finish(results, file_specs, tree_specs)
 
+    # More workers than tasks just costs process startup.
+    workers = min(jobs, max(1, len(shards) + (1 if tree_specs else 0)))
     try:
-        with ProcessPoolExecutor(max_workers=jobs) as pool:
+        pool = ProcessPoolExecutor(max_workers=workers)
+    except (OSError, NotImplementedError, ImportError, ValueError):
+        # A sandbox with no working process pool. Same work, one process.
+        return run_detectors(path, file_specs, tree_specs, jobs=1, ignore=ignore)
+
+    died = None
+    with pool:
+        try:
             # The tree task is the long pole — start it before the shards queue up.
             tree_future = pool.submit(run_tree_task, root, tree_specs, ignore) if tree_specs else None
             shard_futures = [pool.submit(run_file_shard, shard, file_specs, ignore)
                              for shard in shards]
             for future in shard_futures:  # in submission order: chunk order is finding order
                 _absorb(results, future.result())
-            if not shard_futures:
-                _absorb(results, run_file_shard([], file_specs, ignore))
             if tree_future is not None:
                 _absorb(results, tree_future.result())
-    except (OSError, NotImplementedError, ImportError):
-        # A sandbox with no working process pool. Same work, one process.
+        except BrokenProcessPool as exc:
+            # A worker died outright — the OOM reaper on a big tree, or a detector
+            # that crashed the interpreter. `submit` raises this too once the pool
+            # is broken, so it is inside the guard with the waiting.
+            died = exc
+
+    # Outside the `with`, so the dead pool is shut down before the retry rather
+    # than held open for the length of a second full run.
+    if died is not None:
+        print(f"⚠️  a worker process died ({died}); re-running single-process. "
+              "Pass --jobs 1 to skip the wasted attempt, or --skip to drop a "
+              "category that cannot finish.", file=sys.stderr)
         return run_detectors(path, file_specs, tree_specs, jobs=1, ignore=ignore)
 
     return _finish(results, file_specs, tree_specs)
