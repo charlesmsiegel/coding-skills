@@ -305,7 +305,7 @@ straight into Claude Code (`~/.claude/skills/`) or uploads to claude.ai.
 
 ## License
 
-MIT
+[MIT](LICENSE).
 
 ## Related
 
