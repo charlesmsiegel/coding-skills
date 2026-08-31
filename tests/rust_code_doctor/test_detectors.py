@@ -1054,3 +1054,122 @@ def test_missing_cargo_still_produces_a_json_document(tmp_path, monkeypatch):
     assert result.returncode == 0
     report = json.loads(result.stdout)
     assert [f["smell_type"] for f in report["findings"]] == ["cargo:not-installed"]
+
+
+# --- second review pass ---------------------------------------------------- #
+
+def test_a_blocking_call_inside_spawn_blocking_is_not_on_the_executor(tmp_path):
+    """Reporting it would recommend the wrapper already in use."""
+    source = """\
+pub async fn load(path: String) -> Vec<u8> {
+    tokio::task::spawn_blocking(move || std::fs::read(path).unwrap()).await.unwrap()
+}
+"""
+    target = write(tmp_path / "t", {"lib.rs": source}) / "lib.rs"
+    assert "blocking_call_in_async" not in smells(run_detector("find_concurrency_issues.py", target))
+
+
+def test_a_bare_blocking_call_in_async_is_still_reported(tmp_path):
+    source = 'pub async fn load() -> Vec<u8> { std::fs::read("x").unwrap() }\n'
+    target = write(tmp_path / "t", {"lib.rs": source}) / "lib.rs"
+    assert "blocking_call_in_async" in smells(run_detector("find_concurrency_issues.py", target))
+
+
+def test_a_cast_resolves_the_nearest_shadowed_binding(tmp_path):
+    """Rust shadows freely; a forward scan found the first annotation in the
+    file rather than the one in scope, inventing a truncation."""
+    source = "pub fn f() { let x: u64 = 1; let x: u8 = 2; let _ = x as u16; }\n"
+    target = write(tmp_path / "t", {"lib.rs": source}) / "lib.rs"
+    assert "narrowing_cast" not in smells(run_detector("find_type_issues.py", target))
+
+
+def test_an_unshadowed_narrowing_cast_is_still_reported(tmp_path):
+    source = "pub fn f() { let x: u64 = 1; let _ = x as u16; }\n"
+    target = write(tmp_path / "t", {"lib.rs": source}) / "lib.rs"
+    assert "narrowing_cast" in smells(run_detector("find_type_issues.py", target))
+
+
+def test_pointer_sized_casts_are_reported_as_target_dependent(tmp_path):
+    """`usize` is 32 bits on a 32-bit target. Hard-coding 64 both missed
+    `u64 as usize` and called `usize as u32` a definite narrowing."""
+    source = "pub fn f(a: u64, b: usize, c: usize) {\n" \
+             "    let _ = a as usize;\n    let _ = b as u32;\n    let _ = c as u64;\n}\n"
+    found = smells(run_detector("find_type_issues.py",
+                                write(tmp_path / "t", {"lib.rs": source}) / "lib.rs"))
+    assert "target_dependent_cast" in found
+    assert "narrowing_cast" not in found, "neither cast narrows on every target"
+
+
+def test_same_name_in_two_inline_modules_is_not_a_duplicate(tmp_path):
+    source = "mod a { fn helper() {} }\nmod b { fn helper() {} }\n"
+    target = write(tmp_path / "t", {"lib.rs": source}) / "lib.rs"
+    assert "duplicate_definition" not in smells(run_detector("find_ai_scaffolding.py", target))
+
+
+def test_a_real_duplicate_in_one_scope_is_still_reported(tmp_path):
+    target = write(tmp_path / "t", {"lib.rs": "fn helper() {}\nfn helper() {}\n"}) / "lib.rs"
+    assert "duplicate_definition" in smells(run_detector("find_ai_scaffolding.py", target))
+
+
+def test_a_formatted_command_argument_is_only_flagged_when_value_leading(tmp_path):
+    """`.arg(format!(…))` is one argument passed to execve — no shell, no word
+    splitting. The hazard is an argument whose first character is the value."""
+    benign = 'use std::process::Command;\npub fn f(n: &str) {\n' \
+             '    Command::new("cp").arg(format!("/tmp/{n}.txt")).output().ok();\n}\n'
+    risky = 'use std::process::Command;\npub fn f(n: &str) {\n' \
+            '    Command::new("rm").arg(format!("{n}")).output().ok();\n}\n'
+    assert "option_injectable_argument" not in smells(run_detector(
+        "find_security_issues.py", write(tmp_path / "ok", {"lib.rs": benign}) / "lib.rs"))
+    assert "option_injectable_argument" in smells(run_detector(
+        "find_security_issues.py", write(tmp_path / "bad", {"lib.rs": risky}) / "lib.rs"))
+
+
+def test_a_credential_in_an_inline_test_module_is_downgraded(tmp_path):
+    """It is not compiled into a release build, and the same fixture in
+    `tests/` was already downgraded — the two should not disagree."""
+    source = '#[cfg(test)]\nmod tests {\n    const API_KEY: &str = "hunter2-fixture-value";\n' \
+             '    #[test]\n    fn t() { assert_eq!(API_KEY.len(), 21); }\n}\n'
+    findings = run_detector("find_security_issues.py",
+                            write(tmp_path / "t", {"lib.rs": source}) / "lib.rs")
+    credential = [f for f in findings if f["smell_type"] == "credential_named_literal"]
+    assert credential and credential[0]["severity"] == "low"
+
+
+def test_a_production_credential_is_still_high(tmp_path):
+    source = 'const API_KEY: &str = "hunter2-production-value";\n'
+    findings = run_detector("find_security_issues.py",
+                            write(tmp_path / "t", {"lib.rs": source}) / "lib.rs")
+    credential = [f for f in findings if f["smell_type"] == "credential_named_literal"]
+    assert credential and credential[0]["severity"] == "high"
+
+
+def test_a_cfg_gated_missing_module_is_not_a_proven_build_failure(tmp_path):
+    """Under a configuration where the `cfg` is false, rustc never looks."""
+    root = crate(tmp_path / "c", {"src/lib.rs": '#[cfg(feature = "extra")]\nmod maybe;\n'})
+    found = smells(run_detector("find_module_issues.py", root))
+    assert "cfg_gated_module_file_missing" in found
+    assert "module_file_missing" not in found
+
+
+def test_a_custom_lib_path_is_still_a_crate_root(tmp_path):
+    """`[lib] path = "source/root.rs"` resolves `mod helper;` to
+    `source/helper.rs`; inferring roots from the basename looked in
+    `source/root/`."""
+    root = crate(tmp_path / "c", {
+        "source/root.rs": "mod helper;\n",
+        "source/helper.rs": "pub fn h() {}\n",
+    }, manifest='[package]\nname = "demo"\nversion = "0.1.0"\nedition = "2021"\n'
+                '\n[lib]\npath = "source/root.rs"\n')
+    found = smells(run_detector("find_module_issues.py", root))
+    assert "module_file_missing" not in found and "file_never_compiled" not in found
+
+
+def test_autobins_false_stops_implicit_binary_discovery(tmp_path):
+    """Cargo does not build `src/main.rs` then, so its modules are orphans."""
+    root = crate(tmp_path / "c", {
+        "src/lib.rs": "pub fn a() {}\n",
+        "src/main.rs": "mod extra;\nfn main() {}\n",
+        "src/extra.rs": "pub fn e() {}\n",
+    }, manifest='[package]\nname = "demo"\nversion = "0.1.0"\nedition = "2021"\n'
+                "autobins = false\n")
+    assert "file_never_compiled" in smells(run_detector("find_module_issues.py", root))

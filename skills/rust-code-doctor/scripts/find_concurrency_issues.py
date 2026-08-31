@@ -71,6 +71,23 @@ def _in_spans(spans, index) -> bool:
     return any(start < index < end for start, end in spans)
 
 
+def _blocking_pool_spans(file: RsFile) -> list[tuple[int, int]]:
+    """Argument ranges of `spawn_blocking(…)` and `block_in_place(…)`.
+
+    Code inside them runs on the blocking pool, not the executor thread — it is
+    the fix this detector recommends, so reporting it would be recommending the
+    wrapper already in use.
+    """
+    spans = []
+    for index, callee in iter_calls(file):
+        if callee.rsplit("::", 1)[-1] not in ("spawn_blocking", "block_in_place"):
+            continue
+        close = file.closer(index)
+        if close > index:
+            spans.append((index, close))
+    return spans
+
+
 def _check_guard_across_await(file: RsFile, report: Reporter) -> None:
     """A `MutexGuard` that is still alive at an `.await` deadlocks under contention."""
     spans = _async_spans(file)
@@ -145,8 +162,9 @@ def _check_blocking_in_async(file: RsFile, report: Reporter) -> None:
     spans = _async_spans(file)
     if not spans:
         return
+    offloaded = _blocking_pool_spans(file)
     for index, callee in iter_calls(file):
-        if not _in_spans(spans, index):
+        if not _in_spans(spans, index) or _in_spans(offloaded, index):
             continue
         family = _BLOCKING_CALLS.get(callee)
         if family is None:
@@ -159,7 +177,8 @@ def _check_blocking_in_async(file: RsFile, report: Reporter) -> None:
                    "cancel it.", "high")
 
     for name_index, paren, method in iter_method_calls(file):
-        if method not in ("block_on", "recv", "join") or not _in_spans(spans, name_index):
+        if method not in ("block_on", "recv", "join") or not _in_spans(spans, name_index) \
+                or _in_spans(offloaded, name_index):
             continue
         receiver = receiver_text(file, name_index - 1)
         if method == "block_on":

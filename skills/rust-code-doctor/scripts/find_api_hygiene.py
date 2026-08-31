@@ -41,12 +41,17 @@ def _check_derives(file: RsFile, report: Reporter) -> None:
         have = derives | manual
         missing = [t for t in _EXPECTED_DERIVES if t not in have]
         if missing:
+            # This detector sees one file. A hand-written `impl Debug for Widget`
+            # in a sibling module is invisible here, so the finding says what was
+            # inspected rather than asserting the impl does not exist.
             report.add(definition.line, "public_type_without_debug",
-                       f"public `{definition.kind} {definition.name}` does not implement "
-                       f"{', '.join(missing)}",
+                       f"public `{definition.kind} {definition.name}` has no "
+                       f"{', '.join(missing)} derive or impl in this file",
                        "`#[derive(Debug)]`. Without it the type cannot be printed in a panic, a "
                        "test failure or `dbg!`, and the omission propagates: no struct containing "
-                       "it can derive `Debug` either.", "medium")
+                       "it can derive `Debug` either. If the impl is hand-written in another "
+                       "module, this scan cannot see it — `cargo clippy` with "
+                       "`missing_debug_implementations` answers it across the crate.", "medium")
         if definition.kind == "enum" and "Clone" in have and "Copy" not in have \
                 and all(not v.payload for v in definition.variants) and definition.variants:
             report.add(definition.line, "fieldless_enum_without_copy",

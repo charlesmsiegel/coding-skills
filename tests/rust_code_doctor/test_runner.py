@@ -167,3 +167,30 @@ def test_the_project_knows_which_files_rustc_reaches(load_module, tree):
     orphans = [p.name for p in project.orphan_files()]
     assert orphans == ["orphan.rs"]
     assert {p.name for p in project.modules} == {"lib.rs", "store.rs"}
+
+
+def test_a_detector_that_crashes_on_one_file_marks_its_category_incomplete(runner, tree, tmp_path):
+    """Warning on stderr alone let a JSON consumer read a partial category as
+    clean — the one thing this repo's schema says must never happen."""
+    boom = SCRIPTS_DIR / "_boom_for_tests.py"
+    boom.write_text(
+        "def analyze(rsfile, ignore):\n"
+        "    raise ValueError('boom')\n", encoding="utf-8")
+    sys.path.insert(0, str(SCRIPTS_DIR))
+    try:
+        results = runner.run_detectors(str(tree), [("boom", "_boom_for_tests")], [], jobs=1)
+    finally:
+        sys.path.remove(str(SCRIPTS_DIR))
+        boom.unlink()
+    assert isinstance(results["boom"], dict), "a crashed category must not be a bare list"
+    assert "ValueError" in results["boom"]["error"]
+
+
+def test_a_healthy_category_stays_a_plain_list(runner, tree):
+    sys.path.insert(0, str(SCRIPTS_DIR))
+    try:
+        results = runner.run_detectors(str(tree), [("errors", "find_error_handling")], [], jobs=1)
+    finally:
+        sys.path.remove(str(SCRIPTS_DIR))
+    assert isinstance(results["errors"], list)
+    assert any(i["smell_type"] == "unwrap_in_fallible_fn" for i in results["errors"])

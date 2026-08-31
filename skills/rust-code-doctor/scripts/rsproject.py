@@ -69,8 +69,8 @@ class Project:
         self.unparseable: dict[Path, str] = {}
         self.crates: list[Crate] = []
         self.modules: dict[Path, Module] = {}
-        # A `mod x;` that names no file on disk: rustc rejects these outright.
-        self.missing_modules: list[tuple[Path, int, str]] = []
+        # A `mod x;` that names no file on disk. (path, line, name, cfg_gated)
+        self.missing_modules: list[tuple[Path, int, str, bool]] = []
         self._load()
 
     # -- construction ------------------------------------------------------- #
@@ -88,10 +88,13 @@ class Project:
         for crate in self.crates:
             for root_file in crate.roots:
                 if root_file in self.files:
-                    self._walk_module(crate, root_file, "crate", None)
+                    # A crate root owns its directory whatever it is called:
+                    # `[lib] path = "source/root.rs"` makes `mod helper;`
+                    # resolve to `source/helper.rs`, not `source/root/helper.rs`.
+                    self._walk_module(crate, root_file, "crate", None, is_root=True)
 
     def _walk_module(self, crate: Crate, path: Path, module_path: str,
-                     parent: Path | None) -> None:
+                     parent: Path | None, is_root: bool = False) -> None:
         if path in self.modules:
             return
         self.modules[path] = Module(path, crate.name, module_path, parent)
@@ -106,9 +109,14 @@ class Project:
             # `src/foo/bar.rs` is reported both as a missing module and as
             # never compiled — two high-severity findings for correct code.
             chain = _inline_chain(rsfile, declaration)
-            child = _resolve_mod_file(path, declaration.name, rsfile, chain)
+            child = _resolve_mod_file(path, declaration.name, rsfile, chain, is_root)
             if child is None:
-                self.missing_modules.append((path, declaration.line, declaration.name))
+                # A declaration behind a `cfg` may be disabled in the
+                # configuration being built, where rustc never looks for the
+                # file at all — so this is a lead, not a proven build failure.
+                gated = any(a.replace(" ", "").startswith("cfg(") for a in declaration.attrs)
+                self.missing_modules.append(
+                    (path, declaration.line, declaration.name, gated))
                 continue
             if child in self.files:
                 nested = "".join(f"::{name}" for name in chain)
@@ -174,7 +182,8 @@ def _inline_chain(rsfile: RsFile, declaration) -> list[str]:
 
 
 def _resolve_mod_file(parent: Path, name: str, rsfile: RsFile,
-                      chain: list[str] | None = None) -> Path | None:
+                      chain: list[str] | None = None,
+                      is_root: bool = False) -> Path | None:
     """Where `mod name;` in ``parent`` points, honouring `#[path = "…"]`."""
     for declaration in rsfile.mods:
         if declaration.name != name:
@@ -188,7 +197,7 @@ def _resolve_mod_file(parent: Path, name: str, rsfile: RsFile,
 
     # A crate root or a `mod.rs` owns a directory; any other file owns the
     # directory named after it. Each enclosing inline module adds a level.
-    if parent.name in ("lib.rs", "main.rs", "mod.rs"):
+    if is_root or parent.name in ("lib.rs", "main.rs", "mod.rs"):
         directory = parent.parent
     else:
         directory = parent.parent / parent.stem
@@ -260,15 +269,20 @@ def _read_manifest(manifest: Path) -> Crate:
             candidate = directory / str(entry["path"])
             if candidate.is_file():
                 crate.bin_roots.append(candidate.resolve())
-    default_main = directory / "src" / "main.rs"
-    if default_main.is_file() and default_main.resolve() not in crate.bin_roots:
-        crate.bin_roots.append(default_main.resolve())
-    # Cargo auto-discovers both `src/bin/name.rs` and `src/bin/name/main.rs`.
-    # Missing the directory form makes every module under it look uncompiled.
-    for candidate in sorted((directory / "src" / "bin").glob("*.rs")):
-        crate.bin_roots.append(candidate.resolve())
-    for candidate in sorted((directory / "src" / "bin").glob("*/main.rs")):
-        crate.bin_roots.append(candidate.resolve())
+    # `autobins = false` turns off exactly this discovery, leaving only the
+    # explicit `[[bin]]` entries above. Adding the implicit roots anyway would
+    # treat a deliberately-excluded `src/main.rs` as compiled and hide the
+    # orphan findings for everything it declares.
+    if package.get("autobins", True) is not False:
+        default_main = directory / "src" / "main.rs"
+        if default_main.is_file() and default_main.resolve() not in crate.bin_roots:
+            crate.bin_roots.append(default_main.resolve())
+        # Cargo auto-discovers both `src/bin/name.rs` and `src/bin/name/main.rs`.
+        # Missing the directory form makes every module under it look uncompiled.
+        for candidate in sorted((directory / "src" / "bin").glob("*.rs")):
+            crate.bin_roots.append(candidate.resolve())
+        for candidate in sorted((directory / "src" / "bin").glob("*/main.rs")):
+            crate.bin_roots.append(candidate.resolve())
     return crate
 
 
