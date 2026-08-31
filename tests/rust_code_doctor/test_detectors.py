@@ -1253,3 +1253,105 @@ def test_a_const_generic_brace_is_not_the_function_body(tmp_path):
              '    std::fs::read("x").unwrap();\n    7\n}\n'
     target = write(tmp_path / "t", {"lib.rs": source}) / "lib.rs"
     assert "blocking_call_in_async" in smells(run_detector("find_concurrency_issues.py", target))
+
+
+# --- fourth review pass ---------------------------------------------------- #
+#
+# This round was mostly checks that never ran and helpers never called — the
+# kind of defect that looks like coverage and is not.
+
+def test_the_external_test_module_check_actually_runs(tmp_path):
+    """`#[cfg(test)] mod tests;` in an ordinary lib.rs creates no inline test
+    span, so gating on that meant this documented check never fired."""
+    source = "pub fn f() {}\n#[cfg(test)]\nmod tests;\n"
+    target = write(tmp_path / "t", {"lib.rs": source}) / "lib.rs"
+    assert "missing_test_module_file" in smells(run_detector("find_test_smells.py", target))
+
+
+def test_test_directory_markers_are_crate_relative(tmp_path):
+    """A checkout under a directory named `tests` had every file classified as
+    test code, so findings depended on where the repo was cloned."""
+    root = crate(tmp_path / "tests" / "project",
+                 {"src/lib.rs": 'pub fn f() { panic!("boom"); }\n'})
+    assert "panic_in_library" in smells(run_detector("find_error_handling.py", root / "src" / "lib.rs"))
+
+
+def test_a_source_subdirectory_still_finds_its_manifest(tmp_path):
+    """SKILL.md documents `analyze_all.py src/`. Searching for manifests only
+    below that path found none, so every tree detector returned clean."""
+    root = crate(tmp_path / "c", {"src/lib.rs": "mod gone;\npub fn f() {}\n"})
+    assert "module_file_missing" in smells(run_detector("find_module_issues.py", root / "src"))
+
+
+def test_a_mutable_container_parameter_is_left_alone(tmp_path):
+    """`&mut String` exists so the callee can mutate it; `&str` does not compile."""
+    source = "pub fn clear(s: &mut String) { s.clear(); }\n" \
+             "pub fn read(s: &String) -> usize { s.len() }\n"
+    found = smells(run_detector("find_ownership_issues.py",
+                                write(tmp_path / "t", {"lib.rs": source}) / "lib.rs"))
+    assert found.count("ref_string_parameter") if isinstance(found, list) else True
+    findings = run_detector("find_ownership_issues.py",
+                            write(tmp_path / "t2", {"lib.rs": source}) / "lib.rs")
+    lines = [f["line"] for f in findings if f["smell_type"] == "ref_string_parameter"]
+    assert lines == [2], "only the immutable `&String` should be reported"
+
+
+def test_a_bare_matches_is_not_an_assertion(tmp_path):
+    """`matches!(v, P);` computes a boolean and discards it — the exact mistake
+    this check exists to find."""
+    source = "#[cfg(test)]\nmod t {\n    #[test]\n    fn q() { matches!(1u8, 1); }\n}\n"
+    target = write(tmp_path / "t", {"lib.rs": source}) / "lib.rs"
+    assert "test_without_assertion" in smells(run_detector("find_test_smells.py", target))
+
+
+def test_a_build_script_unwrap_is_not_a_production_defect(tmp_path):
+    """SKILL.md already said so, and `is_build_script` existed unused."""
+    source = 'fn main() { let out = std::env::var("OUT_DIR").unwrap(); let _ = out; }\n'
+    target = write(tmp_path / "t", {"build.rs": source}) / "build.rs"
+    assert "unwrap_outside_tests" not in smells(run_detector("find_error_handling.py", target))
+
+
+def test_a_synchronous_recv_in_async_is_reported(tmp_path):
+    """`recv` was selected by the guard and then had no branch, so the check
+    looked like it existed and did nothing."""
+    source = "use std::sync::mpsc::Receiver;\n" \
+             "pub async fn f(rx: Receiver<u8>) -> u8 { rx.recv().unwrap() }\n"
+    target = write(tmp_path / "t", {"lib.rs": source}) / "lib.rs"
+    assert "blocking_recv_in_async" in smells(run_detector("find_concurrency_issues.py", target))
+
+
+def test_an_awaited_recv_is_not_blocking(tmp_path):
+    source = "pub async fn f(mut rx: tokio::sync::mpsc::Receiver<u8>) -> Option<u8> " \
+             "{ rx.recv().await }\n"
+    target = write(tmp_path / "t", {"lib.rs": source}) / "lib.rs"
+    assert "blocking_recv_in_async" not in smells(run_detector("find_concurrency_issues.py", target))
+
+
+def test_filter_is_only_suggested_when_the_conditional_guards_the_push(tmp_path):
+    """`.filter(…)` changes how many elements come out; an `if` wrapping a side
+    effect beside an unconditional push does not."""
+    side_effect = "pub fn f(xs: &[u8], tracing: bool, out: &mut Vec<u8>) {\n" \
+                  "    for x in xs {\n        if tracing { audit(*x); }\n" \
+                  "        out.push(*x);\n    }\n}\nfn audit(_x: u8) {}\n"
+    guarding = "pub fn f(xs: &[u8], out: &mut Vec<u8>) {\n" \
+               "    for x in xs {\n        if *x > 3 { out.push(*x); }\n    }\n}\n"
+    a = run_detector("find_loop_simplifications.py",
+                     write(tmp_path / "a", {"lib.rs": side_effect}) / "lib.rs")
+    b = run_detector("find_loop_simplifications.py",
+                     write(tmp_path / "b", {"lib.rs": guarding}) / "lib.rs")
+    assert "filter" not in next(f["suggestion"] for f in a
+                                if f["smell_type"] == "loop_building_collection")
+    assert "filter" in next(f["suggestion"] for f in b
+                            if f["smell_type"] == "loop_building_collection")
+
+
+def test_a_seeded_accumulator_is_a_fold_not_a_sum(tmp_path):
+    """`.sum()` starts from 0 and would silently drop the seed."""
+    seeded = "pub fn f(xs: &[u32]) -> u32 {\n    let mut total = 10;\n" \
+             "    for x in xs { total += x; }\n    total\n}\n"
+    plain = "pub fn f(xs: &[u32]) -> u32 {\n    let mut total = 0;\n" \
+            "    for x in xs { total += x; }\n    total\n}\n"
+    assert "manual_fold" in smells(run_detector(
+        "find_loop_simplifications.py", write(tmp_path / "a", {"lib.rs": seeded}) / "lib.rs"))
+    assert "manual_sum" in smells(run_detector(
+        "find_loop_simplifications.py", write(tmp_path / "b", {"lib.rs": plain}) / "lib.rs"))

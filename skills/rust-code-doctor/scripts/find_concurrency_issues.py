@@ -186,6 +186,16 @@ def _check_blocking_in_async(file: RsFile, report: Reporter) -> None:
                        f"`{receiver}.block_on(…)` inside async code",
                        "Driving a runtime from inside a runtime panics on tokio and deadlocks "
                        "elsewhere. `.await` the future instead.", "high")
+        elif method == "recv":
+            close = file.closer(paren)
+            if close > 0 and file.value(close + 1) == "." and file.tok(close + 2) is not None \
+                    and file.tokens[close + 2].is_name("await"):
+                continue  # an async channel: `.recv().await` yields, it does not block
+            report.add(file.line_of(name_index), "blocking_recv_in_async",
+                       f"`{receiver}.recv()` blocks the executor thread until a message arrives",
+                       "A `std::sync::mpsc` receiver parks the whole worker. Use the runtime's "
+                       "channel (`tokio::sync::mpsc`) and `.recv().await`, or move the receive "
+                       "into `spawn_blocking`.", "high")
         elif method == "join" and receiver.endswith("handle"):
             report.add(file.line_of(name_index), "thread_join_inside_async",
                        f"`{receiver}.join()` blocks the executor until the thread finishes",

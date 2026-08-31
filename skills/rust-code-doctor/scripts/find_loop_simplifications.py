@@ -108,9 +108,24 @@ def _check_accumulator_loops(file: RsFile, report: Reporter) -> None:
                 continue
             subject = re.match(r"^\s*\w+\s+in\s+(.+)$", " ".join(header.split()))
             source = subject.group(1) if subject else "the iterator"
+            accumulator = match.group(1)
+            # `.sum()` starts from the identity. An accumulator seeded with
+            # anything else would silently lose that seed in the rewrite.
+            seed = _accumulator_seed(file, accumulator, index)
+            identity = "0" if adaptor == "sum" else "1"
+            if seed is not None and seed not in (identity, f"{identity}u32", f"{identity}u64",
+                                                 f"{identity}usize", f"{identity}i32",
+                                                 f"{identity}i64", f"{identity}.0"):
+                report.add(file.tokens[index].line, "manual_fold",
+                           f"loop that {verb} into `{accumulator}`, which starts at `{seed}` "
+                           f"rather than {identity}",
+                           f"`{source}.fold({seed}, |acc, x| acc {operator[0]} …)` — "
+                           f"`.{adaptor}()` starts "
+                           f"from {identity} and would silently drop the `{seed}`.", "low")
+                break
             report.add(file.tokens[index].line, "manual_" + adaptor,
-                       f"loop whose whole body {verb} into `{match.group(1)}`",
-                       f"`let {match.group(1)} = {source}.map(|x| …).{adaptor}::<_>();` — the "
+                       f"loop whose whole body {verb} into `{accumulator}`",
+                       f"`let {accumulator} = {source}.map(|x| …).{adaptor}::<_>();` — the "
                        f"adaptor names the operation and cannot forget to initialise the "
                        "accumulator.", "low")
             break
@@ -128,7 +143,12 @@ def _check_push_loops(file: RsFile, report: Reporter) -> None:
             continue
         if any(file.tokens[i].is_name("await") for i in body_span):
             continue
-        conditional = any(file.tokens[i].is_name("if") for i in body_span)
+        # `.filter(…)` changes how many elements come out, so it is only the
+        # right suggestion when the conditional actually guards the push. An
+        # `if` that wraps a side effect beside an unconditional push is not one.
+        push_index = pushes[0][0]
+        conditional = any(_encloses(file, i, push_index)
+                          for i in body_span if file.tokens[i].is_name("if"))
         target = receiver_text(file, pushes[0][0] - 1)
         source = re.match(r"^\s*(.+?)\s+in\s+(.+)$", " ".join(header.split()))
         origin = source.group(2) if source else "the iterator"
@@ -139,6 +159,41 @@ def _check_push_loops(file: RsFile, report: Reporter) -> None:
                     if conditional else
                     f"`let {target}: Vec<_> = {origin}.map(…).collect();` — and `{target}` can then "
                     "be immutable."), "medium")
+
+
+def _encloses(file: RsFile, keyword: int, index: int) -> bool:
+    """True when the `if` at ``keyword`` has a block containing ``index``."""
+    brace = file.find_op("{", keyword + 1, min(keyword + 40, len(file.tokens)))
+    if brace < 0:
+        return False
+    close = file.closer(brace)
+    if close > 0 and brace < index < close:
+        return True
+    # `else { … }`, which guards the push just as much as the `then` branch.
+    if close > 0 and file.tok(close + 1) is not None and file.tokens[close + 1].is_name("else"):
+        tail = file.find_op("{", close + 1, min(close + 6, len(file.tokens)))
+        if tail > 0:
+            end = file.closer(tail)
+            return end > 0 and tail < index < end
+    return False
+
+
+def _accumulator_seed(file: RsFile, name: str, before: int) -> str | None:
+    """The initialiser of `let mut <name> = …;` above ``before``, or None."""
+    for index in range(before - 1, -1, -1):
+        if not file.tokens[index].is_name("let"):
+            continue
+        cursor = index + 1
+        if file.value(cursor) == "mut":
+            cursor += 1
+        if file.value(cursor) != name:
+            continue
+        equals = file.find_op("=", cursor, min(cursor + 8, len(file.tokens)))
+        semi = file.find_op(";", cursor, len(file.tokens))
+        if equals < 0 or semi < 0 or equals > semi:
+            return None
+        return file.slice(equals + 1, semi).strip()
+    return None
 
 
 def _check_manual_find(file: RsFile, report: Reporter) -> None:

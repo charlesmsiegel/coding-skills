@@ -18,8 +18,11 @@ from common import Reporter, is_test_file, run_file_detector
 from rsparse import RsFile, argument_spans, body_indices, iter_calls, iter_method_calls
 
 _ASSERTION_MACROS = frozenset({
+    # NOT `matches!`: on its own it computes a boolean and throws it away, so a
+    # test whose only "assertion" is `matches!(v, P);` passes when the pattern
+    # does not match. That is precisely the mistake this check exists to find.
     "assert!", "assert_eq!", "assert_ne!", "debug_assert!", "debug_assert_eq!",
-    "debug_assert_ne!", "matches!", "panic!", "unreachable!",
+    "debug_assert_ne!", "panic!", "unreachable!",
     "assert_matches!", "insta::assert_snapshot!", "assert_snapshot!",
     "assert_yaml_snapshot!", "assert_json_snapshot!", "assert_debug_snapshot!",
     "pretty_assertions::assert_eq!", "claim::assert_ok!", "assert_ok!", "assert_err!",
@@ -167,7 +170,11 @@ def analyze(file: RsFile, ignore: set[str]) -> list:
     _check_sleeps(file, report)
     _check_over_broad_assertions(file, report)
     _check_test_mod_placement(file, report)
-    if is_test_file(file.path) or file.test_spans:
+    # The conventional `#[cfg(test)] mod tests;` in an ordinary `lib.rs` creates
+    # no inline test span and the file is not itself a test file, so gating on
+    # either meant this documented check never ran at all.
+    if any(d.is_test_mod and not d.inline for d in file.mods) \
+            or is_test_file(file.path) or file.test_spans:
         _check_unreachable_test_module(file, report)
     return report.findings
 

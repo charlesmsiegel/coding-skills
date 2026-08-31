@@ -14,7 +14,7 @@ an assertion, not a landmine, so the unwrap checks stay quiet there.
 
 import re
 
-from common import Reporter, is_test_file, run_file_detector
+from common import Reporter, is_build_script, is_test_file, run_file_detector
 from rsparse import RsFile, argument_spans, iter_calls, iter_method_calls, receiver_text
 
 # Macros that end the process (or the thread) rather than returning a failure.
@@ -255,7 +255,10 @@ def _check_process_exit(file: RsFile, report: Reporter) -> None:
 
 def analyze(file: RsFile, ignore: set[str]) -> list:
     report = Reporter(file, ignore)
-    testish = is_test_file(file.path)
+    # A `build.rs` runs on the developer's machine at compile time: an unwrap
+    # there is a deliberate build failure with a backtrace, which SKILL.md
+    # already says. `is_build_script` existed for this and was never called.
+    testish = is_test_file(file.path) or is_build_script(file.path)
     _check_unwrap(file, report, testish)
     _check_panic_macros(file, report, testish)
     _check_manual_question_mark(file, report)

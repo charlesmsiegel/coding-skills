@@ -85,13 +85,36 @@ def find_rs_files(path: Path) -> Iterator[Path]:
                 yield base / name
 
 
+def crate_root_of(filepath: Path) -> Path | None:
+    """The nearest ancestor holding a Cargo.toml, or None."""
+    for candidate in filepath.resolve().parents:
+        if (candidate / "Cargo.toml").is_file():
+            return candidate
+    return None
+
+
 def is_test_file(filepath: Path) -> bool:
-    """True when the path names test, bench or example code by Cargo's layout."""
+    """True when the path names test, bench or example code by Cargo's layout.
+
+    Directory markers are matched *below the crate root only*. Every component
+    of an absolute path is the wrong scope: a checkout that happens to live
+    under `/home/me/tests/` would have every one of its files classified as test
+    code, silently suppressing the error-handling and security findings — so the
+    same crate would report differently depending on where it was cloned.
+    """
     stem = filepath.stem
     if stem in TEST_NAME_STEMS or stem.startswith(TEST_NAME_PREFIXES) \
             or stem.endswith(TEST_NAME_SUFFIXES):
         return True
-    return not TEST_DIR_NAMES.isdisjoint(p.lower() for p in filepath.parts)
+    root = crate_root_of(filepath)
+    if root is not None:
+        try:
+            parts = filepath.resolve().relative_to(root).parts
+        except ValueError:
+            parts = filepath.parts
+    else:
+        parts = filepath.parts
+    return not TEST_DIR_NAMES.isdisjoint(p.lower() for p in parts)
 
 
 def is_build_script(filepath: Path) -> bool:
