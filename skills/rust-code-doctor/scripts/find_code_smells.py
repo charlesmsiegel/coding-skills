@@ -38,7 +38,11 @@ def _check_allow_attributes(file: RsFile, report: Reporter) -> None:
             continue
         lints = text[len("allow("):-1] if text.endswith(")") else text
         scope = "the whole crate" if inner else "this item"
-        if any(lint in lints for lint in _BLANKET_ALLOWS):
+        # Compare whole lint names: `unused_mut` is one lint, and matching it
+        # against the `unused` *group* as a substring called a precise
+        # suppression a blanket one.
+        named = {name.strip() for name in lints.split(",") if name.strip()}
+        if named & set(_BLANKET_ALLOWS):
             report.add(token.line, "blanket_lint_suppression",
                        f"`#{'!' if inner else ''}[allow({lints})]` silences a whole lint class for "
                        f"{scope}",

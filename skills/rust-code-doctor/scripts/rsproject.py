@@ -33,6 +33,8 @@ class Crate:
     is_virtual_manifest: bool = False
     lib_root: Path | None = None
     bin_roots: list[Path] = field(default_factory=list)
+    # Explicit `[[test]]`/`[[bench]]`/`[[example]]` paths from the manifest.
+    auxiliary_roots: list[Path] = field(default_factory=list)
     # name -> the raw manifest value (a version string or a table)
     dependencies: dict[str, object] = field(default_factory=dict)
     dev_dependencies: dict[str, object] = field(default_factory=dict)
@@ -150,6 +152,9 @@ class Project:
             build = crate.root_dir / "build.rs"
             if build in self.files:
                 reached.add(build)
+            for path in crate.auxiliary_roots:
+                if path in self.files:
+                    reached.add(path)
         return reached
 
     def orphan_files(self) -> list[Path]:
@@ -185,16 +190,6 @@ def _resolve_mod_file(parent: Path, name: str, rsfile: RsFile,
                       chain: list[str] | None = None,
                       is_root: bool = False) -> Path | None:
     """Where `mod name;` in ``parent`` points, honouring `#[path = "…"]`."""
-    for declaration in rsfile.mods:
-        if declaration.name != name:
-            continue
-        for attribute in declaration.attrs:
-            stripped = attribute.replace(" ", "")
-            if stripped.startswith("path="):
-                target = stripped[len("path="):].strip('"')
-                candidate = (parent.parent / target).resolve()
-                return candidate if candidate.is_file() else None
-
     # A crate root or a `mod.rs` owns a directory; any other file owns the
     # directory named after it. Each enclosing inline module adds a level.
     if is_root or parent.name in ("lib.rs", "main.rs", "mod.rs"):
@@ -203,6 +198,19 @@ def _resolve_mod_file(parent: Path, name: str, rsfile: RsFile,
         directory = parent.parent / parent.stem
     for segment in chain or []:
         directory = directory / segment
+
+    # `#[path]` is relative to the *module's* directory, so the inline chain
+    # applies to it too — resolving it from the file's own directory reported a
+    # valid declaration as missing and its file as never compiled.
+    for declaration in rsfile.mods:
+        if declaration.name != name:
+            continue
+        for attribute in declaration.attrs:
+            stripped = attribute.replace(" ", "")
+            if stripped.startswith("path="):
+                target = stripped[len("path="):].strip('"')
+                candidate = (directory / target).resolve()
+                return candidate if candidate.is_file() else None
     for candidate in (directory / f"{name}.rs", directory / name / "mod.rs"):
         if candidate.is_file():
             return candidate.resolve()
@@ -269,6 +277,15 @@ def _read_manifest(manifest: Path) -> Crate:
             candidate = directory / str(entry["path"])
             if candidate.is_file():
                 crate.bin_roots.append(candidate.resolve())
+    # Cargo compiles a `[[test]] path = "qa/check.rs"` target wherever it lives.
+    # Discovering test targets by layout alone missed those, and a crate whose
+    # tests all sit at a declared path drew the `no_tests_at_all` blocker.
+    for section in ("test", "bench", "example"):
+        for entry in data.get(section) or []:
+            if isinstance(entry, dict) and entry.get("path"):
+                candidate = directory / str(entry["path"])
+                if candidate.is_file():
+                    crate.auxiliary_roots.append(candidate.resolve())
     # `autobins = false` turns off exactly this discovery, leaving only the
     # explicit `[[bin]]` entries above. Adding the implicit roots anyway would
     # treat a deliberately-excluded `src/main.rs` as compiled and hide the

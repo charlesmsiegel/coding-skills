@@ -46,7 +46,22 @@ _SECRET_LITERALS = (
     (re.compile(r'"(-----BEGIN [A-Z ]*PRIVATE KEY-----)'), "a private key"),
 )
 
-_SQL_START = re.compile(r'(?i)^"?\s*(select|insert|update|delete|drop|create|alter)\s')
+_SQL_START = re.compile(r"(?i)^\s*(select|insert|update|delete|drop|create|alter)\s")
+
+# Rust string literals come in several spellings, and SQL is very often written
+# as a raw string so the query can contain quotes: `r#"SELECT … '{}'"#`. Testing
+# the prefixed form against a plain-quote pattern skipped exactly those.
+_STRING_PREFIX = re.compile(r'^(?:[bcr]{0,2})(#*)"')
+
+
+def _literal_body(token_value: str) -> str:
+    """The text inside a Rust string literal, whatever its prefix or hashes."""
+    match = _STRING_PREFIX.match(token_value)
+    if not match:
+        return token_value
+    opening = match.end()
+    closing = len(token_value) - (1 + len(match.group(1)))
+    return token_value[opening:closing] if closing > opening else ""
 
 
 def _check_shell_execution(file: RsFile, report: Reporter) -> None:
@@ -104,7 +119,7 @@ def _check_sql_construction(file: RsFile, report: Reporter) -> None:
         spans = argument_spans(file, index)
         if not spans:
             continue
-        template = file.slice(*spans[0]).strip()
+        template = _literal_body(file.slice(*spans[0]).strip())
         if not _SQL_START.match(template) or "{" not in template:
             continue
         report.add(file.line_of(index), "sql_built_by_interpolation",
@@ -115,7 +130,7 @@ def _check_sql_construction(file: RsFile, report: Reporter) -> None:
                    "allowlist — placeholders cannot bind identifiers.", "high")
 
     for index, token in enumerate(file.tokens):
-        if token.kind != "str" or not _SQL_START.match(token.value):
+        if token.kind != "str" or not _SQL_START.match(_literal_body(token.value)):
             continue
         following = file.tok(index + 1)
         if following is not None and following.is_op("+"):
@@ -164,14 +179,28 @@ def _check_weak_crypto(file: RsFile, report: Reporter) -> None:
                            "strength).", "high")
                 break
 
+    # NOT `thread_rng`/`random`: rand's thread-local generator is a CSPRNG
+    # (ChaCha12), seeded and periodically reseeded from OS entropy. Reporting it
+    # as recoverable was simply wrong, and a security finding that misstates the
+    # primitive is worse than no finding — it teaches people to distrust the
+    # tool. These are the generators that genuinely are not cryptographic.
     for index, callee in iter_calls(file):
         leaf = callee.rsplit("::", 1)[-1]
-        if leaf in ("thread_rng", "random") and _crypto_context(file, index):
+        if leaf in ("seed_from_u64", "from_seed") and _crypto_context(file, index):
+            report.add(file.line_of(index), "deterministic_rng_for_secret",
+                       f"`{callee}(…)` seeds the generator deterministically, where the value "
+                       "looks like a secret",
+                       "A fixed or low-entropy seed makes every output reproducible. Use "
+                       "`OsRng`, or `thread_rng()` — which is a CSPRNG seeded from the OS — and "
+                       "keep the seeded generator for tests.", "high")
+        elif leaf in ("SmallRng", "StepRng", "XorShiftRng", "Pcg32", "Pcg64") \
+                and _crypto_context(file, index):
             report.add(file.line_of(index), "non_cryptographic_rng_for_secret",
-                       f"`{callee}()` used where the value looks like a secret",
-                       "`rand::rngs::OsRng` (or `getrandom`) for keys, tokens and nonces. "
-                       "`thread_rng` is seeded from the OS but is a userspace PRNG whose state "
-                       "can be recovered from enough output.", "medium")
+                       f"`{callee}` is a fast non-cryptographic generator, used where the value "
+                       "looks like a secret",
+                       "`SmallRng` and friends trade unpredictability for speed and are "
+                       "documented as unsuitable for security. Use `OsRng` or `thread_rng()`.",
+                       "high")
 
 
 def _crypto_context(file: RsFile, index: int) -> bool:

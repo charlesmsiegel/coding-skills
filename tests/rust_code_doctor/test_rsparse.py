@@ -305,3 +305,10 @@ def test_restricted_visibility_is_not_public_api(rs):
     assert external.is_public and external.is_exported
     assert not file.functions[0].is_public
     assert file.functions[1].is_public
+
+
+def test_a_const_generic_brace_in_a_where_clause_is_not_the_body(rs):
+    file = parse(rs, "pub fn f<T>() -> u32 where T: Bound<{ N + 1 }> {\n    let x = 1;\n    x\n}\n")
+    func = file.functions[0]
+    assert file.line_of(func.body_open) == 1 and file.line_of(func.body_close) == 4
+    assert "let x" in file.slice(func.body_open, func.body_close)

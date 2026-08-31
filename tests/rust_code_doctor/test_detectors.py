@@ -1173,3 +1173,83 @@ def test_autobins_false_stops_implicit_binary_discovery(tmp_path):
     }, manifest='[package]\nname = "demo"\nversion = "0.1.0"\nedition = "2021"\n'
                 "autobins = false\n")
     assert "file_never_compiled" in smells(run_detector("find_module_issues.py", root))
+
+
+# --- third review pass ----------------------------------------------------- #
+
+def test_a_path_attribute_resolves_under_its_inline_module(tmp_path):
+    """`#[path]` is relative to the module's directory, so the inline chain
+    applies to it too."""
+    root = crate(tmp_path / "c", {
+        "src/lib.rs": 'mod a {\n    #[path = "other.rs"]\n    mod x;\n}\n',
+        "src/a/other.rs": "pub fn f() {}\n",
+    })
+    found = smells(run_detector("find_module_issues.py", root))
+    assert "module_file_missing" not in found and "file_never_compiled" not in found
+
+
+def test_the_no_tests_alarm_is_decided_per_crate(tmp_path):
+    """`cargo test -p b` runs zero tests whatever crate `a` contains."""
+    root = write(tmp_path / "w", {
+        "Cargo.toml": '[workspace]\nmembers = ["a", "b"]\n',
+        "a/Cargo.toml": '[package]\nname = "a"\nversion = "0.1.0"\nedition = "2021"\n',
+        "a/src/lib.rs": "pub fn x() {}\n#[cfg(test)]\nmod t { #[test] fn q() { assert_eq!(1, 1); } }\n",
+        "b/Cargo.toml": '[package]\nname = "b"\nversion = "0.1.0"\nedition = "2021"\n',
+        "b/src/lib.rs": "pub fn a() {}\npub fn b() {}\npub fn c() {}\n",
+    })
+    findings = run_detector("find_untested_modules.py", root)
+    blockers = [f for f in findings if f["smell_type"] == "no_tests_at_all"]
+    assert len(blockers) == 1 and "/b/" in blockers[0]["file"].replace("\\", "/")
+
+
+def test_a_manifest_declared_test_target_counts_as_a_test(tmp_path):
+    """Cargo compiles `[[test]] path = "qa/check.rs"` wherever it lives."""
+    root = crate(tmp_path / "c", {
+        "src/lib.rs": "pub fn a() {}\npub fn b() {}\npub fn c() {}\n",
+        "qa/check.rs": "#[test]\nfn works() { assert_eq!(1, 1); }\n",
+    }, manifest='[package]\nname = "demo"\nversion = "0.1.0"\nedition = "2021"\n'
+                '\n[[test]]\nname = "qa"\npath = "qa/check.rs"\n')
+    assert "no_tests_at_all" not in smells(run_detector("find_untested_modules.py", root))
+
+
+def test_sql_written_as_a_raw_string_is_still_checked(tmp_path):
+    """A raw string is the common way to write a query containing quotes —
+    exactly the queries most likely to be interpolated."""
+    source = 'pub fn q(user: &str) -> String {\n' \
+             '    format!(r#"SELECT * FROM users WHERE name = \'{}\'"#, user)\n}\n'
+    target = write(tmp_path / "t", {"lib.rs": source}) / "lib.rs"
+    assert "sql_built_by_interpolation" in smells(run_detector("find_security_issues.py", target))
+
+
+def test_thread_rng_is_not_reported_as_non_cryptographic(tmp_path):
+    """rand's thread-local generator is a CSPRNG seeded from OS entropy. The
+    old finding misstated the primitive, which is worse than not firing."""
+    source = "pub fn token() -> u64 { let secret_key = rand::thread_rng().gen(); secret_key }\n"
+    target = write(tmp_path / "t", {"lib.rs": source}) / "lib.rs"
+    assert "non_cryptographic_rng_for_secret" not in smells(
+        run_detector("find_security_issues.py", target))
+
+
+def test_a_deterministically_seeded_generator_is_reported(tmp_path):
+    source = "use rand::rngs::StdRng;\n" \
+             "pub fn token() -> u64 { let secret_key = StdRng::seed_from_u64(7).gen(); secret_key }\n"
+    target = write(tmp_path / "t", {"lib.rs": source}) / "lib.rs"
+    assert "deterministic_rng_for_secret" in smells(run_detector("find_security_issues.py", target))
+
+
+def test_a_specific_lint_allow_is_not_a_blanket_suppression(tmp_path):
+    """`unused_mut` is one lint; matching it against the `unused` group as a
+    substring called a precise suppression a blanket one."""
+    precise = write(tmp_path / "a", {"lib.rs": "#![allow(unused_mut)]\npub fn a() {}\n"}) / "lib.rs"
+    blanket = write(tmp_path / "b", {"lib.rs": "#![allow(unused)]\npub fn a() {}\n"}) / "lib.rs"
+    assert "blanket_lint_suppression" not in smells(run_detector("find_code_smells.py", precise))
+    assert "blanket_lint_suppression" in smells(run_detector("find_code_smells.py", blanket))
+
+
+def test_a_const_generic_brace_is_not_the_function_body(tmp_path):
+    """Taking the first `{` made the const expression the body, so the real one
+    was never analysed — silently, since a body was still found."""
+    source = 'pub async fn f<T>() -> u32 where T: Bound<{ N + 1 }> {\n' \
+             '    std::fs::read("x").unwrap();\n    7\n}\n'
+    target = write(tmp_path / "t", {"lib.rs": source}) / "lib.rs"
+    assert "blocking_call_in_async" in smells(run_detector("find_concurrency_issues.py", target))
