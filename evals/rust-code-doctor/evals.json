@@ -1,0 +1,47 @@
+{
+  "skill_name": "rust-code-doctor",
+  "evals": [
+    {
+      "id": 1,
+      "prompt": "This sync module is a mess and I think it has a real bug in it somewhere. Can you sort it out? (attached: sync.rs)",
+      "expected_output": "Runs the detectors first rather than reading by hand, and says plainly that these read syntax and that `cargo check`/`clippy` are the compilation and type authority — offering to run run_external_tools.py rather than claiming the file compiles. Separates real defects from debt and leads with the defects: `self.cache.lock().unwrap()` produces a guard that is still alive across the `.await` inside the loop, which deadlocks the executor under contention; `std::thread::sleep` blocks every other task on the worker; `synced as u8` truncates silently once more than 255 items sync; `static mut SYNC_COUNT` with an `unsafe` block that has no SAFETY comment is a data race and a Rust 2024 migration blocker; `.ok()` on the log write discards the failure; `.unwrap()` inside `fetch`, which already returns `Result`, is a panic where `?` was one character away; the hardcoded `sk-live-…` API key is a committed credential that needs rotating, not just deleting. Only then raises the debt: `&Vec<String>` and `&String` parameters that should be `&[String]` and `&str`, the `dry_run`/`verbose` flag pair that is never read, `for i in 0..ids.len()` that is a `for id in ids`, the push loop that is a `.map().collect()`, `.len() == 0`, `String::from(\"\")`, the `match` that is `unwrap_or_else`, the trailing `return`, `get_region` breaking the getter convention, `Box<dyn Error>` in a library signature, `SyncError` with no `Display`, the all-`Option` fields, and `push_str` of a single char. Says which findings it verified by hand. Does not claim the code is fixed without running `cargo check --all-targets` and the tests.",
+      "files": ["fixtures/sync.rs"]
+    },
+    {
+      "id": 2,
+      "prompt": "Can you get rid of all the .clone() calls in this crate? There are like 200 of them and it's obviously slow.",
+      "expected_output": "Does not do a blanket removal, and does not agree that the count alone proves slowness. Loads references/ownership-and-borrowing.md and names the two legitimate reasons a clone stays — the value has to outlive the borrow, and a profile cleared it — and the one that is not a reason, 'the borrow checker complained'. Points out that clones in constructors and startup paths cost nothing measurable and that the ones inside loops are where the cost actually is, so find_ownership_issues.py's clone_inside_loop findings are the place to start rather than the total. Explains what the borrow errors usually mean instead: disjoint field borrows via destructuring, `mem::take`, collecting changes and applying them after a loop. Insists on a benchmark or profile before treating this as a performance task at all, and on `cargo check` plus the tests after each batch, since removing a clone changes lifetimes and can cascade. Offers to fix a first tranche rather than all 200 in one unreviewable diff.",
+      "files": []
+    },
+    {
+      "id": 3,
+      "prompt": "Review my code. [pastes a Rust service with a `trait Storage` implemented once by `PostgresStorage`, a `StorageFactory` that returns `Box<dyn Storage>`, and a `Utils` struct holding four associated functions]",
+      "expected_output": "Recognises the whole stack as ceremony and says so directly. Makes the Rust-specific argument rather than a general one: a trait is not needed to substitute an implementation in Rust, because a generic parameter accepts any type that fits and the test fake can be a `#[cfg(test)]` struct with no trait at all — so 'I need it to mock the database' is not a reason to keep it. Recommends deleting the trait and the factory and using `PostgresStorage` directly, or taking a generic parameter at the one seam that is genuinely stubbed. Names `Utils` as a module wearing a `struct` keyword and says to make it a module and export the functions. Loads references/overengineering-and-abstraction.md rather than reasoning from Java or Go habits. Does name the genuine exceptions — a published extension point, two implementors that exist now, a `Vec<Box<dyn Storage>>` — so the user can check whether any applies, but does not hedge the recommendation into 'it depends on your team'.",
+      "files": []
+    },
+    {
+      "id": 4,
+      "prompt": "Our CI is green and cargo build passes. Why does your analysis say a file is never compiled?",
+      "expected_output": "Explains the mechanism concretely rather than backing down: rustc reaches a file only through a `mod` declaration from a crate root, so a `.rs` file under `src/` that nothing declares is never opened at all — it does not type-check, its `#[test]` functions do not run, its `unsafe` is never reviewed by the compiler, and it will not appear in coverage. A green build is therefore consistent with the file being dead, and is exactly why nobody noticed. Says how to confirm it: add the `mod` line and see what breaks, or check the file against `cargo llvm-cov` output. Names the two harmless explanations — a `#[path]` attribute or a `cfg`-gated `mod` this scan does not follow — and asks the user to check for them before deleting anything. Recommends adding the `mod` (and fixing whatever errors appear) rather than deleting, since the file may contain work someone is still doing.",
+      "files": []
+    },
+    {
+      "id": 5,
+      "prompt": "Here's a PR from an AI agent adding a retry layer. It compiles and the tests pass. Can you review it?",
+      "expected_output": "Treats compiling and green tests as the starting condition rather than as evidence, and says so — noting that in Rust the compiler's approval covers memory safety and types and says nothing about whether the code does the right thing. Runs analyze_diff.py for findings on the changed lines and find_ai_scaffolding.py, and runs `cargo check --all-targets` and `cargo clippy --all-targets` over the whole crate rather than trusting the change type-checks in isolation. Looks specifically for the generated-Rust tells: piles of `.unwrap()` (especially inside functions that already return `Result`), `.clone()` that ended a borrow-checker argument, a `todo!()` satisfying a trait, an `options`/`config` parameter the body never reads, `Box<dyn Error>` in a library signature, and plausible constants — a retry count, a backoff, a timeout — with no stated origin. Reads the tests hard and checks they can fail by breaking the implementation on purpose, rather than counting them; flags any test whose expected value is computed the same way the code computes it. Checks each claim in the PR description against the diff. Does not reject the code for being generated; applies the same bar as any other change, to the parts the compiler could not check.",
+      "files": []
+    },
+    {
+      "id": 6,
+      "prompt": "We're on edition 2015 and someone says we should upgrade but it seems risky. Also what's this [lints] thing you mentioned?",
+      "expected_output": "Loads references/cargo-and-toolchain.md. Corrects the risk framing with the specific fact that editions are per-crate and interoperate freely, so this is not a coordinated migration across the dependency graph — and that `cargo fix --edition` does the mechanical part, leaving a reviewable diff. Says what 2015 is actually costing: `extern crate` declarations, `dyn` optional on trait objects, module paths that differ from every tutorial written since 2018, and no `async`/`await` keywords, so every newer example has to be mentally translated. Recommends the staged route — modernise the spellings on 2015 first (find_outdated_idioms.py), then bump, then `cargo fix --edition-idioms` — with `cargo check --all-targets` and the tests between each. On `[lints]`: explains that it puts the lint levels in Cargo.toml where `cargo clippy`, CI and every editor read the same configuration, which is what turns a cleared class of finding into one that stays cleared; gives a concrete table and says to add `-D warnings` in CI only after the existing warnings are cleared, or the first contributor will turn it off.",
+      "files": []
+    },
+    {
+      "id": 7,
+      "prompt": "Run your Rust analysis over this repo please. [a crate with no tests and cargo not installed on the machine]",
+      "expected_output": "Runs find_cargo_issues.py first, because the edition and the `[lints]` table change how every other finding should be read. Runs analyze_all.py, and also run_external_tools.py — and when that reports cargo missing, says plainly that no compilation check was performed and that the detectors read syntax only, rather than letting a clean report imply the crate builds. Treats `no_tests_at_all` as a blocker rather than one finding among many: says that refactoring without a safety net is rewriting and hoping, and that characterization tests for the highest-churn modules come before any of the cleanup — noting that in Rust a `#[cfg(test)] mod tests` with `use super::*` reaches private items, so no visibility has to change to write one. Orders the remaining work by churn × severity using git log rather than by finding count, and puts correctness bugs (panics, deadlocks, unsafe, lossy casts) above style. Produces an artifact (list, cards or JSON) rather than editing files unasked, and asks which tracker to use before creating any tickets. Asks before installing Rust rather than doing it.",
+      "files": []
+    }
+  ]
+}

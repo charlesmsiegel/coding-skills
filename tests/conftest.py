@@ -111,7 +111,7 @@ SHARED_NAMES = (
     "find_comment_smells", "find_coupling_issues", "find_dead_code",
     "find_debug_leftovers", "find_dependency_issues", "find_design_smells",
     "find_duplicates", "find_exception_issues", "find_loop_simplifications",
-    "find_mutation_hazards", "find_naming_issues", "find_outdated_idioms",
+    "find_module_issues", "find_mutation_hazards", "find_naming_issues", "find_outdated_idioms",
     "find_overengineering", "find_resource_leaks", "find_security_issues",
     "find_test_smells", "find_type_gaps", "find_untested_modules",
     "format_findings", "imports", "jvmdecl", "lint_fragments", "llmops",
