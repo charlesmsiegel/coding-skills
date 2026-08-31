@@ -56,9 +56,12 @@ def _check_index_loops(file: RsFile, report: Reporter) -> None:
             report.add(file.tokens[index].line, "index_loop_over_two_slices",
                        f"`for {counter} in 0..{collection}.len()` indexing {len(indexed)} "
                        "collections in step",
-                       f"`{collection}.iter().zip({others}.iter())` — `zip` stops at the shorter "
-                       "side instead of panicking, which is the bug this shape hides when the "
-                       "lengths ever differ.", "medium")
+                       f"`{collection}.iter().zip({others}.iter())` — but this is not a "
+                       "behaviour-preserving rewrite: indexing panics when the second slice is "
+                       "shorter, and `zip` silently stops early instead. Decide which you want. "
+                       "If the lengths are an invariant, assert it first "
+                       f"(`assert_eq!({collection}.len(), {others}.len())`) and then `zip`; if a "
+                       "mismatch is a real error, return it rather than truncating.", "medium")
         elif other_uses > 0:
             report.add(file.tokens[index].line, "index_loop_needing_position",
                        f"`for {counter} in 0..{collection}.len()` where the index is used for more "

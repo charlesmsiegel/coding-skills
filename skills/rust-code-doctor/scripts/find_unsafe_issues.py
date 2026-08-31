@@ -39,6 +39,18 @@ def _has_safety_comment(file: RsFile, line: int, reach: int = 4) -> bool:
                for c in file.comments_on_lines(max(1, line - reach), line))
 
 
+def _has_safety_section(file: RsFile, line: int, reach: int = 12) -> bool:
+    """True when a rustdoc `# Safety` heading documents the item at ``line``.
+
+    That heading is the *documented* convention for an unsafe item's contract;
+    `// SAFETY:` is the convention for a block. An item using the first should
+    not be reported for lacking the second.
+    """
+    docs = "\n".join(c.value for c in file.comments_on_lines(max(1, line - reach), line)
+                      if is_doc_comment(c))
+    return "# Safety" in docs or "# safety" in docs.lower()
+
+
 def _check_unsafe_blocks(file: RsFile, report: Reporter) -> None:
     for index, token in enumerate(file.tokens):
         if not token.is_name("unsafe") or file.in_macro_body(index):
@@ -78,7 +90,7 @@ def _check_unsafe_items(file: RsFile, report: Reporter) -> None:
         if not block.is_unsafe:
             continue
         trait_name = (block.trait_name or "").rsplit("::", 1)[-1]
-        if not _has_safety_comment(file, block.line):
+        if not _has_safety_comment(file, block.line) and not _has_safety_section(file, block.line):
             report.add(block.line, "unsafe_impl_without_safety_comment",
                        f"`unsafe impl {trait_name} for {block.type_name}` with no `// SAFETY:` "
                        "comment",
@@ -89,10 +101,8 @@ def _check_unsafe_items(file: RsFile, report: Reporter) -> None:
     for func in file.functions:
         if not func.is_unsafe:
             continue
-        docs = "\n".join(c.value for c in file.comments_on_lines(max(1, func.line - 12), func.line)
-                         if is_doc_comment(c))
-        if "# Safety" not in docs and "# safety" not in docs.lower():
-            severity = "high" if func.is_public else "medium"
+        if not _has_safety_section(file, func.line):
+            severity = "high" if func.is_exported else "medium"
             report.add(func.line, "unsafe_fn_without_safety_docs",
                        f"`unsafe fn {func.qualname}` has no `# Safety` section in its docs",
                        "An `unsafe fn` moves an obligation onto every caller. Document it: "
@@ -100,11 +110,15 @@ def _check_unsafe_items(file: RsFile, report: Reporter) -> None:
                        "enforces it, and without it callers guess.", severity)
 
     for trait in file.traits:
-        if trait.is_unsafe and not _has_safety_comment(file, trait.line):
-            report.add(trait.line, "unsafe_trait_without_safety_docs",
-                       f"`unsafe trait {trait.name}` states no obligation for its implementors",
-                       "Document what an implementor must guarantee — that is the entire content "
-                       "of an unsafe trait.", "high")
+        if not trait.is_unsafe:
+            continue
+        if _has_safety_comment(file, trait.line) or _has_safety_section(file, trait.line):
+            continue
+        report.add(trait.line, "unsafe_trait_without_safety_docs",
+                   f"`unsafe trait {trait.name}` states no obligation for its implementors",
+                   "Document what an implementor must guarantee — that is the entire content "
+                   "of an unsafe trait. Either a rustdoc `# Safety` section or a `// SAFETY:` "
+                   "comment satisfies this.", "high")
 
 
 def _check_static_mut(file: RsFile, report: Reporter) -> None:

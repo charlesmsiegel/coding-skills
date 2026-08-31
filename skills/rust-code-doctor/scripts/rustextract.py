@@ -74,10 +74,18 @@ def split_top_level(file: RsFile, start: int, stop: int, separator: str = ",") -
             if token.value in OPENERS:
                 cursor = file.skip_group(cursor)
                 continue
+            # The lexer emits `>>` as one token, so `Vec<Vec<u8>>` closes two
+            # levels at once. Decrementing by one leaves the depth stuck above
+            # zero and every later comma is swallowed — which merged whole
+            # parameter lists and struct field lists into a single entry.
             if token.value == "<":
                 angle += 1
-            elif token.value == ">" and angle:
+            elif token.value == "<<":
+                angle += 2
+            elif token.value in (">", ">=") and angle:
                 angle -= 1
+            elif token.value == ">>" and angle:
+                angle = max(0, angle - 2)
             elif token.value == separator and not angle:
                 if cursor > begin:
                     spans.append((begin, cursor))
@@ -306,12 +314,20 @@ def _parse_type_def(file: RsFile, index: int, attrs: dict) -> TypeDef | None:
                          doc_lines=file.doc_lines_before(file.tokens[start].line))
 
     limit = len(file.tokens)
-    where_index = _find_name_kw(file, "where", cursor, limit)
-    if where_index >= 0:
-        cursor = where_index
+    # Find this item's own end first. Searching for `where` across the whole
+    # file would otherwise pick up a *later* function's where clause, and the
+    # cursor would then jump past this type's body — giving the struct the
+    # function's braces and no fields at all.
     brace = file.find_op("{", cursor, limit)
     paren = file.find_op("(", cursor, limit)
     semi = file.find_op(";", cursor, limit)
+    item_end = min(x for x in (brace, paren, semi, limit) if x >= 0)
+    where_index = _find_name_kw(file, "where", cursor, item_end)
+    if where_index >= 0:
+        cursor = where_index
+        brace = file.find_op("{", cursor, limit)
+        paren = file.find_op("(", cursor, limit)
+        semi = file.find_op(";", cursor, limit)
     if brace >= 0 and (semi < 0 or brace < semi):
         definition.body_open, definition.body_close = brace, file.closer(brace)
         if keyword == "enum":

@@ -249,3 +249,59 @@ def test_receiver_text_stops_at_a_keyword(rs):
     file = parse(rs, "fn f(m: std::collections::HashMap<u8, u8>) { if m.contains_key(&1) {} }")
     dot = next(i for i, t in enumerate(file.tokens) if t.is_op("."))
     assert rs.receiver_text(file, dot) == "m"
+
+
+# --- regressions from the first review pass ------------------------------- #
+#
+# Each of these was a real defect found by an automated reviewer on the initial
+# commit. They are kept as named tests because every one of them was silent:
+# the parser produced a plausible-looking model and the detectors reported
+# confidently about the wrong thing.
+
+def test_nested_generic_close_does_not_swallow_the_next_parameter(rs):
+    """`>>` is one token and closes two levels; treating it as one left the
+    angle depth stuck above zero, merging every later parameter into the first."""
+    file = parse(rs, "fn g(a: Vec<Vec<u8>>, b: &String, c: HashMap<String, Vec<u8>>) -> u32 { 0 }")
+    assert [(p.name, p.type_text) for p in file.functions[0].params] == [
+        ("a", "Vec<Vec<u8>>"), ("b", "&String"), ("c", "HashMap<String, Vec<u8>>")]
+
+
+def test_nested_generic_close_does_not_swallow_struct_fields(rs):
+    file = parse(rs, "pub struct S { a: Vec<Vec<u8>>, b: u8, c: Option<Box<dyn Fn() -> u8>> }")
+    assert [f.name for f in file.types[0].fields] == ["a", "b", "c"]
+
+
+def test_raw_identifiers_keep_their_semantic_name(rs):
+    """`r#match` is the name `match`. Split into `r`/`#`/`match` the item vanishes,
+    and `mod r#async;` becomes `mod r;` — a module pointing at no file."""
+    file = parse(rs, "fn r#match() {}\nmod r#async;\nstruct r#type;\n")
+    assert [f.name for f in file.functions] == ["match"]
+    assert [m.name for m in file.mods] == ["async"]
+    assert [t.name for t in file.types] == ["type"]
+
+
+def test_a_bare_r_is_still_an_ordinary_identifier(rs):
+    file = parse(rs, "fn f() { let r = 1; let rc = 2; }")
+    assert not [t for t in file.tokens if t.kind == "str"]
+    assert any(t.is_name("r") for t in file.tokens)
+
+
+def test_a_later_where_clause_does_not_steal_the_struct_body(rs):
+    """`_find_name_kw` searched to end-of-file, so a struct with no `where`
+    picked up the next function's — and took that function's braces as its body."""
+    file = parse(rs, "pub struct S { a: u8 }\nfn f<T>(x: T) -> T where T: Clone { x }\n")
+    definition = next(t for t in file.types if t.name == "S")
+    assert [f.name for f in definition.fields] == ["a"]
+    assert file.line_of(definition.body_close) == 1
+
+
+def test_restricted_visibility_is_not_public_api(rs):
+    """`pub(crate)` is internal: it is not API-evolution surface, and dead-code
+    analysis must not exempt it as if a downstream caller could exist."""
+    file = parse(rs, "pub(crate) struct I { a: u8 }\npub struct E { a: u8 }\n"
+                     "pub(super) fn h() {}\npub fn g() {}\n")
+    internal, external = file.types
+    assert not internal.is_public and internal.is_exported
+    assert external.is_public and external.is_exported
+    assert not file.functions[0].is_public
+    assert file.functions[1].is_public

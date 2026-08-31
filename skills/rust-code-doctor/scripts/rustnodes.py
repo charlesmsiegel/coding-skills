@@ -56,6 +56,18 @@ class Func:
 
     @property
     def is_public(self) -> bool:
+        """Reachable from outside the crate — plain `pub`, nothing narrower.
+
+        `pub(crate)`, `pub(super)` and `pub(in …)` are internal: they are not
+        API-evolution surface, they do not need `# Errors` docs for downstream
+        users, and dead-code analysis must not exempt them as if a downstream
+        caller could exist.
+        """
+        return self.visibility == "pub"
+
+    @property
+    def is_exported(self) -> bool:
+        """Visible beyond its own module, at any restriction level."""
         return self.visibility.startswith("pub") and self.visibility != "pub(self)"
 
     @property
@@ -77,6 +89,12 @@ class Field:
 
     @property
     def is_public(self) -> bool:
+        """Reachable from outside the crate — plain `pub`, nothing narrower."""
+        return self.visibility == "pub"
+
+    @property
+    def is_exported(self) -> bool:
+        """Visible beyond its own module, at any restriction level."""
         return self.visibility.startswith("pub") and self.visibility != "pub(self)"
 
 
@@ -106,6 +124,12 @@ class TypeDef:
 
     @property
     def is_public(self) -> bool:
+        """Reachable from outside the crate — plain `pub`, nothing narrower."""
+        return self.visibility == "pub"
+
+    @property
+    def is_exported(self) -> bool:
+        """Visible beyond its own module, at any restriction level."""
         return self.visibility.startswith("pub") and self.visibility != "pub(self)"
 
 
@@ -126,6 +150,12 @@ class Trait:
 
     @property
     def is_public(self) -> bool:
+        """Reachable from outside the crate — plain `pub`, nothing narrower."""
+        return self.visibility == "pub"
+
+    @property
+    def is_exported(self) -> bool:
+        """Visible beyond its own module, at any restriction level."""
         return self.visibility.startswith("pub") and self.visibility != "pub(self)"
 
 
@@ -185,6 +215,12 @@ class Binding:
 
     @property
     def is_public(self) -> bool:
+        """Reachable from outside the crate — plain `pub`, nothing narrower."""
+        return self.visibility == "pub"
+
+    @property
+    def is_exported(self) -> bool:
+        """Visible beyond its own module, at any restriction level."""
         return self.visibility.startswith("pub") and self.visibility != "pub(self)"
 
 
