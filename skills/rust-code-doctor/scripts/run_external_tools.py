@@ -270,10 +270,18 @@ def run_udeps(argv, root):
                                  "--output", "json"], root)
     if returncode is None or returncode not in (0, 1):
         return [_tool_error("cargo-udeps", root, returncode, err or out)]
+    if not (out or "").strip():
+        return [_tool_error("cargo-udeps", root, returncode,
+                            "exited cleanly but produced no JSON output")]
     try:
-        report = json.loads(out or "{}")
-    except json.JSONDecodeError:
-        return []
+        report = json.loads(out)
+    except json.JSONDecodeError as exc:
+        # Swallowing this reported "cargo-udeps ran, nothing unused" for a run
+        # whose results were never read — a version skew or a truncated pipe
+        # would present as a clean dependency audit.
+        return [_tool_error("cargo-udeps", root, returncode,
+                            f"output is not valid JSON ({exc}); "
+                            f"first 120 bytes: {out[:120]!r}")]
     findings = []
     for target, entry in (report.get("unused_deps") or {}).items():
         for name in entry.get("normal", []) + entry.get("development", []):
@@ -300,9 +308,15 @@ def run_tree(argv, root):
         "low")]
 
 
+# Every place a previous run may have left coverage data. `measure_coverage`
+# clears all of them, so a failed run cannot leave one behind for
+# `_coverage_file` to pick up and present as this run's result.
+COVERAGE_FILES = ("lcov.info", "coverage/lcov.info", "target/llvm-cov/lcov.info",
+                  "cobertura.xml", "target/tarpaulin/lcov.info")
+
+
 def _coverage_file(root: Path):
-    for name in ("lcov.info", "coverage/lcov.info", "target/llvm-cov/lcov.info",
-                 "cobertura.xml", "target/tarpaulin/lcov.info"):
+    for name in COVERAGE_FILES:
         candidate = root / name
         if candidate.is_file():
             return candidate
@@ -382,15 +396,17 @@ def apply_fixes(available, cargo, root):
 def measure_coverage(cargo, root):
     """Run the suite under llvm-cov so run_coverage has data. Executes the tests.
 
-    A previous run's `lcov.info` is removed first. Leaving it in place meant a
-    compilation or test failure here was followed by `run_coverage` happily
-    parsing the *old* file — presenting stale clean coverage for a run that
-    never produced any.
+    Every previous run's coverage file is removed first — all of
+    `COVERAGE_FILES`, not just the one this command writes. Leaving any of them
+    meant a compilation or test failure here was followed by `run_coverage`
+    happily parsing an *old* file from a different tool, presenting stale clean
+    coverage for a run that produced none.
     """
-    stale = root / "lcov.info"
-    if stale.is_file():
-        with contextlib.suppress(OSError):
-            stale.unlink()
+    for name in COVERAGE_FILES:
+        stale = root / name
+        if stale.is_file():
+            with contextlib.suppress(OSError):
+                stale.unlink()
     returncode, _out, err = _run(
         [*cargo, "llvm-cov", "--lcov", "--output-path", "lcov.info"], root, timeout=3600)
     if returncode is None:

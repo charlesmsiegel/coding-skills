@@ -9,7 +9,7 @@ from pathlib import Path
 
 from rustextract import extract, skip_generics, split_top_level
 from rustlex import (
-    CONTROL_KEYWORDS, COPY_TYPES, KEYWORDS, OPENERS, PRIMITIVES, RustSyntaxError,
+    CLOSERS, CONTROL_KEYWORDS, COPY_TYPES, KEYWORDS, OPENERS, PRIMITIVES, RustSyntaxError,
     Token, is_doc_comment,
 )
 from rustnodes import Binding, Field, Func, Impl, ModDecl, Param, RsFile, Trait, TypeDef, Use, Variant
@@ -17,7 +17,7 @@ from rustnodes import Binding, Field, Func, Impl, ModDecl, Param, RsFile, Trait,
 __all__ = [
     "RustSyntaxError", "Token", "RsFile", "Func", "Param", "TypeDef", "Field",
     "Variant", "Trait", "Impl", "Use", "ModDecl", "Binding",
-    "KEYWORDS", "PRIMITIVES", "COPY_TYPES", "CONTROL_KEYWORDS", "OPENERS",
+    "KEYWORDS", "PRIMITIVES", "COPY_TYPES", "CONTROL_KEYWORDS", "OPENERS", "CLOSERS",
     "parse_file", "parse_source", "is_doc_comment", "skip_generics",
     "split_top_level", "callee_of", "iter_calls", "iter_method_calls",
     "argument_spans", "body_indices", "names_in", "statement_start",

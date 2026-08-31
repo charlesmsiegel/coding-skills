@@ -15,7 +15,7 @@ compiles, and `try_into()` turns it into a `Result` at the same call site.
 import re
 
 from common import Reporter, run_file_detector
-from rsparse import PRIMITIVES, RsFile
+from rsparse import CLOSERS, PRIMITIVES, RsFile
 
 # Integer widths, for deciding whether an `as` cast can lose data. `usize` and
 # `isize` are deliberately absent: they are 32 bits on a 32-bit target and 64 on
@@ -124,13 +124,27 @@ def _source_type(file: RsFile, as_index: int) -> str:
     name = previous.value
     # Search *backwards* from the cast: Rust shadows freely, and the binding in
     # scope is the nearest one above, not the first one in the file.
-    for index in range(as_index - 1, -1, -1):
-        if not file.tokens[index].is_name("let"):
+    #
+    # A block that has already closed above the cast is not in scope, so its
+    # bindings must be stepped over rather than matched. Without that, both
+    # directions are wrong: `let x: u64 = …; { let x: u8 = …; } x as u16` reads
+    # as the harmless `u8 as u16` and the real truncation is missed, and the
+    # mirror image reports a truncation that cannot happen.
+    index = as_index - 1
+    while index >= 0:
+        token = file.tokens[index]
+        if token.kind == "op" and token.value in CLOSERS:
+            opener = file.closer(index)
+            index = (opener - 1) if opener >= 0 else (index - 1)
+            continue
+        if not token.is_name("let"):
+            index -= 1
             continue
         cursor = index + 1
         if file.value(cursor) == "mut":
             cursor += 1
         if file.value(cursor) != name or file.value(cursor + 1) != ":":
+            index -= 1
             continue
         annotation = file.tok(cursor + 2)
         if annotation is not None and annotation.kind == "name" and annotation.value in PRIMITIVES:

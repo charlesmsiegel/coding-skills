@@ -88,7 +88,8 @@ def _check_clones(file: RsFile, report: Reporter) -> None:
                 continue
 
         for keyword, start, end, kind in loops:
-            if start < name_index < end and _declared_outside(file, subject, keyword, start):
+            if start < name_index < end and _declared_outside(file, subject, keyword,
+                                                              start, name_index):
                 report.add(line, "clone_inside_loop",
                            f"`{subject}.{method}()` inside a `{kind}` loop, on a value from "
                            "outside it",
@@ -97,14 +98,26 @@ def _check_clones(file: RsFile, report: Reporter) -> None:
                 break
 
 
-def _declared_outside(file: RsFile, subject: str, keyword: int, brace: int) -> bool:
-    """True when ``subject`` is bound before the loop rather than by its header."""
+def _declared_outside(file: RsFile, subject: str, keyword: int, brace: int,
+                      clone: int) -> bool:
+    """True when ``subject`` is bound before the loop rather than inside it."""
     if not subject or not subject.isidentifier():
         return False
     for index in range(keyword, brace):
         token = file.tokens[index]
         if token.kind == "name" and token.value == subject:
             return False  # the loop header itself binds it
+    # A `let` in the body above the clone builds a *new* value each iteration,
+    # so there is nothing to hoist: the clone feeds a second consumer of a value
+    # that did not exist before this iteration started.
+    for index in range(brace, clone):
+        if not file.tokens[index].is_name("let"):
+            continue
+        cursor = index + 1
+        if file.value(cursor) == "mut":
+            cursor += 1
+        if file.value(cursor) == subject:
+            return False
     return True
 
 

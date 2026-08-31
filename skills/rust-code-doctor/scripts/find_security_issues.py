@@ -208,6 +208,33 @@ def _crypto_context(file: RsFile, index: int) -> bool:
     return bool(re.search(r"(?i)(token|secret|key|nonce|salt|password|session)", window))
 
 
+# Bindings whose name says the value *names* a credential rather than being one.
+_METADATA_NAME_SUFFIXES = (
+    "_ENV", "_ENV_VAR", "_VAR", "_VARIABLE", "_HEADER", "_HEADER_NAME", "_NAME",
+    "_FIELD", "_KEY_NAME", "_PARAM", "_LABEL", "_PREFIX", "_SUFFIX", "_COLUMN",
+    "_SETTING", "_PATH", "_URL", "_URI", "_ARG", "_FLAG", "_PLACEHOLDER",
+)
+
+# Value shapes that are identifiers, not secrets: an environment variable name,
+# an HTTP header name, a dotted configuration key. A credential does not look
+# like any of these, and reporting one tells the reader to rotate a secret that
+# does not exist — which spends the credibility the real findings need.
+_METADATA_VALUE_SHAPES = (
+    re.compile(r"^[A-Z][A-Z0-9]*(?:_[A-Z0-9]+)+$"),          # APPLICATION_PASSWORD
+    # Header names capitalise every segment. Requiring that keeps a hyphenated
+    # passphrase — `hunter2-production-value` — on the credential side.
+    re.compile(r"^[A-Z][A-Za-z0-9]*(?:-[A-Z][A-Za-z0-9]*)+$"),  # X-Secret-Header
+    re.compile(r"^[a-z][a-z0-9]*(?:\.[a-z0-9_]+)+$"),         # db.password
+)
+
+
+def _names_a_credential(name: str, value: str) -> bool:
+    """True when the binding holds the *name* of a credential, not the credential."""
+    if name.upper().endswith(_METADATA_NAME_SUFFIXES):
+        return True
+    return any(shape.match(value) for shape in _METADATA_VALUE_SHAPES)
+
+
 def _check_hardcoded_secrets(file: RsFile, report: Reporter) -> None:
     testish = is_test_file(file.path)
 
@@ -226,6 +253,8 @@ def _check_hardcoded_secrets(file: RsFile, report: Reporter) -> None:
             continue
         if any(pattern.search(value) for pattern, _ in _SECRET_LITERALS):
             continue  # the literal scan below names the specific credential type
+        if _names_a_credential(binding.name, value.strip('"')):
+            continue
         report.add(binding.line, "credential_named_literal",
                    f"`{binding.kind} {binding.name}` is a string literal in the source",
                    "Load it from the environment (`std::env::var`) or a secret store. A default "
