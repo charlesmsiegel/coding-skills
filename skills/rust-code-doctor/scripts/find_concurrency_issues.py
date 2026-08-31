@@ -113,7 +113,7 @@ def _check_guard_across_await(file: RsFile, report: Reporter) -> None:
             continue
         # `drop(guard)` is the idiomatic way to end a critical section early;
         # awaits after it are not holding anything.
-        released = _dropped_at(file, binding.value, name_index, block_close)
+        released = _dropped_at(file, binding.value, name_index, block_close, block_open)
         awaits = [i for i in range(name_index, min(released, block_close))
                   if file.tokens[i].is_name("await") and file.tokens[i - 1].is_op(".")]
         if not awaits:
@@ -128,10 +128,17 @@ def _check_guard_across_await(file: RsFile, report: Reporter) -> None:
                    "high", related=[file.line_of(awaits[0])])
 
 
-def _dropped_at(file: RsFile, binding: str, start: int, stop: int) -> int:
-    """Index of `drop(binding)` in the range, or ``stop`` when it is never dropped."""
+def _dropped_at(file: RsFile, binding: str, start: int, stop: int, block_open: int) -> int:
+    """Index of an *unconditional* `drop(binding)`, or ``stop`` when there is none.
+
+    A `drop` nested in an `if` or a loop runs on only one path, so treating it as
+    the release point hides the deadlock on every other path — which is the case
+    this check exists to catch. Only a drop in the guard's own block counts.
+    """
     for index, callee in iter_calls(file, start, stop):
         if callee != "drop":
+            continue
+        if _enclosing_block(file, index)[0] != block_open:
             continue
         spans = argument_spans(file, index)
         if spans and file.slice(*spans[0]).strip() == binding:

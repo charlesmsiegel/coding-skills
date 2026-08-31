@@ -1502,3 +1502,188 @@ def test_a_failed_coverage_run_clears_every_stale_candidate(tmp_path, monkeypatc
     messages = module.measure_coverage(["cargo"], root)
     assert any("FAILED" in m for m in messages), messages
     assert module._coverage_file(root) is None, "a stale coverage file survived a failed run"
+
+
+# --- sixth review pass ------------------------------------------------------ #
+
+def test_diverging_macros_are_recognised_as_diverging(tmp_path):
+    """The matcher saw the name token alone, so `panic!` — whose `!` is a
+    separate token — never matched. The macro half of this check never ran."""
+    source = 'pub fn a() { panic!("stop"); do_work(); }\n' \
+             "pub fn b() { todo!(); more(); }\n" \
+             "pub fn c() { std::process::exit(1); after(); }\n" \
+             "fn do_work() {}\nfn more() {}\nfn after() {}\n"
+    findings = run_detector("find_dead_code.py", crate(tmp_path / "a", {"src/lib.rs": source}))
+    lines = sorted(f["line"] for f in findings if f["smell_type"] == "unreachable_code")
+    assert lines == [1, 2, 3], findings
+
+
+def test_code_after_no_diverging_call_is_not_unreachable(tmp_path):
+    """The exemption above must not disarm the check it guards."""
+    source = "pub fn a() { do_work(); fine(); }\nfn do_work() {}\nfn fine() {}\n"
+    findings = run_detector("find_dead_code.py", crate(tmp_path / "b", {"src/lib.rs": source}))
+    assert "unreachable_code" not in smells(findings)
+
+
+def test_length_minus_zero_cannot_underflow(tmp_path):
+    """A correctness claim the reader disproves by inspection costs the real ones."""
+    source = "pub fn a(v: &[u8]) -> usize { v.len() - 0 }\n" \
+             "pub fn b(v: &[u8]) -> usize { v.len() - 0usize }\n"
+    findings = run_detector("find_code_smells.py",
+                            write(tmp_path / "a", {"lib.rs": source}) / "lib.rs")
+    assert "unchecked_length_subtraction" not in smells(findings)
+
+
+def test_length_minus_one_still_underflows(tmp_path):
+    """The exemption above must not disarm the check it guards."""
+    findings = run_detector(
+        "find_code_smells.py",
+        write(tmp_path / "b", {"lib.rs": "pub fn a(v: &[u8]) -> usize { v.len() - 1 }\n"})
+        / "lib.rs")
+    assert "unchecked_length_subtraction" in smells(findings)
+
+
+def test_clone_before_count_is_not_a_redundant_clone(tmp_path):
+    """`Iterator::count` takes `self`, so the clone is what keeps `it` usable."""
+    source = "pub fn a(it: std::slice::Iter<'_, u8>) -> (usize, usize) {\n" \
+             "    let n = it.clone().count();\n    (n, it.len())\n}\n"
+    findings = run_detector("find_ownership_issues.py",
+                            write(tmp_path / "a", {"lib.rs": source}) / "lib.rs")
+    assert "clone_then_read" not in smells(findings)
+
+
+def test_a_transforming_ok_arm_is_not_a_question_mark(tmp_path):
+    """`Ok(v) => v + 1` is not `expr?`; the literal rewrite drops the `+ 1`."""
+    transforming = "pub fn a() -> Result<u32, E> {\n" \
+                   "    let x = match get() { Ok(v) => v + 1, Err(e) => return Err(e) };\n" \
+                   "    Ok(x)\n}\n" \
+                   "pub struct E;\nfn get() -> Result<u32, E> { Ok(1) }\n"
+    findings = run_detector("find_error_handling.py",
+                            write(tmp_path / "a", {"lib.rs": transforming}) / "lib.rs")
+    assert "manual_question_mark" not in smells(findings)
+
+
+def test_an_untouched_ok_arm_is_still_a_question_mark(tmp_path):
+    """The exemption above must not disarm the check it guards."""
+    exact = "pub fn a() -> Result<u32, E> {\n" \
+            "    let x = match get() { Ok(v) => v, Err(e) => return Err(e) };\n" \
+            "    Ok(x)\n}\n" \
+            "pub struct E;\nfn get() -> Result<u32, E> { Ok(1) }\n"
+    findings = run_detector("find_error_handling.py",
+                            write(tmp_path / "b", {"lib.rs": exact}) / "lib.rs")
+    assert "manual_question_mark" in smells(findings)
+
+
+def test_a_safe_method_named_unchecked_is_not_an_unsafe_operation(tmp_path):
+    """Rust reserves none of these names, and outside an unsafe context the std
+    method would not compile — so requiring one loses no true finding."""
+    source = "pub struct Cache;\n" \
+             "impl Cache { pub fn get_unchecked(&self, _i: usize) -> u8 { 0 } }\n" \
+             "pub fn f(c: &Cache) -> u8 { c.get_unchecked(3) }\n"
+    findings = run_detector("find_unsafe_issues.py",
+                            write(tmp_path / "a", {"lib.rs": source}) / "lib.rs")
+    assert "unchecked_operation" not in smells(findings)
+
+
+def test_a_real_unchecked_call_inside_unsafe_is_still_reported(tmp_path):
+    """The exemption above must not disarm the check it guards."""
+    source = "pub fn f(v: &[u8]) -> u8 { unsafe { *v.get_unchecked(3) } }\n"
+    findings = run_detector("find_unsafe_issues.py",
+                            write(tmp_path / "b", {"lib.rs": source}) / "lib.rs")
+    assert "unchecked_operation" in smells(findings)
+
+
+def test_a_conditional_drop_does_not_release_a_guard(tmp_path):
+    """A `drop` on one branch leaves the guard held on every other path, which
+    is the deadlock this check exists to catch."""
+    source = "pub async fn a(m: &std::sync::Mutex<u32>, ready: bool) {\n" \
+             "    let g = m.lock().unwrap();\n    if ready { drop(g); }\n" \
+             "    work().await;\n}\nasync fn work() {}\n"
+    findings = run_detector("find_concurrency_issues.py",
+                            write(tmp_path / "a", {"lib.rs": source}) / "lib.rs")
+    assert "guard_held_across_await" in smells(findings)
+
+
+def test_an_unconditional_drop_still_releases_a_guard(tmp_path):
+    """The check above must not start reporting the idiomatic early release."""
+    source = "pub async fn a(m: &std::sync::Mutex<u32>) {\n" \
+             "    let g = m.lock().unwrap();\n    drop(g);\n" \
+             "    work().await;\n}\nasync fn work() {}\n"
+    findings = run_detector("find_concurrency_issues.py",
+                            write(tmp_path / "b", {"lib.rs": source}) / "lib.rs")
+    assert "guard_held_across_await" not in smells(findings)
+
+
+def test_a_copy_binding_in_another_function_does_not_type_a_clone(tmp_path):
+    """Keyed by name across the file, a `let value: u32` in one function told the
+    reader to drop a clone a `String` in another needs."""
+    source = "pub fn a() { let value: u32 = 1; let _ = value; }\n" \
+             "pub fn b(s: String) { let value: String = s; consume(value.clone()); "
+    source += "consume(value); }\nfn consume(_v: String) {}\n"
+    findings = run_detector("find_ownership_issues.py",
+                            write(tmp_path / "a", {"lib.rs": source}) / "lib.rs")
+    assert "clone_on_copy" not in smells(findings)
+
+
+def test_a_clone_on_a_visible_copy_binding_is_still_reported(tmp_path):
+    """The exemption above must not disarm the check it guards."""
+    source = "pub fn a() { let value: u32 = 1; let _ = value.clone(); }\n"
+    findings = run_detector("find_ownership_issues.py",
+                            write(tmp_path / "b", {"lib.rs": source}) / "lib.rs")
+    assert "clone_on_copy" in smells(findings)
+
+
+def test_a_pub_item_in_a_private_module_is_not_public_api(tmp_path):
+    """Nothing downstream can name it, so the documentation and derive rules it
+    was being held to ask for work with no beneficiary."""
+    source = "mod internal { pub struct Widget { pub x: u32 } }\n"
+    findings = run_detector("find_api_hygiene.py",
+                            write(tmp_path / "a", {"lib.rs": source}) / "lib.rs")
+    assert "public_type_without_debug" not in smells(findings)
+
+
+def test_a_reexported_item_is_public_api_again(tmp_path):
+    """A `pub use` makes the private module's item nameable downstream."""
+    source = "mod shown { pub struct Reexported { pub x: u32 } }\npub use shown::Reexported;\n"
+    findings = run_detector("find_api_hygiene.py",
+                            write(tmp_path / "b", {"lib.rs": source}) / "lib.rs")
+    assert "public_type_without_debug" in smells(findings)
+
+
+def test_a_same_named_trait_is_not_attributed_an_unrelated_impl(tmp_path):
+    """Keyed by unqualified name, `mod b`'s `Service` — which has no implementor
+    at all — was reported as "implemented once, by `A`", naming a type from an
+    unrelated module. A syntax scan cannot resolve which `Service` an impl
+    means, so an ambiguous name is left alone rather than guessed at."""
+    source = "mod a { pub trait Service { fn go(&self); } pub struct A; "
+    source += "impl Service for A { fn go(&self) {} } }\n"
+    source += "mod b { pub trait Service { fn go(&self); } }\n"
+    findings = run_detector("find_overengineering.py",
+                            crate(tmp_path / "a", {"src/lib.rs": source}))
+    misattributed = [f for f in findings
+                     if f["smell_type"] == "trait_with_one_implementor" and f["line"] == 2]
+    assert not misattributed, misattributed
+
+
+def test_an_unambiguous_single_implementor_trait_is_still_reported(tmp_path):
+    """The exemption above must not disarm the check it guards."""
+    source = "pub trait Service { fn go(&self); }\npub struct A;\n" \
+             "impl Service for A { fn go(&self) {} }\n"
+    findings = run_detector("find_overengineering.py",
+                            crate(tmp_path / "b", {"src/lib.rs": source}))
+    assert "trait_with_one_implementor" in smells(findings)
+
+
+def test_an_orphan_file_does_not_justify_a_dependency(tmp_path):
+    """A file no `mod` declares is never compiled, so an import inside it cannot
+    make a declared dependency used — that put this check at odds with the
+    module graph beside it."""
+    root = crate(tmp_path / "a", {
+        "src/lib.rs": "pub fn f() {}\n",
+        "src/orphan.rs": "use anyhow::Result;\npub fn g() -> Result<()> { Ok(()) }\n",
+    }, manifest='[package]\nname = "demo"\nversion = "0.1.0"\nedition = "2021"\n\n'
+                '[dependencies]\nanyhow = "1"\n')
+    findings = run_detector("find_cargo_issues.py", root)
+    unused = [f for f in findings
+              if f["smell_type"] == "unused_dependency" and "anyhow" in f["description"]]
+    assert unused, "an orphan file's import kept `anyhow` looking used"

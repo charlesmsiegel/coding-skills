@@ -147,11 +147,17 @@ def _check_manual_question_mark(file: RsFile, report: Reporter) -> None:
             r"Err\s*\(\s*(\w+)\s*\)\s*=>\s*return\s+Err\s*\(\s*\1\s*\.\s*into\s*\(\s*\)\s*\)",
             r"Err\s*\(\s*(\w+)\s*\)\s*=>\s*return\s+Err\s*\(\s*[\w:]+::from\s*\(\s*\1\s*\)\s*\)",
         )
-        if any(re.search(pattern, compact) for pattern in rethrown):
-            report.add(token.line, "manual_question_mark",
-                       "`match` that returns `Ok` through and re-returns `Err` unchanged",
-                       "That is exactly `expr?`. `?` also applies `From` for the error type, so "
-                       "the explicit conversion goes too.", "medium")
+        if not any(re.search(pattern, compact) for pattern in rethrown):
+            continue
+        # `?` yields the binding untouched, so the rewrite is only exact when the
+        # success arm does too. `Ok(v) => v + 1` is not `expr?`, and applying the
+        # suggestion literally would drop the `+ 1`.
+        if not re.search(r"Ok\s*\(\s*(\w+)\s*\)\s*=>\s*\1\s*[,}]", compact):
+            continue
+        report.add(token.line, "manual_question_mark",
+                   "`match` that returns `Ok` through and re-returns `Err` unchanged",
+                   "That is exactly `expr?`. `?` also applies `From` for the error type, so "
+                   "the explicit conversion goes too.", "medium")
 
 
 def _check_swallowed_errors(file: RsFile, report: Reporter, testish: bool) -> None:

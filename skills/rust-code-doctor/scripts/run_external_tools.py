@@ -134,8 +134,9 @@ def _parse_cargo_json(tool, root, stdout):
 def _locked_first(argv, subcommand, root, extra):
     """Run a cargo subcommand with `--locked`, falling back if the lock is stale.
 
-    A check-only run should not rewrite `Cargo.lock`, so `--locked` is the right
-    default. It is also a hard error when the lockfile genuinely needs updating,
+    A check-only run should not rewrite the user's `Cargo.lock` — `clippy`,
+    `test` and `tree` will update it just as readily as `check` — so `--locked`
+    is the right default for all of them. It is also a hard error when the lockfile genuinely needs updating,
     which would turn "your lock is out of date" into "the compiler did not run"
     — so that one case falls back and says what happened.
     """
@@ -168,11 +169,16 @@ def run_check(argv, root):
 
 
 def run_clippy(argv, root):
-    returncode, out, err = _run(
-        [*argv, "clippy", "--all-targets", "--message-format", "json"], root)
+    returncode, out, err, unlocked = _locked_first(
+        argv, "clippy", root, ["--all-targets", "--message-format", "json"])
     if returncode is None:
         return [_tool_error("cargo-clippy", root, returncode, err)]
     findings = _parse_cargo_json("cargo-clippy", root, out)
+    if unlocked:
+        findings.append(_finding(
+            "cargo-clippy", root / "Cargo.lock", 1, "lockfile-stale",
+            "Cargo.lock does not match Cargo.toml, so this run had to update it",
+            "medium"))
     if not findings and returncode != 0:
         return [_tool_error("cargo-clippy", root, returncode, err or out)]
     return findings
@@ -198,10 +204,16 @@ def run_fmt(argv, root):
 
 def run_test(argv, root):
     """Compile the tests without running them: a test that no longer builds is a failure."""
-    returncode, out, err = _run([*argv, "test", "--no-run", "--message-format", "json"], root)
+    returncode, out, err, unlocked = _locked_first(
+        argv, "test", root, ["--no-run", "--message-format", "json"])
     if returncode is None:
         return [_tool_error("cargo-test", root, returncode, err)]
     findings = _parse_cargo_json("cargo-test", root, out)
+    if unlocked:
+        findings.append(_finding(
+            "cargo-test", root / "Cargo.lock", 1, "lockfile-stale",
+            "Cargo.lock does not match Cargo.toml, so this run had to update it",
+            "medium"))
     if not findings and returncode != 0:
         return [_tool_error("cargo-test", root, returncode, err or out)]
     return findings
@@ -293,7 +305,7 @@ def run_udeps(argv, root):
 
 def run_tree(argv, root):
     """Duplicate versions of one crate: slower builds, and two incompatible types."""
-    returncode, out, err = _run([*argv, "tree", "--duplicates"], root)
+    returncode, out, err, _unlocked = _locked_first(argv, "tree", root, ["--duplicates"])
     if returncode is None or returncode != 0:
         return [_tool_error("cargo-tree", root, returncode, err or out)]
     duplicates = sorted({m.group(1) for m in

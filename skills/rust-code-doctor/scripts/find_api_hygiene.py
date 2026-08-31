@@ -27,13 +27,39 @@ _EXPECTED_DERIVES = ("Debug",)
 _MUST_USE_SHAPES = re.compile(r"^(Self|[A-Z]\w*(<.*>)?)$")
 
 
+def _reexported_from(file: RsFile, module: str) -> bool:
+    """True when a `pub use` in this file re-exports out of ``module``."""
+    return any(u.visibility.startswith("pub") and module in u.path.split("::")
+               for u in file.uses)
+
+
+def _published(file: RsFile, item) -> bool:
+    """True when a `pub` item is actually nameable by a downstream crate.
+
+    `pub` inside a private module is crate-internal: nothing outside can name it
+    unless a `pub use` re-exports it. Holding such an item to public-API rules
+    reports missing docs and derives on code no user can reach — and the fix it
+    asks for is work with no beneficiary.
+    """
+    if not item.is_public:
+        return False
+    for declaration in file.mods:
+        if not declaration.inline or declaration.body_open < 0:
+            continue
+        if not declaration.body_open < item.start < declaration.body_close:
+            continue
+        if not declaration.is_exported and not _reexported_from(file, declaration.name):
+            return False
+    return True
+
+
 def _is_library_file(file: RsFile) -> bool:
     return file.path.name not in ("main.rs", "build.rs") and not is_test_file(file.path)
 
 
 def _check_derives(file: RsFile, report: Reporter) -> None:
     for definition in file.types:
-        if definition.kind not in ("struct", "enum") or not definition.is_public:
+        if definition.kind not in ("struct", "enum") or not _published(file, definition):
             continue
         derives = {d.rsplit("::", 1)[-1] for d in definition.derives}
         manual = {block.trait_name.rsplit("::", 1)[-1] for block in file.impls
@@ -71,7 +97,7 @@ def _check_new_without_default(file: RsFile, report: Reporter) -> None:
             continue
         base = block.type_name.split("<")[0].strip()
         for method in block.methods:
-            if method.name != "new" or method.takes_self or not method.is_public:
+            if method.name != "new" or method.takes_self or not _published(file, method):
                 continue
             if [p for p in method.params if not p.is_self]:
                 continue
@@ -86,7 +112,7 @@ def _check_new_without_default(file: RsFile, report: Reporter) -> None:
 
 def _check_must_use(file: RsFile, report: Reporter) -> None:
     for func in file.functions:
-        if not func.is_public or not func.has_body or func.trait_name is not None:
+        if not _published(file, func) or not func.has_body or func.trait_name is not None:
             continue
         if not func.takes_self or not func.params or func.params[0].by_ref:
             continue
@@ -106,13 +132,14 @@ def _check_public_docs(file: RsFile, report: Reporter) -> None:
         return
     undocumented = []
     for func in file.functions:
-        if func.is_public and func.trait_name is None and not func.doc_lines and func.name != "new":
+        if _published(file, func) and func.trait_name is None and not func.doc_lines \
+                and func.name != "new":
             undocumented.append((func.line, f"fn {func.qualname}"))
     for definition in file.types:
-        if definition.is_public and not definition.doc_lines:
+        if _published(file, definition) and not definition.doc_lines:
             undocumented.append((definition.line, f"{definition.kind} {definition.name}"))
     for trait in file.traits:
-        if trait.is_public and not trait.doc_lines:
+        if _published(file, trait) and not trait.doc_lines:
             undocumented.append((trait.line, f"trait {trait.name}"))
     if len(undocumented) < 3:
         return
@@ -127,7 +154,7 @@ def _check_public_docs(file: RsFile, report: Reporter) -> None:
 
 def _check_non_exhaustive(file: RsFile, report: Reporter) -> None:
     for definition in file.types:
-        if definition.kind != "enum" or not definition.is_public:
+        if definition.kind != "enum" or not _published(file, definition):
             continue
         if len(definition.variants) < 3:
             continue
@@ -145,7 +172,7 @@ def _check_non_exhaustive(file: RsFile, report: Reporter) -> None:
 
 def _check_impl_trait_in_public_return(file: RsFile, report: Reporter) -> None:
     for func in file.functions:
-        if not func.is_public or func.trait_name is not None:
+        if not _published(file, func) or func.trait_name is not None:
             continue
         compact = func.return_type.replace(" ", "")
         if compact.startswith("implIterator") and "+" not in compact:
