@@ -1,6 +1,6 @@
 # coding-skills
 
-Fourteen agentic skills for AI-assisted software work, plus seven Claude Code
+Fifteen agentic skills for AI-assisted software work, plus seven Claude Code
 output styles that change how the agent talks while it uses them.
 
 The skills pair **deterministic detectors** — stdlib-only scripts that parse the
@@ -54,6 +54,23 @@ list — an open issue usually records a design decision made and not yet acted 
   `run_external_tools.py` drives `tsc`, ESLint, Biome, Prettier, madge, knip,
   `npm audit` and coverage when the project already has them — the compiler
   answers what a syntax scanner structurally cannot.
+- **[rust-code-doctor](skills/rust-code-doctor)** — the same idea for Rust, and
+  fully standalone: it ships its own Rust scanner (raw strings with any number
+  of hashes, block comments that nest, the `'` that is a char in one place and a
+  lifetime in another) so the detectors run on a fresh clone with no cargo
+  registry, no network and no successful build. Compilation errors are `cargo
+  check`'s job and the skill says so — `run_external_tools.py` drives `cargo
+  check`, clippy, fmt, test, audit, deny, udeps and coverage and normalises
+  their diagnostics into the same finding shape. What the detectors add on top
+  is what a lint cannot see: error handling that panics or swallows (`unwrap`
+  inside a function that already returns `Result`, `.ok();`, a hand-rolled `?`),
+  `unsafe` whose SAFETY argument was never written down, a lock guard held
+  across an `.await`, narrowing `as` casts, `&String`/`&Vec<T>` parameters and
+  clones inside loops, unidiomatic Rust in the "unpythonic" sense, a Cargo.toml
+  audit that reconciles declared dependencies against imported ones — and the
+  module-graph check, which reports a `.rs` file under `src/` that no `mod`
+  declaration reaches. rustc never opens that file, so it never type-checks, its
+  tests never run, and no linter can report it.
 - **[django-code-doctor](skills/django-code-doctor)** — the Django-specific
   companion, and the one that also writes and upgrades. Fifteen detectors: N+1
   queries and per-row writes, model and migration problems, missing
@@ -251,6 +268,14 @@ django-code-doctor ships its own copies of python-code-doctor's `common.py` and
 `format_findings.py`, byte-identical and CI-enforced, for the same reason: a
 skill has to be self-contained to be installed on its own, and the reporting pipe
 its SKILL.md documents has to work with no sibling skill present.
+
+typescript-code-doctor and rust-code-doctor ship same-named files
+(`common.py`, `runner.py`, `analyze_all.py`, `analyze_diff.py`,
+`format_findings.py`, `run_external_tools.py`) that are **not** copies and are
+deliberately not synced: same shape, different language underneath — a different
+file walker, a different parser facade, a different toolchain to drive. Only the
+finding record and the CLI contract are shared, and those are pinned by each
+skill's own tests rather than by a byte comparison.
 
 No skill may reach into another skill's directory. A release archive holds
 exactly one skill, so `../other-skill/scripts/...` is a path that exists only in
