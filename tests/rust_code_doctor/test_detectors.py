@@ -1355,3 +1355,150 @@ def test_a_seeded_accumulator_is_a_fold_not_a_sum(tmp_path):
         "find_loop_simplifications.py", write(tmp_path / "a", {"lib.rs": seeded}) / "lib.rs"))
     assert "manual_sum" in smells(run_detector(
         "find_loop_simplifications.py", write(tmp_path / "b", {"lib.rs": plain}) / "lib.rs"))
+
+
+def test_a_binding_in_an_exited_scope_does_not_mask_a_cast(tmp_path):
+    """A block that closed above the cast is out of scope, so its `let` is not
+    the binding being cast — and reading it as one hides a real truncation."""
+    masked = "pub fn f() -> u16 {\n    let x: u64 = 1000;\n    { let x: u8 = 1; let _ = x; }\n" \
+             "    x as u16\n}\n"
+    findings = run_detector("find_type_issues.py",
+                            write(tmp_path / "a", {"lib.rs": masked}) / "lib.rs")
+    assert "narrowing_cast" in smells(findings)
+
+
+def test_a_binding_in_an_exited_scope_does_not_invent_a_cast(tmp_path):
+    """The mirror image: the wider type is the one out of scope, so there is no
+    truncation to report."""
+    invented = "pub fn f() -> u16 {\n    let x: u8 = 1;\n    { let x: u64 = 9; let _ = x; }\n" \
+               "    x as u16\n}\n"
+    findings = run_detector("find_type_issues.py",
+                            write(tmp_path / "b", {"lib.rs": invented}) / "lib.rs")
+    assert "narrowing_cast" not in smells(findings)
+
+
+def test_an_external_test_module_resolves_under_its_owning_module(tmp_path):
+    """`mod tests;` in `src/foo.rs` lives at `src/foo/tests.rs`, not `src/tests.rs`."""
+    root = write(tmp_path / "a", {
+        "src/foo.rs": "#[cfg(test)]\nmod tests;\npub fn f() {}\n",
+        "src/foo/tests.rs": "#[test]\nfn t() { assert_eq!(1, 1); }\n",
+    })
+    findings = run_detector("find_test_smells.py", root / "src" / "foo.rs")
+    assert "missing_test_module_file" not in smells(findings)
+
+
+def test_a_genuinely_missing_test_module_is_still_reported(tmp_path):
+    """The exemption above must not disarm the check it guards."""
+    root = write(tmp_path / "b", {"src/foo.rs": "#[cfg(test)]\nmod tests;\npub fn f() {}\n"})
+    findings = run_detector("find_test_smells.py", root / "src" / "foo.rs")
+    assert "missing_test_module_file" in smells(findings)
+
+
+def test_a_credential_name_is_not_a_credential(tmp_path):
+    """A binding holding the *name* of a secret is metadata; telling the reader
+    to rotate it spends the credibility the real findings need."""
+    metadata = 'const PASSWORD_ENV_VAR: &str = "APPLICATION_PASSWORD";\n' \
+               'const SECRET_HEADER: &str = "X-Secret-Header";\n' \
+               'const DB_PASSWORD_KEY: &str = "db.password";\n'
+    findings = run_detector("find_security_issues.py",
+                            write(tmp_path / "a", {"lib.rs": metadata}) / "lib.rs")
+    assert "credential_named_literal" not in smells(findings)
+
+
+def test_a_hyphenated_passphrase_is_still_a_credential(tmp_path):
+    """Header shape requires capitalised segments precisely so this stays caught."""
+    findings = run_detector(
+        "find_security_issues.py",
+        write(tmp_path / "b",
+              {"lib.rs": 'const DB_PASSWORD: &str = "hunter2-production-value";\n'}) / "lib.rs")
+    assert "credential_named_literal" in smells(findings)
+
+
+def test_a_clone_of_a_value_built_in_the_loop_is_not_hoistable(tmp_path):
+    """Each iteration constructs a new value, so there is nothing to hoist."""
+    local = 'pub fn f(xs: &[u32]) {\n    for x in xs {\n        let value = format!("{x}");\n' \
+            "        consume(value.clone());\n        consume(value);\n    }\n}\n" \
+            "fn consume(_v: String) {}\n"
+    findings = run_detector("find_ownership_issues.py",
+                            write(tmp_path / "a", {"lib.rs": local}) / "lib.rs")
+    assert "clone_inside_loop" not in smells(findings)
+
+
+def test_a_clone_of_an_outside_value_is_still_hoistable(tmp_path):
+    """The exemption above must not disarm the check it guards."""
+    outside = "pub fn f(outer: String, xs: &[u32]) {\n    for _x in xs {\n" \
+              "        consume(outer.clone());\n    }\n}\nfn consume(_v: String) {}\n"
+    findings = run_detector("find_ownership_issues.py",
+                            write(tmp_path / "b", {"lib.rs": outside}) / "lib.rs")
+    assert "clone_inside_loop" in smells(findings)
+
+
+def test_a_workspace_member_is_not_scanned_as_the_parent(tmp_path):
+    """A target at the package root makes the scanned directory the whole
+    workspace, and a member's imports must not be read as the parent's."""
+    root = crate(tmp_path / "a", {
+        "lib.rs": "pub fn f() {}\n",
+        "member/Cargo.toml": '[package]\nname = "member"\nversion = "0.1.0"\n'
+                             'edition = "2021"\n\n[dependencies]\nserde = "1"\n',
+        "member/src/lib.rs": "use serde::Serialize;\npub fn g<T: Serialize>(_t: T) {}\n",
+    }, manifest='[package]\nname = "demo"\nversion = "0.1.0"\nedition = "2021"\n\n'
+                '[lib]\npath = "lib.rs"\n\n[dependencies]\n')
+    findings = run_detector("find_cargo_issues.py", root)
+    serde = [f for f in findings
+             if f["smell_type"] == "undeclared_dependency_candidate" and "serde" in f["description"]]
+    assert not serde, f"member's import attributed to the parent: {serde}"
+
+
+def _external():
+    """Import run_external_tools off the skill's scripts directory."""
+    sys.path.insert(0, str(SCRIPTS_DIR))
+    try:
+        sys.modules.pop("run_external_tools", None)
+        import run_external_tools
+        return run_external_tools
+    finally:
+        sys.path.remove(str(SCRIPTS_DIR))
+
+
+def test_unparseable_udeps_output_is_a_tool_error_not_a_clean_audit(tmp_path, monkeypatch):
+    """Swallowing the decode error reported "nothing unused" for a run whose
+    results were never read."""
+    module = _external()
+    root = crate(tmp_path / "a", {"src/lib.rs": "pub fn a() {}\n"})
+    monkeypatch.setattr(module, "_run", lambda *a, **k: (0, "not json at all", ""))
+    findings = module.run_udeps(["cargo"], root)
+    assert [f["smell_type"] for f in findings] == ["cargo-udeps:tool-error"]
+
+
+def test_empty_udeps_output_is_a_tool_error_too(tmp_path, monkeypatch):
+    """An accepted exit status with no output parsed to `{}` and read as clean."""
+    module = _external()
+    root = crate(tmp_path / "b", {"src/lib.rs": "pub fn a() {}\n"})
+    monkeypatch.setattr(module, "_run", lambda *a, **k: (0, "", ""))
+    findings = module.run_udeps(["cargo"], root)
+    assert [f["smell_type"] for f in findings] == ["cargo-udeps:tool-error"]
+
+
+def test_wellformed_udeps_output_still_reports_unused_dependencies(tmp_path, monkeypatch):
+    """The exemptions above must not disarm the check they guard."""
+    module = _external()
+    root = crate(tmp_path / "c", {"src/lib.rs": "pub fn a() {}\n"})
+    payload = json.dumps({"unused_deps": {"demo": {"normal": ["serde"], "development": []}}})
+    monkeypatch.setattr(module, "_run", lambda *a, **k: (1, payload, ""))
+    findings = module.run_udeps(["cargo"], root)
+    assert [f["smell_type"] for f in findings] == ["cargo-udeps:unused-dependency"]
+
+
+def test_a_failed_coverage_run_clears_every_stale_candidate(tmp_path, monkeypatch):
+    """Removing only the root `lcov.info` let `_coverage_file` pick up an old
+    file from another tool and present it as this run's result."""
+    module = _external()
+    root = crate(tmp_path / "d", {"src/lib.rs": "pub fn a() {}\n"})
+    for name in module.COVERAGE_FILES:
+        stale = root / name
+        stale.parent.mkdir(parents=True, exist_ok=True)
+        stale.write_text("SF:src/lib.rs\nDA:1,1\nend_of_record\n", encoding="utf-8")
+    monkeypatch.setattr(module, "_run", lambda *a, **k: (101, "", "compile error"))
+    messages = module.measure_coverage(["cargo"], root)
+    assert any("FAILED" in m for m in messages), messages
+    assert module._coverage_file(root) is None, "a stale coverage file survived a failed run"

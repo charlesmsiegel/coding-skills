@@ -18,7 +18,7 @@ import contextlib
 import re
 from pathlib import Path
 
-from common import Finding, find_rs_files, run_tree_detector
+from common import Finding, crate_root_of, find_rs_files, run_tree_detector
 from rsparse import RustSyntaxError, parse_file
 from rsproject import Crate, load_project
 
@@ -204,7 +204,7 @@ def _crate_sources(crate: Crate) -> list[Path]:
     crate's source as its own, and every member's dependency as undeclared.
     """
     directories = {root.parent for root in crate.roots} or {crate.root_dir / "src"}
-    return _collect(directories)
+    return _collect(directories, crate.root_dir)
 
 
 def _auxiliary_sources(crate: Crate) -> list[Path]:
@@ -215,17 +215,28 @@ def _auxiliary_sources(crate: Crate) -> list[Path]:
     alone reports every one of them as unused.
     """
     directories = {crate.root_dir / name for name in ("tests", "benches", "examples")}
-    paths = _collect(directories)
+    paths = _collect(directories, crate.root_dir)
     build = crate.root_dir / "build.rs"
     if build.is_file():
         paths.append(build)
     return paths
 
 
-def _collect(directories) -> list[Path]:
+def _collect(directories, owner: Path) -> list[Path]:
+    """Rust files under ``directories`` that belong to the package at ``owner``.
+
+    A target placed at the package root (`[lib] path = "lib.rs"`) makes the
+    scanned directory the whole package, which in a workspace contains the
+    member packages too. Without this filter a member's imports are read as the
+    parent's, inventing undeclared-dependency findings and masking the parent's
+    genuinely unused ones. A file belongs to the nearest manifest above it.
+    """
+    resolved_owner = owner.resolve()
     seen: dict[Path, None] = {}
     for directory in sorted(directories):
         for path in find_rs_files(directory):
+            if crate_root_of(path) != resolved_owner:
+                continue
             seen.setdefault(path, None)
     return list(seen)
 

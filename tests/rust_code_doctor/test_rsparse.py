@@ -312,3 +312,29 @@ def test_a_const_generic_brace_in_a_where_clause_is_not_the_body(rs):
     func = file.functions[0]
     assert file.line_of(func.body_open) == 1 and file.line_of(func.body_close) == 4
     assert "let x" in file.slice(func.body_open, func.body_close)
+
+
+def test_an_auxiliary_target_root_has_its_modules_walked(tmp_path):
+    """`[[test]] path = "qa/check.rs"` is its own compilation unit, so the
+    modules it declares are compiled too. Listing the target file without
+    walking it left `qa/helper.rs` outside the graph, and the untested-module
+    check then reported a module `cargo test` runs."""
+    sys.path.insert(0, str(SCRIPTS_DIR))
+    try:
+        for cached in ("rsparse", "rustlex", "rustnodes", "rustextract", "common", "rsproject"):
+            sys.modules.pop(cached, None)
+        import rsproject
+        (tmp_path / "src").mkdir(parents=True)
+        (tmp_path / "qa").mkdir(parents=True)
+        (tmp_path / "Cargo.toml").write_text(
+            '[package]\nname = "demo"\nversion = "0.1.0"\nedition = "2021"\n\n'
+            '[[test]]\nname = "check"\npath = "qa/check.rs"\n', encoding="utf-8")
+        (tmp_path / "src" / "lib.rs").write_text("pub fn f() {}\n", encoding="utf-8")
+        (tmp_path / "qa" / "check.rs").write_text("mod helper;\n", encoding="utf-8")
+        (tmp_path / "qa" / "helper.rs").write_text(
+            "#[test]\nfn t() { assert_eq!(1, 1); }\n", encoding="utf-8")
+        project = rsproject.load_project(tmp_path)
+        compiled = project.compiled_files()
+        assert (tmp_path / "qa" / "helper.rs").resolve() in compiled
+    finally:
+        sys.path.remove(str(SCRIPTS_DIR))

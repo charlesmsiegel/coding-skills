@@ -92,7 +92,12 @@ class Project:
 
     def _build_module_graph(self) -> None:
         for crate in self.crates:
-            for root_file in crate.roots:
+            # An explicit `[[test]] path = "qa/check.rs"` is a compilation unit
+            # in its own right, so the modules it declares are compiled too.
+            # Listing the target file without walking it left `qa/helper.rs`
+            # outside the graph, and `find_untested_modules` then reported
+            # `no_tests_at_all` for a module `cargo test` runs.
+            for root_file in crate.roots + crate.auxiliary_roots:
                 if root_file in self.files:
                     # A crate root owns its directory whatever it is called:
                     # `[lib] path = "source/root.rs"` makes `mod helper;`

@@ -13,6 +13,7 @@ testing this file", this one answers "does the test prove anything".
 """
 
 import re
+from pathlib import Path
 
 from common import Reporter, is_test_file, run_file_detector
 from rsparse import RsFile, argument_spans, body_indices, iter_calls, iter_method_calls
@@ -134,13 +135,29 @@ def _check_over_broad_assertions(file: RsFile, report: Reporter) -> None:
                            "Assert on the value the code produced.", "high")
 
 
+def _owning_directory(path: Path) -> Path:
+    """The directory a `mod name;` in ``path`` resolves against.
+
+    A crate root and a `mod.rs` own the directory they sit in; every other file
+    owns the directory named after it. Resolving `mod tests;` in `src/foo.rs`
+    against `src/` instead of `src/foo/` claims a perfectly runnable test module
+    is missing — a high-severity report that `cargo test` disproves immediately.
+    """
+    if path.name in ("lib.rs", "main.rs", "mod.rs"):
+        return path.parent
+    return path.parent / path.stem
+
+
 def _check_unreachable_test_module(file: RsFile, report: Reporter) -> None:
     """A `#[cfg(test)] mod tests;` whose file is missing runs nothing."""
     for declaration in file.mods:
         if not declaration.is_test_mod or declaration.inline:
             continue
-        sibling = file.path.parent / f"{declaration.name}.rs"
-        nested = file.path.parent / declaration.name / "mod.rs"
+        if any(a.replace(" ", "").startswith("path=") for a in declaration.attrs):
+            continue  # `#[path = "…"]` points somewhere this check cannot follow
+        directory = _owning_directory(file.path)
+        sibling = directory / f"{declaration.name}.rs"
+        nested = directory / declaration.name / "mod.rs"
         if sibling.exists() or nested.exists():
             continue
         report.add(declaration.line, "missing_test_module_file",
