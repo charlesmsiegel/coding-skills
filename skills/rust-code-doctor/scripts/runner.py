@@ -125,6 +125,9 @@ def run_file_shard(paths: list[Path], specs: list[tuple[str, str]],
         except Exception as exc:  # an unimportable detector must not sink the shard
             out[category] = {"issues": [], "error": f"{type(exc).__name__}: {exc}"}
 
+    # category -> the first per-file failure, so the report can say the category
+    # is incomplete rather than letting a zero count read as clean.
+    failures: dict[str, str] = {}
     for path in paths:
         try:
             rsfile = parse_file(path)
@@ -136,9 +139,21 @@ def run_file_shard(paths: list[Path], specs: list[tuple[str, str]],
                 out[category].extend(analyze(rsfile, ignore))
             except Exception as exc:  # a detector bug must not read as a clean file
                 warn_detector_error(path, exc)
+                failures.setdefault(
+                    category, f"{type(exc).__name__} on {path.name}: {exc}")
 
-    return {category: (found if isinstance(found, dict) else [asdict(f) for f in found])
-            for category, found in out.items()}
+    result: dict[str, object] = {}
+    for category, found in out.items():
+        if isinstance(found, dict):
+            result[category] = found
+        elif category in failures:
+            # Keep what was collected *and* the error: the findings are real,
+            # and the category is incomplete.
+            result[category] = {"issues": [asdict(f) for f in found],
+                                "error": failures[category]}
+        else:
+            result[category] = [asdict(f) for f in found]
+    return result
 
 
 def run_tree_task(root: Path, specs: list[tuple[str, str]],
@@ -227,14 +242,28 @@ def run_detectors(path: str, file_specs: list[tuple[str, str]],
 
 
 def _absorb(results: dict, part: dict) -> None:
-    """Merge one task's output, keeping an error dict as the category's whole result."""
+    """Merge one task's output.
+
+    A category that failed carries both its error and whatever it collected
+    before failing — dropping the findings would lose real results, and dropping
+    the error would let an incomplete category read as a clean one.
+    """
     for category, found in part.items():
-        if isinstance(found, dict):  # an error, which replaces whatever it names
-            results[category] = found
-        elif isinstance(results.get(category), dict):
-            continue  # already failed; nothing to append to
+        incoming = found if isinstance(found, dict) else {"issues": found, "error": None}
+        existing = results.get(category)
+        if existing is None:
+            results[category] = list(incoming["issues"]) if not incoming.get("error") \
+                else {"issues": list(incoming["issues"]), "error": incoming["error"]}
+            continue
+        if isinstance(existing, dict):
+            existing["issues"].extend(incoming["issues"])
+            if incoming.get("error") and not existing.get("error"):
+                existing["error"] = incoming["error"]
+        elif incoming.get("error"):
+            results[category] = {"issues": existing + list(incoming["issues"]),
+                                 "error": incoming["error"]}
         else:
-            results.setdefault(category, []).extend(found)
+            existing.extend(incoming["issues"])
 
 
 def _finish(results: dict, file_specs, tree_specs) -> dict:
@@ -242,4 +271,6 @@ def _finish(results: dict, file_specs, tree_specs) -> dict:
         found = results.setdefault(category, [])
         if isinstance(found, list):
             _sort_records(found)
+        elif isinstance(found, dict):
+            _sort_records(found.setdefault("issues", []))
     return results

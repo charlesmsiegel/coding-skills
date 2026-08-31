@@ -28,7 +28,15 @@ def _finding(path, line, smell, description, suggestion, severity, related=None)
 
 
 def _check_missing_modules(project, findings: list) -> None:
-    for path, line, name in project.missing_modules:
+    for path, line, name, gated in project.missing_modules:
+        if gated:
+            findings.append(_finding(
+                path, line, "cfg_gated_module_file_missing",
+                f"`mod {name};` is behind a `cfg` and names no `{name}.rs` or `{name}/mod.rs`",
+                "Under a configuration where the `cfg` is false this is fine — rustc never looks "
+                "for the file. Under one where it is true the crate does not build. Check which "
+                "configurations enable it, and whether the file was meant to exist.", "medium"))
+            continue
         findings.append(_finding(
             path, line, "module_file_missing",
             f"`mod {name};` names no `{name}.rs` or `{name}/mod.rs` next to this file",

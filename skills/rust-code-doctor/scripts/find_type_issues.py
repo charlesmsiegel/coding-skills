@@ -17,9 +17,14 @@ import re
 from common import Reporter, run_file_detector
 from rsparse import PRIMITIVES, RsFile
 
-# Integer widths, for deciding whether an `as` cast can lose data.
+# Integer widths, for deciding whether an `as` cast can lose data. `usize` and
+# `isize` are deliberately absent: they are 32 bits on a 32-bit target and 64 on
+# a 64-bit one, and this analyzer may not be running on the crate's target.
+# Hard-coding 64 both misses `u64 as usize` truncation on 32-bit and calls
+# `usize as u32` a definite narrowing when it is not.
 _WIDTH = {"i8": 8, "u8": 8, "i16": 16, "u16": 16, "i32": 32, "u32": 32,
-          "i64": 64, "u64": 64, "i128": 128, "u128": 128, "isize": 64, "usize": 64}
+          "i64": 64, "u64": 64, "i128": 128, "u128": 128}
+_POINTER_SIZED = {"usize": ("u", 32, 64), "isize": ("i", 32, 64)}
 _SIGNED = {"i8", "i16", "i32", "i64", "i128", "isize"}
 _FLOATS = {"f32", "f64"}
 
@@ -59,6 +64,9 @@ def _check_numeric_casts(file: RsFile, report: Reporter) -> None:
                            f"`{target.value}::try_from(value)` makes the overflow a `Result` "
                            "instead of a silently wrong number.", "low")
             continue
+        if source in _POINTER_SIZED or target.value in _POINTER_SIZED:
+            _report_pointer_sized_cast(report, line, source, target.value)
+            continue
         if source in _WIDTH and target.value in _WIDTH:
             narrowing = _WIDTH[source] > _WIDTH[target.value]
             sign_change = (source in _SIGNED) != (target.value in _SIGNED)
@@ -75,6 +83,33 @@ def _check_numeric_casts(file: RsFile, report: Reporter) -> None:
                            "medium")
 
 
+def _report_pointer_sized_cast(report, line: int, source: str, target: str) -> None:
+    """A cast involving `usize`/`isize`, whose width depends on the target.
+
+    Reported only when it loses data on *some* supported target, and always as
+    the conditional claim it is — the analyzer does not know which target the
+    crate is built for.
+    """
+    widths = {**{k: (v, v) for k, v in _WIDTH.items()},
+              "usize": (32, 64), "isize": (32, 64)}
+    if source not in widths or target not in widths:
+        return
+    low_source, high_source = widths[source]
+    low_target, high_target = widths[target]
+    if high_source <= low_target:
+        return  # widens on every target
+    definite = low_source > high_target
+    report.add(line, "narrowing_cast" if definite else "target_dependent_cast",
+               f"`{source} as {target}` loses data"
+               + ("" if definite else " on a 32-bit target, where `usize` is 32 bits"),
+               f"`{target}::try_from(value)?` — the failure becomes a `Result` you handle "
+               "instead of a wrong number that keeps flowing."
+               + ("" if definite else " This is silent on the 64-bit target you are probably "
+                  "building for and a real truncation on a 32-bit one, which is the worst "
+                  "shape for a bug to have."),
+               "high" if definite else "medium")
+
+
 def _source_type(file: RsFile, as_index: int) -> str:
     """A best guess at what is being cast: a literal suffix or an annotated local."""
     previous = file.tok(as_index - 1)
@@ -87,8 +122,10 @@ def _source_type(file: RsFile, as_index: int) -> str:
     if previous.kind != "name":
         return ""
     name = previous.value
-    for index, token in enumerate(file.tokens[:as_index]):
-        if not token.is_name("let"):
+    # Search *backwards* from the cast: Rust shadows freely, and the binding in
+    # scope is the nearest one above, not the first one in the file.
+    for index in range(as_index - 1, -1, -1):
+        if not file.tokens[index].is_name("let"):
             continue
         cursor = index + 1
         if file.value(cursor) == "mut":
@@ -98,6 +135,7 @@ def _source_type(file: RsFile, as_index: int) -> str:
         annotation = file.tok(cursor + 2)
         if annotation is not None and annotation.kind == "name" and annotation.value in PRIMITIVES:
             return annotation.value
+        return ""  # shadowed by a binding whose type this scan cannot read
     for func in file.functions:
         for param in func.params:
             if param.name == name and param.type_text in PRIMITIVES:

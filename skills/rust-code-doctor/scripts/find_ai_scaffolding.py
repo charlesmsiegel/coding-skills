@@ -77,11 +77,12 @@ def _check_duplicate_definitions(file: RsFile, report: Reporter) -> None:
     for func in file.functions:
         if func.kind == "closure" or not func.name:
             continue
-        # A name defined once in the module and once in its `#[cfg(test)] mod`
-        # is two different items in two different scopes.
+        # Scope, not just name: `mod a { fn helper() {} }` and
+        # `mod b { fn helper() {} }` are two items rustc accepts, and so is a
+        # name defined once in a module and once in its `#[cfg(test)] mod`.
         by_name[(func.owner, func.trait_name, func.name,
-                 file.in_test_code(func.start))].append(func)
-    for (owner, _trait, name, _in_test), group in by_name.items():
+                 _module_scope(file, func.start))].append(func)
+    for (owner, _trait, name, _scope), group in by_name.items():
         if len(group) < 2:
             continue
         # Two `cfg`-gated definitions of one name are the supported way to write
@@ -96,6 +97,13 @@ def _check_duplicate_definitions(file: RsFile, report: Reporter) -> None:
                    "`cfg` branches (fine — check both are maintained) or the file does not "
                    "compile. Either way, two definitions of one name is not what was intended.",
                    "high", related=lines[1:])
+
+
+def _module_scope(file: RsFile, index: int) -> tuple:
+    """The chain of inline modules containing ``index``, outermost first."""
+    return tuple(m.name for m in sorted(
+        (m for m in file.mods if m.inline and m.body_open < index < m.body_close),
+        key=lambda m: m.body_open))
 
 
 def _check_placeholder_prose(file: RsFile, report: Reporter) -> None:

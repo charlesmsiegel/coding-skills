@@ -75,12 +75,26 @@ def _check_shell_execution(file: RsFile, report: Reporter) -> None:
         spans = argument_spans(file, paren)
         if not spans:
             continue
-        text = file.slice(*spans[0])
-        if text.strip().startswith("format!"):
-            report.add(file.line_of(name_index), "interpolated_command_argument",
-                       "`.arg(format!(…))` builds a command argument by interpolation",
-                       "Pass the value as its own argument — `.arg(\"--name\").arg(value)` — so it "
-                       "cannot be read as a flag or split on whitespace.", "medium")
+        text = file.slice(*spans[0]).strip()
+        if not text.startswith("format!"):
+            continue
+        # `.arg(format!("/tmp/{name}.txt"))` is one argument, passed to execve
+        # without a shell: it cannot be split on whitespace and cannot become a
+        # flag. The real hazard is an argument whose *first character* comes
+        # from the interpolated value, which can then start with `-`.
+        template = re.search(r'format!\s*\(\s*(r?#*"(?:[^"\\]|\\.)*")', text)
+        if template is None:
+            continue
+        head = template.group(1).lstrip("r#").strip('"')
+        if not head.startswith(("{", "-")):
+            continue
+        report.add(file.line_of(name_index), "option_injectable_argument",
+                   f"`.arg(format!({template.group(1)[:32]}…))` — the argument begins with the "
+                   "interpolated value, so a value starting with `-` becomes a flag",
+                   "Pass the flag and the value as separate arguments "
+                   "(`.arg(\"--name\").arg(value)`), or use `--` to end option parsing if the "
+                   "program supports it. Note this is option injection, not shell injection: "
+                   "there is no shell here and no word splitting.", "medium")
 
 
 def _check_sql_construction(file: RsFile, report: Reporter) -> None:
@@ -172,6 +186,10 @@ def _check_hardcoded_secrets(file: RsFile, report: Reporter) -> None:
     for binding in file.bindings:
         if not _SECRET_NAMES.search(binding.name):
             continue
+        # A fixture inside `#[cfg(test)] mod tests` is not compiled into a
+        # release build, and a `tests/` file with the same content is already
+        # downgraded — the two should not disagree because of where they live.
+        in_test = testish or file.in_test_code(binding.start)
         value = binding.value_text.strip()
         if not value.startswith('"') or len(value) < 10:
             continue
@@ -184,11 +202,12 @@ def _check_hardcoded_secrets(file: RsFile, report: Reporter) -> None:
                    "Load it from the environment (`std::env::var`) or a secret store. A default "
                    "credential in source is a credential in every build — and rotate the value "
                    "that was committed, because deleting the line does not remove it from git.",
-                   "low" if testish else "high")
+                   "low" if in_test else "high")
 
     for index, token in enumerate(file.tokens):
         if token.kind != "str":
             continue
+        in_test = testish or file.in_test_code(index)
         for pattern, label in _SECRET_LITERALS:
             if pattern.search(token.value):
                 report.add(token.line, "hardcoded_credential",
@@ -196,7 +215,7 @@ def _check_hardcoded_secrets(file: RsFile, report: Reporter) -> None:
                            "Read it from the environment or a secret store, rotate the value that "
                            "was committed, and check whether it reached the published history — "
                            "deleting the line does not remove it from git.",
-                           "low" if testish else "high")
+                           "low" if in_test else "high")
                 break
         else:
             # `PASSWORD = "…"`, `password: "…"` — the name says what the literal is.
@@ -211,7 +230,7 @@ def _check_hardcoded_secrets(file: RsFile, report: Reporter) -> None:
                            f"`{name.value}` is assigned a string literal",
                            "Load it from the environment (`std::env::var`) or a secrets manager. "
                            "A default credential in source is a credential in every build.",
-                           "low" if testish else "high")
+                           "low" if in_test else "high")
 
 
 def _check_path_and_deserialization(file: RsFile, report: Reporter) -> None:
