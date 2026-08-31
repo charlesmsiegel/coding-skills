@@ -15,7 +15,8 @@ which counts `<` and `>` only where a type is already expected.
 from rustlex import OPENERS, RustSyntaxError
 from rustnodes import Binding, Field, Func, Impl, ModDecl, Param, RsFile, Trait, TypeDef, Use, Variant
 
-__all__ = ["extract", "skip_generics", "split_top_level", "RustSyntaxError"]
+__all__ = ["extract", "find_body_brace", "skip_generics", "split_top_level",
+           "RustSyntaxError"]
 
 # Modifiers that may sit between an attribute and the item keyword.
 _LEAD_MODIFIERS = frozenset({"pub", "async", "unsafe", "const", "extern", "default", "move"})
@@ -94,6 +95,34 @@ def split_top_level(file: RsFile, start: int, stop: int, separator: str = ",") -
     if stop > begin:
         spans.append((begin, stop))
     return spans
+
+
+def find_body_brace(file: RsFile, start: int, stop: int) -> int:
+    """The `{` that opens an item body, stepping over generic argument lists.
+
+    `where T: Bound<{ N + 1 }>` contains a brace belonging to a const-generic
+    expression. Taking the first `{` made that expression the function body, so
+    every detector then analysed the wrong tokens — silently, since a body was
+    still found.
+    """
+    cursor = start
+    while cursor < min(stop, len(file.tokens)):
+        token = file.tokens[cursor]
+        if token.kind == "op":
+            if token.value == "<":
+                end = skip_generics(file, cursor)
+                if end > cursor:
+                    cursor = end
+                    continue
+            if token.value == "{":
+                return cursor
+            if token.value == ";":
+                return -1
+            if token.value in ("(", "["):
+                cursor = file.skip_group(cursor)
+                continue
+        cursor += 1
+    return -1
 
 
 def _find_name_kw(file: RsFile, keyword: str, start: int, stop: int) -> int:
@@ -260,7 +289,7 @@ def _parse_fn(file: RsFile, index: int, attrs: dict) -> Func | None:
         return None
 
     limit = len(file.tokens)
-    brace = file.find_op("{", params_close + 1, limit)
+    brace = find_body_brace(file, params_close + 1, limit)
     semi = file.find_op(";", params_close + 1, limit)
     where_index = _find_name_kw(file, "where", params_close + 1,
                                 min(x for x in (brace, semi, limit) if x >= 0))
@@ -318,14 +347,14 @@ def _parse_type_def(file: RsFile, index: int, attrs: dict) -> TypeDef | None:
     # file would otherwise pick up a *later* function's where clause, and the
     # cursor would then jump past this type's body — giving the struct the
     # function's braces and no fields at all.
-    brace = file.find_op("{", cursor, limit)
+    brace = find_body_brace(file, cursor, limit)
     paren = file.find_op("(", cursor, limit)
     semi = file.find_op(";", cursor, limit)
     item_end = min(x for x in (brace, paren, semi, limit) if x >= 0)
     where_index = _find_name_kw(file, "where", cursor, item_end)
     if where_index >= 0:
         cursor = where_index
-        brace = file.find_op("{", cursor, limit)
+        brace = find_body_brace(file, cursor, limit)
         paren = file.find_op("(", cursor, limit)
         semi = file.find_op(";", cursor, limit)
     if brace >= 0 and (semi < 0 or brace < semi):
@@ -404,7 +433,7 @@ def _parse_trait(file: RsFile, index: int, attrs: dict) -> Trait | None:
         end = skip_generics(file, cursor)
         generics = file.slice(cursor, end)
         cursor = end
-    brace = file.find_op("{", cursor, len(file.tokens))
+    brace = find_body_brace(file, cursor, len(file.tokens))
     if brace < 0:
         return None
     colon = file.find_op(":", cursor, brace)
@@ -430,7 +459,7 @@ def _parse_impl(file: RsFile, index: int, attrs: dict) -> Impl | None:
         end = skip_generics(file, cursor)
         generics = file.slice(cursor, end)
         cursor = end
-    brace = file.find_op("{", cursor, len(file.tokens))
+    brace = find_body_brace(file, cursor, len(file.tokens))
     if brace < 0:
         return None
     where_index = _find_name_kw(file, "where", cursor, brace)

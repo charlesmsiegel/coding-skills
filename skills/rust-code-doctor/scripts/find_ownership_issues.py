@@ -218,10 +218,13 @@ def _check_deref_clone(file: RsFile, report: Reporter) -> None:
             opener = file.closer(name_index - 2)
             if opener >= 0 and file.tok(opener + 1) is not None and file.tokens[opener + 1].is_op("*"):
                 report.add(file.line_of(name_index), "deref_then_clone",
-                           "`(*value).clone()`",
-                           "`value.clone()` — auto-deref already reaches through the pointer. The "
-                           "explicit form is how a `Rc<T>` clone accidentally becomes a deep copy "
-                           "of `T`, or the reverse.", "low")
+                           "`(*value).clone()` — the dereference selects which `Clone` runs",
+                           "Check which one you meant, and do not assume `value.clone()` is "
+                           "equivalent: on an `Rc<T>`/`Arc<T>` the explicit deref clones the "
+                           "inner `T` (a deep copy, a different type) while `value.clone()` "
+                           "clones the pointer and bumps the refcount. On a plain `&T` the two "
+                           "are the same and the deref is noise — that is the case worth "
+                           "removing.", "low")
         head = file.tok(name_index - 3)
         if head is not None and head.is_name("as_ref") and previous is not None and previous.is_op(")"):
             report.add(file.line_of(name_index), "as_ref_then_clone",
