@@ -120,7 +120,7 @@ class Project:
             # `src/foo/bar.rs` is reported both as a missing module and as
             # never compiled — two high-severity findings for correct code.
             chain = _inline_chain(rsfile, declaration)
-            child = _resolve_mod_file(path, declaration.name, rsfile, chain, is_root)
+            child = _resolve_mod_file(path, declaration, chain, is_root)
             if child is None:
                 # A declaration behind a `cfg` may be disabled in the
                 # configuration being built, where rustc never looks for the
@@ -154,17 +154,40 @@ class Project:
         """Files rustc actually reaches, plus the ones Cargo compiles by layout."""
         reached = set(self.modules)
         for crate in self.crates:
-            for directory in ("tests", "benches", "examples"):
-                for path in (crate.root_dir / directory).glob("**/*.rs"):
-                    if path in self.files:
-                        reached.add(path)
+            for root in self._layout_roots(crate):
+                # A layout target is a crate root in its own right, so walking
+                # it is what brings its `mod` children in. Globbing the whole
+                # directory instead counted files no target declares — and a
+                # dead `tests/support/orphan.rs` holding the only `#[test]`
+                # then suppressed the `no_tests_at_all` warning it should raise.
+                self._walk_module(crate, root, "crate", None, is_root=True)
+                reached.add(root)
             build = crate.root_dir / "build.rs"
             if build in self.files:
                 reached.add(build)
             for path in crate.auxiliary_roots:
                 if path in self.files:
                     reached.add(path)
-        return reached
+        return reached | set(self.modules)
+
+    def _layout_roots(self, crate: Crate) -> list[Path]:
+        """The integration targets Cargo auto-discovers for ``crate``.
+
+        Cargo takes `tests/foo.rs` and `tests/foo/main.rs` — the top level only.
+        Anything deeper is a module, compiled if and only if some target's `mod`
+        chain reaches it.
+        """
+        roots = []
+        for directory in ("tests", "benches", "examples"):
+            base = crate.root_dir / directory
+            if not base.is_dir():
+                continue
+            for entry in sorted(base.iterdir()):
+                if entry.is_file() and entry.suffix == ".rs" and entry in self.files:
+                    roots.append(entry)
+                elif entry.is_dir() and (entry / "main.rs") in self.files:
+                    roots.append(entry / "main.rs")
+        return roots
 
     def orphan_files(self) -> list[Path]:
         """`src/` files no `mod` declaration reaches — never compiled at all."""
@@ -195,10 +218,10 @@ def _inline_chain(rsfile: RsFile, declaration) -> list[str]:
     return [m.name for m in enclosing]
 
 
-def _resolve_mod_file(parent: Path, name: str, rsfile: RsFile,
-                      chain: list[str] | None = None,
+def _resolve_mod_file(parent: Path, declaration, chain: list[str] | None = None,
                       is_root: bool = False) -> Path | None:
-    """Where `mod name;` in ``parent`` points, honouring `#[path = "…"]`."""
+    """Where ``declaration`` in ``parent`` points, honouring `#[path = "…"]`."""
+    name = declaration.name
     # A crate root or a `mod.rs` owns a directory; any other file owns the
     # directory named after it. Each enclosing inline module adds a level.
     if is_root or parent.name in ("lib.rs", "main.rs", "mod.rs"):
@@ -211,15 +234,17 @@ def _resolve_mod_file(parent: Path, name: str, rsfile: RsFile,
     # `#[path]` is relative to the *module's* directory, so the inline chain
     # applies to it too — resolving it from the file's own directory reported a
     # valid declaration as missing and its file as never compiled.
-    for declaration in rsfile.mods:
-        if declaration.name != name:
-            continue
-        for attribute in declaration.attrs:
-            stripped = attribute.replace(" ", "")
-            if stripped.startswith("path="):
-                target = stripped[len("path="):].strip('"')
-                candidate = (directory / target).resolve()
-                return candidate if candidate.is_file() else None
+    #
+    # The attributes come from *this* declaration, not the first one in the file
+    # that happens to share its name. Sibling inline modules may each declare a
+    # `mod same;` with a different `#[path]`, and reading the wrong one reported
+    # a valid file as missing and left it out of the module graph.
+    for attribute in declaration.attrs:
+        stripped = attribute.replace(" ", "")
+        if stripped.startswith("path="):
+            target = stripped[len("path="):].strip('"')
+            candidate = (directory / target).resolve()
+            return candidate if candidate.is_file() else None
     for candidate in (directory / f"{name}.rs", directory / name / "mod.rs"):
         if candidate.is_file():
             return candidate.resolve()

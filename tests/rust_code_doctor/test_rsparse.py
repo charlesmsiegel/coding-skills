@@ -338,3 +338,65 @@ def test_an_auxiliary_target_root_has_its_modules_walked(tmp_path):
         assert (tmp_path / "qa" / "helper.rs").resolve() in compiled
     finally:
         sys.path.remove(str(SCRIPTS_DIR))
+
+
+def _project(tmp_path):
+    sys.path.insert(0, str(SCRIPTS_DIR))
+    try:
+        for cached in ("rsparse", "rustlex", "rustnodes", "rustextract", "common", "rsproject"):
+            sys.modules.pop(cached, None)
+        import rsproject
+        return rsproject.load_project(tmp_path)
+    finally:
+        sys.path.remove(str(SCRIPTS_DIR))
+
+
+def test_a_path_attribute_binds_to_its_own_declaration(tmp_path):
+    """Sibling inline modules may each declare a `mod same;` with a different
+    `#[path]`. Searching by name read the first one's attributes, so the second
+    resolved to the wrong file and a valid module was reported missing."""
+    (tmp_path / "src" / "a").mkdir(parents=True)
+    (tmp_path / "src" / "b").mkdir(parents=True)
+    (tmp_path / "Cargo.toml").write_text(
+        '[package]\nname = "demo"\nversion = "0.1.0"\nedition = "2021"\n', encoding="utf-8")
+    (tmp_path / "src" / "lib.rs").write_text(
+        'mod a { #[path = "one.rs"] mod same; }\n'
+        'mod b { #[path = "two.rs"] mod same; }\n', encoding="utf-8")
+    (tmp_path / "src" / "a" / "one.rs").write_text("pub fn f() {}\n", encoding="utf-8")
+    (tmp_path / "src" / "b" / "two.rs").write_text("pub fn g() {}\n", encoding="utf-8")
+    project = _project(tmp_path)
+    assert project.missing_modules == [], project.missing_modules
+    compiled = project.compiled_files()
+    assert (tmp_path / "src" / "b" / "two.rs").resolve() in compiled
+
+
+def test_an_undeclared_file_under_tests_is_not_compiled(tmp_path):
+    """Cargo auto-discovers `tests/foo.rs` and `tests/foo/main.rs`, not every
+    nested file. Counting a dead `tests/support/orphan.rs` as compiled let the
+    only `#[test]` in the tree sit somewhere `cargo test` never runs."""
+    (tmp_path / "src").mkdir(parents=True)
+    (tmp_path / "tests" / "support").mkdir(parents=True)
+    (tmp_path / "Cargo.toml").write_text(
+        '[package]\nname = "demo"\nversion = "0.1.0"\nedition = "2021"\n', encoding="utf-8")
+    (tmp_path / "src" / "lib.rs").write_text("pub fn a() {}\n", encoding="utf-8")
+    (tmp_path / "tests" / "support" / "orphan.rs").write_text(
+        "#[test]\nfn t() { assert_eq!(1, 1); }\n", encoding="utf-8")
+    project = _project(tmp_path)
+    assert (tmp_path / "tests" / "support" / "orphan.rs").resolve() \
+        not in project.compiled_files()
+
+
+def test_a_declared_module_under_tests_is_still_compiled(tmp_path):
+    """The exemption above must not drop the modules a real target declares."""
+    (tmp_path / "src").mkdir(parents=True)
+    (tmp_path / "tests" / "support").mkdir(parents=True)
+    (tmp_path / "Cargo.toml").write_text(
+        '[package]\nname = "demo"\nversion = "0.1.0"\nedition = "2021"\n', encoding="utf-8")
+    (tmp_path / "src" / "lib.rs").write_text("pub fn a() {}\n", encoding="utf-8")
+    (tmp_path / "tests" / "real.rs").write_text(
+        "mod support;\n#[test]\nfn t() { assert_eq!(1, 1); }\n", encoding="utf-8")
+    (tmp_path / "tests" / "support" / "mod.rs").write_text("pub mod helper;\n", encoding="utf-8")
+    (tmp_path / "tests" / "support" / "helper.rs").write_text("pub fn h() {}\n", encoding="utf-8")
+    compiled = _project(tmp_path).compiled_files()
+    for relative in ("tests/real.rs", "tests/support/mod.rs", "tests/support/helper.rs"):
+        assert (tmp_path / relative).resolve() in compiled, relative

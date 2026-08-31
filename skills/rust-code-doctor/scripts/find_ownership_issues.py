@@ -25,7 +25,10 @@ _READ_ONLY_METHODS = frozenset({
     "len", "is_empty", "iter", "get", "contains", "contains_key", "as_str",
     "as_slice", "as_bytes", "chars", "bytes", "starts_with", "ends_with",
     "find", "split", "trim", "to_uppercase", "to_lowercase", "keys", "values",
-    "first", "last", "parse", "lines", "count",
+    "first", "last", "parse", "lines",
+    # NOT `count`: `Iterator::count` takes `self` by value, so `it.clone().count()`
+    # is how you count without consuming an iterator you still need. Suggesting
+    # `it.count()` moves `it` and the later use stops compiling.
 })
 
 # Owned container types whose borrowed form is what a parameter usually wants.
@@ -37,9 +40,15 @@ _BY_REF_SUGGESTION = {
 }
 
 
-def _primitive_locals(file: RsFile) -> dict[str, str]:
-    """`let x: u32 = …` bindings, so `.clone()` on one can be called out."""
-    locals_: dict[str, str] = {}
+def _primitive_locals(file: RsFile) -> list[tuple[str, str, int, int]]:
+    """`let x: u32 = …` bindings as (name, type, declaration index, scope end).
+
+    Keyed by name across the whole file, a `let value: u32` in one function
+    decided the type of `value.clone()` in another — telling the reader to drop
+    a clone that a `String` needs to stay usable. Each binding now carries the
+    block it lives in, and the call site resolves the one actually visible.
+    """
+    found: list[tuple[str, str, int, int]] = []
     for index, token in enumerate(file.tokens):
         if not token.is_name("let"):
             continue
@@ -50,9 +59,32 @@ def _primitive_locals(file: RsFile) -> dict[str, str]:
         if name is None or name.kind != "name" or not file.value(name_index + 1) == ":":
             continue
         annotation = file.tok(name_index + 2)
-        if annotation is not None and annotation.kind == "name" and annotation.value in COPY_TYPES:
-            locals_[name.value] = annotation.value
-    return locals_
+        if annotation is None or annotation.kind != "name" or annotation.value not in COPY_TYPES:
+            continue
+        scope_end = _enclosing_block_end(file, index)
+        found.append((name.value, annotation.value, index, scope_end))
+    return found
+
+
+def _enclosing_block_end(file: RsFile, index: int) -> int:
+    """Close index of the innermost `{ … }` containing ``index``."""
+    best_open, best_close = -1, len(file.tokens)
+    for opener, closer in file.match.items():
+        if opener < closer and file.tokens[opener].is_op("{") and opener < index < closer:
+            if opener > best_open:
+                best_open, best_close = opener, closer
+    return best_close
+
+
+def _visible_primitive(bindings, name: str, at: int) -> str | None:
+    """The `Copy` type of ``name`` as seen from token ``at``, if any."""
+    best: tuple[int, str] | None = None
+    for binding_name, type_name, declared, scope_end in bindings:
+        if binding_name != name or not declared < at <= scope_end:
+            continue
+        if best is None or declared > best[0]:
+            best = (declared, type_name)
+    return best[1] if best else None
 
 
 def _check_clones(file: RsFile, report: Reporter) -> None:
@@ -71,9 +103,10 @@ def _check_clones(file: RsFile, report: Reporter) -> None:
                        "Drop the `.clone()`. On a `Copy` type it compiles to the same move and "
                        "reads as if something expensive were happening.", "low")
             continue
-        if method == "clone" and subject in primitives:
+        visible = _visible_primitive(primitives, subject, name_index) if subject else None
+        if method == "clone" and visible is not None:
             report.add(line, "clone_on_copy",
-                       f"`{subject}.clone()` where `{subject}: {primitives[subject]}` is `Copy`",
+                       f"`{subject}.clone()` where `{subject}: {visible}` is `Copy`",
                        "Drop the `.clone()` — assignment already copies.", "low")
             continue
 

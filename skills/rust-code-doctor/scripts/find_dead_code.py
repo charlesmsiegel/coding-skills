@@ -19,7 +19,6 @@ a different reason: it is almost never dead on purpose. It usually means an
 early return was added above code that still looks live to the reader.
 """
 
-import re
 from collections import defaultdict
 from pathlib import Path
 
@@ -31,13 +30,37 @@ from rsproject import load_project
 _ALWAYS_LIVE = frozenset({"main", "new", "default", "drop", "fmt", "from", "into",
                           "clone", "eq", "hash", "next", "poll", "deref", "as_ref"})
 
-_DIVERGING = re.compile(r"^\s*(return\b|break\b|continue\b|panic!|todo!|unimplemented!|"
-                        r"unreachable!|std::process::exit|process::exit)")
+# Keywords that end the current path on their own.
+_DIVERGING_KEYWORDS = frozenset({"return", "break", "continue"})
+
+# Macros that never return. The `!` is a separate token, so matching these
+# against the name token alone silently matched nothing: the whole macro half
+# of this check never fired, and neither did `process::exit`, whose path
+# arrives as separate `std`, `::`, `process` tokens.
+_DIVERGING_MACROS = frozenset({"panic", "todo", "unimplemented", "unreachable", "abort"})
 
 
 def _finding(path, line, smell, description, suggestion, severity, related=None):
     return Finding(file=str(path), line=line, smell_type=smell, description=description,
                    suggestion=suggestion, severity=severity, related_lines=related or [])
+
+
+def _diverges(rsfile, index: int) -> str | None:
+    """The name of the diverging construct starting at ``index``, or None."""
+    token = rsfile.tok(index)
+    if token is None or token.kind != "name":
+        return None
+    if token.value in _DIVERGING_KEYWORDS:
+        return token.value
+    following = rsfile.tok(index + 1)
+    if token.value in _DIVERGING_MACROS and following is not None and following.is_op("!"):
+        return f"{token.value}!"
+    # `process::exit(…)` and `std::process::exit(…)` — the leaf plus its parent
+    # segment, so an unrelated `exit` function does not count.
+    if token.value == "exit" and rsfile.value(index - 1) == "::" \
+            and rsfile.value(index - 2) == "process":
+        return "process::exit"
+    return None
 
 
 def _check_unreachable_code(project, findings: list) -> None:
@@ -51,7 +74,8 @@ def _check_unreachable_code(project, findings: list) -> None:
                 if token.kind == "op" and token.value in ("(", "[", "{"):
                     cursor = rsfile.skip_group(cursor)
                     continue
-                if token.kind == "name" and _DIVERGING.match(token.value + " "):
+                diverging = _diverges(rsfile, cursor)
+                if diverging is not None:
                     end = rsfile.find_op(";", cursor, func.body_close)
                     if end < 0:
                         break
@@ -60,7 +84,7 @@ def _check_unreachable_code(project, findings: list) -> None:
                             and end + 1 < func.body_close:
                         findings.append(_finding(
                             path, following.line, "unreachable_code",
-                            f"statements after `{token.value}` in `{func.qualname}`",
+                            f"statements after `{diverging}` in `{func.qualname}`",
                             "Nothing below this line runs. Usually an early return was added "
                             "above code that still looks live — check which half is the one you "
                             "meant to keep.", "high"))

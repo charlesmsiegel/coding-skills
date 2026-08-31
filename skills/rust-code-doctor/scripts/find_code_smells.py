@@ -187,11 +187,27 @@ def _check_integer_arithmetic(file: RsFile, report: Reporter) -> None:
             continue
         if right.kind != "num":
             continue
+        # `.len() - 0` is the identity. Reporting it is a correctness claim the
+        # reader can disprove by inspection, which costs the real ones.
+        if _literal_value(right.value) == 0:
+            continue
         report.add(token.line, "unchecked_length_subtraction",
                    f"`.len() - {right.value}` panics in debug and wraps to a huge `usize` in "
                    "release when the collection is empty",
                    "`checked_sub` / `saturating_sub`, or iterate instead: `.iter().rev().take(n)` "
                    "needs no arithmetic on the length at all.", "high")
+
+
+def _literal_value(text: str) -> int | None:
+    """The integer a Rust literal denotes, ignoring `_` and any type suffix."""
+    match = re.match(r"^(0[xob])?([0-9a-fA-F_]+)", text)
+    if match is None:
+        return None
+    base = {"0x": 16, "0o": 8, "0b": 2}.get(match.group(1) or "", 10)
+    try:
+        return int(match.group(2).replace("_", ""), base)
+    except ValueError:
+        return None
 
 
 def _is_len_call(file: RsFile, close: int) -> bool:

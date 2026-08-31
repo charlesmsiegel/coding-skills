@@ -48,11 +48,21 @@ def _check_single_impl_traits(project, findings: list) -> None:
             if block.trait_name:
                 implementors[_base(block.trait_name)].append((path, _base(block.type_name)))
 
+    # A trait name declared more than once in the tree — sibling modules, or two
+    # workspace crates — cannot be matched to its impls without resolving `use`,
+    # which a syntax scan cannot do. Counting them together merged unrelated
+    # traits and suppressed both findings; guessing either way would be worse
+    # than saying nothing, so ambiguous names are left alone.
+    declared: dict[str, int] = defaultdict(int)
+    for rsfile in project.files.values():
+        for trait in rsfile.traits:
+            declared[trait.name] += 1
+
     for path, rsfile in project.files.items():
         if is_test_file(path):
             continue
         for trait in rsfile.traits:
-            if trait.name in _STD_TRAITS:
+            if trait.name in _STD_TRAITS or declared[trait.name] > 1:
                 continue
             impls = implementors.get(trait.name, [])
             real = [(p, t) for p, t in impls if not is_test_file(p)]

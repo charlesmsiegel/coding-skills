@@ -198,6 +198,16 @@ class ModDecl:
     def is_test_mod(self) -> bool:
         return any("cfg(test)" in a.replace(" ", "") for a in self.attrs)
 
+    @property
+    def is_public(self) -> bool:
+        """Reachable from outside the crate — plain `pub`, nothing narrower."""
+        return self.visibility == "pub"
+
+    @property
+    def is_exported(self) -> bool:
+        """Visible beyond its own parent module, at any restriction level."""
+        return self.visibility.startswith("pub") and self.visibility != "pub(self)"
+
 
 @dataclass(slots=True)
 class Binding:

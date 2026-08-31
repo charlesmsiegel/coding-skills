@@ -132,6 +132,28 @@ def _check_static_mut(file: RsFile, report: Reporter) -> None:
                        "a hard error, so this is also a migration blocker.", "high")
 
 
+def _unsafe_spans(file: RsFile) -> list[tuple[int, int]]:
+    """Token ranges covered by an `unsafe { … }` block."""
+    spans = []
+    for index, token in enumerate(file.tokens):
+        if not token.is_name("unsafe"):
+            continue
+        brace = index + 1
+        if file.value(brace) != "{":
+            continue
+        close = file.closer(brace)
+        if close > 0:
+            spans.append((brace, close))
+    return spans
+
+
+def _in_unsafe_context(file: RsFile, index: int, spans: list[tuple[int, int]]) -> bool:
+    if any(start <= index <= end for start, end in spans):
+        return True
+    enclosing = file.enclosing_function(index)
+    return enclosing is not None and enclosing.is_unsafe
+
+
 def _check_dangerous_calls(file: RsFile, report: Reporter) -> None:
     for index, callee in iter_calls(file):
         leaf = callee.rsplit("::", 1)[-1]
@@ -156,9 +178,16 @@ def _check_dangerous_calls(file: RsFile, report: Reporter) -> None:
                        "given. `ManuallyDrop` states the same intent in the type, where a reader "
                        "sees it.", "medium")
 
+    unsafe_spans = _unsafe_spans(file)
     for name_index, paren, method in iter_method_calls(file):
         entry = _UNCHECKED.get(method)
         if entry is None:
+            continue
+        # Rust reserves none of these names, so a crate may define a perfectly
+        # safe `Cache::get_unchecked`. Outside an unsafe context the real
+        # std method would not compile, so requiring one loses no true finding
+        # and drops the whole class of false ones.
+        if not _in_unsafe_context(file, name_index, unsafe_spans):
             continue
         invariant, severity = entry
         line = file.line_of(name_index)

@@ -241,15 +241,32 @@ def _collect(directories, owner: Path) -> list[Path]:
     return list(seen)
 
 
-def _check_reconciliation(crate: Crate, root: Path, findings: list) -> None:
-    sources = _crate_sources(crate)
+def _reachable(paths: list[Path], compiled: set[Path] | None) -> list[Path]:
+    """``paths`` narrowed to the ones the module graph reaches, when it is known."""
+    if compiled is None:
+        return paths
+    kept = [p for p in paths if p.resolve() in compiled]
+    # An empty result means the graph and this scan disagree about every file —
+    # a layout this build does not model. Falling back to the unfiltered list
+    # keeps the check running rather than silently reporting nothing.
+    return kept or paths
+
+
+def _check_reconciliation(crate: Crate, root: Path, findings: list,
+                          compiled: set[Path] | None = None) -> None:
+    # Only files rustc actually reaches. An orphan `src/orphan.rs` that no `mod`
+    # declares is never compiled, so an `anyhow` import inside it neither makes a
+    # declared `anyhow` used nor makes an undeclared one a real candidate —
+    # counting it put this check at odds with the module graph beside it.
+    sources = _reachable(_crate_sources(crate), compiled)
     if not sources:
         return
     used, local_modules = _imported_crates(sources)
     # A dev- or build-dependency lives in a target that is not `src/`, so the
     # search for those has to cover `tests/`, `benches/`, `examples/` and
     # `build.rs` as well.
-    auxiliary, auxiliary_local = _imported_crates(_auxiliary_sources(crate))
+    auxiliary, auxiliary_local = _imported_crates(
+        _reachable(_auxiliary_sources(crate), compiled))
     everywhere = used | auxiliary
     local_modules |= auxiliary_local
     declared = {_crate_ident(name): name for name in crate.dependency_names()}
@@ -320,7 +337,7 @@ def analyze(root: Path, ignore: set[str], args) -> list:
         _check_lint_config(crate, findings)
         _check_dependency_specs(crate, root, findings)
         _check_publish_metadata(crate, findings)
-        _check_reconciliation(crate, root, findings)
+        _check_reconciliation(crate, root, findings, project.compiled_files())
 
     return [f for f in findings if f.smell_type not in ignore]
 
