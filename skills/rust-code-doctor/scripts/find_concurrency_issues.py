@@ -16,7 +16,9 @@ and an `async fn` with nothing to await.
 import re
 
 from common import Reporter, run_file_detector
-from rsparse import RsFile, body_indices, iter_calls, iter_method_calls, receiver_text
+from rsparse import (
+    RsFile, argument_spans, body_indices, iter_calls, iter_method_calls, receiver_text,
+)
 
 # Guard-producing methods. The value they return keeps the lock until it drops.
 _GUARD_METHODS = frozenset({"lock", "read", "write", "borrow", "borrow_mut"})
@@ -92,7 +94,10 @@ def _check_guard_across_await(file: RsFile, report: Reporter) -> None:
         block_open, block_close = _enclosing_block(file, name_index)
         if block_close < 0:
             continue
-        awaits = [i for i in range(name_index, block_close)
+        # `drop(guard)` is the idiomatic way to end a critical section early;
+        # awaits after it are not holding anything.
+        released = _dropped_at(file, binding.value, name_index, block_close)
+        awaits = [i for i in range(name_index, min(released, block_close))
                   if file.tokens[i].is_name("await") and file.tokens[i - 1].is_op(".")]
         if not awaits:
             continue
@@ -104,6 +109,17 @@ def _check_guard_across_await(file: RsFile, report: Reporter) -> None:
                    "(`let value = { let g = m.lock()?; g.clone() };`) or use the executor's "
                    "async-aware lock (`tokio::sync::Mutex`), whose guard is safe to hold.",
                    "high", related=[file.line_of(awaits[0])])
+
+
+def _dropped_at(file: RsFile, binding: str, start: int, stop: int) -> int:
+    """Index of `drop(binding)` in the range, or ``stop`` when it is never dropped."""
+    for index, callee in iter_calls(file, start, stop):
+        if callee != "drop":
+            continue
+        spans = argument_spans(file, index)
+        if spans and file.slice(*spans[0]).strip() == binding:
+            return index
+    return stop
 
 
 def _statement_head(file: RsFile, index: int) -> int:

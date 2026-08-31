@@ -39,6 +39,7 @@ import json
 import re
 import shutil
 import subprocess
+import sys
 from collections import defaultdict
 from pathlib import Path
 
@@ -129,12 +130,34 @@ def _parse_cargo_json(tool, root, stdout):
     return findings
 
 
+def _locked_first(argv, subcommand, root, extra):
+    """Run a cargo subcommand with `--locked`, falling back if the lock is stale.
+
+    A check-only run should not rewrite `Cargo.lock`, so `--locked` is the right
+    default. It is also a hard error when the lockfile genuinely needs updating,
+    which would turn "your lock is out of date" into "the compiler did not run"
+    — so that one case falls back and says what happened.
+    """
+    returncode, out, err = _run([*argv, subcommand, "--locked", *extra], root)
+    if returncode is not None and returncode != 0 and not (out or "").strip() \
+            and re.search(r"(?i)lock ?file|--locked|needs to be updated", err or ""):
+        returncode, out, err = _run([*argv, subcommand, *extra], root)
+        return returncode, out, err, True
+    return returncode, out, err, False
+
+
 def run_check(argv, root):
     """`cargo check` — the compiler. Everything a type-aware detector could want."""
-    returncode, out, err = _run([*argv, "check", "--all-targets", "--message-format", "json"], root)
+    returncode, out, err, unlocked = _locked_first(
+        argv, "check", root, ["--all-targets", "--message-format", "json"])
     if returncode is None:
         return [_tool_error("cargo-check", root, returncode, err)]
     findings = _parse_cargo_json("cargo-check", root, out)
+    if unlocked:
+        findings.append(_finding(
+            "cargo-check", root / "Cargo.lock", 1, "lockfile-stale",
+            "Cargo.lock does not match Cargo.toml, so this run had to update it",
+            "medium"))
     if not findings and returncode != 0:
         # A non-zero exit with no diagnostic is a build that never started —
         # unresolved dependencies, a missing toolchain, no network. Reporting it
@@ -160,7 +183,10 @@ def run_fmt(argv, root):
         return [_tool_error("cargo-fmt", root, returncode, err)]
     if returncode == 0:
         return []
-    files = sorted({m.group(1) for m in re.finditer(r"^Diff in (\S+)", out or "", re.MULTILINE)})
+    # `Diff in /path/src/main.rs:1:` — the trailing `:<line>:` is not part of
+    # the path, and keeping it produced findings pointing at nonexistent files.
+    files = sorted({m.group(1) for m in
+                    re.finditer(r"^Diff in (.+?)(?::\d+)?:?\s*$", out or "", re.MULTILINE)})
     if not files:
         return [_finding("cargo-fmt", root, 1, "unformatted",
                          "`cargo fmt --check` reports formatting differences", "low")]
@@ -290,7 +316,10 @@ def run_coverage(_argv, root):
                          "No coverage data found — run `cargo llvm-cov --lcov "
                          "--output-path lcov.info` (or pass --run-tests, which does)", "low")]
     if data_file.suffix != ".info":
-        return []
+        return [_finding("coverage", data_file, 1, "unsupported-format",
+                         f"found {data_file.name}, which this reader cannot parse — coverage was "
+                         "NOT evaluated, which is not the same as fully covered",
+                         "low")]
     findings = []
     current, hits = None, 0
     for line in data_file.read_text(encoding="utf-8", errors="replace").splitlines():
@@ -375,18 +404,33 @@ def main():
     root = _project_root(Path(args.path).resolve())
     cargo_binary = shutil.which("cargo")
     if cargo_binary is None:
-        print("cargo is not on PATH — none of these tools can run, and no compilation check "
-              "was performed. Install Rust (https://rustup.rs) or run this on a machine that "
-              "has it.")
+        absent = ("cargo is not on PATH — none of these tools can run, and no compilation "
+                  "check was performed. Install Rust (https://rustup.rs) or run this on a "
+                  "machine that has it.")
         if args.format == "json":
-            print(json.dumps({"project_root": str(root), "tools_run": [],
-                              "missing_tools": [{"name": "cargo", "install": "https://rustup.rs"}],
-                              "actions_taken": [], "findings": []}, indent=2))
+            # stdout stays a single JSON document: the no-cargo case is exactly
+            # when a caller is most likely piping this somewhere.
+            print(absent, file=sys.stderr)
+            print(json.dumps({
+                "project_root": str(root), "tools_run": [],
+                "missing_tools": [{"name": "cargo", "install": "https://rustup.rs"}],
+                "actions_taken": [], "findings": [_finding(
+                    "cargo", root, 1, "not-installed",
+                    "cargo is not available, so no compilation check was performed — these "
+                    "results describe syntax only", "high")],
+            }, indent=2))
+        else:
+            print(absent)
         return
     cargo = [cargo_binary]
 
-    wanted = set(args.tools.split(",")) if args.tools else set(TOOLS)
-    wanted = {name for name in wanted if name in TOOLS}
+    wanted = {name.strip() for name in args.tools.split(",")} if args.tools else set(TOOLS)
+    unknown = sorted(wanted - set(TOOLS))
+    if unknown:
+        # Silently dropping `--tools chek` would report "no tools run, no
+        # findings" — a compilation check that never happened, reading as clean.
+        parser.error(f"--tools names unknown tools: {', '.join(unknown)} "
+                     f"(choices: {', '.join(sorted(TOOLS))})")
 
     available, missing = {}, []
     for name in TOOLS:

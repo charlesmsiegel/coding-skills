@@ -101,12 +101,19 @@ class Project:
         for declaration in rsfile.mods:
             if declaration.inline:
                 continue
-            child = _resolve_mod_file(path, declaration.name, rsfile)
+            # An `mod bar;` nested inside `mod foo { … }` resolves under
+            # `foo/`, not beside this file. Without the chain, a valid
+            # `src/foo/bar.rs` is reported both as a missing module and as
+            # never compiled — two high-severity findings for correct code.
+            chain = _inline_chain(rsfile, declaration)
+            child = _resolve_mod_file(path, declaration.name, rsfile, chain)
             if child is None:
                 self.missing_modules.append((path, declaration.line, declaration.name))
                 continue
             if child in self.files:
-                self._walk_module(crate, child, f"{module_path}::{declaration.name}", path)
+                nested = "".join(f"::{name}" for name in chain)
+                self._walk_module(crate, child,
+                                  f"{module_path}{nested}::{declaration.name}", path)
 
     # -- queries ------------------------------------------------------------ #
 
@@ -158,7 +165,16 @@ class Project:
         return sorted(orphans)
 
 
-def _resolve_mod_file(parent: Path, name: str, rsfile: RsFile) -> Path | None:
+def _inline_chain(rsfile: RsFile, declaration) -> list[str]:
+    """Names of the inline modules enclosing ``declaration``, outermost first."""
+    enclosing = [m for m in rsfile.mods
+                 if m.inline and m.body_open < declaration.start < m.body_close]
+    enclosing.sort(key=lambda m: m.body_open)
+    return [m.name for m in enclosing]
+
+
+def _resolve_mod_file(parent: Path, name: str, rsfile: RsFile,
+                      chain: list[str] | None = None) -> Path | None:
     """Where `mod name;` in ``parent`` points, honouring `#[path = "…"]`."""
     for declaration in rsfile.mods:
         if declaration.name != name:
@@ -171,11 +187,13 @@ def _resolve_mod_file(parent: Path, name: str, rsfile: RsFile) -> Path | None:
                 return candidate if candidate.is_file() else None
 
     # A crate root or a `mod.rs` owns a directory; any other file owns the
-    # directory named after it.
+    # directory named after it. Each enclosing inline module adds a level.
     if parent.name in ("lib.rs", "main.rs", "mod.rs"):
         directory = parent.parent
     else:
         directory = parent.parent / parent.stem
+    for segment in chain or []:
+        directory = directory / segment
     for candidate in (directory / f"{name}.rs", directory / name / "mod.rs"):
         if candidate.is_file():
             return candidate.resolve()
@@ -245,7 +263,11 @@ def _read_manifest(manifest: Path) -> Crate:
     default_main = directory / "src" / "main.rs"
     if default_main.is_file() and default_main.resolve() not in crate.bin_roots:
         crate.bin_roots.append(default_main.resolve())
+    # Cargo auto-discovers both `src/bin/name.rs` and `src/bin/name/main.rs`.
+    # Missing the directory form makes every module under it look uncompiled.
     for candidate in sorted((directory / "src" / "bin").glob("*.rs")):
+        crate.bin_roots.append(candidate.resolve())
+    for candidate in sorted((directory / "src" / "bin").glob("*/main.rs")):
         crate.bin_roots.append(candidate.resolve())
     return crate
 

@@ -197,13 +197,32 @@ def _check_publish_metadata(crate: Crate, findings: list) -> None:
 
 
 def _crate_sources(crate: Crate) -> list[Path]:
-    """The files this crate actually compiles.
+    """The files this crate's lib and bin targets compile.
 
     Not everything under `crate.root_dir`: a manifest that is both a workspace
     root and a package (ripgrep's own layout) would otherwise claim every member
     crate's source as its own, and every member's dependency as undeclared.
     """
     directories = {root.parent for root in crate.roots} or {crate.root_dir / "src"}
+    return _collect(directories)
+
+
+def _auxiliary_sources(crate: Crate) -> list[Path]:
+    """`build.rs`, `tests/`, `benches/`, `examples/` — the other Cargo targets.
+
+    A dev-dependency is used in `tests/`, and a build-dependency in `build.rs`;
+    neither appears under `src/`, so reconciling them against the lib sources
+    alone reports every one of them as unused.
+    """
+    directories = {crate.root_dir / name for name in ("tests", "benches", "examples")}
+    paths = _collect(directories)
+    build = crate.root_dir / "build.rs"
+    if build.is_file():
+        paths.append(build)
+    return paths
+
+
+def _collect(directories) -> list[Path]:
     seen: dict[Path, None] = {}
     for directory in sorted(directories):
         for path in find_rs_files(directory):
@@ -216,10 +235,16 @@ def _check_reconciliation(crate: Crate, root: Path, findings: list) -> None:
     if not sources:
         return
     used, local_modules = _imported_crates(sources)
+    # A dev- or build-dependency lives in a target that is not `src/`, so the
+    # search for those has to cover `tests/`, `benches/`, `examples/` and
+    # `build.rs` as well.
+    auxiliary, auxiliary_local = _imported_crates(_auxiliary_sources(crate))
+    everywhere = used | auxiliary
+    local_modules |= auxiliary_local
     declared = {_crate_ident(name): name for name in crate.dependency_names()}
 
     for ident, name in sorted(declared.items()):
-        if ident in used or name in used:
+        if ident in everywhere or name in everywhere:
             continue
         # A macro-only or trait-only crate may never be named at a path root.
         findings.append(_finding(

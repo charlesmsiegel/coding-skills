@@ -284,6 +284,20 @@ class Tokenizer:
                 self._advance(match.end())
                 self._emit("num", start, match.end(), line)
                 return True
+        # A raw identifier: `r#match` is the name `match`, not `r` then `#` then
+        # a keyword. Splitting it loses the item entirely, and `mod r#async;`
+        # becomes `mod r;` — a module declaration pointing at a file that does
+        # not exist.
+        if text.startswith("r#", self.i):
+            match = _IDENT.match(text, self.i + 2)
+            if match:
+                end = match.end()
+                self._advance(end)
+                # The token spans `r#match` (so slicing reproduces the source)
+                # but its value is the semantic name, which is what every
+                # extractor and detector matches on.
+                self.tokens.append(Token("name", text[start + 2:end], line, start, end))
+                return True
         match = _IDENT.match(text, self.i)
         if match:
             self._advance(match.end())

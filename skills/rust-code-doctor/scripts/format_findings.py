@@ -152,7 +152,11 @@ def main():
                                str(i.get("file")), i.get("line", 0)))
 
     if not issues:
-        print("No findings at or above the requested severity.")
+        # A clean report still has to satisfy the format the caller asked for:
+        # the JSON pipeline this script documents is broken precisely when
+        # there is nothing to report, which is the common case in CI.
+        print("[]" if args.format == "json" else
+              "No findings at or above the requested severity.")
         return
 
     if args.format == "json":

@@ -9,6 +9,7 @@ output, and the real bug goes out with it.
 """
 
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -902,3 +903,154 @@ def test_duplicates_finds_a_copied_block(tmp_path):
                       f"pub fn two(offset: u32, base: u32) {{\n{block}\n}}\n",
     })
     assert "duplicated_block" in smells(run_detector("find_duplicates.py", root))
+
+
+# --------------------------------------------------------------------------- #
+# Regressions from the first review pass
+#
+# Every one of these was a confident false finding, or a silently unusable
+# output contract, on the initial commit.
+# --------------------------------------------------------------------------- #
+
+def test_a_module_declared_inside_an_inline_module_resolves_under_it(tmp_path):
+    """`mod foo { mod bar; }` resolves `bar` under `foo/`, not beside lib.rs.
+    Resolving it beside lib.rs produced two high-severity findings for a
+    correctly wired file: missing, and never compiled."""
+    root = crate(tmp_path / "c", {
+        "src/lib.rs": "mod foo { mod bar; }\n",
+        "src/foo/bar.rs": "pub fn b() {}\n",
+    })
+    found = smells(run_detector("find_module_issues.py", root))
+    assert "module_file_missing" not in found
+    assert "file_never_compiled" not in found
+
+
+def test_a_directory_style_binary_root_is_a_crate_root(tmp_path):
+    """Cargo compiles `src/bin/<name>/main.rs`; missing it made every module
+    reachable from that binary look like it was never compiled."""
+    root = crate(tmp_path / "c", {
+        "src/lib.rs": "pub fn a() {}\n",
+        "src/bin/server/main.rs": "mod helper;\nfn main() {}\n",
+        "src/bin/server/helper.rs": "pub fn h() {}\n",
+    })
+    assert "file_never_compiled" not in smells(run_detector("find_module_issues.py", root))
+
+
+def test_a_guard_dropped_before_the_await_is_not_held_across_it(tmp_path):
+    source = """\
+use std::sync::Mutex;
+pub struct C { inner: Mutex<u32> }
+impl C {
+    pub async fn bump(&self) -> u32 {
+        let guard = self.inner.lock().unwrap();
+        let seen = *guard;
+        drop(guard);
+        fetch(seen).await
+    }
+}
+async fn fetch(n: u32) -> u32 { n }
+"""
+    target = write(tmp_path / "t", {"lib.rs": source}) / "lib.rs"
+    assert "guard_held_across_await" not in smells(run_detector("find_concurrency_issues.py", target))
+
+
+def test_a_guard_still_alive_at_the_await_is_still_reported(tmp_path):
+    """The `drop` exemption must not disarm the check it guards."""
+    source = """\
+use std::sync::Mutex;
+pub struct C { inner: Mutex<u32> }
+impl C {
+    pub async fn bump(&self) -> u32 {
+        let guard = self.inner.lock().unwrap();
+        let out = fetch(*guard).await;
+        drop(guard);
+        out
+    }
+}
+async fn fetch(n: u32) -> u32 { n }
+"""
+    target = write(tmp_path / "t", {"lib.rs": source}) / "lib.rs"
+    assert "guard_held_across_await" in smells(run_detector("find_concurrency_issues.py", target))
+
+
+def test_a_rustdoc_safety_section_documents_an_unsafe_trait(tmp_path):
+    source = """\
+/// A marker for uniquely-owned pointers.
+///
+/// # Safety
+///
+/// Implementors must guarantee the contained pointer has no other owner.
+pub unsafe trait Unique {}
+"""
+    target = write(tmp_path / "t", {"lib.rs": source}) / "lib.rs"
+    assert "unsafe_trait_without_safety_docs" not in smells(run_detector("find_unsafe_issues.py", target))
+
+
+def test_a_production_name_containing_test_is_not_a_test_file(tmp_path):
+    """`contest_runner.rs` contains `test_`. Classified as a test, every
+    error-handling finding in it was suppressed."""
+    source = "pub fn run(p: &str) -> Result<String, std::io::Error> {\n" \
+             "    Ok(std::fs::read_to_string(p).unwrap())\n}\n"
+    target = write(tmp_path / "t", {"contest_runner.rs": source}) / "contest_runner.rs"
+    assert "unwrap_in_fallible_fn" in smells(run_detector("find_error_handling.py", target))
+
+
+def test_a_test_in_an_orphan_file_does_not_clear_the_no_tests_alarm(tmp_path):
+    """`cargo test` runs zero tests when the only `#[test]` is in a file no
+    `mod` declaration reaches."""
+    root = crate(tmp_path / "c", {
+        "src/lib.rs": "pub fn a() {}\npub fn b() {}\npub fn c() {}\n",
+        "src/orphan.rs": "#[test]\nfn t() { assert_eq!(1, 1); }\n",
+    })
+    assert "no_tests_at_all" in smells(run_detector("find_untested_modules.py", root))
+
+
+def test_dev_and_build_dependencies_are_looked_for_in_their_own_targets(tmp_path):
+    """A dev-dependency lives in `tests/` and a build-dependency in `build.rs`;
+    reconciling both against `src/` alone reported every one as unused."""
+    root = crate(tmp_path / "c", {
+        "src/lib.rs": "use serde::Serialize;\npub fn a() {}\n",
+        "tests/it.rs": "use proptest::prelude::*;\n#[test]\nfn t() { assert_eq!(1, 1); }\n",
+        "build.rs": "fn main() { cc::Build::new(); }\n",
+    }, manifest='[package]\nname = "demo"\nversion = "0.1.0"\nedition = "2021"\n'
+                '\n[dependencies]\nserde = "1"\n'
+                '\n[dev-dependencies]\nproptest = "1"\n'
+                '\n[build-dependencies]\ncc = "1"\n')
+    assert "unused_dependency" not in smells(run_detector("find_cargo_issues.py", root))
+
+
+def test_format_findings_emits_json_for_a_clean_report(tmp_path):
+    """The documented JSON pipeline was unusable in its most common case."""
+    result = subprocess.run(
+        [sys.executable, str(SCRIPTS_DIR / "format_findings.py"), "--format", "json"],
+        input="[]", capture_output=True, text=True, timeout=120,
+    )
+    assert result.returncode == 0
+    assert json.loads(result.stdout) == []
+
+
+def test_an_unknown_tool_name_is_an_error_not_a_silent_skip(tmp_path):
+    """`--tools chek` reporting "no findings" is a compilation check that never
+    ran, presented as a clean bill."""
+    root = crate(tmp_path / "c", {"src/lib.rs": "pub fn a() {}\n"})
+    result = subprocess.run(
+        [sys.executable, str(SCRIPTS_DIR / "run_external_tools.py"), str(root),
+         "--tools", "chek"],
+        capture_output=True, text=True, timeout=120,
+    )
+    assert result.returncode != 0
+    assert "unknown tools" in result.stderr
+
+
+def test_missing_cargo_still_produces_a_json_document(tmp_path, monkeypatch):
+    """The no-cargo case is exactly when a caller is most likely piping this."""
+    root = crate(tmp_path / "c", {"src/lib.rs": "pub fn a() {}\n"})
+    result = subprocess.run(
+        [sys.executable, str(SCRIPTS_DIR / "run_external_tools.py"), str(root),
+         "--format", "json"],
+        capture_output=True, text=True, timeout=300,
+        env={**os.environ, "PATH": str(tmp_path / "empty")},
+    )
+    assert result.returncode == 0
+    report = json.loads(result.stdout)
+    assert [f["smell_type"] for f in report["findings"]] == ["cargo:not-installed"]

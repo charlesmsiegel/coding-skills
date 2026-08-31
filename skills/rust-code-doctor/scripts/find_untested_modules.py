@@ -46,8 +46,14 @@ def analyze(root: Path, ignore: set[str], args) -> list:
 
     inline_tested = {path for path, rsfile in project.files.items() if rsfile.test_spans}
     integration = _integration_test_text(project)
+    # Only tests in files rustc actually compiles. A `#[test]` in an orphan
+    # file — one no `mod` declaration reaches — never runs, and counting it
+    # would suppress the `no_tests_at_all` blocker for a crate where
+    # `cargo test` genuinely runs zero tests.
+    compiled = project.compiled_files()
     total_tests = sum(
-        1 for rsfile in project.files.values() for func in rsfile.functions
+        1 for path, rsfile in project.files.items() if path in compiled
+        for func in rsfile.functions
         if any(a.split("(")[0].strip() in ("test", "tokio::test", "async_std::test", "rstest",
                                            "proptest", "quickcheck")
                for a in func.attrs))
