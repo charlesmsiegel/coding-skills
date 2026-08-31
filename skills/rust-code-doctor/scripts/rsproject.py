@@ -66,7 +66,11 @@ class Project:
     """A parsed tree: every Rust file, plus the crates and module graph over it."""
 
     def __init__(self, root: Path):
-        self.root = root.resolve()
+        # A user may point this at `src/`, which SKILL.md itself documents.
+        # Discovering manifests only *below* that path finds none, so the crate
+        # roots and module graph are empty and every tree detector returns a
+        # falsely clean result. Widen to the crate the path belongs to.
+        self.root = _widen_to_crate(root.resolve())
         self.files: dict[Path, RsFile] = {}
         self.unparseable: dict[Path, str] = {}
         self.crates: list[Crate] = []
@@ -215,6 +219,17 @@ def _resolve_mod_file(parent: Path, name: str, rsfile: RsFile,
         if candidate.is_file():
             return candidate.resolve()
     return None
+
+
+def _widen_to_crate(root: Path) -> Path:
+    """The nearest ancestor holding a Cargo.toml, or ``root`` unchanged."""
+    start = root if root.is_dir() else root.parent
+    if (start / "Cargo.toml").is_file():
+        return start
+    for candidate in start.parents:
+        if (candidate / "Cargo.toml").is_file():
+            return candidate
+    return root
 
 
 def _discover_crates(root: Path) -> list[Crate]:

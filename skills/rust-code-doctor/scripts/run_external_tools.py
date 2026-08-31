@@ -35,6 +35,7 @@ Usage:
 """
 
 import argparse
+import contextlib
 import json
 import re
 import shutil
@@ -379,11 +380,24 @@ def apply_fixes(available, cargo, root):
 
 
 def measure_coverage(cargo, root):
-    """Run the suite under llvm-cov so run_coverage has data. Executes the tests."""
+    """Run the suite under llvm-cov so run_coverage has data. Executes the tests.
+
+    A previous run's `lcov.info` is removed first. Leaving it in place meant a
+    compilation or test failure here was followed by `run_coverage` happily
+    parsing the *old* file — presenting stale clean coverage for a run that
+    never produced any.
+    """
+    stale = root / "lcov.info"
+    if stale.is_file():
+        with contextlib.suppress(OSError):
+            stale.unlink()
     returncode, _out, err = _run(
         [*cargo, "llvm-cov", "--lcov", "--output-path", "lcov.info"], root, timeout=3600)
     if returncode is None:
         return [f"coverage: could not run cargo llvm-cov ({err.strip()[:120]})"]
+    if returncode != 0:
+        return [f"coverage: `cargo llvm-cov` FAILED (exit {returncode}) — no coverage data was "
+                f"produced; {err.strip()[-160:] or 'see the tool output'}"]
     return [f"coverage: ran `cargo llvm-cov` in {root} (exit {returncode})"]
 
 

@@ -129,7 +129,10 @@ def _check_reference_parameters(file: RsFile, report: Reporter) -> None:
             if param.is_self:
                 continue
             annotation = " ".join(param.type_text.split())
-            match = re.match(r"^&\s*(?:'\w+\s+)?(?:mut\s+)?([A-Za-z_][\w:]*)\s*(<.*>)?$", annotation)
+            # `&mut String` and `&mut Vec<T>` exist so the callee can `clear`,
+            # `push` or `truncate`. Recommending `&str`/`&[T]` removes the
+            # operations the function is for, and does not compile.
+            match = re.match(r"^&\s*(?:'\w+\s+)?([A-Za-z_][\w:]*)\s*(<.*>)?$", annotation)
             if not match:
                 continue
             base = match.group(1).rsplit("::", 1)[-1]

@@ -36,6 +36,7 @@ from common import (
     SEVERITY_RANK,
     configure_output,
     find_rs_files,
+    is_generated,
     warn_detector_error,
     warn_unparseable,
 )
@@ -133,6 +134,12 @@ def run_file_shard(paths: list[Path], specs: list[tuple[str, str]],
             rsfile = parse_file(path)
         except (RustSyntaxError, OSError) as exc:
             warn_unparseable(path, exc)
+            continue
+        if is_generated(rsfile):
+            # bindgen, prost and friends can be tens of thousands of lines. Their
+            # findings are not the author's to fix, and left in they drown the
+            # ones that are. `common.is_generated` existed for this and was
+            # never consulted.
             continue
         for category, analyze in detectors:
             try:
