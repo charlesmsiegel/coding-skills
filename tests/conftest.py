@@ -106,7 +106,8 @@ def run_script():
 # here, so a new collision cannot arrive silently.
 SHARED_NAMES = (
     "analyze_all", "analyze_complexity", "analyze_diff", "assemble",
-    "check_codemap_state", "common", "coverage_data", "diffutil", "extract_tabs",
+    "check_codemap_state", "common", "corpus_stats", "coverage_data", "diffutil",
+    "extract_tabs",
     "find_ai_scaffolding", "find_async_issues", "find_code_smells",
     "find_comment_smells", "find_coupling_issues", "find_dead_code",
     "find_debug_leftovers", "find_dependency_issues", "find_design_smells",
@@ -114,9 +115,9 @@ SHARED_NAMES = (
     "find_module_issues", "find_mutation_hazards", "find_naming_issues", "find_outdated_idioms",
     "find_overengineering", "find_resource_leaks", "find_security_issues",
     "find_test_smells", "find_type_gaps", "find_untested_modules",
-    "format_findings", "imports", "jvmdecl", "lint_fragments", "llmops",
-    "manifests", "resources", "rubric", "run_external_tools", "runner",
-    "verify_citations",
+    "format_findings", "imports", "inject_masthead", "jvmdecl", "lint_fragments",
+    "llmops", "manifests", "resources", "rubric", "run_external_tools", "runner",
+    "search_sources", "snowball", "sources", "verify_citations",
 )
 
 
