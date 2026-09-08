@@ -708,3 +708,25 @@ def test_an_imported_type_annotation_is_not_a_mutated_import(tmp_path):
                 if f["smell_type"] == "mutates_imported_object"]
 
     assert [Path(f["file"]).name for f in reported] == ["mutated.ts"]
+
+
+def test_marker_words_inside_prose_are_not_todo_markers(tmp_path):
+    """`todo` as the name of a command, or a word in a sentence, is vocabulary.
+    A marker sits at the start of the comment or is tagged with `:`/`(`."""
+    root = write(tmp_path, {"notes.ts": """\
+// the key of a default run: `evals todo` then `evals run`
+// the retry hack above is what the old client did; keep it until v2 ships
+/* the grammar accepts \\uXXXX anywhere a basic character may appear */
+export const a = 1;
+// TODO: handle the empty case
+// FIXME(alice) negative inputs
+/*
+ * XXX this is fragile
+ * see TODO: retry budget
+ */
+export const b = 2;
+"""})
+    lines = sorted(f["line"] for f in run_detector("find_comment_smells.py", root)
+                   if f["smell_type"] == "todo_marker")
+
+    assert lines == [5, 6, 8, 9]

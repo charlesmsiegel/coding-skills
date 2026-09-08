@@ -15,6 +15,7 @@ self-contained.)
 import ast
 import io
 import json
+import re
 import tokenize
 import argparse
 from pathlib import Path
@@ -38,6 +39,23 @@ class CodeSmell:
 _PRAGMA_PREFIXES = ("!", "type:", "noqa", "pragma", "pylint:", "mypy:",
                     "isort:", "fmt:", "nopep8", "coding:", "-*-")
 _TODO_MARKERS = ("TODO", "FIXME", "HACK", "XXX", "BUG", "OPTIMIZE", "REFACTOR", "DEPRECATED")
+# A marker is a *tag*, not a word: it opens the comment (`# TODO rewrite`,
+# `# -- HACK --`, `# todo: later`) or is tagged anywhere with `:`/`(`
+# (`# see TODO: budget`, `# FIXME(alice)`). Inside prose the same letters are
+# vocabulary — `evals todo` names a command, "the bug this fixes" explains one,
+# `\uXXXX` is escape notation — and a substring search scores every one.
+_MARKER_WORDS = "|".join(_TODO_MARKERS)
+_MARKER_OPENS_COMMENT = re.compile(rf"^\W*({_MARKER_WORDS})\b(?P<tag>\s*[:(\-])?", re.IGNORECASE)
+_MARKER_TAGGED = re.compile(rf"\b({_MARKER_WORDS})\b(?=\s*[:(])")
+
+
+def task_marker(text: str) -> str | None:
+    """The marker this comment carries, or None when it merely uses the word."""
+    opening = _MARKER_OPENS_COMMENT.match(text)
+    if opening and (opening.group(1).isupper() or opening.group("tag")):
+        return opening.group(1).upper()
+    tagged = _MARKER_TAGGED.search(text)
+    return tagged.group(1) if tagged else None
 
 # A comment is treated as code only if its first parsed node is one of these...
 _CODE_NODES = (
@@ -99,8 +117,7 @@ def detect(source: str, filename: str, ignore: set):
         if any(text.lower().startswith(p) for p in _PRAGMA_PREFIXES):
             continue
 
-        upper = text.upper()
-        marker = next((m for m in _TODO_MARKERS if m in upper), None)
+        marker = task_marker(text)
         if marker:
             add(line, "todo_comment",
                 f"{marker} marker: deferred work that should be tracked",

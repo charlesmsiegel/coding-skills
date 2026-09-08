@@ -3715,3 +3715,226 @@ def test_analyze_all_counts_candidates_and_lists_them_separately(tmp_path):
 
 # run_external_tools lives in tests/python_code_doctor/test_external_tools.py —
 # it needs stub-executable fixtures the rest of these detectors have no use for.
+
+
+# --------------------------------------------------------------------------- #
+# False positives triaged against a real project (hardy's health-triage): each
+# case below is a shape the detector once scored as a defect and must not.
+# --------------------------------------------------------------------------- #
+
+
+def test_future_import_is_never_an_unused_import(tmp_path):
+    """`from __future__ import annotations` is a compiler directive, not a name."""
+    (tmp_path / "sample.py").write_text(
+        "from __future__ import annotations\n"
+        "\n"
+        "def f(x: int) -> int:\n"
+        "    return x\n"
+    )
+
+    assert kinds_by_name(run_detector("find_dead_code.py", tmp_path), "unused_import") == {}
+
+
+def test_explicit_name_as_name_alias_declares_a_re_export(tmp_path):
+    """`from m import x as x` / `import m as m` is the typed re-export convention.
+
+    PEP 484 says the redundant alias marks a public re-export, and a facade
+    module full of them is the classic shape. A plain alias is still checked.
+    """
+    (tmp_path / "facade.py").write_text(
+        "from backends import Macaulay2Backend as Macaulay2Backend\n"
+        "from backends import _Sentinel as _Sentinel\n"
+        "import helpers as helpers\n"
+        "from backends import Other as Renamed\n"
+        "import json\n"
+    )
+
+    assert kinds_by_name(run_detector("find_dead_code.py", tmp_path), "unused_import") \
+        == {"Renamed": None, "json": None}
+
+
+def test_a_free_function_handed_out_as_a_value_is_a_callback(tmp_path):
+    """A function registered by name has its signature dictated by the registry.
+
+    `Command("help", handle_help)` passes the function as a value; whoever
+    calls it later decides the arguments. That makes an unused parameter a
+    lead, not a defect — same as a nested callback. A decorated free function
+    is the same situation (the decorator is the caller). Only a free function
+    the file itself calls directly still owns its signature.
+    """
+    (tmp_path / "handlers.py").write_text(
+        "import functools\n"
+        "\n"
+        "def handle_help(ui, argument, state):\n"
+        "    return state\n"
+        "\n"
+        "@functools.lru_cache\n"
+        "def cached(key, spare):\n"
+        "    return key\n"
+        "\n"
+        "def standalone(used, spare):\n"
+        "    return used\n"
+        "\n"
+        "def build_registry(Command):\n"
+        "    standalone(1, 2)\n"
+        "    return [Command('help', handle_help)]\n"
+    )
+    kinds = {(f['name'], f['line']): f.get('kind')
+             for f in run_detector("find_dead_code.py", tmp_path)
+             if f["issue_type"] == "unused_parameter"}
+
+    assert kinds == {
+        ("ui", 3): "candidate", ("argument", 3): "candidate",
+        ("spare", 7): "candidate",
+        ("spare", 10): None,
+    }
+
+
+def test_a_stub_body_has_no_unused_parameters(tmp_path):
+    """A Protocol method, an abstract stub, a `raise NotImplementedError`: the
+    parameters are the whole point and the body is deliberately empty."""
+    (tmp_path / "ports.py").write_text(
+        "from typing import Protocol\n"
+        "\n"
+        "class Ui(Protocol):\n"
+        "    def pressed(self, frame, number) -> None:\n"
+        "        ...\n"
+        "\n"
+        "    def render(self, frame) -> None:\n"
+        "        \"\"\"Draw the frame.\"\"\"\n"
+        "\n"
+        "def later(frame, number):\n"
+        "    raise NotImplementedError\n"
+    )
+
+    assert kinds_by_name(run_detector("find_dead_code.py", tmp_path), "unused_parameter") == {}
+
+
+def _duplicate_pair(tmp_path, body_a: str, body_b: str) -> list[dict]:
+    (tmp_path / "one.py").write_text(body_a)
+    (tmp_path / "two.py").write_text(body_b)
+    return run_detector("find_duplicates.py", tmp_path)
+
+
+def test_a_block_nested_inside_a_duplicate_is_not_a_second_duplicate(tmp_path):
+    """Two identical functions contain identical loops which contain identical
+    ifs. That is one duplicate, not three: the nested groups are the same copy
+    seen at smaller granularity."""
+    body = (
+        "def split(text, opener, closer):\n"
+        "    depth = 0\n"
+        "    for index, char in enumerate(text):\n"
+        "        if char == opener:\n"
+        "            depth += 1\n"
+        "        elif char == closer:\n"
+        "            depth -= 1\n"
+        "        if depth == 0 and char == closer:\n"
+        "            return text[:index], text[index + 1:]\n"
+        "    return text, ''\n"
+    )
+    findings = _duplicate_pair(tmp_path, body, body.replace("split", "cut"))
+
+    assert len(findings) == 1, [f["description"] for f in findings]
+    assert findings[0]["occurrences"][0]["type"] == "function"
+
+
+def test_docstrings_do_not_count_toward_duplicate_size(tmp_path):
+    """A one-expression body under a long docstring is not a 9-line duplicate."""
+    doc = '    """One line.\n\n    Two.\n\n    Three.\n\n    Four.\n    """\n'
+    one = f"def normalise(text):\n{doc}    return ' '.join(text.split())\n"
+    two = f"def collapse(label):\n{doc}    return ' '.join(label.split())\n"
+
+    assert _duplicate_pair(tmp_path, one, two) == []
+
+
+def test_reported_duplicate_size_is_executable_lines(tmp_path):
+    body = "\n".join(f"    v{i} = x + {i}" for i in range(6)) + "\n    return v5\n"
+    one = f"def first(x):\n    '''doc\n\n    more doc\n\n    still doc\n    '''\n{body}"
+    two = f"def second(y):\n{body.replace('x', 'y')}"
+    findings = _duplicate_pair(tmp_path, one, two)
+
+    assert len(findings) == 1
+    assert findings[0]["lines"] == 8, findings[0]
+
+
+def test_blocks_that_differ_only_in_literals_are_a_candidate(tmp_path):
+    """`_digest("environment", x)` and `_digest("procedure", x)` have one shape and
+    two meanings; the literal is the meaning. Erasing it finds a lead, not a defect.
+    Identical up to renaming stays a finding."""
+    def make(tag: str, name: str) -> str:
+        return (
+            f"def {name}(payload):\n"
+            f"    header = build_header({tag!r}, payload)\n"
+            f"    body = encode(payload, header)\n"
+            f"    checksum = digest(body)\n"
+            f"    trailer = build_trailer({tag!r}, checksum)\n"
+            f"    return header + body + trailer\n"
+        )
+    (tmp_path / "same.py").write_text(make("environment", "environment_digest")
+                                      + "\n" + make("environment", "environment_copy"))
+    (tmp_path / "other.py").write_text(make("procedure", "procedure_digest"))
+    findings = run_detector("find_duplicates.py", tmp_path)
+    by_kind = {f.get("kind"): sorted(o["name"] for o in f["occurrences"]) for f in findings}
+
+    assert by_kind == {
+        None: ["environment_copy", "environment_digest"],
+        "candidate": ["environment_copy", "environment_digest", "procedure_digest"],
+    }
+    lead = next(f for f in findings if f.get("kind") == "candidate")
+    assert "literal" in lead["description"]
+
+
+def test_marker_words_inside_prose_are_not_task_markers(tmp_path):
+    """TODO in the name of an implemented command, BUG in an explanation, XXX in
+    escape notation, Debug in a log title: vocabulary, not deferred work."""
+    (tmp_path / "sample.py").write_text(
+        "# the key of a *default* run: `evals todo` then `evals run --max-turns 40`\n"
+        "# `todo` exists to report the key a run launched now would carry\n"
+        "# shape of the bug this module exists to end.\n"
+        "# Observed verbatim from M2 (CI run 30167266358, \"Debug M2 raw stdout\")\n"
+        "#: character goes out as `\\uXXXX`, which the grammar accepts anywhere\n"
+        "# Deprecated fields are dropped before hashing so old boards still pool.\n"
+        "x = 1\n"
+    )
+
+    assert run_detector("find_comment_smells.py", tmp_path) == []
+
+
+def test_task_markers_are_recognised_where_people_actually_put_them(tmp_path):
+    (tmp_path / "sample.py").write_text(
+        "# TODO: rewrite this parser\n"
+        "# FIXME(alice) negative inputs\n"
+        "# XXX this is a hack\n"
+        "# todo: lowercase but tagged\n"
+        "# -- HACK --\n"
+        "# see TODO: the retry budget below\n"
+        "x = 1\n"
+    )
+    lines = sorted(f["line"] for f in run_detector("find_comment_smells.py", tmp_path)
+                   if f["smell_type"] == "todo_comment")
+
+    assert lines == [1, 2, 3, 4, 5, 6]
+
+
+def test_sibling_test_modules_importing_each_other_are_not_missing_dependencies(tmp_path):
+    """pytest puts a test file's directory on sys.path, so `from test_chat import
+    helper` resolves to the file next door — a `tests/` directory needs no
+    __init__.py and no entry in pyproject.toml for that."""
+    (tmp_path / "pyproject.toml").write_text(
+        '[project]\nname = "x"\nversion = "0"\ndependencies = []\n'
+    )
+    tests = tmp_path / "tests"
+    tests.mkdir()
+    (tests / "conftest.py").write_text("import pytest\n")
+    (tests / "workspace_helpers.py").write_text("def make():\n    return 1\n")
+    (tests / "test_chat.py").write_text("from workspace_helpers import make\n\ndef helper():\n    return make()\n")
+    (tests / "test_audit.py").write_text(
+        "from test_chat import helper\n"
+        "from tests.workspace_helpers import make\n"
+        "import requests\n"
+    )
+    missing = sorted(f["description"].split("'")[1]
+                     for f in run_detector("find_dependency_issues.py", tmp_path)
+                     if f["smell_type"] == "missing_dependency")
+
+    assert missing == ["requests"]

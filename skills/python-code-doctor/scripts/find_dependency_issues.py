@@ -279,6 +279,18 @@ def _compute_local_packages(root: Path) -> frozenset:
     return frozenset(names)
 
 
+def _resolves_beside(name: str, importer: Path) -> bool:
+    """True when `name` is a module or directory in the importing file's own directory."""
+    beside = importer.parent
+    return (beside / f"{name}.py").is_file() or (beside / name).is_dir()
+
+
+def _is_namespace_dir(directory: Path) -> bool:
+    """A directory of .py files with no __init__.py is an importable namespace
+    package (PEP 420) — `tests/` is the everyday example."""
+    return directory.is_dir() and any(p.suffix == ".py" for p in directory.iterdir())
+
+
 def _is_local(name: str, root: Path) -> bool:
     """Return True if `name` appears to be a local module under root."""
     # Fast direct checks
@@ -287,6 +299,8 @@ def _is_local(name: str, root: Path) -> bool:
         or (root / name / "__init__.py").exists()
         or (root / "src" / f"{name}.py").exists()
         or (root / "src" / name / "__init__.py").exists()
+        or _is_namespace_dir(root / name)
+        or _is_namespace_dir(root / "src" / name)
     ):
         return True
     # Full package scan (cached)
@@ -381,7 +395,14 @@ def analyze(root: Path, ignore: set) -> list[CodeSmell]:
             continue
         if _is_local(mod, root):
             continue
-        third_party_imports[mod] = files
+        # pytest (and any script run from its own directory) puts the importing
+        # file's directory on sys.path, so `from test_chat import helper` in
+        # tests/ resolves to the file next door. No manifest declares that, and
+        # a tests/ directory needs no __init__.py for it to work.
+        unresolved = [f for f in files if not _resolves_beside(mod, Path(f))]
+        if not unresolved:
+            continue
+        third_party_imports[mod] = unresolved
 
     # ------------------------------------------------------------------ #
     # 4. No manifest at all

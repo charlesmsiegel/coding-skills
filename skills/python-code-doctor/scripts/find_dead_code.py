@@ -76,6 +76,11 @@ class ScopeTracker(ast.NodeVisitor):
         self.current_app_config_names: set[str] = set()
         self.django_app_config_classes: set[ast.ClassDef] = set()
         self.function_stack: list[ast.FunctionDef | ast.AsyncFunctionDef] = []
+        # Names loaded as values rather than called: `Command("help", handle_help)`
+        # hands the function to a registry, and whoever calls it later dictates
+        # its parameters. Decided in finalize, once the whole file has been read.
+        self.value_references: Set[str] = set()
+        self.pending_params: list[tuple[DeadCodeIssue, ast.FunctionDef | ast.AsyncFunctionDef]] = []
 
     def _at_module_scope(self, node: ast.AST) -> bool:
         parent = self.parents.get(node)
@@ -202,10 +207,18 @@ class ScopeTracker(ast.NodeVisitor):
                 module = alias.name
         return module.rsplit(".", 1)[-1] in _DJANGO_REGISTRATION_MODULES
 
+    @staticmethod
+    def _is_explicit_reexport(alias: ast.alias) -> bool:
+        # `from m import x as x` / `import m as m`: the redundant alias is the
+        # typed-Python convention (PEP 484) for "this name is part of my public
+        # API". A facade module is nothing but these, and none of them is used
+        # by the facade itself.
+        return alias.asname is not None and alias.asname == alias.name
+
     def visit_Import(self, node: ast.Import):
         self._remember_imports(node)
         for alias in node.names:
-            if self._suppresses_f401(node, alias) or \
+            if self._suppresses_f401(node, alias) or self._is_explicit_reexport(alias) or \
                     (self._in_appconfig_ready() and self._is_registration_import(node, alias)):
                 continue
             name = alias.asname if alias.asname else alias.name.split('.')[0]
@@ -214,10 +227,13 @@ class ScopeTracker(ast.NodeVisitor):
 
     def visit_ImportFrom(self, node: ast.ImportFrom):
         self._remember_imports(node)
+        if node.module == "__future__":
+            # A compiler directive. It binds a name, but nothing is meant to read it.
+            return
         for alias in node.names:
             if alias.name == '*':
                 continue
-            if self._suppresses_f401(node, alias) or \
+            if self._suppresses_f401(node, alias) or self._is_explicit_reexport(alias) or \
                     (self._in_appconfig_ready() and self._is_registration_import(node, alias)):
                 continue
             name = alias.asname if alias.asname else alias.name
@@ -227,6 +243,9 @@ class ScopeTracker(ast.NodeVisitor):
     def visit_Name(self, node: ast.Name):
         if isinstance(node.ctx, ast.Load):
             self.used_names.add(node.id)
+            parent = self.parents.get(node)
+            if not (isinstance(parent, ast.Call) and parent.func is node):
+                self.value_references.add(node.id)
         elif isinstance(node.ctx, ast.Store) and self._at_module_scope(node):
             self.import_origins.pop(node.id, None)
             self.current_app_config_names.discard(node.id)
@@ -303,6 +322,27 @@ class ScopeTracker(ast.NodeVisitor):
                         confidence=100
                     ))
 
+    @staticmethod
+    def _is_stub_body(node) -> bool:
+        """A Protocol method, an abstract stub, `raise NotImplementedError`: the
+        parameters are the contract and the body is empty on purpose."""
+        body = node.body
+        if body and isinstance(body[0], ast.Expr) and isinstance(body[0].value, ast.Constant) \
+                and isinstance(body[0].value.value, str):
+            body = body[1:]
+        for stmt in body:
+            if isinstance(stmt, ast.Pass):
+                continue
+            if isinstance(stmt, ast.Expr) and isinstance(stmt.value, ast.Constant) \
+                    and stmt.value.value is Ellipsis:
+                continue
+            if isinstance(stmt, ast.Raise) and stmt.exc is not None:
+                raised = stmt.exc.func if isinstance(stmt.exc, ast.Call) else stmt.exc
+                if isinstance(raised, ast.Name) and raised.id == "NotImplementedError":
+                    continue
+            return False
+        return True
+
     def _check_unused_params(self, node):
         if node.name.startswith('_'):
             return
@@ -310,13 +350,17 @@ class ScopeTracker(ast.NodeVisitor):
         # parameters are the framework's business, not dead code.
         if self._is_fixture(node) or (self._is_test_file() and self._is_test_function_name(node.name)):
             return
+        if self._is_stub_body(node):
+            return
 
         # Only a free, module-level function chooses its own signature, so an
         # unused parameter there is a provable defect. A method (overrides,
         # ABC/Protocol conformance) or a nested callback/stub (its signature is
         # dictated by the caller it is passed to, e.g. monkeypatch targets) must
-        # accept parameters it need not use — those are unscored leads.
-        kind = None if self._at_module_scope(node) else "candidate"
+        # accept parameters it need not use — those are unscored leads. So is a
+        # free function the file hands out as a value or decorates: finalize
+        # downgrades those once it has seen every reference.
+        kind = None if self._at_module_scope(node) and not node.decorator_list else "candidate"
 
         # A leading underscore is the conventional mark of a deliberately unused
         # parameter; honoring it keeps the detector aligned with every linter.
@@ -334,14 +378,24 @@ class ScopeTracker(ast.NodeVisitor):
                 used.add(child.id)
 
         for param in params - used:
-            self.issues.append(DeadCodeIssue(
+            self.pending_params.append((DeadCodeIssue(
                 file=self.filename, line=node.lineno,
                 issue_type="unused_parameter", name=param,
                 description=f"Parameter '{param}' in {node.name}() is never used",
                 confidence=80, kind=kind
-            ))
+            ), node))
 
     def finalize(self):
+        # A free function this file passes around as a value (a registry entry,
+        # a callback, a dispatch-table row) has its signature dictated by the
+        # receiver, exactly like a nested callback. Only now, with the whole
+        # file read, is that known.
+        for issue, node in self.pending_params:
+            if issue.kind is None and node.name in self.value_references:
+                issue.kind = "candidate"
+            self.issues.append(issue)
+        self.pending_params.clear()
+
         # An unused import IS provable inside one file — unless the name is
         # re-exported via __all__, in which case it is part of the public API.
         for name, line in self.imports.items():
