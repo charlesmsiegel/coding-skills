@@ -268,3 +268,35 @@ def test_generate_report_counts_candidates_and_rejects_invalid_records(tree, loa
     assert report["summary"]["total_issues"] == 2
     assert report["summary"]["total_candidates"] == 1
     assert "bogus" in report["meta"]["records_rejected"]["types"]
+
+
+def test_the_diff_lens_marks_a_candidate_as_a_lead_not_a_ranked_defect(load_module, capsys):
+    """No diff-safe Rust detector emits a candidate yet, so the renderer is
+    exercised directly — the shape it must print the day one does.
+
+    A severity icon on a lead reads as a verdict the syntax never proved, and a
+    bare arrow reads as a fix that was forgotten. What the record has instead is
+    the benign readings the reader must rule out first.
+    """
+    module = load_module(SCRIPTS_DIR, "analyze_diff")
+    findings = [
+        {"file": "a.rs", "line": 1, "smell_type": "unwrap_in_fallible_fn",
+         "description": "a defect", "suggestion": "fix it", "severity": "high",
+         "kind": "finding"},
+        {"file": "a.rs", "line": 2, "smell_type": "narrowing_cast",
+         "description": "a lead", "suggestion": "", "severity": "high",
+         "kind": "candidate",
+         "also_caused_by": ["the range was checked by the caller"]},
+    ]
+    module.print_text(["a.rs"], findings, "0123456789abcdef")
+    out = capsys.readouterr().out
+
+    assert "[CANDIDATE]" in out
+    assert "? also caused by: the range was checked by the caller" in out
+    marked = [line for line in out.splitlines() if "[CANDIDATE]" in line]
+    assert marked and not any(icon in line for line in marked for icon in "🔴🟡🟢"), \
+        "a candidate was given a severity icon it did not earn"
+    assert [line for line in out.splitlines() if line.strip() == "→"] == [], \
+        "a candidate rendered a fix arrow with nothing after it"
+    assert "1 finding(s), 1 candidate(s)" in out, \
+        "the count line still calls every record a finding"

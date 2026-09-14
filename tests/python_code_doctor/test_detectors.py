@@ -4016,3 +4016,40 @@ def test_inexact_duplicates_are_candidates_with_reasons(tmp_path):
     assert records, "two blocks with one shape and different literals"
     assert all(r["kind"] == "candidate" for r in records)
     assert all(r["also_caused_by"] and not r["suggestion"] for r in records)
+
+
+def test_the_diff_lens_marks_a_candidate_as_a_lead_not_a_ranked_defect(tmp_path):
+    """A dynamic `PRAGMA` on a changed line is a candidate, and the lens must say so.
+
+    A severity icon on a lead reads as a verdict the syntax never proved, and a
+    bare arrow reads as a fix that was forgotten. What the record has instead is
+    the benign readings the reader must rule out first.
+    """
+    _git(tmp_path, "init", "-q")
+    target = tmp_path / "mod.py"
+    target.write_text("BASE = 1\n")
+    _git(tmp_path, "add", "-A")
+    _git(tmp_path, "commit", "-qm", "base")
+    target.write_text(
+        "BASE = 1\n"
+        "def describe(conn, table):\n"
+        '    return conn.execute(f"PRAGMA table_info({table})").fetchall()\n'
+    )
+    _git(tmp_path, "add", "-A")
+
+    result = subprocess.run(
+        [sys.executable, str(SCRIPTS_DIR / "analyze_diff.py"), "HEAD"],
+        cwd=tmp_path, capture_output=True, text=True, timeout=300,
+    )
+    assert result.returncode == 0, result.stderr[:500]
+    output = result.stdout
+    assert "sql_injection" in output, "the fixture must reach the renderer"
+
+    assert "[CANDIDATE]" in output
+    assert "? also caused by:" in output
+    marked = [line for line in output.splitlines() if "[CANDIDATE]" in line]
+    assert marked and not any(icon in line for line in marked for icon in "🔴🟡🟢"), \
+        "a candidate was given a severity icon it did not earn"
+    assert not arrow_only_lines(output), \
+        "a candidate rendered a fix arrow with nothing after it"
+    assert "candidate(s)" in output, "the count line still calls every record a finding"
