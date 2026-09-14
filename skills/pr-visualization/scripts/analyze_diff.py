@@ -126,16 +126,20 @@ def main() -> int:
     if args.worktree:
         raw = git(repo, "-c", "core.quotepath=false", "diff", "--no-color", merge_base)
         head_desc = "working tree"
-        commits = []
     else:
         raw = git(repo, "-c", "core.quotepath=false", "diff", "--no-color", f"{merge_base}..{args.head}")
         head_desc = args.head
-        commits = []
-        for line in git(repo, "log", "--format=%h%x1f%an%x1f%s", f"{merge_base}..{args.head}").splitlines():
-            if not line.strip():
-                continue
-            sha, author, subject = (line.split("\x1f", 2) + ["", ""])[:3]
-            commits.append({"sha": sha, "author": author, "subject": subject})
+    # The commits in range are attributed in both modes: a worktree review of a
+    # feature branch includes everything committed since the base, and those
+    # commits have authors even though the uncommitted tail does not. Only a
+    # worktree with nothing committed past the base (merge_base == HEAD) has
+    # an empty range here.
+    commits = []
+    for line in git(repo, "log", "--format=%h%x1f%an%x1f%s", f"{merge_base}..{args.head}").splitlines():
+        if not line.strip():
+            continue
+        sha, author, subject = (line.split("\x1f", 2) + ["", ""])[:3]
+        commits.append({"sha": sha, "author": author, "subject": subject})
 
     fds = parse_diff(raw)
     if args.worktree:
