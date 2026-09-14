@@ -247,3 +247,41 @@ def test_a_nested_fixture_manifest_does_not_reset_the_project_root(common, tmp_p
     assert common.project_root_of(nested) == repo
     assert common.is_test_file(nested)
     assert not common.is_test_file(repo / "src" / "app.ts")
+
+
+def test_git_boundary_stops_a_marker_above_the_checkout_from_winning(common, tmp_path):
+    """A `.git` above the checkout — a home directory, a CI workspace, a monorepo
+    umbrella — must not pull the project root above the checkout: that turns
+    every production file's relative path into something starting with a test
+    directory name and silences the security and error-handling findings."""
+    common._root_of_dir.cache_clear()
+    outer = tmp_path / "outer"
+    (outer / ".git").mkdir(parents=True)
+    repo = outer / "tests" / "repo"
+    (repo / "src").mkdir(parents=True)
+    (repo / "package.json").write_text('{"name": "repo"}')
+    (repo / ".git").mkdir()
+    source = repo / "src" / "app.ts"
+    source.write_text("export const a = 1;\n")
+
+    assert common.project_root_of(source) == repo
+    assert not common.is_test_file(source)
+
+
+def test_git_at_the_root_still_scopes_a_nested_fixture_to_the_checkout(common, tmp_path):
+    """The nested-fixture case from the outermost-marker fix must keep passing
+    once the walk also stops at `.git`: `.git` at the checkout root is itself
+    the stopping point, not a reason to climb past it."""
+    common._root_of_dir.cache_clear()
+    repo = tmp_path / "repo"
+    (repo / "src").mkdir(parents=True)
+    (repo / "package.json").write_text('{"name": "repo"}')
+    (repo / ".git").mkdir()
+    fixture = repo / "tests" / "fixtures" / "app"
+    (fixture / "src").mkdir(parents=True)
+    (fixture / "package.json").write_text('{"name": "fixture"}')
+    nested = fixture / "src" / "x.ts"
+    nested.write_text("export const x = 1;\n")
+
+    assert common.project_root_of(nested) == repo
+    assert common.is_test_file(nested)
