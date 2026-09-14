@@ -102,11 +102,9 @@ def analyze(root: Path, ignore: set[str], _args) -> list[Finding]:
         ancestors = set(path.parents)
         return [manifest for manifest, directory in manifest_dirs if directory in ancestors]
 
-    # package -> where it is imported from, and manifest -> what its own files import
-    used_in_source: dict[str, list[tuple[Path, int]]] = defaultdict(list)
-    used_in_tests: dict[str, list[tuple[Path, int]]] = defaultdict(list)
     # (manifest, package) sites, so "missing" is answered per workspace
     missing_sites: dict[Path, dict[str, tuple[Path, int]]] = defaultdict(dict)
+    # manifest -> what its own files (and its workspaces' files) import
     source_by_manifest: dict[Path, set[str]] = defaultdict(set)
     tests_by_manifest: dict[Path, set[str]] = defaultdict(set)
     # Usage is read from every file, generated ones included — a runtime package
@@ -116,7 +114,6 @@ def analyze(root: Path, ignore: set[str], _args) -> list[Finding]:
     owned_by_a_tool = set(project.generated)
     for path, tsfile in project.files.items():
         is_test = is_test_file(path)
-        bucket = used_in_tests if is_test else used_in_source
         chain = _chain_of(path)
         for record in tsfile.imports:
             specifier = record.module
@@ -127,7 +124,6 @@ def analyze(root: Path, ignore: set[str], _args) -> list[Finding]:
             name = _package_of(specifier.removeprefix("node:"))
             if name in NODE_BUILTINS:
                 continue
-            bucket[name].append((path, record.line))
             for manifest in chain:
                 (tests_by_manifest if is_test else source_by_manifest)[manifest].add(name)
             if path not in owned_by_a_tool:

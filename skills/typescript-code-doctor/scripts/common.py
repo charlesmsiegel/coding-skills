@@ -49,9 +49,12 @@ DECLARATION_SUFFIXES = (".d.ts", ".d.mts", ".d.cts")
 TEST_DIR_NAMES = frozenset({"__tests__", "__test__", "test", "tests", "spec", "e2e", "cypress"})
 TEST_NAME_MARKERS = (".test.", ".spec.", "-test.", "_test.")
 
-# Files that mark the top of a project. Test-directory classification is
-# scoped below the nearest one, so where a checkout lives cannot change what
-# it reports.
+# Files that mark the top of a project. The project root is the OUTERMOST
+# marker found *inside the checkout*, bounded by the first `.git` — a `.git`
+# directory is the checkout boundary, so markers above it belong to something
+# else (a home directory, a CI workspace, a monorepo umbrella) and are never
+# consulted. Test-directory classification is scoped below that root, so
+# where a checkout lives cannot change what it reports.
 ROOT_MARKERS = ("package.json", "tsconfig.json", ".git")
 
 
@@ -104,7 +107,8 @@ def find_ts_files(path: Path) -> Iterator[Path]:
 
 @functools.lru_cache(maxsize=None)
 def _root_of_dir(directory: Path) -> Path | None:
-    """The OUTERMOST ancestor of (or equal to) ``directory`` holding a root marker.
+    """The OUTERMOST ancestor of (or equal to) ``directory`` holding a root marker,
+    bounded by the first `.git` directory met on the way up.
 
     Outermost, not nearest: a fixture project committed under `tests/` carries
     its own `package.json`, and stopping at the nearest marker made *that* the
@@ -113,6 +117,14 @@ def _root_of_dir(directory: Path) -> Path | None:
     leniency off for the whole fixture tree. The walk therefore keeps going past
     the first hit and remembers the last one. A checkout whose only marker is at
     its own top still resolves there, because nothing above it carries one.
+
+    But "keep going" cannot mean "keep going forever": a `.git` directory is the
+    checkout boundary, so a marker above it belongs to something else — a `.git`
+    in the home directory, a CI workspace repo, a monorepo umbrella — and must
+    not become the root. That directory is itself still a candidate (`.git` is
+    a marker), the walk just does not climb past it. If no `.git` is ever met,
+    the walk runs to the filesystem root as before, so a plain checkout without
+    version control is unaffected.
 
     Cached on the resolved directory: the answer is a property of the directory,
     not of the file inside it, and every detector asks it of every file it
@@ -128,16 +140,24 @@ def _root_of_dir(directory: Path) -> Path | None:
     outermost = None
     for candidate in (directory, *directory.parents):
         try:
-            if (any((candidate / marker).exists() for marker in ROOT_MARKERS)
-                    or any(candidate.glob("tsconfig*.json"))):
-                outermost = candidate
+            is_checkout_root = (candidate / ".git").exists()
+            has_marker = (
+                is_checkout_root
+                or any((candidate / marker).exists() for marker in ROOT_MARKERS if marker != ".git")
+                or any(candidate.glob("tsconfig*.json"))
+            )
         except OSError:
             continue
+        if has_marker:
+            outermost = candidate
+        if is_checkout_root:
+            break
     return outermost
 
 
 def project_root_of(filepath: Path) -> Path | None:
-    """The outermost ancestor holding a package.json, a tsconfig, or .git; None if none."""
+    """The outermost marker inside the checkout, bounded by the first `.git`;
+    None if no marker is ever found."""
     return _root_of_dir(filepath.resolve().parent)
 
 

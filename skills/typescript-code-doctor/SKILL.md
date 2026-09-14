@@ -177,7 +177,8 @@ conservative (false negatives over false positives) so the output stays
 trustworthy, and several apply a lighter standard inside test files — a cast that
 installs a mock is not a claim about the product's types. A test file is one
 under `tests/`, `__tests__/`, `spec/`, `e2e/` or `cypress/` *below the project
-root* (the nearest `package.json`, tsconfig or `.git`), or one named
+root* (the outermost `package.json` or tsconfig inside the checkout, bounded by
+the first `.git`), or one named
 `*.test.*` / `*.spec.*` — where the checkout itself lives does not change the
 classification.
 
