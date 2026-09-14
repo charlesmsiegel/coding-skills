@@ -201,3 +201,26 @@ def test_generated_files_are_recognized_by_header_only(common, tmp_path, head, e
     path = tmp_path / "gen.ts"
     path.write_text(head + "export const x = 1;\n", encoding="utf-8")
     assert common.is_generated_file(path) is expected
+
+
+def test_project_root_is_resolved_once_per_directory(common, tmp_path, monkeypatch):
+    """Every detector asks for the root of every file it touches, and the answer
+    is a property of the directory, not of the file. Walking the ancestors again
+    per file doubles the filesystem work of a whole-tree run."""
+    repo = tmp_path / "repo"
+    (repo / "src").mkdir(parents=True)
+    (repo / "package.json").write_text('{"name": "repo"}')
+    first = repo / "src" / "a.ts"
+    second = repo / "src" / "b.ts"
+    for path in (first, second):
+        path.write_text("export const a = 1;\n")
+
+    probes = []
+    real_exists = Path.exists
+    monkeypatch.setattr(Path, "exists", lambda self: (probes.append(self), real_exists(self))[1])
+
+    assert common.project_root_of(first) == repo
+    assert probes, "the first call must actually walk the ancestors"
+    probes.clear()
+    assert common.project_root_of(second) == repo
+    assert probes == [], "the second file in the same directory re-walked the tree"
