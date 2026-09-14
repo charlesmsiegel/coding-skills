@@ -82,7 +82,18 @@ def analyze(root: Path, ignore: set[str], _args) -> list[Finding]:
             edge_lines.setdefault((path, target), line)
         graph[path] = targets
 
+    # Generated files stay in the graph — a cycle that runs through one is still
+    # a cycle — but the finding is anchored on a member the reader may edit. A
+    # cycle entirely inside tool-owned files is the generator's bug, not this
+    # checkout's, so it is not reported here at all.
+    owned_by_a_tool = set(project.generated)
     for cycle in _find_cycles(graph)[:20]:
+        editable = [p for p in cycle if p not in owned_by_a_tool]
+        if not editable:
+            continue
+        # Rotated so the cycle reads from the file the finding is filed against.
+        start = cycle.index(editable[0])
+        cycle = cycle[start:] + cycle[:start]
         names = [_relative(project.root, p) for p in cycle]
         head = cycle[0]
         add(head, edge_lines.get((cycle[-1], head), 1), "import_cycle",
@@ -92,7 +103,7 @@ def analyze(root: Path, ignore: set[str], _args) -> list[Finding]:
             "initialised module, and which side loses depends on the bundler's entry order.",
             "high" if len(cycle) <= 3 else "medium")
 
-    for path, tsfile in project.files.items():
+    for path, tsfile in project.analyzable.items():
         relative_name = _relative(project.root, path)
         if is_test_file(path):
             continue

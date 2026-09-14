@@ -43,12 +43,25 @@ class Project:
     generated: list[Path] = field(default_factory=list)
 
     @property
+    def analyzable(self) -> dict[Path, TsFile]:
+        """`files` minus the tool-owned ones: every legitimate finding LOCATION.
+
+        A generated file stays in `files` because its imports, exports and graph
+        edges are real evidence — a runtime package imported only by a generated
+        API client is genuinely used, and a module a generated barrel re-exports
+        is genuinely referenced. What it is not is somewhere to report a defect:
+        nobody edits it, and the bug (if any) belongs to the generator.
+        """
+        owned = set(self.generated)
+        return {path: tsfile for path, tsfile in self.files.items() if path not in owned}
+
+    @property
     def sources(self) -> list[Path]:
-        return [p for p in self.files if not is_test_file(p)]
+        return [p for p in self.analyzable if not is_test_file(p)]
 
     @property
     def tests(self) -> list[Path]:
-        return [p for p in self.files if is_test_file(p)]
+        return [p for p in self.analyzable if is_test_file(p)]
 
     def resolve(self, importer: Path, specifier: str) -> Path | None:
         """The file a specifier points at, or None when it is external."""
@@ -165,9 +178,12 @@ def _build_project(root: Path, quiet: bool) -> Project:
     project = Project(root=root, aliases=_load_aliases(root) if root.is_dir() else {})
     for path in find_ts_files(root):
         resolved = path.resolve()
+        # A generated file IS parsed into `files`: its imports and exports are
+        # whole-tree evidence, and dropping them made a package only a generated
+        # client imports look unused. `generated` is what keeps it out of
+        # `analyzable`, which is where findings may be located.
         if is_generated_file(path):
             project.generated.append(resolved)
-            continue
         try:
             project.files[resolved] = parse_file(path)
         except TsSyntaxError as exc:

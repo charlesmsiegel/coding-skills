@@ -62,7 +62,7 @@ def _block_windows(tsfile):
 
 def _check_blocks(project, add) -> None:
     seen: dict[str, list[tuple[Path, int]]] = defaultdict(list)
-    for path, tsfile in project.files.items():
+    for path, tsfile in project.analyzable.items():
         # Test files repeat their arrange/act/assert scaffolding on purpose;
         # reporting that buries the duplication in the code under test.
         if is_declaration_file(path) or is_test_file(path):
@@ -112,7 +112,7 @@ def _type_shape(decl) -> str:
 
 def _check_types(project, add) -> None:
     shapes: dict[str, list[tuple[Path, int, str]]] = defaultdict(list)
-    for path, tsfile in project.files.items():
+    for path, tsfile in project.analyzable.items():
         for decl in tsfile.types:
             if decl.kind == "enum" or len(decl.members) < 3:
                 continue
@@ -135,7 +135,7 @@ def _check_types(project, add) -> None:
 
 def _check_literals(project, add) -> None:
     occurrences: dict[str, list[tuple[Path, int]]] = defaultdict(list)
-    for path, tsfile in project.files.items():
+    for path, tsfile in project.analyzable.items():
         if is_test_file(path) or is_declaration_file(path):
             continue
         import_lines = {record.line for record in tsfile.imports}
