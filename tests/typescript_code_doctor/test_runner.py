@@ -252,6 +252,10 @@ def test_generate_report_counts_candidates_and_rejects_invalid_records(project, 
     assert report["summary"]["total_issues"] == 2
     assert report["summary"]["total_candidates"] == 1
     assert "bogus" in report["meta"]["records_rejected"]["types"]
+    # A detector emitting contract-invalid records is a broken detector, and
+    # analyzer_errors is what code-overview's coverage logic reads — so the
+    # category is graded as ungraded rather than as clean.
+    assert "did not satisfy" in report["meta"]["analyzer_errors"]["types"]
 
 
 def test_a_candidate_only_category_earns_no_recommendation(tmp_path, load_module, capsys):
