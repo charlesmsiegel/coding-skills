@@ -791,3 +791,11 @@ export const b = 2;
                    if f["smell_type"] == "todo_marker")
 
     assert lines == [5, 6, 8, 9]
+
+
+@pytest.mark.parametrize("name", ["App.tsx", "worker.mts", "legacy.cts"])
+def test_no_tsconfig_is_reported_for_any_typescript_extension(tmp_path, name):
+    """The `no_tsconfig` gate used to glob `*.ts` only, so a TSX-only repo with
+    no tsconfig was reported clean on the check the guide says to answer first."""
+    root = write(tmp_path, {f"src/{name}": "export const a = 1;\n"})
+    assert "no_tsconfig" in smells(run_detector("find_tsconfig_issues.py", root))

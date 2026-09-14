@@ -18,7 +18,7 @@ import json
 import re
 from pathlib import Path
 
-from common import EXCLUDE_DIRS, Finding, run_tree_detector
+from common import EXCLUDE_DIRS, Finding, find_ts_files, run_tree_detector
 
 # option -> (severity, what it costs to leave it off)
 STRICT_FAMILY = {
@@ -121,12 +121,7 @@ def _configs(root: Path) -> list[Path]:
 
 
 def _has_typescript(root: Path) -> bool:
-    if root.is_file():
-        return root.suffix in (".ts", ".tsx")
-    for candidate in root.rglob("*.ts"):
-        if EXCLUDE_DIRS.isdisjoint(candidate.relative_to(root).parts):
-            return True
-    return False
+    return any(True for _ in find_ts_files(root))
 
 
 def _finding(path: Path, line: int, smell: str, description: str, suggestion: str, severity: str) -> Finding:

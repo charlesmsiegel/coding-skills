@@ -10,6 +10,7 @@ copy-pasted per script; this module is the single copy.
 import argparse
 import contextlib
 import json
+import os
 import sys
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -60,18 +61,32 @@ def configure_output() -> None:
                 reconfigure(errors="replace")
 
 
-def find_ts_files(path: Path) -> Iterator[Path]:
-    """Yield the TypeScript files under ``path``, skipping vendored/built dirs."""
+def walk_tree(path: Path) -> Iterator[Path]:
+    """Yield every regular file under ``path``, pruning vendored/built directories.
+
+    The excluded directories are pruned during the walk rather than filtered
+    after it. `node_modules` holds tens of thousands of files, and `rglob`
+    would traverse and materialize every one of them before the first was
+    discarded — which is the difference between a fast scan and one that
+    appears to hang on an installed checkout. Every other enumeration in this
+    skill goes through here so the pruning rule has one home.
+    """
     if path.is_file():
-        if path.suffix in TS_EXTENSIONS:
-            yield path
+        yield path
         return
     if not path.is_dir():
         return
-    for candidate in sorted(path.rglob("*")):
-        if candidate.suffix not in TS_EXTENSIONS or not candidate.is_file():
-            continue
-        if EXCLUDE_DIRS.isdisjoint(candidate.relative_to(path).parts):
+    for directory, subdirectories, names in os.walk(path):
+        subdirectories[:] = sorted(d for d in subdirectories if d not in EXCLUDE_DIRS)
+        base = Path(directory)
+        for name in sorted(names):
+            yield base / name
+
+
+def find_ts_files(path: Path) -> Iterator[Path]:
+    """Yield the TypeScript files under ``path``, skipping vendored/built dirs."""
+    for candidate in walk_tree(path):
+        if candidate.suffix in TS_EXTENSIONS and candidate.is_file():
             yield candidate
 
 
