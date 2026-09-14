@@ -61,7 +61,7 @@ def configure_output() -> None:
                 reconfigure(errors="replace")
 
 
-def walk_tree(path: Path) -> Iterator[Path]:
+def walk_tree(path: Path, *, keep: frozenset[str] | set[str] = frozenset()) -> Iterator[Path]:
     """Yield every regular file under ``path``, pruning vendored/built directories.
 
     The excluded directories are pruned during the walk rather than filtered
@@ -69,7 +69,10 @@ def walk_tree(path: Path) -> Iterator[Path]:
     would traverse and materialize every one of them before the first was
     discarded — which is the difference between a fast scan and one that
     appears to hang on an installed checkout. Every other enumeration in this
-    skill goes through here so the pruning rule has one home.
+    skill goes through here so the pruning rule has one home. ``keep`` names
+    a directory that is otherwise in `EXCLUDE_DIRS` but should still be
+    descended into here — e.g. a caller looking for coverage reports nested
+    under a package's own `coverage/` directory in a monorepo.
     """
     if path.is_file():
         yield path
@@ -77,7 +80,7 @@ def walk_tree(path: Path) -> Iterator[Path]:
     if not path.is_dir():
         return
     for directory, subdirectories, names in os.walk(path):
-        subdirectories[:] = sorted(d for d in subdirectories if d not in EXCLUDE_DIRS)
+        subdirectories[:] = sorted(d for d in subdirectories if d not in EXCLUDE_DIRS or d in keep)
         base = Path(directory)
         for name in sorted(names):
             yield base / name

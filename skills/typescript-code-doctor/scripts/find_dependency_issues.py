@@ -122,7 +122,12 @@ def analyze(root: Path, ignore: set[str], _args) -> list[Finding]:
         _report_unused(add, manifest, runtime, dev, used_in_source, used_in_tests)
         _report_misplaced(add, manifest, runtime, used_in_source, used_in_tests)
         _report_versions(add, manifest, runtime, dev)
-        _report_lockfiles(add, manifest)
+
+    # Lockfiles are a workspace-wide concern, not a per-package one: npm/yarn/
+    # pnpm workspaces keep a single lockfile at the root by design, so
+    # checking every sub-package's directory would flag each one as missing
+    # a lockfile it was never meant to have.
+    _report_lockfiles(add, packages[0][0])
     return findings
 
 

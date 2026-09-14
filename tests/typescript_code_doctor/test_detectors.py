@@ -826,3 +826,30 @@ def test_the_sixth_manifest_is_reconciled(tmp_path):
     records = run_detector("find_dependency_issues.py", write(tmp_path, files))
     assert any(r["smell_type"] == "unused_dependency" and "left-pad" in r["description"]
                for r in records)
+
+
+def test_workspace_lockfile_is_checked_once_at_the_root(tmp_path):
+    """A workspace's lockfile lives only at the root by design — auditing
+    every sub-package's directory for one used to flag each as missing it."""
+    root = write(tmp_path, {
+        "package.json": json.dumps({"name": "root", "workspaces": ["packages/*"]}),
+        "package-lock.json": "{}",
+        "packages/a/package.json": json.dumps({"name": "a", "dependencies": {}}),
+        "packages/a/index.ts": "export const a = 1;\n",
+        "packages/b/package.json": json.dumps({"name": "b", "dependencies": {}}),
+        "packages/b/index.ts": "export const b = 1;\n",
+    })
+    records = run_detector("find_dependency_issues.py", root)
+    assert not [r for r in records if r["smell_type"] == "no_lockfile"]
+
+
+def test_a_root_with_no_lockfile_is_still_reported_exactly_once(tmp_path):
+    root = write(tmp_path, {
+        "package.json": json.dumps({"name": "root", "workspaces": ["packages/*"]}),
+        "packages/a/package.json": json.dumps({"name": "a", "dependencies": {}}),
+        "packages/a/index.ts": "export const a = 1;\n",
+        "packages/b/package.json": json.dumps({"name": "b", "dependencies": {}}),
+        "packages/b/index.ts": "export const b = 1;\n",
+    })
+    records = run_detector("find_dependency_issues.py", root)
+    assert len([r for r in records if r["smell_type"] == "no_lockfile"]) == 1
