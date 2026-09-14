@@ -82,7 +82,13 @@ def render(title, findings, limit=200):
         lines.append(f"{marker} "
                      f"{f['file']}:{f['line']}  {f['smell_type']}")
         lines.append(f"   {f['description']}")
-        lines.append(f"   → {f['suggestion']}")
+        # A candidate has no fix to print — an empty arrow reads as one that was
+        # forgotten. What it has is the benign readings the reader must rule out.
+        if f.get("suggestion"):
+            lines.append(f"   → {f['suggestion']}")
+        if f.get("kind") == "candidate":
+            for reason in f.get("also_caused_by") or []:
+                lines.append(f"   ? also caused by: {reason}")
     if len(findings) > limit:
         lines.append(f"\n... and {len(findings) - limit} more")
     return "\n".join(lines)

@@ -46,6 +46,12 @@ def run_aggregator_text(target: Path):
     return result.stdout
 
 
+RELATION_WALK = {
+    "shop/templates/a.html":
+        "{% for obj in objects %}{{ obj.owner.profile.name }}{% endfor %}\n",
+}
+
+
 PROJECT = {
     "shop/models.py": "from django.db import models\n\n\n"
                       "class Thing(models.Model):\n"
@@ -165,6 +171,35 @@ def test_text_output_does_not_call_relation_walk_candidates_findings(tmp_path):
     output = run_aggregator_text(project)
     assert "1 candidate(s)" in output
     assert "[CANDIDATE]" in output
+
+
+def arrow_only_lines(output: str) -> list[str]:
+    """Lines whose whole content is the suggestion arrow — a fix that is not there."""
+    return [line for line in output.splitlines() if line.strip() == "→"]
+
+
+def test_a_candidate_renders_its_reasons_instead_of_an_empty_fix(tmp_path):
+    """A candidate carries no fix, so the aggregator must not print an empty one.
+
+    What it has instead is the list of ways healthy code produces the same
+    observation, which is what the reader needs in order to rule them out.
+    """
+    output = run_aggregator_text(build_project(tmp_path / "proj", RELATION_WALK))
+
+    assert "? also caused by:" in output
+    assert not arrow_only_lines(output), "a candidate rendered a fix arrow with nothing after it"
+
+
+def test_a_detectors_own_text_output_renders_candidate_reasons_too(tmp_path):
+    """django_report.render is the surface a single detector prints through."""
+    project = build_project(tmp_path / "proj", RELATION_WALK)
+    result = subprocess.run(
+        [sys.executable, str(SCRIPTS_DIR / "find_template_issues.py"), str(project)],
+        capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=300)
+    assert result.returncode == 0, result.stderr[:500]
+
+    assert "? also caused by:" in result.stdout
+    assert not arrow_only_lines(result.stdout), "a candidate rendered a fix arrow with nothing after it"
 
 
 def test_output_feeds_python_code_doctors_formatter(tmp_path):
