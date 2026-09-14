@@ -861,3 +861,17 @@ def test_a_leftover_is_reported_in_a_repo_cloned_under_tests(tmp_path):
         "src/app.ts": "export function f() { console.log('debug'); return 1; }\n",
     })
     assert "console_leftover" in smells(run_detector("find_debug_leftovers.py", root))
+
+
+def test_a_d_mts_declaration_is_not_scanned_as_implementation(tmp_path):
+    """`.mts` is a supported source extension, so `foo.d.mts` was collected and
+    then fed to every code detector as if it were a module with a body."""
+    root = write(tmp_path, {
+        "package.json": '{"name": "p"}',
+        "src/shapes.d.mts": "export declare function shape(x: any): any;\n",
+        "src/main.ts": "export const m = 1;\n",
+    })
+    records = run_detector("find_type_gaps.py", root)
+    assert not any(r["file"].endswith("shapes.d.mts") for r in records)
+    dead = run_detector("find_dead_code.py", root)
+    assert not any(r["file"].endswith("shapes.d.mts") for r in dead)
