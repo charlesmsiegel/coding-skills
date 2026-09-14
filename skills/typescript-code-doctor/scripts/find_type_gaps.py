@@ -99,7 +99,8 @@ def _check_assertions(file: TsFile, report: Reporter, test: bool) -> None:
                          ("the value was just narrowed by a runtime check the compiler cannot follow",
                           "the assertion sits at a serialization boundary — JSON.parse, a DOM "
                           "lookup — where the shape is known by contract",
-                          "the file is a test installing a double"),
+                          "the assertion widens rather than narrows — `as const`, `as unknown` "
+                          "before a checked narrowing — and cannot hide a shape mismatch"),
                          "low")
 
 
