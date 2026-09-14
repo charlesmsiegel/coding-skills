@@ -37,6 +37,7 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 from collections import defaultdict
 from pathlib import Path
 
@@ -395,6 +396,12 @@ def main():
 
     root = _project_root(Path(args.path).resolve())
     wanted = set(args.tools.split(",")) if args.tools else set(TOOLS)
+    # A name this script does not have is dropped, but never in silence: asking
+    # for a tool that never ran and being told nothing is how an unrun check
+    # reads as a passing one.
+    unknown = sorted(wanted - set(TOOLS))
+    if unknown:
+        print("⚠️  unknown tool(s) ignored: " + ", ".join(unknown), file=sys.stderr)
     wanted = {name for name in wanted if name in TOOLS}
 
     available, missing = {}, []
