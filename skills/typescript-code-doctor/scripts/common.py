@@ -45,6 +45,11 @@ TS_EXTENSIONS = (".ts", ".tsx", ".mts", ".cts")
 TEST_DIR_NAMES = frozenset({"__tests__", "__test__", "test", "tests", "spec", "e2e", "cypress"})
 TEST_NAME_MARKERS = (".test.", ".spec.", "-test.", "_test.")
 
+# Files that mark the top of a project. Test-directory classification is
+# scoped below the nearest one, so where a checkout lives cannot change what
+# it reports.
+ROOT_MARKERS = ("package.json", "tsconfig.json", ".git")
+
 
 def configure_output() -> None:
     """Keep emoji output from crashing narrow console encodings.
@@ -93,12 +98,39 @@ def find_ts_files(path: Path) -> Iterator[Path]:
             yield candidate
 
 
+def project_root_of(filepath: Path) -> Path | None:
+    """The nearest ancestor holding a package.json, a tsconfig, or .git; None if none."""
+    for candidate in filepath.resolve().parents:
+        if any((candidate / marker).exists() for marker in ROOT_MARKERS):
+            return candidate
+        if any(candidate.glob("tsconfig*.json")):
+            return candidate
+    return None
+
+
 def is_test_file(filepath: Path) -> bool:
-    """True when the path names a test file by directory or by suffix."""
+    """True when the path names a test file by directory or by suffix.
+
+    Directory markers are matched *below the project root only*. Every
+    component of an absolute path is the wrong scope: a checkout that happens
+    to live under `/tmp/tests/` would have every one of its files classified
+    as test code, silently suppressing the security and error-handling
+    findings — so the same repo would report differently depending on where
+    it was cloned. Without a root marker every component still counts, which
+    is the old behaviour and the right one for a loose file.
+    """
     name = filepath.name
     if any(marker in name for marker in TEST_NAME_MARKERS):
         return True
-    return not TEST_DIR_NAMES.isdisjoint(p.lower() for p in filepath.parts)
+    root = project_root_of(filepath)
+    if root is not None:
+        try:
+            parts = filepath.resolve().relative_to(root).parts
+        except ValueError:
+            parts = filepath.parts
+    else:
+        parts = filepath.parts
+    return not TEST_DIR_NAMES.isdisjoint(p.lower() for p in parts)
 
 
 def is_declaration_file(filepath: Path) -> bool:

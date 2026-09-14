@@ -124,3 +124,36 @@ def test_text_report_separates_candidates(common, capsys):
     assert "Candidates — unverified leads" in out
     assert out.index("a defect") < out.index("Candidates — unverified leads") < out.index("a lead")
     assert "Also caused by:" in out and "it is a test double" in out
+
+
+def test_a_checkout_under_a_tests_directory_is_not_test_code(common, tmp_path):
+    """Every component of the absolute path is the wrong scope: a repo cloned
+    to /tmp/tests/repo had all of its sources classified as tests, which
+    silenced the security and error-handling findings on exactly those files."""
+    repo = tmp_path / "tests" / "repo"
+    (repo / "src").mkdir(parents=True)
+    (repo / "package.json").write_text('{"name": "repo"}')
+    source = repo / "src" / "app.ts"
+    source.write_text("export const a = 1;\n")
+    assert common.project_root_of(source) == repo
+    assert not common.is_test_file(source)
+
+
+def test_test_directories_below_the_root_still_classify(common, tmp_path):
+    repo = tmp_path / "repo"
+    for rel in ("tests/a.ts", "src/__tests__/b.ts", "e2e/c.ts", "src/d.test.ts", "src/e.spec.tsx"):
+        path = repo / rel
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("export {};\n")
+    (repo / "tsconfig.json").write_text("{}")
+    for rel in ("tests/a.ts", "src/__tests__/b.ts", "e2e/c.ts", "src/d.test.ts", "src/e.spec.tsx"):
+        assert common.is_test_file(repo / rel), rel
+    assert not common.is_test_file(repo / "src" / "f.ts")
+
+
+def test_without_a_root_marker_every_component_counts(common, tmp_path):
+    loose = tmp_path / "spec" / "loose.ts"
+    loose.parent.mkdir(parents=True)
+    loose.write_text("export {};\n")
+    assert common.project_root_of(loose) is None
+    assert common.is_test_file(loose)

@@ -853,3 +853,11 @@ def test_a_root_with_no_lockfile_is_still_reported_exactly_once(tmp_path):
     })
     records = run_detector("find_dependency_issues.py", root)
     assert len([r for r in records if r["smell_type"] == "no_lockfile"]) == 1
+
+
+def test_a_leftover_is_reported_in_a_repo_cloned_under_tests(tmp_path):
+    root = write(tmp_path / "tests" / "repo", {
+        "package.json": '{"name": "repo"}',
+        "src/app.ts": "export function f() { console.log('debug'); return 1; }\n",
+    })
+    assert "console_leftover" in smells(run_detector("find_debug_leftovers.py", root))
