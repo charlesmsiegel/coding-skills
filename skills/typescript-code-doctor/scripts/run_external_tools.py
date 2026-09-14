@@ -32,6 +32,7 @@ Usage:
 """
 
 import argparse
+import contextlib
 import json
 import os
 import re
@@ -245,7 +246,11 @@ def _audit_argv(root: Path) -> tuple[str, list[str]] | None:
     if inv is None:
         return None
     if manager == "yarn" and _is_yarn_berry(root):
-        return manager, [*inv, "npm", "audit", "--json"]   # Yarn Berry
+        # Berry's default scope is the active workspace's DIRECT dependencies.
+        # A whole-project report cannot call that "audited": `--all` takes in
+        # every workspace and `--recursive` the transitive tree, which is where
+        # most advisories live.
+        return manager, [*inv, "npm", "audit", "--all", "--recursive", "--json"]
     return manager, [*inv, "audit", "--json"]
 
 
@@ -281,31 +286,68 @@ def run_audit(_inv, root):
     returncode, out, err = _run(argv, root, timeout=600)
     if returncode is None or not (out or "").strip():
         return [_tool_error(f"{manager}-audit", root, returncode, err or out)]
-    manifest = root / "package.json"
-    findings = []
-    try:
-        data = json.loads(out)
-    except json.JSONDecodeError:
-        # yarn emits newline-delimited JSON; take the advisory objects out of it.
-        for line in out.splitlines():
-            try:
-                record = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            advisory = (record.get("data") or {}).get("advisory")
-            if advisory:
-                findings.append(_advisory_finding(manager, manifest, advisory.get("module_name"),
-                                                  advisory.get("severity"), advisory.get("title", ""),
-                                                  advisory.get("url", "")))
-        return findings or [_tool_error(f"{manager}-audit", root, returncode, "unparseable output")]
+    findings = _parse_audit(manager, root / "package.json", out)
+    if findings is None:
+        return [_tool_error(f"{manager}-audit", root, returncode, "unparseable output")]
+    return findings
 
-    for name, entry in (data.get("vulnerabilities") or {}).items():
-        via = entry.get("via") or []
-        titles = [v.get("title", "") for v in via if isinstance(v, dict)]
-        urls = [v.get("url", "") for v in via if isinstance(v, dict)]
-        findings.append(_advisory_finding(manager, manifest, name, entry.get("severity"),
-                                          titles[0] if titles else "known advisory",
-                                          urls[0] if urls else ""))
+
+def _parse_audit(manager, manifest, out) -> list[dict] | None:
+    """The advisories in whichever shape this manager writes; None if it is not JSON.
+
+    There are four shapes, and reading only npm's made a pnpm audit full of
+    advisories come back empty — which the report then showed as clean:
+
+    - npm 7+: one object, `vulnerabilities` keyed by package name.
+    - pnpm, and Yarn 2/3: npm 6's shape — one object, `advisories` keyed by
+      advisory id, the package named in `module_name`.
+    - Yarn 1: one object per line, each advisory under `data.advisory` in that
+      npm 6 form (plus an `auditSummary` line, which is not an advisory).
+    - Yarn 4: one object per line, `{"value": <package>, "children": {"ID",
+      "Issue", "URL", "Severity", ...}}`.
+
+    An output that parses but holds no advisory is a clean audit, not an
+    unparseable one: Yarn 1's summary-only output is what "nothing found" looks
+    like there.
+    """
+    try:
+        documents = [json.loads(out)]
+    except json.JSONDecodeError:
+        documents = []
+        for line in out.splitlines():
+            with contextlib.suppress(json.JSONDecodeError):
+                documents.append(json.loads(line))
+        if not documents:
+            return None
+
+    findings = []
+
+    def npm6_advisory(advisory):
+        findings.append(_advisory_finding(manager, manifest, advisory.get("module_name"),
+                                          advisory.get("severity"), advisory.get("title", ""),
+                                          advisory.get("url", "")))
+
+    for document in documents:
+        if not isinstance(document, dict):
+            continue
+        for name, entry in (document.get("vulnerabilities") or {}).items():       # npm 7+
+            via = entry.get("via") or []
+            titles = [v.get("title", "") for v in via if isinstance(v, dict)]
+            urls = [v.get("url", "") for v in via if isinstance(v, dict)]
+            findings.append(_advisory_finding(manager, manifest, name, entry.get("severity"),
+                                              titles[0] if titles else "known advisory",
+                                              urls[0] if urls else ""))
+        for advisory in (document.get("advisories") or {}).values():             # pnpm, Yarn 2/3
+            if isinstance(advisory, dict):
+                npm6_advisory(advisory)
+        data = document.get("data")                                              # Yarn 1
+        if isinstance(data, dict) and isinstance(data.get("advisory"), dict):
+            npm6_advisory(data["advisory"])
+        children = document.get("children")                                      # Yarn 4
+        if isinstance(children, dict) and "Severity" in children and "value" in document:
+            findings.append(_advisory_finding(manager, manifest, document["value"],
+                                              children.get("Severity"), children.get("Issue", ""),
+                                              children.get("URL", "")))
     return findings
 
 
