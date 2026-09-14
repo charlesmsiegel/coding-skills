@@ -93,6 +93,17 @@ def signature_changes(fd):
     return changed, deleted, new
 
 
+def _authors(commits: list[dict]) -> list[dict]:
+    """Who made the change: most commits first, ties in order of first appearance."""
+    counts: dict[str, int] = {}
+    for commit in commits:
+        if commit["author"]:
+            counts[commit["author"]] = counts.get(commit["author"], 0) + 1
+    order = list(counts)
+    return [{"name": name, "commits": counts[name]}
+            for name in sorted(order, key=lambda n: (-counts[n], order.index(n)))]
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("repo")
@@ -117,8 +128,12 @@ def main() -> int:
     else:
         raw = git(repo, "-c", "core.quotepath=false", "diff", "--no-color", f"{merge_base}..{args.head}")
         head_desc = args.head
-        commits = [line for line in git(repo, "log", "--oneline", f"{merge_base}..{args.head}").splitlines()
-                   if line.strip()]
+        commits = []
+        for line in git(repo, "log", "--format=%h%x1f%an%x1f%s", f"{merge_base}..{args.head}").splitlines():
+            if not line.strip():
+                continue
+            sha, author, subject = (line.split("\x1f", 2) + ["", ""])[:3]
+            commits.append({"sha": sha, "author": author, "subject": subject})
 
     fds = parse_diff(raw)
     if args.worktree:
@@ -245,7 +260,10 @@ def main() -> int:
 
     commits_html = ""
     if commits:
-        li = "".join(f"<li><code>{esc(c.split(' ',1)[0])}</code> {esc(c.split(' ',1)[1] if ' ' in c else '')}</li>" for c in commits[:30])
+        li = "".join(
+            f"<li><code>{esc(c['sha'])}</code> {esc(c['subject'])} "
+            f"<span class='dim'>— {esc(c['author'])}</span></li>"
+            for c in commits[:30])
         commits_html = f"<details><summary>{len(commits)} commit{'s' if len(commits)!=1 else ''} in range</summary><div class='body'><ul>{li}</ul></div></details>"
 
     body = f"""
@@ -433,6 +451,7 @@ def main() -> int:
         "base": base, "merge_base": merge_base[:12], "head": head_desc, "note": note,
         "excluded_generated_docs": excluded_docs,
         "commits": len(commits) if commits else None,
+        "authors": _authors(commits),
         "totals": {"files": len(fds), "additions": total_add, "deletions": total_del,
                    "directories": spread, "shape": shape},
         "by_category": {c: len(by_cat[c]) for c in cat_order},
