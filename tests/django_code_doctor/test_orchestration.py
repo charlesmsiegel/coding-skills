@@ -245,6 +245,27 @@ def test_the_diff_lens_reports_only_changed_lines(git_project):
     assert "old.py" not in files, "the diff lens reported untouched legacy code"
 
 
+def test_the_diff_lens_renders_a_candidates_reasons_instead_of_an_empty_fix(git_project):
+    """A candidate carries no fix, so the diff lens must not print an empty one.
+
+    What it has instead is the benign readings the reader must rule out, and it
+    is marked as a lead rather than given a severity icon it did not earn.
+    """
+    template = git_project / "shop" / "templates"
+    template.mkdir(parents=True, exist_ok=True)
+    (template / "a.html").write_text(
+        "{% for obj in objects %}{{ obj.owner.profile.name }}{% endfor %}\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(git_project), "add", "-A"], capture_output=True, timeout=120)
+
+    output = run("analyze_diff.py", "--path", git_project).stdout
+    assert "relation_walk_in_loop" in output, "the fixture must reach the renderer"
+
+    assert "[CANDIDATE]" in output
+    assert "? also caused by:" in output
+    assert [line for line in output.splitlines() if line.strip() == "→"] == [], \
+        "a candidate rendered a fix arrow with nothing after it"
+
+
 def test_the_diff_lens_names_what_it_did_not_run(git_project):
     output = run("analyze_diff.py", "--path", git_project).stdout
     # Silence about a whole-tree category must not read as a clean bill of health.
