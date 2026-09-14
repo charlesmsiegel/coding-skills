@@ -1116,3 +1116,20 @@ def test_a_pnpm_workspace_named_like_a_test_directory_is_still_reconciled(tmp_pa
 
     unpinned = [r for r in records if r["smell_type"] == "unpinned_dependency"]
     assert unpinned and Path(unpinned[0]["file"]).as_posix().endswith("packages/e2e/package.json")
+
+
+@pytest.mark.parametrize("workspaces", [["/apps/*"], "apps/*", {"packages": ["/x"]}, [42]],
+                         ids=["absolute", "bare-string", "yarn-object-absolute", "non-string"])
+def test_a_malformed_workspaces_field_does_not_crash_reconciliation(tmp_path, workspaces):
+    """`Path.glob` raises NotImplementedError on an absolute pattern; a bare
+    string is one pattern, not a list of its characters. Neither may take the
+    whole detector down — the manifest is still reconciled."""
+    root = write(tmp_path, {
+        "package.json": json.dumps({"name": "root", "workspaces": workspaces,
+                                    "dependencies": {"left-pad": "*"}}),
+        "package-lock.json": "{}",
+        "src/main.ts": "import pad from 'left-pad';\nexport const m = pad;\n",
+    })
+    records = run_detector("find_dependency_issues.py", root)
+
+    assert "unpinned_dependency" in smells(records)

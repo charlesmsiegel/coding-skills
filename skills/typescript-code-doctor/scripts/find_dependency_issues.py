@@ -198,15 +198,19 @@ def _declared_workspaces(manifest: Path, package: dict) -> set[Path]:
     patterns = package.get("workspaces") or []
     if isinstance(patterns, dict):          # yarn's {"packages": [...], "nohoist": [...]}
         patterns = patterns.get("packages") or []
+    if isinstance(patterns, str):           # a bare string is a single pattern, not its characters
+        patterns = [patterns]
     patterns = [p for p in patterns if isinstance(p, str)]
     pnpm = manifest.parent / "pnpm-workspace.yaml"
     if pnpm.is_file():
         patterns.extend(_pnpm_workspace_patterns(pnpm))
     found: set[Path] = set()
     for pattern in patterns:
-        if pattern.startswith("!"):
+        # Negations only narrow; an absolute pattern is not a workspace glob
+        # (and pathlib raises NotImplementedError on it, not ValueError).
+        if pattern.startswith(("!", "/")) or pattern.startswith("\\"):
             continue
-        with contextlib.suppress(OSError, ValueError):
+        with contextlib.suppress(OSError, ValueError, NotImplementedError):
             found.update(match.resolve() for match in manifest.parent.glob(pattern.rstrip("/"))
                          if match.is_dir())
     return found
