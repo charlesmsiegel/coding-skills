@@ -16,7 +16,7 @@ import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from common import EXCLUDE_DIRS, TS_EXTENSIONS, find_ts_files, is_test_file, warn_unparseable
+from common import TS_EXTENSIONS, find_ts_files, is_test_file, walk_tree, warn_unparseable
 from find_tsconfig_issues import load_jsonc
 from tsparse import TsFile, TsSyntaxError, parse_file
 
@@ -90,9 +90,9 @@ class Project:
 def _load_aliases(root: Path) -> dict[str, list[Path]]:
     """tsconfig `paths` as prefix -> directories, so `@app/x` resolves."""
     aliases: dict[str, list[Path]] = {}
-    configs = [p for p in root.rglob("tsconfig*.json")
-               if EXCLUDE_DIRS.isdisjoint(p.relative_to(root).parts)] if root.is_dir() else []
-    for config in sorted(configs, key=lambda p: len(p.relative_to(root).parts))[:5]:
+    configs = [p for p in walk_tree(root)
+               if p.name.startswith("tsconfig") and p.suffix == ".json"] if root.is_dir() else []
+    for config in sorted(configs, key=lambda p: (len(p.relative_to(root).parts), str(p))):
         data = load_jsonc(config) or {}
         options = data.get("compilerOptions") or {}
         if not isinstance(options, dict):
@@ -177,11 +177,11 @@ def read_package_json(root: Path) -> tuple[Path | None, dict]:
     """The nearest package.json and its parsed contents."""
     if root.is_file():
         root = root.parent
-    for candidate in [root, *sorted(root.rglob("package.json"), key=lambda p: len(p.parts))[:3]]:
-        manifest = candidate if candidate.name == "package.json" else candidate / "package.json"
+    candidates = [root / "package.json"] + sorted(
+        (p for p in walk_tree(root) if p.name == "package.json"),
+        key=lambda p: (len(p.relative_to(root).parts), str(p)))
+    for manifest in candidates:
         if not manifest.is_file():
-            continue
-        if not EXCLUDE_DIRS.isdisjoint(manifest.parts):
             continue
         try:
             return manifest, json.loads(manifest.read_text(encoding="utf-8-sig", errors="replace"))
