@@ -209,8 +209,13 @@ def print_text_report(report: dict):
         print(f"   [{issue['category']}] {issue.get('issue_type', issue.get('smell_type', issue.get('pattern_type', '?')))}")
         if 'description' in issue:
             print(f"   {issue['description']}")
-        if 'suggestion' in issue:
+        # A candidate has no fix to print — an empty arrow reads as one that was
+        # forgotten. What it has is the benign readings the reader must rule out.
+        if issue.get('suggestion'):
             print(f"   → {issue['suggestion']}")
+        if issue.get('kind') == 'candidate':
+            for reason in issue.get('also_caused_by') or []:
+                print(f"   ? also caused by: {reason}")
 
     # A candidate is kept out of this list on purpose. It is printed under its
     # own heading below with what to check, because listing a lead among the

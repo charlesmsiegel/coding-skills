@@ -29,6 +29,21 @@ def run_detector(script: str, target: Path, *extra: str) -> list[dict]:
     return json.loads(result.stdout)
 
 
+def run_detector_text(script: str, target: Path, *extra: str) -> str:
+    """One detector's human-readable output — the other half of every CLI."""
+    result = subprocess.run(
+        [sys.executable, str(SCRIPTS_DIR / script), str(target), *extra],
+        capture_output=True, text=True, timeout=120,
+    )
+    assert result.returncode == 0, f"{script} exited {result.returncode}: {result.stderr[:500]}"
+    return result.stdout
+
+
+def arrow_only_lines(output: str) -> list[str]:
+    """Lines whose whole content is the suggestion arrow — a fix that is not there."""
+    return [line for line in output.splitlines() if line.strip() == "→"]
+
+
 def smell_types(findings: list[dict]) -> set[str]:
     return {f["smell_type"] for f in findings}
 
@@ -621,6 +636,18 @@ def test_a_dynamic_pragma_is_a_candidate_not_an_injection_finding(tmp_path):
     assert "PRAGMA" in findings[0]["description"]
     assert findings[0]["also_caused_by"], "a candidate names how healthy code produces it"
     assert not findings[0]["suggestion"], "a candidate carries what to confirm, not a fix"
+
+
+def test_a_pragma_candidates_text_output_shows_reasons_not_an_empty_fix(tmp_path):
+    """The human-readable half of the same record: no fix to print, reasons to print."""
+    (tmp_path / "sample.py").write_text(
+        "def describe(conn, table):\n"
+        '    return conn.execute(f"PRAGMA table_info({table})").fetchall()\n'
+    )
+    output = run_detector_text("find_security_issues.py", tmp_path)
+
+    assert "? also caused by:" in output
+    assert not arrow_only_lines(output), "a candidate rendered a fix arrow with nothing after it"
 
 
 @pytest.mark.parametrize("statement", [
@@ -3714,6 +3741,27 @@ def test_analyze_all_counts_candidates_and_lists_them_separately(tmp_path):
     assert "Address security risks" not in text, (
         "the recommendation tells someone to fix eval/exec and shell=True; nothing found one"
     )
+
+
+def test_the_candidates_section_prints_reasons_instead_of_an_empty_fix(tmp_path):
+    """A candidate has no fix, so the report must not print an empty arrow for one.
+
+    What the reader needs under that heading is the benign explanations to rule
+    out, which is the only thing the record carries in place of a fix.
+    """
+    (tmp_path / "db.py").write_text(
+        "def describe(conn, table):\n"
+        '    return conn.execute(f"PRAGMA table_info({table})").fetchall()\n'
+    )
+
+    text = subprocess.run(
+        [sys.executable, str(SCRIPTS_DIR / "analyze_all.py"), str(tmp_path),
+         "--skip-duplicates"],
+        capture_output=True, text=True, timeout=300, check=True).stdout
+    _, _, candidates = text.partition("❓ CANDIDATES")
+
+    assert "? also caused by:" in candidates
+    assert not arrow_only_lines(text), "a candidate rendered a fix arrow with nothing after it"
 
 
 # run_external_tools lives in tests/python_code_doctor/test_external_tools.py —
