@@ -209,9 +209,11 @@ Four of these answer questions the detectors structurally **cannot**:
 
 **When a tool is missing, ask before installing.** The script never installs
 anything and never runs `npx` in download mode; it lists each absent tool with an
-`npm install --save-dev` hint under `missing_tools`. When that list is non-empty
-and the tools would help, **ask the user whether to install them** (e.g. via the
-AskUserQuestion tool) and only install on confirmation.
+`npm install --save-dev` hint under `missing_tools` — except `audit`, whose hint
+names the package manager the lockfile calls for, since that is what is missing.
+When that list is non-empty and the tools would help, **ask the user whether to
+install them** (e.g. via the AskUserQuestion tool) and only install on
+confirmation.
 
 ## Reviewing a change request (diff lens)
 

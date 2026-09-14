@@ -231,13 +231,30 @@ def _package_manager(root: Path) -> str:
     return "npm"
 
 
-def run_audit(inv, root):
-    """Known advisories against the installed dependency tree."""
+def _audit_argv(root: Path) -> tuple[str, list[str]] | None:
+    """The manager the lockfile names, and the audit command for *that* manager.
+
+    Resolved independently of the `npm` binary: a pnpm project is audited by
+    pnpm, a yarn project by yarn, and when that executable is not installed
+    the audit is reported missing rather than run under a different manager
+    and labelled as this one.
+    """
     manager = _package_manager(root)
-    if manager == "yarn":
-        argv = [*inv, "npm", "audit", "--json"]
-    else:
-        argv = [*inv, "audit", "--json"]
+    inv = _invocation(root, manager)
+    if inv is None:
+        return None
+    if manager == "yarn" and (root / ".yarnrc.yml").is_file():
+        return manager, [*inv, "npm", "audit", "--json"]   # Yarn Berry
+    return manager, [*inv, "audit", "--json"]
+
+
+def run_audit(_inv, root):
+    """Known advisories against the installed dependency tree."""
+    resolved = _audit_argv(root)
+    if resolved is None:
+        manager = _package_manager(root)
+        return [_tool_error(f"{manager}-audit", root, None, f"{manager} is not installed")]
+    manager, argv = resolved
     returncode, out, err = _run(argv, root, timeout=600)
     if returncode is None or not (out or "").strip():
         return [_tool_error(f"{manager}-audit", root, returncode, err or out)]
@@ -332,7 +349,7 @@ TOOLS = {
     "prettier": ("prettier", run_prettier, ["--write", "."]),
     "madge":    ("madge", run_madge, None),
     "knip":     ("knip", run_knip, None),
-    "npm":      ("npm (ships with node)", run_audit, None),
+    "audit":    ("the package manager named by the lockfile", run_audit, None),
     "coverage": ("vitest/jest with coverage enabled", run_coverage, None),
 }
 
@@ -386,6 +403,15 @@ def main():
             continue
         if name == "coverage":
             available[name] = []  # a reader over files on disk, not an executable
+            continue
+        if name == "audit":
+            resolved = _audit_argv(root)
+            if resolved:
+                available[name] = resolved[1]
+            else:
+                manager = _package_manager(root)
+                missing.append({"name": name, "install": f"install {manager} (it is not on PATH "
+                                                          f"or in node_modules/.bin)"})
             continue
         inv = _invocation(root, name)
         if inv:
