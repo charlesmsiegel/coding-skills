@@ -300,3 +300,25 @@ def test_the_diff_lens_marks_a_candidate_as_a_lead_not_a_ranked_defect(load_modu
         "a candidate rendered a fix arrow with nothing after it"
     assert "1 finding(s), 1 candidate(s)" in out, \
         "the count line still calls every record a finding"
+
+
+def test_a_candidate_only_category_earns_no_recommendation(tmp_path, load_module, capsys):
+    """RECOMMENDATIONS tells the reader to change code. A category whose only
+    record is an unverified lead has not earned an instruction."""
+    module = load_module(SCRIPTS_DIR, "analyze_all")
+    report = {
+        "meta": {"analyzed_path": str(tmp_path), "timestamp": "t",
+                 "analyzers_run": ["type_issues"], "analyzers_skipped": [], "analyzer_errors": {}},
+        "summary": {"total_issues": 1, "total_candidates": 1,
+                    "by_severity": {"high": 0, "medium": 0, "low": 1},
+                    "by_category": {"type_issues": 1}},
+        "categories": {"type_issues": {"count": 1, "issues": [
+            {"file": "a.rs", "line": 2, "smell_type": "narrowing_cast", "description": "a lead",
+             "suggestion": "", "severity": "low", "kind": "candidate", "category": "type_issues",
+             "also_caused_by": ["the range was checked by the caller"]},
+        ]}},
+    }
+    module.print_text_report(report)
+    out = capsys.readouterr().out
+    assert module.RECOMMENDATIONS["type_issues"] not in out, \
+        "a lead bought advice about a defect nothing found"
