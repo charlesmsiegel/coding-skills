@@ -14,36 +14,43 @@ A detector is:
         sys.exit(run("find_x", "what it looks for", collect))
 
 Records match python-code-doctor's shape exactly: file, line, smell_type,
-description, suggestion, severity. Unproven leads additionally carry
-``kind: candidate`` so code-overview can show them without grading them.
+description, suggestion, severity, and an always-present ``kind``. A finding
+carries a fix; an unproven lead carries ``kind: candidate``, no fix, and the
+benign readings in ``also_caused_by``, so code-overview can show it without
+grading it.
 """
 
 import json
 import argparse
 from collections import defaultdict
+from dataclasses import asdict
 
-from common import SEVERITY_ICONS, configure_output
+from common import SEVERITY_ICONS, Finding, configure_output
 from django_context import build_context
 
 SEVERITY_RANK = {"high": 0, "medium": 1, "low": 2}
 
 
 def finding(file, line, smell_type, description, suggestion, severity):
-    return {
-        "file": str(file),
-        "line": line or 1,
-        "smell_type": smell_type,
-        "description": description,
-        "suggestion": suggestion,
-        "severity": severity,
-    }
+    record = Finding(file=str(file), line=line or 1, smell_type=smell_type,
+                     description=description, suggestion=suggestion, severity=severity)
+    return _emit(record)
 
 
-def candidate(file, line, smell_type, description, suggestion, severity, also_caused_by=()):
-    record = finding(file, line, smell_type, description, suggestion, severity)
-    record["kind"] = "candidate"
-    record["also_caused_by"] = list(also_caused_by)
-    return record
+def candidate(file, line, smell_type, description, also_caused_by, severity):
+    record = Finding(file=str(file), line=line or 1, smell_type=smell_type,
+                     description=description, also_caused_by=tuple(also_caused_by),
+                     severity=severity, kind="candidate")
+    return _emit(record)
+
+
+def _emit(record):
+    """The dict shape every django detector has always returned, with the
+    tuple fields serialised as lists and `kind` always present."""
+    out = asdict(record)
+    out["also_caused_by"] = list(record.also_caused_by)
+    out["related_lines"] = list(record.related_lines)
+    return out
 
 
 def render(title, findings, limit=200):

@@ -118,9 +118,9 @@ def test_form_wrappers_only_report_nested_domain_relations(tmp_path):
                                  "{% endfor %}\n",
     })
     hits = relation_walks(run_detector("find_template_issues.py", project))
-    assert [(f["line"], f["suggestion"]) for f in hits] == [
-        (5, "select_related/prefetch_related 'owner__profile' on the queryset the view passes in."),
-    ]
+    assert [f["line"] for f in hits] == [5]
+    assert not hits[0]["suggestion"], "a candidate carries what to confirm, not a fix"
+    assert any("prefetch_related" in reason for reason in hits[0]["also_caused_by"])
 
 
 def test_scalar_and_file_value_accesses_are_not_relations(tmp_path):
@@ -141,8 +141,9 @@ def test_genuine_nested_model_relations_still_report(tmp_path):
     })
     hits = relation_walks(run_detector("find_template_issues.py", project))
     assert len(hits) == 2
-    assert {hit["kind"] for hit in hits} == {"candidate"}
     assert all("already loaded" in hit["also_caused_by"][0] for hit in hits)
+    assert all(r["kind"] == "candidate" and r["also_caused_by"] and not r["suggestion"]
+               for r in hits)
 
 
 def test_a_clean_template_produces_nothing(tmp_path):

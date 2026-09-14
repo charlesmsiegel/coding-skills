@@ -39,11 +39,13 @@ class CodeSmell:
     severity: str
     code_snippet: str = ""
     # A scored defect by default. Set to "candidate" for a lead the downstream
-    # merge must NOT score. Stripped from JSON when None so a genuine finding
-    # stays a plain finding. Used for interpolation that is not provably unsafe
-    # here: a PRAGMA takes no bound parameters, so a dynamic-table PRAGMA can
-    # only be written by interpolation and is not, on its own, injection.
-    kind: str | None = None
+    # merge must NOT score — a candidate carries no fix and names, in
+    # also_caused_by, the ways a healthy codebase produces the same
+    # observation. Used for interpolation that is not provably unsafe here: a
+    # PRAGMA takes no bound parameters, so a dynamic-table PRAGMA can only be
+    # written by interpolation and is not, on its own, injection.
+    kind: str = "finding"
+    also_caused_by: tuple[str, ...] = ()
 
 
 # Names whose assignment to a plain string literal suggests a hardcoded secret
@@ -180,10 +182,11 @@ _SUBPROCESS_FUNCS = {"run", "call", "check_call", "check_output", "Popen"}
 def detect(tree, filename, lines, ignore):
     issues = []
 
-    def add(line, st, desc, sug, sev, kind=None):
+    def add(line, st, desc, sug, sev, kind="finding", also_caused_by=()):
         if st in ignore:
             return
-        issues.append(CodeSmell(filename, line, st, desc, sug, sev, _get_line(lines, line), kind))
+        issues.append(CodeSmell(filename, line, st, desc, sug, sev, _get_line(lines, line),
+                                kind, tuple(also_caused_by)))
 
     for node in ast.walk(tree):
 
@@ -213,10 +216,13 @@ def detect(tree, filename, lines, ignore):
                     # than a scored SQL-injection finding.
                     add(node.lineno, "sql_injection",
                         f"Call to .{func.attr}() interpolates a value into a PRAGMA statement",
-                        "PRAGMA accepts no bound parameters, so a dynamic identifier can only be "
-                        "interpolated. Confirm the interpolated value is not attacker-controlled "
-                        "(e.g. validate a table name against a known set).",
-                        "high", kind="candidate")
+                        "", "high", kind="candidate",
+                        also_caused_by=(
+                            "PRAGMA accepts no bound parameters, so a dynamic identifier can "
+                            "only be interpolated — this is the only spelling",
+                            "the interpolated value is validated against a known set of table "
+                            "names before it reaches the statement",
+                        ))
                 else:
                     add(node.lineno, "sql_injection",
                         f"Call to .{func.attr}() passes a dynamically built SQL string",
@@ -419,12 +425,11 @@ def analyze_file(filepath: Path, ignore: set) -> list:
 def to_record(issue: "CodeSmell") -> dict:
     """The JSON shape this detector emits, shared with the runner.
 
-    `kind` is dropped when unset rather than serialised as null: a null there
-    would read as "this record was classified and came back neither".
+    `kind` is always present, so a consumer never has to read an absent key as
+    a classification; the reasons tuple serialises as a list.
     """
     record = asdict(issue)
-    if record.get("kind") is None:
-        record.pop("kind", None)
+    record["also_caused_by"] = list(record["also_caused_by"])
     return record
 
 
@@ -443,8 +448,8 @@ def main():
     sort_findings(all_issues)
 
     if args.format == "json":
-        # `kind` is stripped unless set to "candidate", so a scored finding
-        # carries no key and the downstream merge scores it as a defect.
+        # `kind` is always present — "finding" for a scored defect, "candidate"
+        # for a lead the downstream merge must not score.
         print(json.dumps([to_record(i) for i in all_issues], indent=2))
     else:
         if not all_issues:
