@@ -75,7 +75,8 @@ def _check_interfaces(tsfile, path: Path, implementers, lead) -> None:
              f"({where.name})",
              ("a second implementation lives in test code or in a package this scan did not load",
               "the interface is a library's public contract and the class is one vendor of it",
-              "the interface exists so a test double can be written without importing the class"),
+              "the interface is declaration-merged or augmented elsewhere — a `declare module` "
+              "block, a `.d.ts` — which a syntax scan cannot see"),
              "medium")
 
 
