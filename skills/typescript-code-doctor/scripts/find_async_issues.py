@@ -185,11 +185,12 @@ def _check_await_in_loop(file: TsFile, report: Reporter) -> None:
         awaits = [i for i in range(cursor, close)
                   if file.tokens[i].is_name("await") and _same_function(file, i, cursor)]
         if awaits:
-            report.add(token.line, "await_in_loop",
-                       f"`await` inside a {token.value} loop — {len(awaits)} sequential round trip(s) per iteration",
-                       "If the iterations are independent, collect the promises and "
-                       "`await Promise.all(...)` once. If each iteration depends on the last, or the "
-                       "target rate-limits, keep the loop and say so in a comment.", "medium")
+            report.candidate(token.line, "await_in_loop",
+                             f"`await` inside a {token.value} loop — {len(awaits)} sequential round trip(s) per iteration",
+                             ("each iteration depends on the previous iteration's result",
+                              "the target rate-limits and the loop is deliberately serial",
+                              "side-effect order is part of the contract"),
+                             "medium")
 
 
 def _same_function(file: TsFile, index: int, loop_body: int) -> bool:

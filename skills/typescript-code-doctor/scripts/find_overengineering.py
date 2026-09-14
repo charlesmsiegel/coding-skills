@@ -31,6 +31,12 @@ def analyze(root: Path, ignore: set[str], _args) -> list[Finding]:
                                     description=description, suggestion=suggestion,
                                     severity=severity, related_lines=related or []))
 
+    def lead(path, line, smell, description, also_caused_by, severity):
+        if smell not in ignore:
+            findings.append(Finding(file=str(path), line=line, smell_type=smell,
+                                    description=description, also_caused_by=tuple(also_caused_by),
+                                    severity=severity, kind="candidate"))
+
     implementers: dict[str, list[tuple[Path, str]]] = defaultdict(list)
     subclasses: dict[str, list[tuple[Path, str]]] = defaultdict(list)
     type_uses: dict[str, int] = defaultdict(int)
@@ -47,14 +53,14 @@ def analyze(root: Path, ignore: set[str], _args) -> list[Finding]:
     for path, tsfile in project.files.items():
         if is_test_file(path):
             continue
-        _check_interfaces(tsfile, path, implementers, add)
+        _check_interfaces(tsfile, path, implementers, lead)
         _check_classes(tsfile, path, subclasses, add)
         _check_wrapper_module(tsfile, path, add)
         _check_single_use_generics(tsfile, path, add)
     return findings
 
 
-def _check_interfaces(tsfile, path: Path, implementers, add) -> None:
+def _check_interfaces(tsfile, path: Path, implementers, lead) -> None:
     for decl in tsfile.types:
         if decl.kind != "interface" or not decl.members:
             continue
@@ -64,12 +70,13 @@ def _check_interfaces(tsfile, path: Path, implementers, add) -> None:
         where, class_name = impls[0]
         if not any(m.type_text.startswith("(") or "=>" in m.type_text for m in decl.members):
             continue  # a data shape with one class using it is fine
-        add(path, decl.line, "single_implementation_interface",
-            f"`{decl.name}` declares behaviour and is implemented only by `{class_name}` "
-            f"({where.name})",
-            "Delete the interface and use the class type. TypeScript is structurally typed, so a "
-            "test double does not need the interface to exist — and an interface with one "
-            "implementation only adds a file to keep in sync.", "medium")
+        lead(path, decl.line, "single_implementation_interface",
+             f"`{decl.name}` declares behaviour and is implemented only by `{class_name}` "
+             f"({where.name})",
+             ("a second implementation lives in test code or in a package this scan did not load",
+              "the interface is a library's public contract and the class is one vendor of it",
+              "the interface exists so a test double can be written without importing the class"),
+             "medium")
 
 
 def _check_classes(tsfile, path: Path, subclasses, add) -> None:

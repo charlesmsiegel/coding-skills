@@ -212,9 +212,9 @@ consumers extend, `type` for everything else, especially unions.
 | `explicit_any` | Is the shape genuinely unknown (→ `unknown` + narrow), or just unwritten (→ write it)? |
 | `as_any` | What error is this silencing? Fix that. |
 | `double_assertion` | The two types are unrelated. Which one is wrong? |
-| `type_assertion` | Is there a check next to it? If not, what makes this true? |
+| `type_assertion` | Is there a check next to it? If not, what makes this true? Reported as a candidate: the record lists the benign readings to rule out before acting. |
 | `non_null_assertion` | Which of the three cases above is it? |
 | `ts_ignore` | Convert to `@ts-expect-error` with a reason; it then expires on its own. |
-| `all_optional_type` | Which combinations are actually legal? That is your union. |
+| `all_optional_type` | Which combinations are actually legal? That is your union. Reported as a candidate: the record lists the benign readings to rule out before acting. |
 | `unsafe_builtin_type` | What is the real signature/shape? |
 | `untyped_parameter` | Under `noImplicitAny` this is a build error, not a style note. |

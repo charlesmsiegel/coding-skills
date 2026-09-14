@@ -19,11 +19,13 @@ touch every caller.
 primitive type are swappable and nothing notices — `move(userId, orgId)` compiles
 with the arguments reversed. Fixes, in ascending cost: an options object (names
 are checked), a branded type (`type UserId = string & { readonly __brand: unique symbol }`),
-or a small value object where behaviour lives with the data.
+or a small value object where behaviour lives with the data. Reported as a
+candidate: the record lists the benign readings to rule out before acting.
 
 **Data clump.** `data_clump`. The same three parameters travelling together
 through five functions are one concept without a name. Naming it also gives the
-next function that needs the group a type to accept.
+next function that needs the group a type to accept. Reported as a candidate:
+the record lists the benign readings to rule out before acting.
 
 **God class / god module.** `god_class`, `god_module`. Look at which fields each
 method touches (that is what LCOM measures); the groups are the classes.
@@ -73,7 +75,9 @@ is the only reason to hesitate — check, then delete.
 
 **Speculative generality.** `single_implementation_interface`,
 `abstract_class_with_one_subclass`, `single_use_type_parameter`. See
-`references/overengineering-and-abstraction.md`.
+`references/overengineering-and-abstraction.md`. `single_implementation_interface`
+is reported as a candidate: the record lists the benign readings to rule out
+before acting.
 
 **Data class.** `data_class`. A class with fields and no behaviour is an
 `interface` or a `type` — no constructor, no instantiation, structurally typed.
@@ -116,7 +120,8 @@ across many files. The union already exists in everyone's head; declare it.
 
 **Optional soup.** `all_optional_type`. An interface where everything is optional
 permits `{}`, so it constrains nothing and every consumer writes guards. The legal
-combinations are a discriminated union.
+combinations are a discriminated union. Reported as a candidate: the record
+lists the benign readings to rule out before acting.
 
 **Unchecked index.** `arr[0]`, `map.get(k)` and `Object.entries(o)[i]` treated as
 definitely present. `noUncheckedIndexedAccess` makes this a compile error; without

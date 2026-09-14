@@ -45,11 +45,13 @@ def _check_class_fields(file: TsFile, report: Reporter) -> None:
         for prop in klass.props:
             if prop.accessibility in ("private", "protected") or prop.readonly or prop.is_static:
                 continue
-            report.add(prop.line, "public_mutable_field",
-                       f"`{klass.name}.{prop.name}` is public and mutable — any caller can set it",
-                       "Mark it `private` (or `readonly` when it is set once in the constructor). A "
-                       "public field is an invariant nobody can defend, and every write site becomes "
-                       "part of the class's contract.", "medium")
+            report.candidate(prop.line, "public_mutable_field",
+                             f"`{klass.name}.{prop.name}` is public and mutable — any caller can set it",
+                             ("the class is a plain data holder — a DTO, a config — whose fields "
+                              "are meant to be set by callers",
+                              "the field is mutated only through a framework: an ORM entity, a form model",
+                              "the field is assigned once during builder-style initialization"),
+                             "medium")
         for prop in klass.props:
             if prop.readonly or prop.is_static or prop.name not in assigned:
                 continue

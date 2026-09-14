@@ -588,6 +588,67 @@ def test_tsconfig_audit(tmp_path):
     assert "outdated_target" in found
 
 
+# --------------------------------------------------------------------------- #
+# Candidates: leads the syntax cannot prove, with the benign readings attached
+# --------------------------------------------------------------------------- #
+
+def _candidates(records, smell):
+    return [r for r in records if r["smell_type"] == smell]
+
+
+@pytest.mark.parametrize("script, source, smell", [
+    ("find_type_gaps.py",
+     "export function port(raw: string): number { return (JSON.parse(raw) as { port: number }).port; }\n",
+     "type_assertion"),
+    ("find_type_gaps.py",
+     "export function total(xs: number[]) { return xs.reduce((a, b) => a + b, 0); }\n",
+     "missing_return_type"),
+    ("find_type_gaps.py",
+     "export interface Loose { a?: string; b?: number; c?: boolean; d?: Date }\n",
+     "all_optional_type"),
+    ("find_async_issues.py",
+     "export async function run(ids: string[]): Promise<void> {\n  for (const id of ids) { await fetch(id); }\n}\n",
+     "await_in_loop"),
+    ("find_encapsulation_issues.py",
+     "export class Counter { count = 0; }\n",
+     "public_mutable_field"),
+])
+def test_file_level_heuristics_are_candidates(tmp_path, script, source, smell):
+    root = write(tmp_path / smell, {"sample.ts": source})
+    found = _candidates(run_detector(script, root), smell)
+    assert found, f"{script} did not report {smell}"
+    for record in found:
+        assert record["kind"] == "candidate"
+        assert record["also_caused_by"], "a candidate names how healthy code produces it"
+        assert not record["suggestion"], "a candidate carries no fix"
+
+
+def test_design_smells_are_candidates(tmp_path):
+    root = write(tmp_path, {"sample.ts": BAD_DESIGN})
+    records = run_detector("find_design_smells.py", root)
+    for smell in ("data_clump", "primitive_obsession"):
+        found = _candidates(records, smell)
+        assert found and all(r["kind"] == "candidate" and r["also_caused_by"]
+                             and not r["suggestion"] for r in found), smell
+
+
+def test_tree_level_heuristics_are_candidates(tmp_path):
+    root = write(tmp_path, {
+        "package.json": '{"name": "p"}',
+        "src/index.ts": "export * from './a';\nexport * from './b';\nexport { c } from './c';\n",
+        "src/a.ts": "export const a = 1;\n",
+        "src/b.ts": "export const b = 2;\n",
+        "src/c.ts": "export const c = 3;\n",
+        "src/svc.ts": "export interface Service { run(): void }\nexport class Impl implements Service { run(): void {} }\n",
+    })
+    barrels = _candidates(run_detector("find_module_issues.py", root), "barrel_file")
+    singles = _candidates(run_detector("find_overengineering.py", root), "single_implementation_interface")
+    for found in (barrels, singles):
+        assert found
+        assert all(r["kind"] == "candidate" and r["also_caused_by"] and not r["suggestion"]
+                   for r in found)
+
+
 def test_tsconfig_audit_is_quiet_on_a_strict_config(tmp_path):
     write(tmp_path, {
         "tsconfig.json": json.dumps({"compilerOptions": {

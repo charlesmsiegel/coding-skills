@@ -67,6 +67,12 @@ def analyze(root: Path, ignore: set[str], _args) -> list[Finding]:
                                     description=description, suggestion=suggestion,
                                     severity=severity, related_lines=related or []))
 
+    def lead(path, line, smell, description, also_caused_by, severity):
+        if smell not in ignore:
+            findings.append(Finding(file=str(path), line=line, smell_type=smell,
+                                    description=description, also_caused_by=tuple(also_caused_by),
+                                    severity=severity, kind="candidate"))
+
     graph: dict[Path, list[Path]] = {}
     edge_lines: dict[tuple[Path, Path], int] = {}
     for path in project.files:
@@ -103,13 +109,14 @@ def analyze(root: Path, ignore: set[str], _args) -> list[Finding]:
             own_code = [f for f in tsfile.functions if f.has_body] + tsfile.classes
             if len(re_exports) >= 3 and not own_code:
                 star = sum(1 for e in tsfile.exports if e.kind == "star")
-                add(path, 1, "barrel_file",
-                    f"{relative_name} is a barrel re-exporting {len(re_exports)} symbol(s)"
-                    + (f", {star} of them with `export *`" if star else ""),
-                    "Import from the defining module instead. A barrel makes every importer load "
-                    "the whole folder, is the usual way an import cycle appears by accident, and "
-                    "`export *` hides which module actually owns a name.",
-                    "medium" if star else "low")
+                lead(path, 1, "barrel_file",
+                     f"{relative_name} is a barrel re-exporting {len(re_exports)} symbol(s)"
+                     + (f", {star} of them with `export *`" if star else ""),
+                     ("the barrel is the package's declared public entry point — `main` or "
+                      "`exports` in package.json",
+                      "the bundler tree-shakes and package.json declares `sideEffects: false`",
+                      "the folder is a library boundary and the barrel is its only import path by policy"),
+                     "medium" if star else "low")
 
         for record in tsfile.imports:
             if record.module.count("../") >= DEEP_RELATIVE_SEGMENTS:

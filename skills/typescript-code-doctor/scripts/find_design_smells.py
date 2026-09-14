@@ -101,11 +101,12 @@ def _check_data_clumps(file: TsFile, report: Reporter) -> None:
             continue
         reported.add(clump)
         where = ", ".join(f"{name}()" for name, _ in sites[:4])
-        report.add(sites[0][1], "data_clump",
-                   f"`{', '.join(clump)}` are passed together to {len(sites)} functions ({where})",
-                   "Those parameters are one concept. Give it a type and pass the object — the "
-                   "argument order stops mattering, and the next function that needs the group gets "
-                   "it for free.", "medium", related=[line for _, line in sites[1:5]])
+        report.candidate(sites[0][1], "data_clump",
+                         f"`{', '.join(clump)}` are passed together to {len(sites)} functions ({where})",
+                         ("the parameters are a documented positional API that callers depend on",
+                          "the functions are overloads or adapters of one external signature",
+                          "the group is passed through unchanged to a third-party call"),
+                         "medium", related=[line for _, line in sites[1:5]])
 
 
 def _check_primitive_obsession(file: TsFile, report: Reporter) -> None:
@@ -118,12 +119,13 @@ def _check_primitive_obsession(file: TsFile, report: Reporter) -> None:
             else:
                 run = 0
         if longest >= PRIMITIVE_RUN:
-            report.add(func.line, "primitive_obsession",
-                       f"`{func.qualname}` takes {longest} adjacent parameters of primitive type",
-                       "Adjacent same-typed parameters are swappable at the call site and the "
-                       "compiler cannot tell. Use branded types (`type UserId = string & { __brand: "
-                       "'UserId' }`) or an options object so the names are checked.",
-                       "medium" if longest >= PRIMITIVE_RUN + 1 else "low")
+            report.candidate(func.line, "primitive_obsession",
+                             f"`{func.qualname}` takes {longest} adjacent parameters of primitive type",
+                             ("the values are validated at the boundary and the function is internal",
+                              "the signature mirrors a third-party API the code cannot change",
+                              "the parameters are of distinct semantic types the compiler could only "
+                              "express with branding the project has chosen not to adopt"),
+                             "medium" if longest >= PRIMITIVE_RUN + 1 else "low")
 
 
 def _check_temporary_fields(file: TsFile, report: Reporter) -> None:
