@@ -250,3 +250,25 @@ def test_generate_report_counts_candidates_and_rejects_invalid_records(project, 
     assert report["summary"]["total_issues"] == 2
     assert report["summary"]["total_candidates"] == 1
     assert "bogus" in report["meta"]["records_rejected"]["types"]
+
+
+def test_a_candidate_only_category_earns_no_recommendation(tmp_path, load_module, capsys):
+    """RECOMMENDATIONS tells the reader to change code. A category whose only
+    record is an unverified lead has not earned an instruction."""
+    module = load_module(SCRIPTS_DIR, "analyze_all")
+    report = {
+        "meta": {"analyzed_path": str(tmp_path), "timestamp": "t",
+                 "analyzers_run": ["type_gaps"], "analyzers_skipped": [], "analyzer_errors": {}},
+        "summary": {"total_issues": 1, "total_candidates": 1,
+                    "by_severity": {"high": 0, "medium": 0, "low": 1},
+                    "by_category": {"type_gaps": 1}},
+        "categories": {"type_gaps": {"count": 1, "issues": [
+            {"file": "a.ts", "line": 2, "smell_type": "type_assertion", "description": "a lead",
+             "suggestion": "", "severity": "low", "kind": "candidate", "category": "type_gaps",
+             "also_caused_by": ["the value was narrowed by a runtime check"]},
+        ]}},
+    }
+    module.print_text_report(report)
+    out = capsys.readouterr().out
+    assert module.RECOMMENDATIONS["type_gaps"] not in out, \
+        "a lead bought advice about a defect nothing found"

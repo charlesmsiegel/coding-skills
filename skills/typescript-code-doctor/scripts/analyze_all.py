@@ -249,6 +249,16 @@ def print_text_report(report: dict) -> None:
     print("=" * 70)
     print("💡 RECOMMENDATIONS")
     print("=" * 70)
+
+    # Recommendations are instructions to change code, so they are counted off
+    # the asserted defects only. `by_category` deliberately counts everything
+    # reported — telling someone to "close the escape hatches" because an
+    # ordinary `as` cast was raised is advice about a defect nothing found.
+    summary = {**summary, "by_category": {
+        category: sum(1 for issue in data["issues"] if issue.get("kind") != "candidate")
+        for category, data in report["categories"].items()
+    }}
+
     advice = [RECOMMENDATIONS[category] for category in CATEGORIES
               if summary["by_category"].get(category, 0) and category in RECOMMENDATIONS]
     for line in advice or ["• Your code is in good shape! Consider minor improvements."]:
