@@ -2595,6 +2595,121 @@ git commit -m "Document root-relative test classification and candidate reportin
 
 ---
 
+### Task 16: pr-visualization's summary header names the PR author
+
+Added mid-execution at the user's request. The assembled report's header and
+the Summary tab should say who made the change; today the analyzer collects
+commits as `--oneline` strings and the header template carries no author.
+
+**Files:**
+- Modify: `skills/pr-visualization/scripts/analyze_diff.py:116-121` (commit collection), `:247-250` (the commits `<details>` list), `:432-434` (summary dict)
+- Modify: `skills/pr-visualization/SKILL.md:30` (what the summary gives), `:44` (Summary tab row), `:70` (the `--meta` line of the assemble command)
+- Test: `tests/pr_visualization/test_analyzers.py` (append)
+
+**Interfaces:**
+- Consumes: `common.git(repo, *args)`; the `repo`, `tabs`, `run_script` fixtures from `tests/conftest.py`; `BASE_CORE` / `CHANGED_CORE` from the test module.
+- Produces: `summary["authors"]`: a list of `{"name": str, "commits": int}`, most commits first, ties in order of first appearance, `[]` in `--worktree` mode; `commits` becomes a list of `{"sha", "author", "subject"}` dicts inside `analyze_diff.py` (not emitted); the commits list in the Footprint fragment shows `<sha> <subject> — <author>`.
+
+- [ ] **Step 1: Write the failing test**
+
+Append to `tests/pr_visualization/test_analyzers.py`:
+
+```python
+def test_diff_reports_the_authors_of_the_range(repo, tabs, run_script):
+    """The report header names who made the change: every author in the range,
+    most commits first, and an uncommitted diff has none."""
+    repo.write("src/core.py", BASE_CORE)
+    repo.commit("base")
+    repo.git("config", "user.name", "Ada Lovelace")
+    repo.write("src/core.py", CHANGED_CORE)
+    repo.commit("first change")
+    repo.write("src/extra.py", "def extra():\n    return 1\n")
+    repo.commit("second change")
+    repo.git("config", "user.name", "Grace Hopper")
+    repo.write("src/more.py", "def more():\n    return 2\n")
+    repo.commit("third change")
+
+    summary = json.loads(
+        run_script(SCRIPTS / "analyze_diff.py", repo.path, "--tabs-dir", tabs, "--base", "HEAD~3").stdout
+    )
+    assert summary["authors"] == [{"name": "Ada Lovelace", "commits": 2},
+                                  {"name": "Grace Hopper", "commits": 1}]
+    footprint = (tabs / "02-footprint.html").read_text(encoding="utf-8")
+    assert "Ada Lovelace" in footprint and "Grace Hopper" in footprint
+
+    repo.write("src/more.py", "def more():\n    return 3\n")
+    worktree = json.loads(
+        run_script(SCRIPTS / "analyze_diff.py", repo.path, "--tabs-dir", tabs,
+                   "--base", "HEAD", "--worktree").stdout
+    )
+    assert worktree["authors"] == []
+```
+
+If `commits_html` renders into a fragment other than `02-footprint.html`, point the assertion at that fragment and say so in the report.
+
+- [ ] **Step 2: Run to verify it fails**
+
+Run: `pytest tests/pr_visualization/test_analyzers.py::test_diff_reports_the_authors_of_the_range -q`
+Expected: `KeyError: 'authors'`.
+
+- [ ] **Step 3: Collect authors with the commits**
+
+In `analyze_diff.py`, replace the commit collection in the non-worktree branch (lines 118–121):
+
+```python
+        raw = git(repo, "-c", "core.quotepath=false", "diff", "--no-color", f"{merge_base}..{args.head}")
+        head_desc = args.head
+        commits = []
+        for line in git(repo, "log", "--format=%h%x1f%an%x1f%s", f"{merge_base}..{args.head}").splitlines():
+            if not line.strip():
+                continue
+            sha, author, subject = (line.split("\x1f", 2) + ["", ""])[:3]
+            commits.append({"sha": sha, "author": author, "subject": subject})
+```
+
+Add, near the other module-level helpers:
+
+```python
+def _authors(commits: list[dict]) -> list[dict]:
+    """Who made the change: most commits first, ties in order of first appearance."""
+    counts: dict[str, int] = {}
+    for commit in commits:
+        if commit["author"]:
+            counts[commit["author"]] = counts.get(commit["author"], 0) + 1
+    order = list(counts)
+    return [{"name": name, "commits": counts[name]}
+            for name in sorted(order, key=lambda n: (-counts[n], order.index(n)))]
+```
+
+Replace the commits list rendering (line ~248):
+
+```python
+        li = "".join(
+            f"<li><code>{esc(c['sha'])}</code> {esc(c['subject'])} "
+            f"<span class='dim'>— {esc(c['author'])}</span></li>"
+            for c in commits[:30])
+```
+
+In the summary dict, after `"commits": len(commits) if commits else None,` add `"authors": _authors(commits),`.
+
+- [ ] **Step 4: Tell the agent to use it**
+
+In `skills/pr-visualization/SKILL.md`:
+- line 30, after "`analyze_diff` gives": insert "the authors of the range (`authors`, most commits first), ".
+- line 44, the Summary row: "Behavioral summary from the diff itself, opening with who made the change (`authors` from the analyze_diff summary); claimed-vs-actual; what didn't change".
+- line 70: `--meta "by <authors, most commits first> · base <base-ref> @ <sha> → <head> · +<adds>/−<dels> · generated <date>"`.
+
+- [ ] **Step 5: Run the tests, validate, commit**
+
+Run: `pytest tests/pr_visualization -q` — expected all pass. Run `ruff check skills/pr-visualization tests/pr_visualization` and `python tools/validate_skills.py` (SKILL.md changed).
+
+```bash
+git add skills/pr-visualization/scripts/analyze_diff.py skills/pr-visualization/SKILL.md tests/pr_visualization/test_analyzers.py
+git commit -m "pr-visualization: name the change's authors in the summary and header"
+```
+
+---
+
 ## Self-review notes
 
 **Spec coverage.** §6.2 items 1–4: Tasks 1–7. §6.3 first reclassifications: Task 8. §7A: Task 11. §7B: Task 12. §7C: Task 9. §7D (three caps, plus the fourth found in `find_dependency_issues._manifests`): Task 10. §7E: Task 9 and Task 10. §7F: Task 13. §7G: Task 14, header markers only, with the `outDir` deferral stated. §16.1 failing-first: every task's Step 2. §16.4 mutation check: Task 7 Step 3. §16.5 output compatibility: Global Constraints and Task 5's `validate_record` returning a copy.
