@@ -28,7 +28,8 @@ def which(monkeypatch, external):
     ({"package-lock.json": "{}"}, "npm", ["audit", "--json"]),
     ({"pnpm-lock.yaml": ""}, "pnpm", ["audit", "--json"]),
     ({"yarn.lock": ""}, "yarn", ["audit", "--json"]),
-    ({"yarn.lock": "", ".yarnrc.yml": "nodeLinker: node-modules\n"}, "yarn", ["npm", "audit", "--json"]),
+    ({"yarn.lock": "", ".yarnrc.yml": "nodeLinker: node-modules\n"}, "yarn",
+     ["npm", "audit", "--all", "--recursive", "--json"]),
 ])
 def test_audit_argv_names_and_runs_the_same_manager(external, which, tmp_path, files, manager, tail):
     for name, content in files.items():
@@ -92,8 +93,8 @@ def test_an_unknown_tool_name_is_named_rather_than_silently_dropped(
 
 
 @pytest.mark.parametrize("package_manager, tail", [
-    ("yarn@4.1.0", ["npm", "audit", "--json"]),      # Berry
-    ("yarn@2.4.3", ["npm", "audit", "--json"]),      # Berry
+    ("yarn@4.1.0", ["npm", "audit", "--all", "--recursive", "--json"]),      # Berry
+    ("yarn@2.4.3", ["npm", "audit", "--all", "--recursive", "--json"]),      # Berry
     ("yarn@1.22.19", ["audit", "--json"]),           # classic
 ])
 def test_yarn_berry_is_recognised_from_package_manager(
@@ -108,3 +109,65 @@ def test_yarn_berry_is_recognised_from_package_manager(
     manager, argv = external._audit_argv(tmp_path)
     assert manager == "yarn"
     assert argv == ["/bin/yarn", *tail]
+
+
+PNPM_ADVISORIES = (
+    '{"actions": [], "advisories": {"1094499": {"module_name": "lodash", "severity": "high", '
+    '"title": "Prototype Pollution", "url": "https://github.com/advisories/GHSA-1"}}, '
+    '"metadata": {"vulnerabilities": {"high": 1}}}'
+)
+YARN1_LINES = (
+    '{"type":"auditAdvisory","data":{"resolution":{"id":1094499},"advisory":{"module_name":"lodash",'
+    '"severity":"high","title":"Prototype Pollution","url":"https://github.com/advisories/GHSA-1"}}}\n'
+    '{"type":"auditSummary","data":{"vulnerabilities":{"high":1}}}\n'
+)
+YARN4_LINES = (
+    '{"value":"lodash","children":{"ID":1094499,"Issue":"Prototype Pollution",'
+    '"URL":"https://github.com/advisories/GHSA-1","Severity":"high","Vulnerable Versions":"<4.17.21",'
+    '"Tree Versions":["4.17.20"],"Dependents":["app@workspace:."]}}\n'
+)
+
+
+@pytest.mark.parametrize("files, output", [
+    ({"pnpm-lock.yaml": ""}, PNPM_ADVISORIES),
+    ({"yarn.lock": "", ".yarnrc.yml": "yarnPath: .yarn/releases/yarn-3.6.0.cjs\n"}, PNPM_ADVISORIES),
+    ({"yarn.lock": ""}, YARN1_LINES),
+    ({"yarn.lock": "", ".yarnrc.yml": "nodeLinker: node-modules\n"}, YARN4_LINES),
+], ids=["pnpm", "yarn-berry-3", "yarn-classic", "yarn-berry-4"])
+def test_run_audit_reads_every_managers_advisory_shape(external, which, tmp_path, monkeypatch,
+                                                       files, output):
+    """pnpm and Yarn 2/3 write npm 6's `advisories` map, Yarn 1 writes one
+    `data.advisory` object per line, Yarn 4 writes one `value`/`children` object
+    per line. Reading only npm 7's `vulnerabilities` map turned a pnpm audit full
+    of advisories into an empty list — reported as a clean audit."""
+    for name, text in files.items():
+        (tmp_path / name).write_text(text, encoding="utf-8")
+    (tmp_path / "package.json").write_text("{}", encoding="utf-8")
+    monkeypatch.setattr(external, "_run", lambda argv, cwd, timeout=900: (0, output, ""))
+
+    findings = external.run_audit(None, tmp_path)
+
+    assert len(findings) == 1, findings
+    assert "lodash" in findings[0]["description"]
+    assert "Prototype Pollution" in findings[0]["description"]
+    assert findings[0]["smell_type"].endswith("-audit:high")
+
+
+def test_a_summary_only_yarn_classic_audit_is_clean_not_unparseable(external, which, tmp_path,
+                                                                    monkeypatch):
+    """Yarn 1 prints an `auditSummary` line even when nothing is vulnerable."""
+    (tmp_path / "yarn.lock").write_text("", encoding="utf-8")
+    (tmp_path / "package.json").write_text("{}", encoding="utf-8")
+    monkeypatch.setattr(external, "_run", lambda argv, cwd, timeout=900:
+                        (0, '{"type":"auditSummary","data":{"vulnerabilities":{}}}\n', ""))
+
+    assert external.run_audit(None, tmp_path) == []
+
+
+def test_non_json_audit_output_is_a_tool_error(external, which, tmp_path, monkeypatch):
+    (tmp_path / "pnpm-lock.yaml").write_text("", encoding="utf-8")
+    (tmp_path / "package.json").write_text("{}", encoding="utf-8")
+    monkeypatch.setattr(external, "_run", lambda argv, cwd, timeout=900: (1, "ERR_PNPM_NO_LOCKFILE", ""))
+
+    findings = external.run_audit(None, tmp_path)
+    assert findings[0]["smell_type"] == "pnpm-audit:tool-error"
