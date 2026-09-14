@@ -9,6 +9,7 @@ copy-pasted per script; this module is the single copy.
 
 import argparse
 import contextlib
+import functools
 import json
 import os
 import sys
@@ -101,8 +102,14 @@ def find_ts_files(path: Path) -> Iterator[Path]:
             yield candidate
 
 
-def project_root_of(filepath: Path) -> Path | None:
-    """The nearest ancestor holding a package.json, a tsconfig, or .git; None if none.
+@functools.lru_cache(maxsize=None)
+def _root_of_dir(directory: Path) -> Path | None:
+    """The nearest ancestor of (or equal to) ``directory`` holding a root marker.
+
+    Cached on the resolved directory: the answer is a property of the directory,
+    not of the file inside it, and every detector asks it of every file it
+    touches. Without the cache a whole-tree run re-walks and re-stats the same
+    ancestors once per file.
 
     A directory the process cannot stat or list (a `700` home directory on a
     shared host, a restrictive bind-mount, locked-down CI) raises `OSError`
@@ -110,7 +117,7 @@ def project_root_of(filepath: Path) -> Path | None:
     candidate is treated as having no marker so the walk keeps going instead
     of crashing the whole detector run.
     """
-    for candidate in filepath.resolve().parents:
+    for candidate in (directory, *directory.parents):
         try:
             if any((candidate / marker).exists() for marker in ROOT_MARKERS):
                 return candidate
@@ -119,6 +126,11 @@ def project_root_of(filepath: Path) -> Path | None:
         except OSError:
             continue
     return None
+
+
+def project_root_of(filepath: Path) -> Path | None:
+    """The nearest ancestor holding a package.json, a tsconfig, or .git; None if none."""
+    return _root_of_dir(filepath.resolve().parent)
 
 
 def is_test_file(filepath: Path) -> bool:
