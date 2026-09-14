@@ -3919,9 +3919,11 @@ def test_task_markers_are_recognised_where_people_actually_put_them(tmp_path):
 def test_sibling_test_modules_importing_each_other_are_not_missing_dependencies(tmp_path):
     """pytest puts a test file's directory on sys.path, so `from test_chat import
     helper` resolves to the file next door — a `tests/` directory needs no
-    __init__.py and no entry in pyproject.toml for that."""
+    __init__.py and no entry in pyproject.toml for that. pytest itself is a
+    declared dev extra: the subject here is sibling resolution, not tooling."""
     (tmp_path / "pyproject.toml").write_text(
         '[project]\nname = "x"\nversion = "0"\ndependencies = []\n'
+        '[project.optional-dependencies]\ndev = ["pytest"]\n'
     )
     tests = tmp_path / "tests"
     tests.mkdir()
