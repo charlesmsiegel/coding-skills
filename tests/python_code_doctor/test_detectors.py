@@ -648,6 +648,11 @@ def test_a_pragma_candidates_text_output_shows_reasons_not_an_empty_fix(tmp_path
 
     assert "? also caused by:" in output
     assert not arrow_only_lines(output), "a candidate rendered a fix arrow with nothing after it"
+    # A severity rank on a lead reads as a verdict the evidence does not support.
+    assert "[CANDIDATE]" in output
+    assert "[HIGH]" not in output
+    assert "0 finding(s), 1 candidate(s)" in output, \
+        "the header still counts the lead as a security issue found"
 
 
 @pytest.mark.parametrize("statement", [
