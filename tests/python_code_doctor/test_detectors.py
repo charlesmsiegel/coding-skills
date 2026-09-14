@@ -619,6 +619,8 @@ def test_a_dynamic_pragma_is_a_candidate_not_an_injection_finding(tmp_path):
 
     assert [f["kind"] for f in findings] == ["candidate"]
     assert "PRAGMA" in findings[0]["description"]
+    assert findings[0]["also_caused_by"], "a candidate names how healthy code produces it"
+    assert not findings[0]["suggestion"], "a candidate carries what to confirm, not a fix"
 
 
 @pytest.mark.parametrize("statement", [
@@ -636,7 +638,8 @@ def test_a_dynamic_query_is_still_a_scored_finding(tmp_path, statement):
                 if f["smell_type"] == "sql_injection"]
 
     assert len(findings) == 1
-    assert "kind" not in findings[0], "a scored defect carries no kind key at all"
+    assert findings[0]["kind"] == "finding"
+    assert not findings[0].get("also_caused_by")
 
 
 def test_weak_hash_usedforsecurity_false_not_flagged(tmp_path):
@@ -3037,8 +3040,8 @@ def test_ready_import_suppression_requires_django_provenance_and_direct_method(t
 # `kind: "candidate"` and the graders downstream keep them out of the score.
 
 
-def kinds_by_name(findings: list[dict], issue_type: str) -> dict[str, str | None]:
-    return {f["name"]: f.get("kind") for f in findings if f["issue_type"] == issue_type}
+def kinds_by_name(findings: list[dict], issue_type: str) -> dict[str, str]:
+    return {f["name"]: f["kind"] for f in findings if f["issue_type"] == issue_type}
 
 
 def test_a_public_module_level_name_is_a_candidate_not_a_finding(tmp_path):
@@ -3059,7 +3062,7 @@ def test_an_unused_import_stays_a_finding(tmp_path):
     """The one dead-code claim a single file *can* prove: nothing here uses it."""
     (tmp_path / "sample.py").write_text("import os\n")
 
-    assert kinds_by_name(run_detector("find_dead_code.py", tmp_path), "unused_import") == {"os": None}
+    assert kinds_by_name(run_detector("find_dead_code.py", tmp_path), "unused_import") == {"os": "finding"}
 
 
 def test_dunder_all_re_export_is_neither_a_finding_nor_a_lead(tmp_path):
@@ -3149,11 +3152,11 @@ def test_only_a_free_function_owns_its_signature(tmp_path):
         "        return used\n"
         "    return callback\n"
     )
-    kinds = {(f["name"], f["line"]): f.get("kind")
+    kinds = {(f["name"], f["line"]): f["kind"]
              for f in run_detector("find_dead_code.py", tmp_path)
              if f["issue_type"] == "unused_parameter"}
 
-    assert kinds == {("spare", 1): None, ("spare", 5): "candidate", ("spare", 9): "candidate"}
+    assert kinds == {("spare", 1): "finding", ("spare", 5): "candidate", ("spare", 9): "candidate"}
 
 
 # ---- find_duplicates ------------------------------------------------------ #
@@ -3750,7 +3753,7 @@ def test_explicit_name_as_name_alias_declares_a_re_export(tmp_path):
     )
 
     assert kinds_by_name(run_detector("find_dead_code.py", tmp_path), "unused_import") \
-        == {"Renamed": None, "json": None}
+        == {"Renamed": "finding", "json": "finding"}
 
 
 def test_a_free_function_handed_out_as_a_value_is_a_callback(tmp_path):
@@ -3779,14 +3782,14 @@ def test_a_free_function_handed_out_as_a_value_is_a_callback(tmp_path):
         "    standalone(1, 2)\n"
         "    return [Command('help', handle_help)]\n"
     )
-    kinds = {(f['name'], f['line']): f.get('kind')
+    kinds = {(f['name'], f['line']): f['kind']
              for f in run_detector("find_dead_code.py", tmp_path)
              if f["issue_type"] == "unused_parameter"}
 
     assert kinds == {
         ("ui", 3): "candidate", ("argument", 3): "candidate",
         ("spare", 7): "candidate",
-        ("spare", 10): None,
+        ("spare", 10): "finding",
     }
 
 
@@ -3874,13 +3877,13 @@ def test_blocks_that_differ_only_in_literals_are_a_candidate(tmp_path):
                                       + "\n" + make("environment", "environment_copy"))
     (tmp_path / "other.py").write_text(make("procedure", "procedure_digest"))
     findings = run_detector("find_duplicates.py", tmp_path)
-    by_kind = {f.get("kind"): sorted(o["name"] for o in f["occurrences"]) for f in findings}
+    by_kind = {f["kind"]: sorted(o["name"] for o in f["occurrences"]) for f in findings}
 
     assert by_kind == {
-        None: ["environment_copy", "environment_digest"],
+        "finding": ["environment_copy", "environment_digest"],
         "candidate": ["environment_copy", "environment_digest", "procedure_digest"],
     }
-    lead = next(f for f in findings if f.get("kind") == "candidate")
+    lead = next(f for f in findings if f["kind"] == "candidate")
     assert "literal" in lead["description"]
 
 
@@ -3940,3 +3943,28 @@ def test_sibling_test_modules_importing_each_other_are_not_missing_dependencies(
                      if f["smell_type"] == "missing_dependency")
 
     assert missing == ["requests"]
+
+
+def test_dead_code_candidates_carry_reasons_and_findings_carry_fixes(tmp_path):
+    (tmp_path / "sample.py").write_text(
+        "import os\n\n"
+        "def helper():\n    return 1\n"
+    )
+    records = run_detector("find_dead_code.py", tmp_path)
+    by_type = {r["issue_type"]: r for r in records}
+    assert by_type["unused_import"]["kind"] == "finding"
+    assert by_type["unused_import"]["suggestion"]
+    assert by_type["unused_function"]["kind"] == "candidate"
+    assert by_type["unused_function"]["also_caused_by"]
+    assert not by_type["unused_function"].get("suggestion")
+
+
+def test_inexact_duplicates_are_candidates_with_reasons(tmp_path):
+    body = "def {name}(items):\n    out = []\n    for item in items:\n        if item.kind == '{tag}':\n            out.append(item.value * 2)\n        else:\n            out.append(item.value)\n    return out\n"
+    (tmp_path / "a.py").write_text(body.format(name="first", tag="alpha"))
+    (tmp_path / "b.py").write_text(body.format(name="second", tag="beta"))
+    records = [r for r in run_detector("find_duplicates.py", tmp_path)
+               if r["smell_type"] == "duplicate_code"]
+    assert records, "two blocks with one shape and different literals"
+    assert all(r["kind"] == "candidate" for r in records)
+    assert all(r["also_caused_by"] and not r["suggestion"] for r in records)

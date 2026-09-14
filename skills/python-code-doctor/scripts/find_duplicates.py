@@ -271,9 +271,7 @@ def to_findings(duplicates: list[DuplicateGroup]) -> list[dict]:
         else:
             description = (f"{count} {first['type']} blocks with one shape but different literals "
                            f"(~{dup.lines} executable lines each); also at {others}")
-            suggestion = ('Read them side by side before extracting: a literal that differs is often '
-                          'the whole meaning (a tag, a message, a mode), and one function with a flag '
-                          'parameter is worse than the copy.')
+            suggestion = ''
             severity = 'low'
         finding = {
             'file': first['file'],
@@ -286,8 +284,14 @@ def to_findings(duplicates: list[DuplicateGroup]) -> list[dict]:
             'code_snippet': first['preview'].split('\n')[0][:80],
             'occurrences': [{k: v for k, v in o.items() if k != 'end_line'} for o in dup.occurrences],
         }
+        finding['kind'] = 'finding' if dup.exact else 'candidate'
         if not dup.exact:
-            finding['kind'] = 'candidate'
+            finding['also_caused_by'] = [
+                'a literal that differs is the whole meaning — a tag, a message, a mode — '
+                'and one function with a flag parameter would be worse than the copy',
+                'the blocks implement one protocol for two backends and are expected to '
+                'diverge',
+            ]
         findings.append(finding)
     return findings
 

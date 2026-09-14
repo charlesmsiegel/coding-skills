@@ -48,9 +48,40 @@ class DeadCodeIssue:
     confidence: int
     # A scored defect by default. Set to "candidate" for a lead the downstream
     # merge must NOT score: cross-module use is invisible to this file-local
-    # analysis, so a public module-level name cannot be *proven* dead here. The
-    # key is stripped from JSON when None so a finding stays a plain finding.
-    kind: str | None = None
+    # analysis, so a public module-level name cannot be *proven* dead here. A
+    # finding carries a fix; a candidate carries its benign explanations and no
+    # fix, because recommending a deletion on file-local evidence is how live
+    # code gets deleted.
+    kind: str = "finding"
+    suggestion: str = ""
+    also_caused_by: tuple[str, ...] = ()
+
+
+# What to do about a proven dead-code finding, by issue type. A finding must
+# carry a fix; these are the fixes the description already implies.
+_SUGGESTIONS = {
+    "unused_import": "Remove the import, or re-export it through __all__ if it is public API.",
+    "unused_variable": "Remove the assignment, or use the value.",
+    "unused_parameter": "Remove the parameter, or prefix it with an underscore if the "
+                        "signature is dictated by a caller.",
+    "unreachable_code": "Delete the code after the return/raise, or fix the control flow "
+                        "so it can run.",
+    "constant_condition": "Replace the always-true/always-false condition with the branch "
+                          "that runs, or fix the condition.",
+    "dead_loop": "Remove the loop body that never executes, or fix the loop bounds.",
+    "empty_if": "Remove the empty branch, or fill it with the intended action.",
+}
+_DEFAULT_SUGGESTION = "Remove it, or reference it where it is meant to be used."
+
+_CANDIDATE_REASONS = {
+    "unused_function": ("another module imports and calls it — cross-module use is "
+                        "invisible to a single-file scan",
+                        "it is looked up by name: a plugin registry, getattr, or a template"),
+    "unused_class": ("another module imports and instantiates it",
+                     "it is registered by name: an ORM model, a plugin, a serializer"),
+    "unused_parameter": ("the signature is dictated by the receiver — a callback, a "
+                         "registry entry, a dispatch-table row",),
+}
 
 
 class ScopeTracker(ast.NodeVisitor):
@@ -360,7 +391,8 @@ class ScopeTracker(ast.NodeVisitor):
         # accept parameters it need not use — those are unscored leads. So is a
         # free function the file hands out as a value or decorates: finalize
         # downgrades those once it has seen every reference.
-        kind = None if self._at_module_scope(node) and not node.decorator_list else "candidate"
+        kind = ("finding" if self._at_module_scope(node) and not node.decorator_list
+                else "candidate")
 
         # A leading underscore is the conventional mark of a deliberately unused
         # parameter; honoring it keeps the detector aligned with every linter.
@@ -382,7 +414,9 @@ class ScopeTracker(ast.NodeVisitor):
                 file=self.filename, line=node.lineno,
                 issue_type="unused_parameter", name=param,
                 description=f"Parameter '{param}' in {node.name}() is never used",
-                confidence=80, kind=kind
+                confidence=80, kind=kind,
+                also_caused_by=(() if kind == "finding"
+                                else _CANDIDATE_REASONS["unused_parameter"])
             ), node))
 
     def finalize(self):
@@ -391,8 +425,9 @@ class ScopeTracker(ast.NodeVisitor):
         # receiver, exactly like a nested callback. Only now, with the whole
         # file read, is that known.
         for issue, node in self.pending_params:
-            if issue.kind is None and node.name in self.value_references:
+            if issue.kind == "finding" and node.name in self.value_references:
                 issue.kind = "candidate"
+                issue.also_caused_by = _CANDIDATE_REASONS["unused_parameter"]
             self.issues.append(issue)
         self.pending_params.clear()
 
@@ -432,7 +467,8 @@ class ScopeTracker(ast.NodeVisitor):
                 file=self.filename, line=node.lineno,
                 issue_type="unused_function", name=name,
                 description=f"Function '{name}' appears unused in this file",
-                confidence=60, kind="candidate"
+                confidence=60, kind="candidate",
+                also_caused_by=_CANDIDATE_REASONS["unused_function"]
             ))
 
         for name, node in self.classes.items():
@@ -448,7 +484,8 @@ class ScopeTracker(ast.NodeVisitor):
                 file=self.filename, line=node.lineno,
                 issue_type="unused_class", name=name,
                 description=f"Class '{name}' appears unused in this file",
-                confidence=60, kind="candidate"
+                confidence=60, kind="candidate",
+                also_caused_by=_CANDIDATE_REASONS["unused_class"]
             ))
 
 
@@ -543,12 +580,16 @@ def to_record(issue: "DeadCodeIssue") -> dict:
     """The JSON shape this detector emits. Shared with the runner so a pooled
     run and a `find_dead_code.py <path>` run produce the same records.
 
-    `kind` is dropped when unset rather than serialised as null, and severity is
-    derived from confidence, which is what this detector ranks by.
+    A finding carries a fix and a candidate carries its benign explanations;
+    `kind` is always present. Severity is derived from confidence, which is
+    what this detector ranks by.
     """
     record = asdict(issue)
-    if record.get('kind') is None:
-        record.pop('kind', None)
+    record['also_caused_by'] = list(issue.also_caused_by)
+    if issue.kind == "finding" and not issue.suggestion:
+        record['suggestion'] = _SUGGESTIONS.get(issue.issue_type, _DEFAULT_SUGGESTION)
+    if issue.kind == "candidate":
+        record['suggestion'] = ""
     record['severity'] = (
         'high' if issue.confidence >= 90
         else ('medium' if issue.confidence >= 70 else 'low')
@@ -579,8 +620,8 @@ def main():
     if args.format == 'json':
         # severity travels with the finding so standalone output renders the
         # same as analyze_all's aggregation (confidence maps onto severity).
-        # `kind` is stripped unless set to "candidate", so a scored finding
-        # carries no key and the downstream merge scores it as a defect.
+        # `kind` is always present — "finding" for a scored defect, "candidate"
+        # for a lead the downstream merge must not score.
         print(json.dumps([to_record(i) for i in all_issues], indent=2))
     else:
         if not all_issues:
