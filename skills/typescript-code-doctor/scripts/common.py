@@ -102,12 +102,22 @@ def find_ts_files(path: Path) -> Iterator[Path]:
 
 
 def project_root_of(filepath: Path) -> Path | None:
-    """The nearest ancestor holding a package.json, a tsconfig, or .git; None if none."""
+    """The nearest ancestor holding a package.json, a tsconfig, or .git; None if none.
+
+    A directory the process cannot stat or list (a `700` home directory on a
+    shared host, a restrictive bind-mount, locked-down CI) raises `OSError`
+    from `.exists()`/`.glob()` rather than reporting "not found"; such a
+    candidate is treated as having no marker so the walk keeps going instead
+    of crashing the whole detector run.
+    """
     for candidate in filepath.resolve().parents:
-        if any((candidate / marker).exists() for marker in ROOT_MARKERS):
-            return candidate
-        if any(candidate.glob("tsconfig*.json")):
-            return candidate
+        try:
+            if any((candidate / marker).exists() for marker in ROOT_MARKERS):
+                return candidate
+            if any(candidate.glob("tsconfig*.json")):
+                return candidate
+        except OSError:
+            continue
     return None
 
 

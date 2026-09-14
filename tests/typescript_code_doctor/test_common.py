@@ -159,6 +159,30 @@ def test_without_a_root_marker_every_component_counts(common, tmp_path):
     assert common.is_test_file(loose)
 
 
+def test_an_inaccessible_ancestor_does_not_crash_the_walk(common, tmp_path, monkeypatch):
+    """A directory above the file that the process cannot stat (a `700` home
+    directory on a shared host, a restrictive bind-mount, locked-down CI)
+    must not blow up the walk to the project root."""
+    locked = tmp_path / "locked"
+    repo = locked / "repo"
+    (repo / "src").mkdir(parents=True)
+    (repo / "package.json").write_text('{"name": "repo"}')
+    source = repo / "src" / "app.ts"
+    source.write_text("export const a = 1;\n")
+
+    real_exists = Path.exists
+
+    def flaky_exists(self, *args, **kwargs):
+        if locked in self.parents or self == locked:
+            raise PermissionError(13, "Permission denied", str(self))
+        return real_exists(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "exists", flaky_exists)
+
+    assert common.project_root_of(source) is None
+    assert common.is_test_file(source) is False
+
+
 @pytest.mark.parametrize("name, expected", [
     ("types.d.ts", True), ("types.d.mts", True), ("types.d.cts", True),
     ("types.ts", False), ("d.ts", False), ("mod.mts", False),
