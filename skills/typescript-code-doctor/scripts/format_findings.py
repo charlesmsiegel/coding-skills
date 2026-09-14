@@ -63,8 +63,24 @@ def _size_for(severity):
     return {"high": "M", "medium": "S", "low": "S"}.get(severity, "S")
 
 
+# A record carrying `kind: "candidate"` is an unverified lead, and every renderer
+# here would otherwise turn it into a refactoring ticket with a proposed fix
+# attached. That is how someone deletes live code on a tool's say-so.
+_CANDIDATE_NOTE = ("Unverified lead, not a confirmed defect — confirm it before acting. "
+                   "Graders exclude candidates from the score.")
+
+
+def _is_candidate(issue):
+    return issue.get("kind") == "candidate"
+
+
 def _render_list(issues):
-    lines = [f"# Findings — {len(issues)} item(s)", "",
+    confirmed = sum(1 for i in issues if not _is_candidate(i))
+    leads = len(issues) - confirmed
+    heading = f"# Findings — {confirmed} finding(s)"
+    if leads:
+        heading += f", {leads} candidate(s)"
+    lines = [heading, "",
              "| Severity | Type | Location | Description |",
              "|---|---|---|---|"]
     for issue in issues:
@@ -73,8 +89,10 @@ def _render_list(issues):
         description = (issue.get("description", "") or "").replace("|", "\\|")
         if len(description) > 100:
             description = description[:97] + "..."
-        lines.append(f"| {_ICON.get(severity, '')} {severity} | {_type_of(issue)} | "
-                     f"`{location}` | {description} |")
+        rank = "❓ candidate" if _is_candidate(issue) else f"{_ICON.get(severity, '')} {severity}"
+        lines.append(f"| {rank} | {_type_of(issue)} | `{location}` | {description} |")
+    if leads:
+        lines += ["", f"❓ **candidate** — {_CANDIDATE_NOTE}"]
     return "\n".join(lines)
 
 
@@ -84,11 +102,13 @@ def _render_cards(issues):
         severity = issue.get("severity", "medium")
         smell = _type_of(issue)
         category = issue.get("category", "")
+        lead = _is_candidate(issue)
         labels = ["lang:typescript", f"smell:{smell}", f"size:{_size_for(severity)}",
-                  f"priority:{severity}"]
+                  "priority:candidate" if lead else f"priority:{severity}"]
         if category:
             labels.append(f"area:{category}")
-        out.append(f"### [Refactor] {smell} — {Path(str(issue.get('file', '?'))).name}:{issue.get('line', '?')}")
+        out.append(f"### [{'Investigate' if lead else 'Refactor'}] {smell} — "
+                   f"{Path(str(issue.get('file', '?'))).name}:{issue.get('line', '?')}")
         out.append("")
         out.append(f"**Labels:** {'  '.join(labels)}")
         out.append("")
@@ -98,6 +118,11 @@ def _render_cards(issues):
         if issue.get("related_lines"):
             out.append("")
             out.append(f"**Also at lines:** {', '.join(str(n) for n in issue['related_lines'])}")
+        if lead:
+            out.append("")
+            out.append(f"**Candidate:** {_CANDIDATE_NOTE}")
+            for reason in issue.get("also_caused_by") or []:
+                out.append(f"- Also caused by: {reason}")
         if _suggestion(issue):
             out.append("")
             out.append(f"**Proposed fix:** {_suggestion(issue)}")
@@ -105,10 +130,15 @@ def _render_cards(issues):
         out.append("**Standard:** (link the relevant coding-standard or rule)")
         out.append("")
         out.append("**Definition of Done:**")
-        out.append("- [ ] Behavior unchanged (existing + new tests green)")
-        out.append("- [ ] `tsc --noEmit` and the linter clean")
-        out.append("- [ ] No new `any`, assertion, or `@ts-ignore`")
-        out.append("- [ ] Enforcement rule added if this closes a smell class")
+        if lead:
+            out.append("- [ ] Confirmed against the benign explanations above, "
+                       "or closed as not a defect")
+            out.append("- [ ] If confirmed, refiled as a finding with a fix")
+        else:
+            out.append("- [ ] Behavior unchanged (existing + new tests green)")
+            out.append("- [ ] `tsc --noEmit` and the linter clean")
+            out.append("- [ ] No new `any`, assertion, or `@ts-ignore`")
+            out.append("- [ ] Enforcement rule added if this closes a smell class")
         out.append("")
     return "\n".join(out)
 
@@ -116,8 +146,9 @@ def _render_cards(issues):
 def _render_json(issues):
     tickets = []
     for issue in issues:
-        tickets.append({
-            "title": f"[Refactor] {_type_of(issue)} in "
+        lead = _is_candidate(issue)
+        ticket = {
+            "title": f"[{'Investigate' if lead else 'Refactor'}] {_type_of(issue)} in "
                      f"{Path(str(issue.get('file', '?'))).name}:{issue.get('line', '?')}",
             "severity": issue.get("severity", "medium"),
             "smell": _type_of(issue),
@@ -125,7 +156,12 @@ def _render_json(issues):
             "description": issue.get("description", ""),
             "proposed_fix": _suggestion(issue),
             "labels": ["lang:typescript", f"smell:{_type_of(issue)}"],
-        })
+        }
+        if lead:
+            ticket["kind"] = "candidate"
+            ticket["also_caused_by"] = list(issue.get("also_caused_by") or [])
+            ticket["labels"].append("kind:candidate")
+        tickets.append(ticket)
     return json.dumps(tickets, indent=2)
 
 
