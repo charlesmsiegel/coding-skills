@@ -5,6 +5,7 @@ lockfile implied: on a yarn project it ran `npm npm audit`, which cannot
 succeed, and on a pnpm project it ran npm's audit and reported it as pnpm's.
 """
 
+import sys
 from pathlib import Path
 
 import pytest
@@ -72,3 +73,19 @@ def test_run_audit_executes_the_resolved_argv_and_labels_it(external, tmp_path, 
 
 def test_the_tool_table_has_an_audit_entry_and_no_npm_entry(external):
     assert "audit" in external.TOOLS and "npm" not in external.TOOLS
+
+
+def test_an_unknown_tool_name_is_named_rather_than_silently_dropped(
+        external, tmp_path, monkeypatch, capsys):
+    """`--tools npm` asks for a tool this script does not have. Filtering the
+    name out in silence runs *nothing* and reports it as a clean pass."""
+    (tmp_path / "package.json").write_text('{"name": "p"}', encoding="utf-8")
+    monkeypatch.setattr(
+        sys, "argv",
+        ["run_external_tools.py", str(tmp_path), "--tools", "npm,tsc", "--format", "json"])
+
+    external.main()
+    captured = capsys.readouterr()
+    assert "unknown tool(s) ignored" in captured.err
+    assert "npm" in captured.err
+    assert "tsc" not in captured.err, "a tool this script does have was called unknown"
