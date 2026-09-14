@@ -284,7 +284,7 @@ def _coverage_files(root: Path):
         candidate = root / name
         if candidate.is_file():
             return candidate
-    for candidate in walk_tree(root):
+    for candidate in walk_tree(root, keep={"coverage"}):
         if candidate.name == "coverage-final.json":
             return candidate
     return None
