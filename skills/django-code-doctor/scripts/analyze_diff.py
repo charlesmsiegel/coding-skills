@@ -165,10 +165,20 @@ def render(findings, stats):
                  SEVERITY_ICONS["medium"] + " " + str(by_severity["medium"]) + "  " +
                  SEVERITY_ICONS["low"] + " " + str(by_severity["low"]) + ")\n")
     for f in findings[:200]:
-        lines.append(SEVERITY_ICONS[f["severity"]] + " [" + f["severity"].upper() + "] " +
+        # Marked as django_report.render marks it: a lead is not a defect, and a
+        # severity icon on one reads as a verdict the evidence does not support.
+        marker = ("? [CANDIDATE]" if f.get("kind") == "candidate"
+                  else SEVERITY_ICONS[f["severity"]] + " [" + f["severity"].upper() + "]")
+        lines.append(marker + " " +
                      str(f["file"]) + ":" + str(f["line"]) + "  " + f["smell_type"])
         lines.append("   " + f["description"])
-        lines.append("   → " + f["suggestion"])
+        # A candidate has no fix to print — an empty arrow reads as one that was
+        # forgotten. What it has is the benign readings the reader must rule out.
+        if f.get("suggestion"):
+            lines.append("   → " + f["suggestion"])
+        if f.get("kind") == "candidate":
+            for reason in f.get("also_caused_by") or []:
+                lines.append("   ? also caused by: " + reason)
     return "\n".join(lines)
 
 
