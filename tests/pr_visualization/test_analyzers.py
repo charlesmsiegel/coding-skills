@@ -531,6 +531,29 @@ def test_diff_reports_the_authors_of_the_range(repo, tabs, run_script):
     assert worktree["authors"] == []
 
 
+def test_worktree_review_of_a_branch_keeps_its_committed_authors(repo, tabs, run_script):
+    """`--worktree` on a feature branch diffs everything since the base, the
+    committed part included — and that part has authors. Initialising the
+    commit list to empty in worktree mode reported `authors: []` for the most
+    common way of reviewing one's own branch."""
+    repo.git("checkout", "-qb", "main")
+    repo.write("src/core.py", BASE_CORE)
+    repo.commit("base")
+    repo.git("checkout", "-qb", "feature")
+    repo.git("config", "user.name", "Ada Lovelace")
+    repo.write("src/core.py", CHANGED_CORE)
+    repo.commit("committed on the branch")
+    repo.write("src/extra.py", "def extra():\n    return 1\n")  # uncommitted
+
+    summary = json.loads(
+        run_script(SCRIPTS / "analyze_diff.py", repo.path, "--tabs-dir", tabs,
+                   "--base", "main", "--worktree").stdout
+    )
+    assert summary["authors"] == [{"name": "Ada Lovelace", "commits": 1}]
+    assert summary["commits"] == 1
+    assert {f["path"] for f in summary["risk_ordered_files"]} >= {"src/core.py", "src/extra.py"}
+
+
 def test_diff_breaks_an_author_tie_by_who_committed_first(repo, tabs, run_script):
     """`git log` lists the range newest-first. Enumerating it in that order makes
     "first appearance" mean the *last* commit, so a tie names the wrong author
