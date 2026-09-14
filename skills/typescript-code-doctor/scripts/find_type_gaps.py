@@ -94,10 +94,13 @@ def _check_assertions(file: TsFile, report: Reporter, test: bool) -> None:
             # predicate is the sanctioned narrowing idiom — the assertion is
             # what the function exists to justify.
             continue
-        report.add(token.line, "type_assertion",
-                   f"Type assertion `as {nxt.value}` — asserted, not checked",
-                   "An assertion moves a compile-time error to runtime. Prefer a type guard, "
-                   "a discriminated union, or `satisfies` when you only want the literal checked.", "low")
+        report.candidate(token.line, "type_assertion",
+                         f"Type assertion `as {nxt.value}` — asserted, not checked",
+                         ("the value was just narrowed by a runtime check the compiler cannot follow",
+                          "the assertion sits at a serialization boundary — JSON.parse, a DOM "
+                          "lookup — where the shape is known by contract",
+                          "the file is a test installing a double"),
+                         "low")
 
 
 def _in_type_guard(file: TsFile, index: int) -> bool:
@@ -188,10 +191,13 @@ def _check_signatures(file: TsFile, report: Reporter) -> None:
                            "Annotate it. Without `noImplicitAny` this is silently `any`; with it, "
                            "the build breaks for every caller instead of here.", "medium")
         if not func.return_type and not _is_component(func) and func.has_body:
-            report.add(func.line, "missing_return_type",
-                       f"Exported {func.kind} `{func.qualname}` has no declared return type",
-                       "Declare it. An inferred return type is a contract nobody wrote down, and it "
-                       "changes silently when the body changes.", "low")
+            report.candidate(func.line, "missing_return_type",
+                             f"Exported {func.kind} `{func.qualname}` has no declared return type",
+                             ("the body returns one literal or one constructor call, so the "
+                              "inferred type is stable",
+                              "the project relies on inference by convention and reviews "
+                              "signature changes in diffs"),
+                             "low")
 
 
 def _check_catch_clauses(file: TsFile, report: Reporter) -> None:
@@ -218,12 +224,14 @@ def _check_optional_soup(file: TsFile, report: Reporter) -> None:
             continue
         optional = [m for m in members if m.optional]
         if len(optional) / len(members) >= 0.8:
-            report.add(decl.line, "all_optional_type",
-                       f"`{decl.name}` has {len(optional)} of {len(members)} members optional — "
-                       "the type permits an empty object",
-                       "Split it into the states that actually occur (a discriminated union), or make "
-                       "the required fields required. A type where everything is optional checks nothing.",
-                       "medium")
+            report.candidate(decl.line, "all_optional_type",
+                             f"`{decl.name}` has {len(optional)} of {len(members)} members optional — "
+                             "the type permits an empty object",
+                             ("it is a partial-update or patch payload where every field is "
+                              "legitimately optional",
+                              "it is an options bag with a meaningful default for every member",
+                              "it mirrors an external schema that is genuinely all-optional"),
+                             "medium")
 
 
 def analyze(file: TsFile, ignore: set[str]) -> list:
