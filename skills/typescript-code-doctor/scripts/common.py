@@ -151,6 +151,24 @@ def is_declaration_file(filepath: Path) -> bool:
     return filepath.name.endswith(DECLARATION_SUFFIXES)
 
 
+# Markers that tools write into files they own. `@generated` is the convention
+# Prettier, Jest and code-review tools honour; `DO NOT EDIT` is the
+# protoc/openapi/go-style banner. Both are checked in the first five lines
+# only, and matched exactly: "please do not edit this without asking" in a
+# hand-written header must not silence a file's findings.
+_GENERATED_MARKERS = ("@generated", "DO NOT EDIT")
+
+
+def is_generated_file(filepath: Path) -> bool:
+    """True when the file's header says a tool owns it."""
+    try:
+        with open(filepath, encoding="utf-8", errors="replace") as handle:
+            head = [next(handle, "") for _ in range(5)]
+    except OSError:
+        return False
+    return any(marker in line for line in head for marker in _GENERATED_MARKERS)
+
+
 def warn_unparseable(filepath: Path, exc: Exception) -> None:
     """Note a file the tokenizer could not make sense of.
 
@@ -366,8 +384,12 @@ def run_file_detector(
     ignore = set(args.ignore.split(",")) if args.ignore else set()
 
     findings: list[Finding] = []
+    generated = 0
     for filepath in find_ts_files(Path(args.path)):
         if skip_declaration_files and is_declaration_file(filepath):
+            continue
+        if is_generated_file(filepath):
+            generated += 1
             continue
         try:
             findings.extend(analyze(parse_file(filepath), ignore))
@@ -377,6 +399,9 @@ def run_file_detector(
             warn_unparseable(filepath, exc)
         except Exception as exc:  # a detector bug must not read as a clean file
             warn_detector_error(filepath, exc)
+    if generated:
+        print(f"ℹ️  {generated} generated file(s) skipped (header says a tool owns them)",
+              file=sys.stderr)
     emit(findings, args.format, clean_message)
 
 

@@ -16,7 +16,14 @@ import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from common import TS_EXTENSIONS, find_ts_files, is_test_file, walk_tree, warn_unparseable
+from common import (
+    TS_EXTENSIONS,
+    find_ts_files,
+    is_generated_file,
+    is_test_file,
+    walk_tree,
+    warn_unparseable,
+)
 from find_tsconfig_issues import load_jsonc
 from tsparse import TsFile, TsSyntaxError, parse_file
 
@@ -33,6 +40,7 @@ class Project:
     files: dict[Path, TsFile] = field(default_factory=dict)
     failed: dict[Path, str] = field(default_factory=dict)
     aliases: dict[str, list[Path]] = field(default_factory=dict)
+    generated: list[Path] = field(default_factory=list)
 
     @property
     def sources(self) -> list[Path]:
@@ -157,6 +165,9 @@ def _build_project(root: Path, quiet: bool) -> Project:
     project = Project(root=root, aliases=_load_aliases(root) if root.is_dir() else {})
     for path in find_ts_files(root):
         resolved = path.resolve()
+        if is_generated_file(path):
+            project.generated.append(resolved)
+            continue
         try:
             project.files[resolved] = parse_file(path)
         except TsSyntaxError as exc:
