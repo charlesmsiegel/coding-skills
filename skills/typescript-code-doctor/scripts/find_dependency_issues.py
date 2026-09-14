@@ -17,7 +17,7 @@ import json
 from collections import defaultdict
 from pathlib import Path
 
-from common import EXCLUDE_DIRS, Finding, is_test_file, run_tree_detector
+from common import Finding, is_test_file, run_tree_detector, walk_tree
 from tsproject import load_project
 
 # Node's own modules, which are never dependencies.
@@ -51,10 +51,9 @@ def _package_of(specifier: str) -> str:
 def _manifests(root: Path) -> list[Path]:
     if root.is_file():
         root = root.parent
-    found = [p for p in root.rglob("package.json")
-             if EXCLUDE_DIRS.isdisjoint(p.relative_to(root).parts)]
-    found.sort(key=lambda p: len(p.relative_to(root).parts))
-    return found[:5]
+    found = [p for p in walk_tree(root) if p.name == "package.json"]
+    found.sort(key=lambda p: (len(p.relative_to(root).parts), str(p)))
+    return found
 
 
 def analyze(root: Path, ignore: set[str], _args) -> list[Finding]:
@@ -76,20 +75,21 @@ def analyze(root: Path, ignore: set[str], _args) -> list[Finding]:
                 "happens to be installed.", "medium")
         return findings
 
-    manifest = manifests[0]
-    try:
-        package = json.loads(manifest.read_text(encoding="utf-8-sig", errors="replace"))
-    except (OSError, json.JSONDecodeError) as exc:
-        add(manifest, 1, "unparseable_manifest",
-            f"package.json could not be parsed ({exc}), so dependencies were not reconciled",
-            "Fix the JSON.", "medium")
+    # Every manifest under the tree gets its own dependencies reconciled — a
+    # monorepo's second, third, or sixth package.json is not shadowed by its
+    # first, the way a single-manifest reading would silently shadow it.
+    packages: list[tuple[Path, dict]] = []
+    for manifest in manifests:
+        try:
+            package = json.loads(manifest.read_text(encoding="utf-8-sig", errors="replace"))
+        except (OSError, json.JSONDecodeError) as exc:
+            add(manifest, 1, "unparseable_manifest",
+                f"package.json could not be parsed ({exc}), so dependencies were not reconciled",
+                "Fix the JSON.", "medium")
+            continue
+        packages.append((manifest, package))
+    if not packages:
         return findings
-
-    runtime = dict(package.get("dependencies") or {})
-    dev = dict(package.get("devDependencies") or {})
-    peer = dict(package.get("peerDependencies") or {})
-    optional = dict(package.get("optionalDependencies") or {})
-    declared = {**runtime, **dev, **peer, **optional}
 
     # package -> where it is imported from
     used_in_source: dict[str, list[tuple[Path, int]]] = defaultdict(list)
@@ -107,11 +107,22 @@ def analyze(root: Path, ignore: set[str], _args) -> list[Finding]:
                 continue
             bucket[name].append((path, record.line))
 
-    _report_missing(add, manifest, declared, used_in_source, used_in_tests)
-    _report_unused(add, manifest, runtime, dev, used_in_source, used_in_tests)
-    _report_misplaced(add, manifest, runtime, used_in_source, used_in_tests)
-    _report_versions(add, manifest, runtime, dev)
-    _report_lockfiles(add, manifest)
+    # "Missing" is a whole-tree question — a package used anywhere is fine as
+    # long as some manifest declares it — so it is checked once against the
+    # union of everything declared, not once per manifest.
+    declared_anywhere: dict[str, str] = {}
+    for _, package in packages:
+        for field in ("dependencies", "devDependencies", "peerDependencies", "optionalDependencies"):
+            declared_anywhere.update(package.get(field) or {})
+    _report_missing(add, packages[0][0], declared_anywhere, used_in_source, used_in_tests)
+
+    for manifest, package in packages:
+        runtime = dict(package.get("dependencies") or {})
+        dev = dict(package.get("devDependencies") or {})
+        _report_unused(add, manifest, runtime, dev, used_in_source, used_in_tests)
+        _report_misplaced(add, manifest, runtime, used_in_source, used_in_tests)
+        _report_versions(add, manifest, runtime, dev)
+        _report_lockfiles(add, manifest)
     return findings
 
 

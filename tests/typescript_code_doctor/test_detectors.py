@@ -799,3 +799,30 @@ def test_no_tsconfig_is_reported_for_any_typescript_extension(tmp_path, name):
     no tsconfig was reported clean on the check the guide says to answer first."""
     root = write(tmp_path, {f"src/{name}": "export const a = 1;\n"})
     assert "no_tsconfig" in smells(run_detector("find_tsconfig_issues.py", root))
+
+
+def test_the_eleventh_tsconfig_is_audited(tmp_path):
+    """Discovery used to keep the first ten configs and drop the rest silently."""
+    files = {"src/a.ts": "export const a = 1;\n",
+             "tsconfig.json": json.dumps({"compilerOptions": {"strict": True, "target": "es2022"}})}
+    for n in range(10):
+        files[f"packages/p{n:02d}/tsconfig.json"] = json.dumps(
+            {"compilerOptions": {"strict": True, "target": "es2022"}})
+        files[f"packages/p{n:02d}/index.ts"] = "export const x = 1;\n"
+    files["packages/zz/tsconfig.json"] = json.dumps({"compilerOptions": {"strict": False}})
+    files["packages/zz/index.ts"] = "export const z = 1;\n"
+    records = run_detector("find_tsconfig_issues.py", write(tmp_path, files))
+    assert any(r["smell_type"] == "strict_mode_off" and r["file"].endswith("zz/tsconfig.json")
+               for r in records)
+
+
+def test_the_sixth_manifest_is_reconciled(tmp_path):
+    files = {}
+    for n in range(5):
+        files[f"packages/p{n}/package.json"] = json.dumps({"name": f"p{n}", "dependencies": {}})
+        files[f"packages/p{n}/index.ts"] = "export const x = 1;\n"
+    files["packages/zz/package.json"] = json.dumps({"name": "zz", "dependencies": {"left-pad": "*"}})
+    files["packages/zz/index.ts"] = "export const z = 1;\n"
+    records = run_detector("find_dependency_issues.py", write(tmp_path, files))
+    assert any(r["smell_type"] == "unused_dependency" and "left-pad" in r["description"]
+               for r in records)

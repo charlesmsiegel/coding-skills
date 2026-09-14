@@ -40,7 +40,7 @@ import subprocess
 from collections import defaultdict
 from pathlib import Path
 
-from common import EXCLUDE_DIRS, SEVERITY_ICONS, configure_output
+from common import SEVERITY_ICONS, configure_output, walk_tree
 
 _ICON = SEVERITY_ICONS
 _TSC_LINE = re.compile(
@@ -284,8 +284,8 @@ def _coverage_files(root: Path):
         candidate = root / name
         if candidate.is_file():
             return candidate
-    for candidate in root.rglob("coverage-final.json"):
-        if EXCLUDE_DIRS.isdisjoint(set(candidate.relative_to(root).parts) - {"coverage"}):
+    for candidate in walk_tree(root):
+        if candidate.name == "coverage-final.json":
             return candidate
     return None
 

@@ -18,7 +18,7 @@ import json
 import re
 from pathlib import Path
 
-from common import EXCLUDE_DIRS, Finding, find_ts_files, run_tree_detector
+from common import Finding, find_ts_files, run_tree_detector, walk_tree
 
 # option -> (severity, what it costs to leave it off)
 STRICT_FAMILY = {
@@ -114,10 +114,10 @@ def _line_of(path: Path, option: str) -> int:
 def _configs(root: Path) -> list[Path]:
     if root.is_file():
         return [root] if root.name.startswith("tsconfig") else []
-    found = [p for p in root.rglob("tsconfig*.json")
-             if EXCLUDE_DIRS.isdisjoint(p.relative_to(root).parts)]
+    found = [p for p in walk_tree(root)
+             if p.name.startswith("tsconfig") and p.suffix == ".json"]
     found.sort(key=lambda p: (len(p.relative_to(root).parts), str(p)))
-    return found[:10]
+    return found
 
 
 def _has_typescript(root: Path) -> bool:
