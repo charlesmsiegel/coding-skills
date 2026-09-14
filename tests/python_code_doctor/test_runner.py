@@ -346,3 +346,7 @@ def test_generate_report_rejects_records_that_break_the_contract(tmp_path, load_
     assert [i["smell_type"] for i in issues] == ["eval_call"]
     assert issues[0]["kind"] == "finding"
     assert "sql_injection" in report["meta"]["records_rejected"]["security"]
+    # A detector emitting contract-invalid records is a broken detector, and
+    # analyzer_errors is what code-overview's coverage logic reads — so the
+    # category is graded as ungraded rather than as clean.
+    assert "did not satisfy" in report["meta"]["analyzer_errors"]["security"]

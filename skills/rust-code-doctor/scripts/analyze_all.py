@@ -154,6 +154,12 @@ def generate_report(path: str, skip: set | None = None, jobs: int | None = None)
                       f"and were dropped: {errors[0]}"
             for category, errors in sorted(rejected.items())
         }
+        # A detector emitting contract-invalid records is a broken detector, so
+        # the same message goes into analyzer_errors: that is what the
+        # ⚠️ ANALYSIS INCOMPLETE block prints and what code-overview's coverage
+        # logic reads, so the category is treated as ungraded rather than clean.
+        for category, message in report["meta"]["records_rejected"].items():
+            report["meta"]["analyzer_errors"].setdefault(category, message)
 
     return report
 
