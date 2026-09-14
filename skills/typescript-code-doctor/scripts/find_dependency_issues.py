@@ -88,8 +88,12 @@ def analyze(root: Path, ignore: set[str], _args) -> list[Finding]:
                 "Fix the JSON.", "medium")
             continue
         packages.append((manifest, package))
+    parsed = packages
+    packages = _without_fixtures(parsed)
     if not packages:
         return findings
+    kept = {manifest for manifest, _ in packages}
+    fixture_dirs = [manifest.parent for manifest, _ in parsed if manifest not in kept]
 
     # A source file's declared set is its NEAREST manifest plus every ANCESTOR
     # manifest above it. A root's declarations really are hoisted down to every
@@ -113,6 +117,8 @@ def analyze(root: Path, ignore: set[str], _args) -> list[Finding]:
     # never becomes the missing_dependency site.
     owned_by_a_tool = set(project.generated)
     for path, tsfile in project.files.items():
+        if _below(path, fixture_dirs):
+            continue  # a fixture project's own file: not this project's usage
         is_test = is_test_file(path)
         chain = _chain_of(path)
         for record in tsfile.imports:
@@ -155,6 +161,71 @@ def analyze(root: Path, ignore: set[str], _args) -> list[Finding]:
     # a lockfile it was never meant to have.
     _report_lockfiles(add, packages[0][0])
     return findings
+
+
+def _without_fixtures(packages: list[tuple[Path, dict]]) -> list[tuple[Path, dict]]:
+    """Drop the manifests that belong to fixture projects.
+
+    A self-contained app committed under `tests/fixtures/` so a test can point
+    a tool at it carries its own `package.json`, and its dependencies are
+    synthetic by design — a deliberately unpinned or unused one is often the
+    point of the fixture. Reconciling it as a workspace reported those against
+    the fixture manifest, and reconciling its files against the root manifest
+    reported its imports as missing there.
+
+    A manifest below a test directory is therefore a fixture, unless an
+    ancestor manifest *declares* that directory as a workspace: `apps/e2e` in
+    a monorepo is a real package whose dependencies matter, and its name is
+    not a reason to skip it. Everything below a fixture manifest goes with
+    it, nested workspaces of the fixture included.
+    """
+    declared: set[Path] = set()
+    for manifest, package in packages:
+        declared.update(_declared_workspaces(manifest, package))
+    fixture_dirs = [manifest.parent for manifest, _ in packages
+                    if is_test_file(manifest) and manifest.parent not in declared]
+    return [(manifest, package) for manifest, package in packages
+            if not _below(manifest, fixture_dirs)]
+
+
+def _below(path: Path, directories: list[Path]) -> bool:
+    return any(directory == path.parent or directory in path.parents for directory in directories)
+
+
+def _declared_workspaces(manifest: Path, package: dict) -> set[Path]:
+    """The directories a manifest's `workspaces` globs (or a `pnpm-workspace.yaml`
+    beside it) name. Negated patterns are ignored: they only ever narrow."""
+    patterns = package.get("workspaces") or []
+    if isinstance(patterns, dict):          # yarn's {"packages": [...], "nohoist": [...]}
+        patterns = patterns.get("packages") or []
+    patterns = [p for p in patterns if isinstance(p, str)]
+    pnpm = manifest.parent / "pnpm-workspace.yaml"
+    if pnpm.is_file():
+        patterns.extend(_pnpm_workspace_patterns(pnpm))
+    found: set[Path] = set()
+    for pattern in patterns:
+        if pattern.startswith("!"):
+            continue
+        with contextlib.suppress(OSError, ValueError):
+            found.update(match.resolve() for match in manifest.parent.glob(pattern.rstrip("/"))
+                         if match.is_dir())
+    return found
+
+
+def _pnpm_workspace_patterns(path: Path) -> list[str]:
+    """The `packages:` list of a pnpm-workspace.yaml — the one list in that file
+    naming directories — read without a YAML parser, which the stdlib lacks."""
+    patterns: list[str] = []
+    key = None
+    with contextlib.suppress(OSError):
+        for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+            if line and not line[0].isspace() and line.rstrip().endswith(":"):
+                key = line.rstrip()[:-1].strip()
+                continue
+            stripped = line.strip()
+            if key == "packages" and stripped.startswith("- "):
+                patterns.append(stripped[2:].strip().strip("'\""))
+    return patterns
 
 
 def _line_in_manifest(manifest: Path, name: str) -> int:

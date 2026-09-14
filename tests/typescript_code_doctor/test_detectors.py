@@ -1061,3 +1061,58 @@ def test_a_generated_test_still_counts_as_coverage_evidence(tmp_path):
     assert "no_tests_at_all" not in found
     assert "untested_module" not in found
 
+
+# --------------------------------------------------------------------------- #
+# Fixture projects under test directories are not workspaces
+# --------------------------------------------------------------------------- #
+
+def test_a_fixture_manifest_under_tests_is_not_reconciled(tmp_path):
+    """`tests/fixtures/app/package.json` is a self-contained project a test
+    points a tool at; its `"bad-fixture": "*"` is the point of the fixture, not
+    a defect of this repo. It is neither a workspace to report against nor a
+    consumer whose imports the root manifest has to declare."""
+    root = write(tmp_path, {
+        "package.json": json.dumps({"name": "root", "dependencies": {"left-pad": "1.3.0"}}),
+        "package-lock.json": "{}",
+        "src/main.ts": "import pad from 'left-pad';\nexport const m = pad;\n",
+        "tests/fixtures/app/package.json": json.dumps(
+            {"name": "fixture", "dependencies": {"bad-fixture": "*"}}),
+        "tests/fixtures/app/src/x.ts": "import bad from 'bad-fixture';\nimport y from 'not-declared';\n"
+                                       "export const x = [bad, y];\n",
+    })
+    records = run_detector("find_dependency_issues.py", root)
+
+    on_fixture = [r for r in records if "tests/fixtures/app" in Path(r["file"]).as_posix()]
+    assert not on_fixture, on_fixture
+    assert not [r for r in records if "not-declared" in r["description"]], \
+        "the fixture's import was reconciled against the root manifest"
+    assert not [r for r in records if "bad-fixture" in r["description"]]
+
+
+def test_a_declared_workspace_named_like_a_test_directory_is_still_reconciled(tmp_path):
+    """`apps/e2e` is a real package — the root's `workspaces` says so — and its
+    dependencies matter, whatever its directory is called."""
+    root = write(tmp_path, {
+        "package.json": json.dumps({"name": "root", "workspaces": ["apps/*"]}),
+        "package-lock.json": "{}",
+        "apps/e2e/package.json": json.dumps({"name": "e2e", "dependencies": {"bad-e2e": "*"}}),
+        "apps/e2e/run.ts": "import bad from 'bad-e2e';\nexport const r = bad;\n",
+    })
+    records = run_detector("find_dependency_issues.py", root)
+
+    unpinned = [r for r in records if r["smell_type"] == "unpinned_dependency"]
+    assert unpinned and Path(unpinned[0]["file"]).as_posix().endswith("apps/e2e/package.json")
+
+
+def test_a_pnpm_workspace_named_like_a_test_directory_is_still_reconciled(tmp_path):
+    root = write(tmp_path, {
+        "package.json": json.dumps({"name": "root"}),
+        "pnpm-lock.yaml": "",
+        "pnpm-workspace.yaml": "packages:\n  - 'packages/*'\n  - '!**/node_modules/**'\n",
+        "packages/e2e/package.json": json.dumps({"name": "e2e", "dependencies": {"bad-e2e": "*"}}),
+        "packages/e2e/run.ts": "import bad from 'bad-e2e';\nexport const r = bad;\n",
+    })
+    records = run_detector("find_dependency_issues.py", root)
+
+    unpinned = [r for r in records if r["smell_type"] == "unpinned_dependency"]
+    assert unpinned and Path(unpinned[0]["file"]).as_posix().endswith("packages/e2e/package.json")
