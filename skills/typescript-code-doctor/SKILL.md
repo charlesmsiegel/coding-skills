@@ -53,8 +53,9 @@ just cloned or on a project whose build is currently broken. The only requiremen
 is a **Python 3.11+ interpreter** to launch them with; nothing needs installing.
 
 `run_external_tools.py` additionally drives `tsc`, ESLint, Biome, Prettier, madge,
-knip, `npm audit` and coverage *when the project already has them*; it reports the
-ones that are missing rather than failing, and no detector depends on it.
+knip, `npm`/`pnpm`/`yarn` audit (whichever the lockfile names) and coverage *when
+the project already has them*; it reports the ones that are missing rather than
+failing, and no detector depends on it.
 
 **What the scanner cannot do:** it reads syntax, not types. Questions that need
 the type checker — is this promise handled, is this condition always true, is this
@@ -179,6 +180,32 @@ under `tests/`, `__tests__/`, `spec/`, `e2e/` or `cypress/` *below the project
 root* (the nearest `package.json`, tsconfig or `.git`), or one named
 `*.test.*` / `*.spec.*` — where the checkout itself lives does not change the
 classification.
+
+Declaration files (`.d.ts`, `.d.mts`, `.d.cts`) carry no implementation, so the
+code detectors skip them. So does any file whose first five lines say
+`@generated` or `DO NOT EDIT`: a tool owns it and a finding there is a bug report
+against the generator, not the checkout. The skipped generated files are counted
+on stderr so their silence is never mistaken for a clean bill.
+
+**Findings and candidates.** Most records assert a defect and carry the fix. A
+record that instead carries `"kind": "candidate"` is an *unverified lead* — it
+names what was observed, not what is wrong, because the detector reads syntax
+one file at a time and the evidence that settles it is elsewhere. A candidate
+carries `also_caused_by`, the benign readings a healthy codebase produces, and
+**no `suggestion`**: there is nothing to fix until the lead is confirmed.
+
+Nine heuristics are reported this way: `type_assertion`, `missing_return_type`,
+`all_optional_type`, `await_in_loop`, `single_implementation_interface`,
+`barrel_file`, `data_clump`, `primitive_obsession` and `public_mutable_field`.
+Each is ordinary, correct TypeScript often enough that only a reader with the
+surrounding context can tell. Confirm one before acting on it — an `as` at a
+boundary where the value really was checked is the honest spelling, not a defect.
+
+`format_findings.py` files candidates as *Investigate*, not *Refactor*;
+`analyze_all.py` counts them in `summary.total_candidates`, lists them under
+their own heading rather than among the high-severity issues, and never lets one
+buy a RECOMMENDATIONS bullet; and **code-overview excludes them from a
+code-health score**, so a candidate never costs a grade.
 
 ## Use the project's own tools when they exist
 

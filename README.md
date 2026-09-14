@@ -55,8 +55,9 @@ list — an open issue usually records a design decision made and not yet acted 
   promise bugs, encapsulation leaks, import cycles and barrels, dependency
   reconciliation, and the usual smell/design/duplication set.
   `run_external_tools.py` drives `tsc`, ESLint, Biome, Prettier, madge, knip,
-  `npm audit` and coverage when the project already has them — the compiler
-  answers what a syntax scanner structurally cannot.
+  `npm`/`pnpm`/`yarn` audit (whichever the lockfile names) and coverage when the
+  project already has them — the compiler answers what a syntax scanner
+  structurally cannot.
 - **[rust-code-doctor](skills/rust-code-doctor)** — the same idea for Rust, and
   fully standalone: it ships its own Rust scanner (raw strings with any number
   of hashes, block comments that nest, the `'` that is a char in one place and a
