@@ -174,7 +174,11 @@ aggregates them and can drop whole categories with `--skip cat1,cat2`
 (`--skip-duplicates` is shorthand for the slowest one). They are deliberately
 conservative (false negatives over false positives) so the output stays
 trustworthy, and several apply a lighter standard inside test files — a cast that
-installs a mock is not a claim about the product's types.
+installs a mock is not a claim about the product's types. A test file is one
+under `tests/`, `__tests__/`, `spec/`, `e2e/` or `cypress/` *below the project
+root* (the nearest `package.json`, tsconfig or `.git`), or one named
+`*.test.*` / `*.spec.*` — where the checkout itself lives does not change the
+classification.
 
 ## Use the project's own tools when they exist
 

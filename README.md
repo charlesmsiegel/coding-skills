@@ -47,8 +47,11 @@ list — an open issue usually records a design decision made and not yet acted 
 - **[typescript-code-doctor](skills/typescript-code-doctor)** — the same idea for
   TypeScript, and fully standalone: it ships its own TS/TSX scanner (strings,
   template literals, regex-vs-division, JSX text, bracket matching) so the
-  detectors run against a checkout with no `node_modules` and no build. Covers
-  the type system (`any`/`as`/`!`/`@ts-ignore` and a tsconfig strictness audit),
+  detectors run against a checkout with no `node_modules` and no build.
+  Contextual heuristics — an ordinary `as` cast, an `await` in a loop, a
+  barrel file, a data clump — are reported as candidates with their benign
+  readings attached, never as defects. Covers the type system (`any`/`as`/`!`/
+  `@ts-ignore` and a tsconfig strictness audit),
   promise bugs, encapsulation leaks, import cycles and barrels, dependency
   reconciliation, and the usual smell/design/duplication set.
   `run_external_tools.py` drives `tsc`, ESLint, Biome, Prettier, madge, knip,
