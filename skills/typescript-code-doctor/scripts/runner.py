@@ -39,6 +39,7 @@ from common import (
     configure_output,
     find_ts_files,
     is_declaration_file,
+    is_generated_file,
     warn_detector_error,
     warn_unparseable,
 )
@@ -183,7 +184,7 @@ def run_detectors(path: str, file_specs: list[tuple[str, str]],
     root = Path(path)
     jobs = jobs or default_jobs()
 
-    files = [p for p in find_ts_files(root) if not is_declaration_file(p)]
+    files = [p for p in find_ts_files(root) if not is_declaration_file(p) and not is_generated_file(p)]
     shards = chunk(files, jobs, weight=_source_size)
 
     results: dict[str, object] = {}
