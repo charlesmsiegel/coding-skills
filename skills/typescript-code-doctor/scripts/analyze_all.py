@@ -173,8 +173,12 @@ def print_text_report(report: dict) -> None:
     print("📈 SUMMARY")
     print("-" * 40)
     print(f"Total issues found: {summary['total_issues']}")
-    if summary.get("total_candidates"):
-        print(f"Candidates: {summary['total_candidates']} (unverified leads, not counted as defects)")
+    # Worded as python-code-doctor words it. The candidates ARE part of the
+    # total above — a line that says they are "not counted" contradicts the
+    # number it sits under.
+    candidate_count = summary.get("total_candidates", 0)
+    if candidate_count:
+        print(f"  ❓ of which {candidate_count} are candidates — unverified leads, not defects")
     print()
     print("By severity:")
     for severity, count in summary["by_severity"].items():

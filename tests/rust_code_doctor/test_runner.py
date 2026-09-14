@@ -241,7 +241,9 @@ def test_candidates_are_counted_separately_and_kept_out_of_the_high_list(tmp_pat
     high_block = out[out.index("HIGH SEVERITY ISSUES"):out.index("CANDIDATES")]
     assert "a defect" in high_block and "a lead" not in high_block
     assert "a lead" in out[out.index("CANDIDATES"):]
-    assert "Candidates: 1" in out
+    assert "Total issues found: 2" in out
+    assert "of which 1 are candidates" in out, \
+        "the summary line claimed the candidates were excluded from the total"
 
 
 def test_generate_report_counts_candidates_and_rejects_invalid_records(tree, load_module, monkeypatch):
