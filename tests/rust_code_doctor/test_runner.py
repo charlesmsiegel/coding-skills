@@ -328,3 +328,23 @@ def test_a_candidate_only_category_earns_no_recommendation(tmp_path, load_module
     out = capsys.readouterr().out
     assert module.RECOMMENDATIONS["type_issues"] not in out, \
         "a lead bought advice about a defect nothing found"
+
+
+def test_the_report_hop_keeps_a_record_carrying_an_extra_key(tree, load_module, monkeypatch):
+    """The hop validates the contract's fields; a detector that also attaches
+    something of its own has not broken the contract. Dropping the record loses
+    a real finding over a key the validator simply did not know about."""
+    module = load_module(SCRIPTS_DIR, "analyze_all")
+
+    def fake_run_detectors(path, file_specs, tree_specs, jobs=None):
+        return {"types": [
+            {"file": "a.rs", "line": 1, "smell_type": "unwrap_in_fallible_fn", "description": "d",
+             "suggestion": "fix", "severity": "high", "kind": "finding",
+             "also_caused_by": [], "code_snippet": "", "related_lines": [], "lines": 5},
+        ]}
+
+    monkeypatch.setattr(module, "run_detectors", fake_run_detectors)
+    monkeypatch.setattr(module, "ANALYZERS", [("types", "find_type_issues", "Types", module.FILE)])
+    report = module.generate_report(str(tree))
+    assert [i["smell_type"] for i in report["categories"]["types"]["issues"]] == ["unwrap_in_fallible_fn"]
+    assert not report["meta"].get("records_rejected")

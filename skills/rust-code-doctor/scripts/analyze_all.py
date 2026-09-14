@@ -4,6 +4,7 @@ Run every detector over a Rust project and merge the output into one report.
 """
 
 import argparse
+import dataclasses
 import io
 import json
 import sys
@@ -18,6 +19,11 @@ from runner import default_jobs, run_detectors
 # answer from a single parsed file and are sharded across the pool, TREE
 # detectors need the whole project at once and share one load of it.
 FILE, TREE = "file", "tree"
+
+# The contract's own fields. A detector that also attaches something of its
+# own — a line span, a rule id — has not broken the contract, so the extra key
+# is ignored on the hop instead of costing the whole record.
+_FINDING_FIELDS = {field.name for field in dataclasses.fields(Finding)}
 
 ANALYZERS = [
     ("cargo", "find_cargo_issues", "Auditing Cargo.toml", TREE),
@@ -129,7 +135,7 @@ def generate_report(path: str, skip: set | None = None, jobs: int | None = None)
             # is dropped and named here, instead of reaching a grader as a
             # finding it never proved.
             try:
-                Finding(**{k: v for k, v in issue.items() if k != "category"})
+                Finding(**{k: v for k, v in issue.items() if k in _FINDING_FIELDS})
             except (TypeError, ValueError) as exc:
                 rejected.setdefault(category, []).append(str(exc))
                 continue
