@@ -1,6 +1,7 @@
 """Tests for the aggregator, the diff lens, and the external-tool runner."""
 
 import json
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -264,6 +265,10 @@ def test_the_diff_lens_renders_a_candidates_reasons_instead_of_an_empty_fix(git_
     assert "? also caused by:" in output
     assert [line for line in output.splitlines() if line.strip() == "→"] == [], \
         "a candidate rendered a fix arrow with nothing after it"
+    # The count line must not fold the lead in with the defects it heads, and the
+    # severity tally behind it counts proven records only.
+    assert re.search(r"\d+ finding\(s\), [1-9]\d* candidate\(s\) on changed lines", output), \
+        "the count line still calls every record a finding"
 
 
 def test_the_diff_lens_names_what_it_did_not_run(git_project):

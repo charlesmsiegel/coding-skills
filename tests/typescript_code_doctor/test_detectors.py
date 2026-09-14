@@ -889,3 +889,51 @@ def test_generated_files_are_skipped_and_counted(tmp_path):
     records = json.loads(result.stdout)
     assert all(r["file"].endswith("main.ts") for r in records) and records
     assert "1 generated file(s) skipped" in result.stderr
+
+
+# --------------------------------------------------------------------------- #
+# The CR-review lens: a candidate is a lead, not a ranked defect
+# --------------------------------------------------------------------------- #
+
+def _git_init(root: Path) -> None:
+    for args in (["init", "-q"], ["config", "user.email", "t@t.co"],
+                 ["config", "user.name", "t"], ["config", "commit.gpgsign", "false"],
+                 ["add", "-A"], ["commit", "-qm", "base"]):
+        subprocess.run(["git", "-C", str(root), *args], capture_output=True, timeout=120)
+
+
+def test_the_diff_lens_marks_a_candidate_as_a_lead_not_a_ranked_defect(tmp_path):
+    """An `as` cast on a changed line is a candidate, and the lens must say so.
+
+    A severity icon on a lead reads as a verdict the syntax never proved, and a
+    bare arrow reads as a fix that was forgotten. What the record has instead is
+    the benign readings the reader must rule out first.
+    """
+    root = write(tmp_path / "repo", {
+        "package.json": '{"name": "p"}',
+        "src/main.ts": "export const base = 1;\n",
+    })
+    _git_init(root)
+    (root / "src" / "main.ts").write_text(
+        "export const base = 1;\n"
+        "export function port(raw: string): number {\n"
+        "  return (JSON.parse(raw) as { port: number }).port;\n"
+        "}\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(root), "add", "-A"], capture_output=True, timeout=120)
+
+    result = subprocess.run(
+        [sys.executable, str(SCRIPTS_DIR / "analyze_diff.py"), "HEAD"],
+        cwd=root, capture_output=True, text=True, encoding="utf-8",
+        errors="replace", timeout=600)
+    assert result.returncode == 0, result.stderr[-800:]
+    output = result.stdout
+    assert "type_assertion" in output, "the fixture must reach the renderer"
+
+    assert "[CANDIDATE]" in output
+    assert "? also caused by:" in output
+    marked = [line for line in output.splitlines() if "[CANDIDATE]" in line]
+    assert marked and not any(icon in line for line in marked for icon in "🔴🟡🟢"), \
+        "a candidate was given a severity icon it did not earn"
+    assert [line for line in output.splitlines() if line.strip() == "→"] == [], \
+        "a candidate rendered a fix arrow with nothing after it"
+    assert "candidate(s)" in output, "the count line still calls every record a finding"

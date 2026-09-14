@@ -157,10 +157,16 @@ def render(findings, stats):
         lines.append("✅ No findings on the changed lines.")
         return "\n".join(lines)
 
+    # Counted as django_report.render counts them: a lead is not a defect, so it
+    # is named apart from the findings and kept out of the severity tally, which
+    # is a ranking of proven defects.
+    proven = [f for f in findings if f.get("kind") != "candidate"]
+    candidates = [f for f in findings if f.get("kind") == "candidate"]
     by_severity = defaultdict(int)
-    for f in findings:
+    for f in proven:
         by_severity[f["severity"]] += 1
-    lines.append(str(len(findings)) + " finding(s) on changed lines  (" +
+    lines.append(str(len(proven)) + " finding(s), " + str(len(candidates)) +
+                 " candidate(s) on changed lines  (" +
                  SEVERITY_ICONS["high"] + " " + str(by_severity["high"]) + "  " +
                  SEVERITY_ICONS["medium"] + " " + str(by_severity["medium"]) + "  " +
                  SEVERITY_ICONS["low"] + " " + str(by_severity["low"]) + ")\n")
