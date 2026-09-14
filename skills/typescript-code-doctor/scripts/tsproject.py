@@ -61,7 +61,15 @@ class Project:
 
     @property
     def tests(self) -> list[Path]:
-        return [p for p in self.analyzable if is_test_file(p)]
+        """Every test file, generated ones included.
+
+        Tests are read as *evidence* — which modules they reach — never as a
+        place to locate a finding, and a generated test exercises what it
+        imports just as well as a hand-written one. Deriving this from
+        `analyzable` made a project whose only tests were generated look
+        untested, and raised the high-severity `no_tests_at_all` alarm.
+        """
+        return [p for p in self.files if is_test_file(p)]
 
     def resolve(self, importer: Path, specifier: str) -> Path | None:
         """The file a specifier points at, or None when it is external."""
