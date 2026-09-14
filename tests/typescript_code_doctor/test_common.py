@@ -224,3 +224,26 @@ def test_project_root_is_resolved_once_per_directory(common, tmp_path, monkeypat
     probes.clear()
     assert common.project_root_of(second) == repo
     assert probes == [], "the second file in the same directory re-walked the tree"
+
+
+def test_a_nested_fixture_manifest_does_not_reset_the_project_root(common, tmp_path):
+    """A fixture project committed under `tests/` carries its own package.json.
+
+    Stopping at the nearest marker made that manifest the project root, so
+    `tests/fixtures/app/src/x.ts` sat at `src/x.ts` relative to "its" root and
+    classified as production code — the test-file leniency silently switched off
+    for a whole fixture tree. Classification is relative to the checkout.
+    """
+    repo = tmp_path / "repo"
+    (repo / "src").mkdir(parents=True)
+    (repo / "package.json").write_text('{"name": "repo"}')
+    (repo / "src" / "app.ts").write_text("export const a = 1;\n")
+    fixture = repo / "tests" / "fixtures" / "app"
+    (fixture / "src").mkdir(parents=True)
+    (fixture / "package.json").write_text('{"name": "fixture"}')
+    nested = fixture / "src" / "x.ts"
+    nested.write_text("export const x = 1;\n")
+
+    assert common.project_root_of(nested) == repo
+    assert common.is_test_file(nested)
+    assert not common.is_test_file(repo / "src" / "app.ts")

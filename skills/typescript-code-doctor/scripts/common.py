@@ -104,7 +104,15 @@ def find_ts_files(path: Path) -> Iterator[Path]:
 
 @functools.lru_cache(maxsize=None)
 def _root_of_dir(directory: Path) -> Path | None:
-    """The nearest ancestor of (or equal to) ``directory`` holding a root marker.
+    """The OUTERMOST ancestor of (or equal to) ``directory`` holding a root marker.
+
+    Outermost, not nearest: a fixture project committed under `tests/` carries
+    its own `package.json`, and stopping at the nearest marker made *that* the
+    project root — so `tests/fixtures/app/src/x.ts` sat at `src/x.ts` inside
+    "its" root and classified as production code, switching the test-file
+    leniency off for the whole fixture tree. The walk therefore keeps going past
+    the first hit and remembers the last one. A checkout whose only marker is at
+    its own top still resolves there, because nothing above it carries one.
 
     Cached on the resolved directory: the answer is a property of the directory,
     not of the file inside it, and every detector asks it of every file it
@@ -117,19 +125,19 @@ def _root_of_dir(directory: Path) -> Path | None:
     candidate is treated as having no marker so the walk keeps going instead
     of crashing the whole detector run.
     """
+    outermost = None
     for candidate in (directory, *directory.parents):
         try:
-            if any((candidate / marker).exists() for marker in ROOT_MARKERS):
-                return candidate
-            if any(candidate.glob("tsconfig*.json")):
-                return candidate
+            if (any((candidate / marker).exists() for marker in ROOT_MARKERS)
+                    or any(candidate.glob("tsconfig*.json"))):
+                outermost = candidate
         except OSError:
             continue
-    return None
+    return outermost
 
 
 def project_root_of(filepath: Path) -> Path | None:
-    """The nearest ancestor holding a package.json, a tsconfig, or .git; None if none."""
+    """The outermost ancestor holding a package.json, a tsconfig, or .git; None if none."""
     return _root_of_dir(filepath.resolve().parent)
 
 
