@@ -458,13 +458,21 @@ def main():
         by_type = defaultdict(int)
         for i in all_issues:
             by_type[i.smell_type] += 1
-        print(f"Found {len(all_issues)} security issue(s):\n\nSummary:")
+        # A candidate is a lead, not a defect: counting one as a "security issue
+        # found" is a verdict the evidence does not support, so it is named apart.
+        proven = [i for i in all_issues if i.kind != "candidate"]
+        leads = [i for i in all_issues if i.kind == "candidate"]
+        print(f"Found {len(proven)} finding(s), {len(leads)} candidate(s):\n\nSummary:")
         for s, c in sorted(by_type.items(), key=lambda x: -x[1]):
             print(f"  {s}: {c}")
         print()
         icons = SEVERITY_ICONS
         for i in all_issues:
-            print(f"{icons[i.severity]} [{i.severity.upper()}] {i.file}:{i.line}")
+            # Marked as django_report.render marks it: a severity icon on a lead
+            # reads as a verdict the evidence does not support.
+            marker = ("? [CANDIDATE]" if i.kind == "candidate"
+                      else f"{icons[i.severity]} [{i.severity.upper()}]")
+            print(f"{marker} {i.file}:{i.line}")
             print(f"   {i.smell_type}: {i.description}")
             if i.code_snippet:
                 print(f"   Code: {i.code_snippet}")
