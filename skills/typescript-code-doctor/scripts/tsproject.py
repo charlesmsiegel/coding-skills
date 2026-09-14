@@ -22,7 +22,7 @@ from tsparse import TsFile, TsSyntaxError, parse_file
 
 # Tried in order when a specifier has no extension.
 _CANDIDATE_SUFFIXES = (
-    ".ts", ".tsx", ".mts", ".cts", ".d.ts",
+    ".ts", ".tsx", ".mts", ".cts", ".d.ts", ".d.mts", ".d.cts",
     "/index.ts", "/index.tsx", "/index.mts", "/index.cts",
 )
 

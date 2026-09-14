@@ -157,3 +157,11 @@ def test_without_a_root_marker_every_component_counts(common, tmp_path):
     loose.write_text("export {};\n")
     assert common.project_root_of(loose) is None
     assert common.is_test_file(loose)
+
+
+@pytest.mark.parametrize("name, expected", [
+    ("types.d.ts", True), ("types.d.mts", True), ("types.d.cts", True),
+    ("types.ts", False), ("d.ts", False), ("mod.mts", False),
+])
+def test_declaration_files_are_recognized_in_every_module_flavour(common, name, expected):
+    assert common.is_declaration_file(Path("src") / name) is expected

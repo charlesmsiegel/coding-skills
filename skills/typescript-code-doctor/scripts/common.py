@@ -39,6 +39,9 @@ EXCLUDE_DIRS = frozenset({
 # almost always live under an excluded build directory.
 TS_EXTENSIONS = (".ts", ".tsx", ".mts", ".cts")
 
+# Declaration-file suffixes across all three module flavours.
+DECLARATION_SUFFIXES = (".d.ts", ".d.mts", ".d.cts")
+
 # Filename markers that make a file a test. Used by several detectors to
 # apply a different standard (a `console.log` in a test is not a leftover)
 # and by find_untested_modules to tell the two halves of a repo apart.
@@ -134,8 +137,8 @@ def is_test_file(filepath: Path) -> bool:
 
 
 def is_declaration_file(filepath: Path) -> bool:
-    """True for `.d.ts` — types only, so most code detectors do not apply."""
-    return filepath.name.endswith(".d.ts")
+    """True for `.d.ts`, `.d.mts`, `.d.cts` — types only, so most code detectors do not apply."""
+    return filepath.name.endswith(DECLARATION_SUFFIXES)
 
 
 def warn_unparseable(filepath: Path, exc: Exception) -> None:
