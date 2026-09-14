@@ -10,6 +10,7 @@ per script; this module is the single copy.
 import ast
 import contextlib
 import sys
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterator
 
@@ -138,6 +139,123 @@ def sort_findings(findings: list) -> list:
     findings.sort(key=lambda f: (f.severity != "high", f.severity != "medium",
                                  f.file, f.line))
     return findings
+
+
+# --------------------------------------------------------------------------- #
+# The confidence discipline, as a type
+# --------------------------------------------------------------------------- #
+
+class SchemaError(ValueError):
+    """A detector tried to emit a record its evidence does not support."""
+
+
+VALID_KINDS = frozenset({"finding", "candidate"})
+
+
+@dataclass(frozen=True)
+class Finding:
+    """One output record, in one of two kinds.
+
+    A **finding** asserts a defect. It carries a concrete fix, because a claim
+    you cannot act on is not worth making.
+
+    A **candidate** reports a lead that needs verification. It carries the
+    specific ways a healthy codebase produces the same observation, and it
+    carries no fix — recommending an edit on heuristic evidence is how a tool
+    like this talks someone into deleting live code.
+
+    The constructor enforces the difference. Prose in a reference file does not
+    survive contact with a detector author in a hurry; a raised exception does.
+
+    Frozen to ensure the schema enforcement holds across the lifetime of the
+    object, not just at construction time.
+    """
+
+    file: str
+    line: int
+    smell_type: str
+    description: str
+    suggestion: str = ""
+    # Tuples, not lists. `frozen=True` blocks reassignment but not in-place
+    # mutation, so a list here would let `candidate.also_caused_by.clear()`
+    # walk a validated record into a schema-invalid state that
+    # __post_init__ never re-checks — and it would then serialise and emit
+    # like any other record. __post_init__ below coerces any list handed to
+    # the constructor (including one that came back out of json.loads,
+    # which knows nothing about tuples) into a tuple, so the type is
+    # actually enforced, not just annotated.
+    also_caused_by: tuple[str, ...] = ()
+    severity: str = "medium"
+    kind: str = "finding"
+    code_snippet: str = ""
+    # Other lines that participate in the same finding. analyze_diff.py uses
+    # these so a cross-declaration smell surfaces when any participant changed.
+    related_lines: tuple[int, ...] = ()
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "also_caused_by", tuple(self.also_caused_by))
+        object.__setattr__(self, "related_lines", tuple(self.related_lines))
+        if self.kind not in VALID_KINDS:
+            raise SchemaError(
+                f"{self.smell_type}: kind must be one of {sorted(VALID_KINDS)}, got {self.kind!r}"
+            )
+        if self.kind == "finding":
+            if not self.suggestion.strip():
+                raise SchemaError(
+                    f"{self.smell_type}: a finding asserts a defect and must carry a suggestion; "
+                    "if you cannot name the fix, emit a candidate instead"
+                )
+            if self.also_caused_by:
+                raise SchemaError(
+                    f"{self.smell_type}: also_caused_by belongs to candidates; a finding that has "
+                    "benign explanations is a candidate"
+                )
+        else:
+            if self.suggestion.strip():
+                raise SchemaError(
+                    f"{self.smell_type}: a candidate must not carry a suggestion — it is an "
+                    "unverified lead, and a fix on unverified evidence is how live code gets deleted"
+                )
+            if not self.also_caused_by or not any(s.strip() for s in self.also_caused_by):
+                raise SchemaError(
+                    f"{self.smell_type}: a candidate must name the ways a healthy codebase produces "
+                    "this observation in also_caused_by, so the reader can rule them out"
+                )
+
+
+# The keys Python detectors use for the same three ideas. `format_findings.py`
+# and `analyze_all.py` already read these alternatives; the validator accepts
+# the same spellings so a detector need not be rewritten to be checked.
+_TYPE_KEYS = ("smell_type", "issue_type", "pattern_type", "type")
+
+
+def _severity_of(record: dict) -> str:
+    if record.get("severity"):
+        return str(record["severity"])
+    confidence = record.get("confidence")
+    if isinstance(confidence, (int, float)):
+        return "high" if confidence >= 90 else ("medium" if confidence >= 70 else "low")
+    return "medium"
+
+
+def validate_record(record: dict) -> dict:
+    """Check one detector record against the finding/candidate contract.
+
+    Raises SchemaError when a finding has no fix or a candidate has no benign
+    explanation. Returns a copy of the record with `kind` made explicit, so a
+    consumer never has to guess what an absent key meant. The argument is not
+    mutated.
+    """
+    smell = next((str(record[key]) for key in _TYPE_KEYS if record.get(key)), "issue")
+    suggestion = str(record.get("suggestion") or record.get("after") or "")
+    kind = str(record.get("kind") or "finding")
+    Finding(
+        file=str(record.get("file", "")), line=int(record.get("line") or 1),
+        smell_type=smell, description=str(record.get("description", "")),
+        suggestion=suggestion, severity=_severity_of(record), kind=kind,
+        also_caused_by=tuple(record.get("also_caused_by") or ()),
+    )
+    return {**record, "kind": kind}
 
 
 class _SaidOnce:

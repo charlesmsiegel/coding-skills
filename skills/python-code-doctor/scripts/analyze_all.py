@@ -9,7 +9,7 @@ import json
 import argparse
 from pathlib import Path
 from datetime import datetime
-from common import SEVERITY_ICONS, configure_output
+from common import SEVERITY_ICONS, SchemaError, configure_output, validate_record
 from runner import default_jobs, run_detectors
 
 
@@ -98,6 +98,8 @@ def generate_report(path: str, skip: set | None = None, jobs: int | None = None)
         'categories': {}
     }
 
+    rejected: dict[str, list[str]] = {}
+
     for category, data in results.items():
         issues = []
         if isinstance(data, list):
@@ -110,15 +112,24 @@ def generate_report(path: str, skip: set | None = None, jobs: int | None = None)
 
         normalized = []
         for issue in issues:
-            if isinstance(issue, dict):
-                if 'severity' not in issue:
-                    if 'confidence' in issue:
-                        conf = issue['confidence']
-                        issue['severity'] = 'high' if conf >= 90 else ('medium' if conf >= 70 else 'low')
-                    else:
-                        issue['severity'] = 'medium'
-                issue['category'] = category
-                normalized.append(issue)
+            if not isinstance(issue, dict):
+                continue
+            # Every Python detector's records pass through here, so this is
+            # where the contract is enforced. A record that breaks it is
+            # dropped and named, never counted as a finding it did not prove.
+            try:
+                issue = validate_record(issue)
+            except SchemaError as exc:
+                rejected.setdefault(category, []).append(str(exc))
+                continue
+            if 'severity' not in issue:
+                if 'confidence' in issue:
+                    conf = issue['confidence']
+                    issue['severity'] = 'high' if conf >= 90 else ('medium' if conf >= 70 else 'low')
+                else:
+                    issue['severity'] = 'medium'
+            issue['category'] = category
+            normalized.append(issue)
 
         report['categories'][category] = {'issues': normalized, 'count': len(normalized)}
         report['summary']['total_issues'] += len(normalized)
@@ -130,6 +141,13 @@ def generate_report(path: str, skip: set | None = None, jobs: int | None = None)
             sev = issue.get('severity', 'medium')
             if sev in report['summary']['by_severity']:
                 report['summary']['by_severity'][sev] += 1
+
+    if rejected:
+        report['meta']['records_rejected'] = {
+            category: f"{len(errors)} record(s) did not satisfy the findings schema "
+                      f"and were dropped: {errors[0]}"
+            for category, errors in sorted(rejected.items())
+        }
 
     return report
 
