@@ -96,7 +96,9 @@ def signature_changes(fd):
 def _authors(commits: list[dict]) -> list[dict]:
     """Who made the change: most commits first, ties in order of first appearance."""
     counts: dict[str, int] = {}
-    for commit in commits:
+    # `git log` hands back the range newest-first, so the walk is reversed:
+    # otherwise "first appearance" names whoever committed last.
+    for commit in reversed(commits):
         if commit["author"]:
             counts[commit["author"]] = counts.get(commit["author"], 0) + 1
     order = list(counts)
