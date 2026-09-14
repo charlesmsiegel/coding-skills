@@ -244,9 +244,31 @@ def _audit_argv(root: Path) -> tuple[str, list[str]] | None:
     inv = _invocation(root, manager)
     if inv is None:
         return None
-    if manager == "yarn" and (root / ".yarnrc.yml").is_file():
+    if manager == "yarn" and _is_yarn_berry(root):
         return manager, [*inv, "npm", "audit", "--json"]   # Yarn Berry
     return manager, [*inv, "audit", "--json"]
+
+
+def _is_yarn_berry(root: Path) -> bool:
+    """True for Yarn 2+, whose audit is `yarn npm audit` — classic's is `yarn audit`.
+
+    `.yarnrc.yml` is Berry's own config file, but a repo pinned through Corepack
+    need not ship one: `package.json`'s `packageManager` field is then the only
+    thing that names the major. Reading only the file ran classic's subcommand on
+    Berry, where it does not exist, and the audit came back as a tool error.
+    """
+    if (root / ".yarnrc.yml").is_file():
+        return True
+    try:
+        package = json.loads((root / "package.json").read_text(
+            encoding="utf-8-sig", errors="replace"))
+    except (OSError, json.JSONDecodeError):
+        return False
+    pinned = package.get("packageManager")
+    if not isinstance(pinned, str) or not pinned.startswith("yarn@"):
+        return False
+    major = pinned[len("yarn@"):].lstrip("^~=v").split(".", 1)[0]
+    return major.isdigit() and int(major) >= 2
 
 
 def run_audit(_inv, root):

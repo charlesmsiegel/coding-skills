@@ -89,3 +89,22 @@ def test_an_unknown_tool_name_is_named_rather_than_silently_dropped(
     assert "unknown tool(s) ignored" in captured.err
     assert "npm" in captured.err
     assert "tsc" not in captured.err, "a tool this script does have was called unknown"
+
+
+@pytest.mark.parametrize("package_manager, tail", [
+    ("yarn@4.1.0", ["npm", "audit", "--json"]),      # Berry
+    ("yarn@2.4.3", ["npm", "audit", "--json"]),      # Berry
+    ("yarn@1.22.19", ["audit", "--json"]),           # classic
+])
+def test_yarn_berry_is_recognised_from_package_manager(
+        external, which, tmp_path, package_manager, tail):
+    """A Berry repo need not ship `.yarnrc.yml`; Corepack's `packageManager`
+    field pins the major on its own. Reading only the file ran `yarn audit` on
+    Berry, where that subcommand does not exist."""
+    (tmp_path / "yarn.lock").write_text("", encoding="utf-8")
+    (tmp_path / "package.json").write_text(
+        f'{{"name": "p", "packageManager": "{package_manager}"}}', encoding="utf-8")
+
+    manager, argv = external._audit_argv(tmp_path)
+    assert manager == "yarn"
+    assert argv == ["/bin/yarn", *tail]
