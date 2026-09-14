@@ -50,7 +50,7 @@ def analyze(root: Path, ignore: set[str], _args) -> list[Finding]:
             if token.kind == "name":
                 type_uses[token.value] += 1
 
-    for path, tsfile in project.files.items():
+    for path, tsfile in project.analyzable.items():
         if is_test_file(path):
             continue
         _check_interfaces(tsfile, path, implementers, lead)

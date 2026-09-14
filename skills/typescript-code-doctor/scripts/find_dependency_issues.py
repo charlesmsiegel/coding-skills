@@ -68,7 +68,7 @@ def analyze(root: Path, ignore: set[str], _args) -> list[Finding]:
     manifests = _manifests(root)
     project = load_project(root)
     if not manifests:
-        if project.files:
+        if project.analyzable:
             add(root / "package.json", 1, "no_manifest",
                 "TypeScript sources but no package.json under this path",
                 "Add one so the dependency set is declared rather than inherited from whatever "
@@ -109,6 +109,11 @@ def analyze(root: Path, ignore: set[str], _args) -> list[Finding]:
     missing_sites: dict[Path, dict[str, tuple[Path, int]]] = defaultdict(dict)
     source_by_manifest: dict[Path, set[str]] = defaultdict(set)
     tests_by_manifest: dict[Path, set[str]] = defaultdict(set)
+    # Usage is read from every file, generated ones included — a runtime package
+    # imported only by a generated API client is genuinely used. A finding is
+    # never *located* in one, though, so a generated import contributes usage but
+    # never becomes the missing_dependency site.
+    owned_by_a_tool = set(project.generated)
     for path, tsfile in project.files.items():
         is_test = is_test_file(path)
         bucket = used_in_tests if is_test else used_in_source
@@ -125,8 +130,9 @@ def analyze(root: Path, ignore: set[str], _args) -> list[Finding]:
             bucket[name].append((path, record.line))
             for manifest in chain:
                 (tests_by_manifest if is_test else source_by_manifest)[manifest].add(name)
-            nearest = chain[-1] if chain else packages[0][0]
-            missing_sites[nearest].setdefault(name, (path, record.line))
+            if path not in owned_by_a_tool:
+                nearest = chain[-1] if chain else packages[0][0]
+                missing_sites[nearest].setdefault(name, (path, record.line))
 
     declared_by_manifest = {
         manifest: _declared(package) for manifest, package in packages

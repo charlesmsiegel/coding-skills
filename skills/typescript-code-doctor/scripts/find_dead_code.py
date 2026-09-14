@@ -118,7 +118,7 @@ def analyze(root: Path, ignore: set[str], _args) -> list[Finding]:
             findings.append(Finding(file=str(path), line=line, smell_type=smell,
                                     description=description, suggestion=suggestion, severity=severity))
 
-    for path, tsfile in project.files.items():
+    for path, tsfile in project.analyzable.items():
         if is_declaration_file(path):
             continue
         _check_unused_imports(tsfile, path, add)
@@ -155,7 +155,7 @@ def _check_unused_exports(project, add) -> None:
                 star_reexported.add(target)
             imported.setdefault(target, set()).update(names)
 
-    for path, tsfile in project.files.items():
+    for path, tsfile in project.analyzable.items():
         posix = path.as_posix()
         if is_test_file(path) or is_declaration_file(path) or ENTRY_PATTERNS.search(posix):
             continue
