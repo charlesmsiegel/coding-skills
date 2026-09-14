@@ -468,7 +468,14 @@ def main():
             print(f"   {i.smell_type}: {i.description}")
             if i.code_snippet:
                 print(f"   Code: {i.code_snippet}")
-            print(f"   → {i.suggestion}\n")
+            # A candidate has no fix to print — an empty arrow reads as one that
+            # was forgotten. What it has is the readings the reader must rule out.
+            if i.suggestion:
+                print(f"   → {i.suggestion}")
+            if i.kind == "candidate":
+                for reason in i.also_caused_by:
+                    print(f"   ? also caused by: {reason}")
+            print()
 
 
 if __name__ == "__main__":
