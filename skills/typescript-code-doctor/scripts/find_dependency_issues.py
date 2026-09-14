@@ -91,11 +91,28 @@ def analyze(root: Path, ignore: set[str], _args) -> list[Finding]:
     if not packages:
         return findings
 
-    # package -> where it is imported from
+    # A source file's declared set is its NEAREST manifest plus every ANCESTOR
+    # manifest above it. A root's declarations really are hoisted down to every
+    # workspace; a sibling workspace's are not installed here at all. Unioning
+    # the whole tree made b's declaration cover a's import, which hid the clean-
+    # install break in a *and* kept b's orphaned declaration looking used.
+    manifest_dirs = [(manifest, manifest.parent) for manifest, _ in packages]
+
+    def _chain_of(path: Path) -> list[Path]:
+        ancestors = set(path.parents)
+        return [manifest for manifest, directory in manifest_dirs if directory in ancestors]
+
+    # package -> where it is imported from, and manifest -> what its own files import
     used_in_source: dict[str, list[tuple[Path, int]]] = defaultdict(list)
     used_in_tests: dict[str, list[tuple[Path, int]]] = defaultdict(list)
+    # (manifest, package) sites, so "missing" is answered per workspace
+    missing_sites: dict[Path, dict[str, tuple[Path, int]]] = defaultdict(dict)
+    source_by_manifest: dict[Path, set[str]] = defaultdict(set)
+    tests_by_manifest: dict[Path, set[str]] = defaultdict(set)
     for path, tsfile in project.files.items():
-        bucket = used_in_tests if is_test_file(path) else used_in_source
+        is_test = is_test_file(path)
+        bucket = used_in_tests if is_test else used_in_source
+        chain = _chain_of(path)
         for record in tsfile.imports:
             specifier = record.module
             if not specifier or specifier.startswith(".") or specifier.startswith("/"):
@@ -106,21 +123,28 @@ def analyze(root: Path, ignore: set[str], _args) -> list[Finding]:
             if name in NODE_BUILTINS:
                 continue
             bucket[name].append((path, record.line))
+            for manifest in chain:
+                (tests_by_manifest if is_test else source_by_manifest)[manifest].add(name)
+            nearest = chain[-1] if chain else packages[0][0]
+            missing_sites[nearest].setdefault(name, (path, record.line))
 
-    # "Missing" is a whole-tree question — a package used anywhere is fine as
-    # long as some manifest declares it — so it is checked once against the
-    # union of everything declared, not once per manifest.
-    declared_anywhere: dict[str, str] = {}
-    for _, package in packages:
-        for field in ("dependencies", "devDependencies", "peerDependencies", "optionalDependencies"):
-            declared_anywhere.update(package.get(field) or {})
-    _report_missing(add, packages[0][0], declared_anywhere, used_in_source, used_in_tests)
+    declared_by_manifest = {
+        manifest: _declared(package) for manifest, package in packages
+    }
+    for nearest, sites in missing_sites.items():
+        visible: dict[str, str] = {}
+        for manifest in _chain_of(nearest):  # the ancestors of the manifest's own directory
+            visible.update(declared_by_manifest.get(manifest) or {})
+        visible.update(declared_by_manifest.get(nearest) or {})
+        _report_missing(add, visible, sites)
 
     for manifest, package in packages:
         runtime = dict(package.get("dependencies") or {})
         dev = dict(package.get("devDependencies") or {})
-        _report_unused(add, manifest, runtime, dev, used_in_source, used_in_tests)
-        _report_misplaced(add, manifest, runtime, used_in_source, used_in_tests)
+        _report_unused(add, manifest, runtime, dev,
+                       source_by_manifest[manifest], tests_by_manifest[manifest])
+        _report_misplaced(add, manifest, runtime,
+                          source_by_manifest[manifest], tests_by_manifest[manifest])
         _report_versions(add, manifest, runtime, dev)
 
     # Lockfiles are a workspace-wide concern, not a per-package one: npm/yarn/
@@ -141,11 +165,18 @@ def _line_in_manifest(manifest: Path, name: str) -> int:
     return 1
 
 
-def _report_missing(add, manifest, declared, used_in_source, used_in_tests) -> None:
-    for name, sites in sorted({**used_in_source, **used_in_tests}.items()):
+def _declared(package: dict) -> dict:
+    """Every dependency field of one manifest, flattened."""
+    declared: dict = {}
+    for field in ("dependencies", "devDependencies", "peerDependencies", "optionalDependencies"):
+        declared.update(package.get(field) or {})
+    return declared
+
+
+def _report_missing(add, declared, sites) -> None:
+    for name, (path, line) in sorted(sites.items()):
         if name in declared:
             continue
-        path, line = sites[0]
         add(path, line, "missing_dependency",
             f"`{name}` is imported but declared in no dependency field",
             "Add it to package.json. It resolves today only because something else installed it; "

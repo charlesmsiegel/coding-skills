@@ -937,3 +937,52 @@ def test_the_diff_lens_marks_a_candidate_as_a_lead_not_a_ranked_defect(tmp_path)
     assert [line for line in output.splitlines() if line.strip() == "→"] == [], \
         "a candidate rendered a fix arrow with nothing after it"
     assert "candidate(s)" in output, "the count line still calls every record a finding"
+
+
+# --------------------------------------------------------------------------- #
+# Dependency reconciliation is scoped to a file's own manifest chain
+# --------------------------------------------------------------------------- #
+
+def test_a_siblings_declaration_does_not_satisfy_this_workspaces_import(tmp_path):
+    """A package declared in workspace b is not installed for workspace a.
+
+    Unioning every manifest in the tree made b's declaration cover a's import,
+    so the clean-install break in a went unreported *and* b's now-orphaned
+    declaration looked used. Both halves are wrong, and they hide each other.
+    """
+    root = write(tmp_path, {
+        "package.json": json.dumps({"name": "root", "workspaces": ["packages/*"]}),
+        "package-lock.json": "{}",
+        "packages/a/package.json": json.dumps({"name": "a", "dependencies": {}}),
+        "packages/a/index.ts": "import pad from 'left-pad';\nexport const a = pad;\n",
+        "packages/b/package.json": json.dumps({"name": "b", "dependencies": {"left-pad": "^1.0.0"}}),
+        "packages/b/index.ts": "export const b = 1;\n",
+    })
+    records = run_detector("find_dependency_issues.py", root)
+
+    missing = [r for r in records
+               if r["smell_type"] == "missing_dependency" and "left-pad" in r["description"]]
+    assert missing, "a's import was covered by a sibling workspace's declaration"
+    assert Path(missing[0]["file"]).as_posix().endswith("packages/a/index.ts")
+
+    unused = [r for r in records
+              if r["smell_type"] == "unused_dependency" and "left-pad" in r["description"]]
+    assert unused, "b's declaration was kept alive by a sibling workspace's import"
+    assert Path(unused[0]["file"]).as_posix().endswith("packages/b/package.json")
+
+
+def test_a_root_declaration_covers_a_workspace_below_it(tmp_path):
+    """Hoisted root declarations really are installed for every workspace, so a
+    file's chain is its nearest manifest *and every ancestor above it*."""
+    root = write(tmp_path, {
+        "package.json": json.dumps({"name": "root", "workspaces": ["packages/*"],
+                                    "dependencies": {"left-pad": "^1.0.0"}}),
+        "package-lock.json": "{}",
+        "packages/a/package.json": json.dumps({"name": "a", "dependencies": {}}),
+        "packages/a/index.ts": "import pad from 'left-pad';\nexport const a = pad;\n",
+    })
+    records = run_detector("find_dependency_issues.py", root)
+
+    assert not [r for r in records
+                if r["smell_type"] in ("missing_dependency", "unused_dependency")
+                and "left-pad" in r["description"]]
