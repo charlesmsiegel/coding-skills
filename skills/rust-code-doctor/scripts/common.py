@@ -12,7 +12,7 @@ import contextlib
 import json
 import os
 import sys
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Callable, Iterator
 
@@ -154,24 +154,86 @@ def warn_detector_error(filepath: Path, exc: Exception) -> None:
 SEVERITY_RANK = {"high": 0, "medium": 1, "low": 2}
 
 
-@dataclass
+class SchemaError(ValueError):
+    """A detector tried to emit a record its evidence does not support."""
+
+
+VALID_KINDS = frozenset({"finding", "candidate"})
+
+
+@dataclass(frozen=True)
 class Finding:
-    """The single output record. `smell_type` is what `--ignore` matches."""
+    """One output record, in one of two kinds.
+
+    A **finding** asserts a defect. It carries a concrete fix, because a claim
+    you cannot act on is not worth making.
+
+    A **candidate** reports a lead that needs verification. It carries the
+    specific ways a healthy codebase produces the same observation, and it
+    carries no fix — recommending an edit on heuristic evidence is how a tool
+    like this talks someone into deleting live code.
+
+    The constructor enforces the difference. Prose in a reference file does not
+    survive contact with a detector author in a hurry; a raised exception does.
+
+    Frozen to ensure the schema enforcement holds across the lifetime of the
+    object, not just at construction time.
+    """
 
     file: str
     line: int
     smell_type: str
     description: str
-    suggestion: str
+    suggestion: str = ""
+    # Tuples, not lists. `frozen=True` blocks reassignment but not in-place
+    # mutation, so a list here would let `candidate.also_caused_by.clear()`
+    # walk a validated record into a schema-invalid state that
+    # __post_init__ never re-checks — and it would then serialise and emit
+    # like any other record. __post_init__ below coerces any list handed to
+    # the constructor (including one that came back out of json.loads,
+    # which knows nothing about tuples) into a tuple, so the type is
+    # actually enforced, not just annotated.
+    also_caused_by: tuple[str, ...] = ()
     severity: str = "medium"
+    kind: str = "finding"
     code_snippet: str = ""
     # Other lines that participate in the same finding. analyze_diff.py uses
     # these so a cross-declaration smell surfaces when any participant changed.
-    related_lines: list[int] = field(default_factory=list)
+    related_lines: tuple[int, ...] = ()
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "also_caused_by", tuple(self.also_caused_by))
+        object.__setattr__(self, "related_lines", tuple(self.related_lines))
+        if self.kind not in VALID_KINDS:
+            raise SchemaError(
+                f"{self.smell_type}: kind must be one of {sorted(VALID_KINDS)}, got {self.kind!r}"
+            )
+        if self.kind == "finding":
+            if not self.suggestion.strip():
+                raise SchemaError(
+                    f"{self.smell_type}: a finding asserts a defect and must carry a suggestion; "
+                    "if you cannot name the fix, emit a candidate instead"
+                )
+            if self.also_caused_by:
+                raise SchemaError(
+                    f"{self.smell_type}: also_caused_by belongs to candidates; a finding that has "
+                    "benign explanations is a candidate"
+                )
+        else:
+            if self.suggestion.strip():
+                raise SchemaError(
+                    f"{self.smell_type}: a candidate must not carry a suggestion — it is an "
+                    "unverified lead, and a fix on unverified evidence is how live code gets deleted"
+                )
+            if not self.also_caused_by or not any(s.strip() for s in self.also_caused_by):
+                raise SchemaError(
+                    f"{self.smell_type}: a candidate must name the ways a healthy codebase produces "
+                    "this observation in also_caused_by, so the reader can rule them out"
+                )
 
 
 class Reporter:
-    """Collects findings for one file, honouring the detector's --ignore set."""
+    """Collects records for one file, honouring the detector's --ignore set."""
 
     def __init__(self, rsfile, ignore: set[str]):
         self.rsfile = rsfile
@@ -180,13 +242,28 @@ class Reporter:
 
     def add(self, line: int, smell_type: str, description: str, suggestion: str,
             severity: str = "medium", related: list[int] | None = None) -> None:
-        if smell_type in self.ignore:
-            return
-        self.findings.append(Finding(
+        """A finding: the evidence proves a defect and names its fix."""
+        self._add(Finding(
             file=str(self.rsfile.path), line=line, smell_type=smell_type,
             description=description, suggestion=suggestion, severity=severity,
-            code_snippet=self.rsfile.snippet(line), related_lines=related or [],
+            kind="finding", code_snippet=self.rsfile.snippet(line),
+            related_lines=tuple(related or ()),
         ))
+
+    def candidate(self, line: int, smell_type: str, description: str,
+                  also_caused_by: list[str] | tuple[str, ...], severity: str = "low",
+                  related: list[int] | None = None) -> None:
+        """A candidate: a lead the syntax alone cannot prove, with the benign readings."""
+        self._add(Finding(
+            file=str(self.rsfile.path), line=line, smell_type=smell_type,
+            description=description, also_caused_by=tuple(also_caused_by),
+            severity=severity, kind="candidate", code_snippet=self.rsfile.snippet(line),
+            related_lines=tuple(related or ()),
+        ))
+
+    def _add(self, record: Finding) -> None:
+        if record.smell_type not in self.ignore:
+            self.findings.append(record)
 
 
 def build_parser(description: str) -> argparse.ArgumentParser:
@@ -199,7 +276,9 @@ def build_parser(description: str) -> argparse.ArgumentParser:
 
 
 def sort_findings(findings: list[Finding]) -> list[Finding]:
-    findings.sort(key=lambda f: (SEVERITY_RANK.get(f.severity, 1), f.file, f.line))
+    """Findings before candidates, then by severity, then by location."""
+    findings.sort(key=lambda f: (f.kind != "finding",
+                                 SEVERITY_RANK.get(f.severity, 1), f.file, f.line))
     return findings
 
 
@@ -207,21 +286,35 @@ def print_findings(findings: list[Finding], clean_message: str) -> None:
     if not findings:
         print(f"✅ {clean_message}")
         return
+    confirmed = [f for f in findings if f.kind == "finding"]
+    leads = [f for f in findings if f.kind == "candidate"]
     counts: dict[str, int] = {}
     for finding in findings:
         counts[finding.smell_type] = counts.get(finding.smell_type, 0) + 1
-    print(f"Found {len(findings)} issue(s):\n")
+    print(f"{len(confirmed)} finding(s), {len(leads)} candidate(s):\n")
     print("Summary:")
     for smell, count in sorted(counts.items(), key=lambda item: -item[1]):
         print(f"  {smell}: {count}")
     print()
-    for finding in findings:
+    for finding in confirmed:
         icon = SEVERITY_ICONS.get(finding.severity, "")
         print(f"{icon} [{finding.severity.upper()}] {finding.file}:{finding.line}")
         print(f"   {finding.smell_type}: {finding.description}")
         if finding.code_snippet:
             print(f"   Code: {finding.code_snippet}")
         print(f"   → {finding.suggestion}\n")
+    if leads:
+        print("Candidates — unverified leads, check before acting:\n")
+    for lead in leads:
+        icon = SEVERITY_ICONS.get(lead.severity, "")
+        print(f"{icon} [candidate] {lead.file}:{lead.line}")
+        print(f"   {lead.smell_type}: {lead.description}")
+        if lead.code_snippet:
+            print(f"   Code: {lead.code_snippet}")
+        print("   Also caused by:")
+        for reason in lead.also_caused_by:
+            print(f"     - {reason}")
+        print()
 
 
 def emit(findings: list[Finding], output_format: str, clean_message: str) -> None:
