@@ -529,3 +529,23 @@ def test_diff_reports_the_authors_of_the_range(repo, tabs, run_script):
                    "--base", "HEAD", "--worktree").stdout
     )
     assert worktree["authors"] == []
+
+
+def test_diff_breaks_an_author_tie_by_who_committed_first(repo, tabs, run_script):
+    """`git log` lists the range newest-first. Enumerating it in that order makes
+    "first appearance" mean the *last* commit, so a tie names the wrong author
+    first — the reviewer reads the change as having started with them."""
+    repo.write("src/core.py", BASE_CORE)
+    repo.commit("base")
+    repo.git("config", "user.name", "Ada Lovelace")
+    repo.write("src/core.py", CHANGED_CORE)
+    repo.commit("first change")
+    repo.git("config", "user.name", "Grace Hopper")
+    repo.write("src/more.py", "def more():\n    return 2\n")
+    repo.commit("second change")
+
+    summary = json.loads(
+        run_script(SCRIPTS / "analyze_diff.py", repo.path, "--tabs-dir", tabs, "--base", "HEAD~2").stdout
+    )
+    assert summary["authors"] == [{"name": "Ada Lovelace", "commits": 1},
+                                  {"name": "Grace Hopper", "commits": 1}]
