@@ -186,7 +186,9 @@ Declaration files (`.d.ts`, `.d.mts`, `.d.cts`) carry no implementation, so the
 code detectors skip them. So does any file whose first five lines say
 `@generated` or `DO NOT EDIT`: a tool owns it and a finding there is a bug report
 against the generator, not the checkout. The skipped generated files are counted
-on stderr so their silence is never mistaken for a clean bill.
+— on stderr by the standalone detectors, and in `meta.generated_files_skipped`
+(and the report header) by `analyze_all.py` — so their silence is never mistaken
+for a clean bill.
 
 **Findings and candidates.** Most records assert a defect and carry the fix. A
 record that instead carries `"kind": "candidate"` is an *unverified lead* — it

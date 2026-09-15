@@ -91,11 +91,12 @@ def generate_report(path: str, skip: set | None = None, jobs: int | None = None)
     for _, _, label, _ in scheduled:
         print(f"🔍 {label}...", file=sys.stderr)
 
+    stats: dict[str, int] = {}
     results = run_detectors(
         path,
         [(category, module) for category, module, _, kind in scheduled if kind == FILE],
         [(category, module) for category, module, _, kind in scheduled if kind == TREE],
-        jobs=jobs,
+        jobs=jobs, stats=stats,
     )
     # Report in the table's order, not the order the pool happened to finish in.
     results = {category: results[category] for category, _, _, _ in scheduled}
@@ -109,6 +110,9 @@ def generate_report(path: str, skip: set | None = None, jobs: int | None = None)
             # category -> error string for every analyzer that did not complete.
             # A zero count for one of these categories means "unknown", not "clean".
             "analyzer_errors": {},
+            # Files the per-file detectors never saw because a tool owns them.
+            # Their silence is not a clean bill; the reader has to be told.
+            "generated_files_skipped": stats.get("generated_files_skipped", 0),
         },
         "summary": {
             "total_issues": 0,
@@ -180,6 +184,9 @@ def print_text_report(report: dict) -> None:
     print("=" * 70)
     print(f"Path: {meta['analyzed_path']}")
     print(f"Time: {meta['timestamp']}")
+    generated = meta.get("generated_files_skipped", 0)
+    if generated:
+        print(f"ℹ️  {generated} generated file(s) skipped (header says a tool owns them)")
     print()
 
     print("📈 SUMMARY")
