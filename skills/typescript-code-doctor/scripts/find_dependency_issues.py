@@ -165,8 +165,14 @@ def analyze(root: Path, ignore: set[str], _args) -> list[Finding]:
     # Lockfiles are a workspace-wide concern, not a per-package one: npm/yarn/
     # pnpm workspaces keep a single lockfile at the root by design, so
     # checking every sub-package's directory would flag each one as missing
-    # a lockfile it was never meant to have.
-    _report_lockfiles(add, packages[0][0])
+    # a lockfile it was never meant to have. Checked once per *independent*
+    # package root instead — a manifest with no manifest above it in the
+    # scanned tree — so sibling standalone packages under one directory each
+    # get their own verdict rather than only the first one found.
+    directories = [manifest.parent for manifest, _ in packages]
+    for manifest, _ in packages:
+        if not any(other in manifest.parent.parents for other in directories):
+            _report_lockfiles(add, manifest)
     return findings
 
 
@@ -237,6 +243,22 @@ def _pnpm_workspace_patterns(path: Path) -> list[str]:
             if key == "packages" and stripped.startswith("- "):
                 patterns.append(stripped[2:].strip().strip("'\""))
     return patterns
+
+
+def _lockfile_above(directory: Path) -> bool:
+    """True when an ancestor inside the same checkout holds a lockfile.
+
+    Scanning `packages/a` of a monorepo on its own must not report the lockfile
+    that sits, by design, at the root. The walk stops at the first `.git` met
+    (inclusive), so a lockfile in some unrelated directory above the checkout
+    cannot vouch for it."""
+    for candidate in directory.parents:
+        with contextlib.suppress(OSError):
+            if any((candidate / name).is_file() for name in LOCKFILES):
+                return True
+            if (candidate / ".git").exists():
+                return False
+    return False
 
 
 def _line_in_manifest(manifest: Path, name: str) -> int:
@@ -315,6 +337,8 @@ def _report_versions(add, manifest, runtime, dev) -> None:
 def _report_lockfiles(add, manifest) -> None:
     directory = manifest.parent
     present = [name for name in LOCKFILES if (directory / name).is_file()]
+    if not present and _lockfile_above(directory):
+        return  # a nested workspace scanned on its own: the root's lockfile governs it
     if not present:
         add(manifest, 1, "no_lockfile",
             "No lockfile beside package.json",
