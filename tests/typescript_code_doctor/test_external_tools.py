@@ -171,3 +171,40 @@ def test_non_json_audit_output_is_a_tool_error(external, which, tmp_path, monkey
 
     findings = external.run_audit(None, tmp_path)
     assert findings[0]["smell_type"] == "pnpm-audit:tool-error"
+
+
+def test_a_nested_workspace_is_audited_by_the_roots_manager_from_the_root(
+        external, which, tmp_path, monkeypatch):
+    """`_project_root` stops at the member's own package.json, but the lockfile
+    that names the manager sits at the monorepo root. Choosing there picked npm
+    for a pnpm workspace and audited one member from its own directory."""
+    root = tmp_path / "mono"
+    member = root / "packages" / "a"
+    member.mkdir(parents=True)
+    (root / "package.json").write_text('{"name": "root"}', encoding="utf-8")
+    (root / "pnpm-lock.yaml").write_text("", encoding="utf-8")
+    (member / "package.json").write_text('{"name": "a"}', encoding="utf-8")
+    seen = []
+
+    def fake_run(argv, cwd, timeout=900):
+        seen.append((argv, Path(cwd)))
+        return 0, '{"advisories": {}}', ""
+
+    monkeypatch.setattr(external, "_run", fake_run)
+
+    manager, argv = external._audit_argv(member)
+    assert manager == "pnpm" and argv == ["/bin/pnpm", "audit", "--json"]
+    assert external.run_audit(None, member) == []
+    assert seen == [(["/bin/pnpm", "audit", "--json"], root)]
+
+
+def test_a_lockfile_above_the_checkout_does_not_pick_the_manager(external, which, tmp_path):
+    outer = tmp_path / "outer"
+    repo = outer / "repo"
+    repo.mkdir(parents=True)
+    (outer / "pnpm-lock.yaml").write_text("", encoding="utf-8")
+    (repo / ".git").mkdir()
+    (repo / "package.json").write_text('{"name": "repo"}', encoding="utf-8")
+
+    assert external._workspace_root(repo) == repo
+    assert external._package_manager(repo) == "npm"
