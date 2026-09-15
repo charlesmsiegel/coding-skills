@@ -106,15 +106,20 @@ def analyze(root: Path, ignore: set[str], _args) -> list[Finding]:
         ancestors = set(path.parents)
         return [manifest for manifest, directory in manifest_dirs if directory in ancestors]
 
-    # (manifest, package) sites, so "missing" is answered per workspace
-    missing_sites: dict[Path, dict[str, tuple[Path, int]]] = defaultdict(dict)
+    # (manifest, package) sites, so "missing" is answered per workspace. A site
+    # is (file, line, via): `via` names the generated importer when the site had
+    # to be moved onto the manifest because no editable file imports the package.
+    missing_sites: dict[Path, dict[str, tuple[Path, int, Path | None]]] = defaultdict(dict)
     # manifest -> what its own files (and its workspaces' files) import
     source_by_manifest: dict[Path, set[str]] = defaultdict(set)
     tests_by_manifest: dict[Path, set[str]] = defaultdict(set)
     # Usage is read from every file, generated ones included — a runtime package
-    # imported only by a generated API client is genuinely used. A finding is
-    # never *located* in one, though, so a generated import contributes usage but
-    # never becomes the missing_dependency site.
+    # imported only by a generated API client is genuinely used, and one it
+    # imports that nothing declares is genuinely missing (a clean install cannot
+    # resolve it). A finding is never *located* in a generated file, though: a
+    # missing package seen only from one is reported against the manifest that
+    # should declare it, with the generated importer named as the evidence, and
+    # an editable importer takes the site back whenever there is one.
     owned_by_a_tool = set(project.generated)
     for path, tsfile in project.files.items():
         if _below(path, fixture_dirs):
@@ -132,9 +137,11 @@ def analyze(root: Path, ignore: set[str], _args) -> list[Finding]:
                 continue
             for manifest in chain:
                 (tests_by_manifest if is_test else source_by_manifest)[manifest].add(name)
-            if path not in owned_by_a_tool:
-                nearest = chain[-1] if chain else packages[0][0]
-                missing_sites[nearest].setdefault(name, (path, record.line))
+            nearest = chain[-1] if chain else packages[0][0]
+            site = (nearest, 1, path) if path in owned_by_a_tool else (path, record.line, None)
+            existing = missing_sites[nearest].get(name)
+            if existing is None or (existing[2] is not None and site[2] is None):
+                missing_sites[nearest][name] = site
 
     declared_by_manifest = {
         manifest: _declared(package) for manifest, package in packages
@@ -251,11 +258,12 @@ def _declared(package: dict) -> dict:
 
 
 def _report_missing(add, declared, sites) -> None:
-    for name, (path, line) in sorted(sites.items()):
+    for name, (path, line, via) in sorted(sites.items()):
         if name in declared:
             continue
+        importer = f" (by {via.name}, a generated file)" if via is not None else ""
         add(path, line, "missing_dependency",
-            f"`{name}` is imported but declared in no dependency field",
+            f"`{name}` is imported{importer} but declared in no dependency field",
             "Add it to package.json. It resolves today only because something else installed it; "
             "a clean install, a different package manager, or a dependency bump removes it without "
             "warning.", "high")
