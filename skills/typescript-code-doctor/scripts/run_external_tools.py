@@ -225,7 +225,30 @@ def run_knip(inv, root):
     return findings
 
 
+_LOCKFILES = ("package-lock.json", "npm-shrinkwrap.json", "yarn.lock", "pnpm-lock.yaml")
+
+
+def _workspace_root(root: Path) -> Path:
+    """The directory whose lockfile governs ``root``.
+
+    `_project_root` stops at the nearest package.json, which for a workspace
+    member is the member's own — and the lockfile that names the package
+    manager sits at the monorepo root, by design. Choosing the manager there
+    picked npm for a pnpm or Yarn workspace and ran the audit from the child
+    directory, where "every workspace, recursively" covers one package. The
+    walk stops at the first `.git` met (inclusive): a lockfile above the
+    checkout belongs to something else.
+    """
+    for candidate in [root, *root.parents]:
+        if any((candidate / name).is_file() for name in _LOCKFILES):
+            return candidate
+        if (candidate / ".git").exists():
+            break
+    return root
+
+
 def _package_manager(root: Path) -> str:
+    root = _workspace_root(root)
     if (root / "pnpm-lock.yaml").is_file():
         return "pnpm"
     if (root / "yarn.lock").is_file():
@@ -241,6 +264,7 @@ def _audit_argv(root: Path) -> tuple[str, list[str]] | None:
     the audit is reported missing rather than run under a different manager
     and labelled as this one.
     """
+    root = _workspace_root(root)
     manager = _package_manager(root)
     inv = _invocation(root, manager)
     if inv is None:
@@ -283,6 +307,7 @@ def run_audit(_inv, root):
         manager = _package_manager(root)
         return [_tool_error(f"{manager}-audit", root, None, f"{manager} is not installed")]
     manager, argv = resolved
+    root = _workspace_root(root)  # audit where the lockfile is, not in one member
     returncode, out, err = _run(argv, root, timeout=600)
     if returncode is None or not (out or "").strip():
         return [_tool_error(f"{manager}-audit", root, returncode, err or out)]
