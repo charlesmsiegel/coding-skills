@@ -283,7 +283,13 @@ def _report_missing(add, declared, sites) -> None:
     for name, (path, line, via) in sorted(sites.items()):
         if name in declared:
             continue
-        importer = f" (by {via.name}, a generated file)" if via is not None else ""
+        importer = ""
+        if via is not None:  # named relative to the manifest: two client.ts files must differ
+            try:
+                shown = via.relative_to(path.parent).as_posix()
+            except ValueError:
+                shown = via.name
+            importer = f" (by {shown}, a generated file)"
         add(path, line, "missing_dependency",
             f"`{name}` is imported{importer} but declared in no dependency field",
             "Add it to package.json. It resolves today only because something else installed it; "

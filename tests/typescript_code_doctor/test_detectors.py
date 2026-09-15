@@ -1153,7 +1153,7 @@ def test_a_package_imported_only_by_a_generated_file_is_missing_at_the_manifest(
                if r["smell_type"] == "missing_dependency" and "axios" in r["description"]]
     assert missing, "a package only a generated file imports was not reported missing"
     assert Path(missing[0]["file"]).name == "package.json"
-    assert "client.ts" in missing[0]["description"]
+    assert "src/client.ts" in missing[0]["description"]
 
 
 def test_an_editable_importer_is_the_missing_site_even_beside_a_generated_one(tmp_path):
