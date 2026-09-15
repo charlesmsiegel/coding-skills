@@ -175,16 +175,30 @@ def run_tree_task(root: Path, specs: list[tuple[str, str]],
 
 def run_detectors(path: str, file_specs: list[tuple[str, str]],
                   tree_specs: list[tuple[str, str]], *, jobs: int | None = None,
-                  ignore: set[str] | None = None) -> dict[str, object]:
+                  ignore: set[str] | None = None,
+                  stats: dict[str, int] | None = None) -> dict[str, object]:
     """Run every named detector and return category -> records (or an error dict).
 
     ``file_specs`` and ``tree_specs`` are ``(category, module_name)`` pairs.
+    ``stats``, when given, receives ``generated_files_skipped``: the files the
+    per-file detectors never saw because a tool owns them. The standalone
+    detectors say this on stderr; the aggregate report has to say it too, or a
+    tree of generated sources reads as a clean one.
     """
     ignore = set(ignore or ())
     root = Path(path)
     jobs = jobs or default_jobs()
 
-    files = [p for p in find_ts_files(root) if not is_declaration_file(p) and not is_generated_file(p)]
+    files, generated = [], 0
+    for candidate in find_ts_files(root):
+        if is_declaration_file(candidate):
+            continue
+        if is_generated_file(candidate):
+            generated += 1
+            continue
+        files.append(candidate)
+    if stats is not None:
+        stats["generated_files_skipped"] = generated
     shards = chunk(files, jobs, weight=_source_size)
 
     results: dict[str, object] = {}
