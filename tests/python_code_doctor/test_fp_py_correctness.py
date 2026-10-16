@@ -101,3 +101,95 @@ def test_a_reasoned_noqa_may_sit_on_the_comment_line_below(common):
 ])
 def test_looks_like_test(common, path, expected):
     assert common.looks_like_test(path) is expected
+
+
+# ---- inconsistent_returns -------------------------------------------------- #
+
+
+def test_explicit_return_none_beside_a_value_is_consistent(tmp_path):
+    """PEP 8 asks for exactly this spelling: no finding, at any severity."""
+    found = records("find_return_issues.py", tmp_path,
+                    "def f(x) -> int | None:\n"
+                    "    if x:\n"
+                    "        return None\n"
+                    "    return 1\n",
+                    "inconsistent_returns")
+    assert found == []
+
+
+def test_a_nested_functions_returns_are_not_charged_to_its_parent(tmp_path):
+    """A `def` directly in the body is its own scope; its `return 1` is not the outer's."""
+    found = records("find_return_issues.py", tmp_path,
+                    "def outer(c):\n"
+                    "    def inner():\n"
+                    "        return 1\n"
+                    "    if c:\n"
+                    "        return\n"
+                    "    inner()\n",
+                    "inconsistent_returns")
+    assert found == []
+
+
+def test_a_bare_return_beside_a_value_is_still_flagged(tmp_path):
+    """RET502: the true positive the explicit-None rule must not swallow."""
+    found = records("find_return_issues.py", tmp_path,
+                    "def f(x):\n"
+                    "    if x:\n"
+                    "        return\n"
+                    "    return 1\n",
+                    "inconsistent_returns")
+    assert len(findings(found)) == 1
+    assert "bare 'return'" in found[0]["description"]
+
+
+def test_falling_off_the_end_after_a_value_is_flagged(tmp_path):
+    """RET503: one path returns 1, the other runs off the end and returns None."""
+    found = records("find_return_issues.py", tmp_path,
+                    "def f(x):\n"
+                    "    if x:\n"
+                    "        return 1\n",
+                    "inconsistent_returns")
+    assert len(findings(found)) == 1
+    assert "end of its body" in found[0]["description"]
+    assert found[0]["severity"] == "medium"
+
+
+@pytest.mark.parametrize("body", [
+    # every branch returns
+    "    if x:\n        return 1\n    else:\n        return 2\n",
+    # a with block that returns
+    "    with x:\n        return 1\n",
+    # a handler that raises
+    "    try:\n        return int(x)\n    except ValueError:\n        raise\n",
+    # an infinite loop left only by returning
+    "    while True:\n        if x:\n            return 1\n",
+    # a never-returning call
+    "    if x:\n        return 1\n    sys.exit(2)\n",
+    # a finally that returns
+    "    try:\n        pass\n    finally:\n        return 1\n",
+    # a method annotated NoReturn, called through self
+    "    if x:\n        return 1\n    self._abort()\n",
+])
+def test_bodies_that_cannot_fall_off_are_not_flagged(tmp_path, body):
+    source = ("import sys\n"
+              "from typing import NoReturn\n"
+              "class C:\n"
+              "    def _abort(self) -> NoReturn:\n"
+              "        raise SystemExit\n"
+              "def f(x, self=None):\n" + body)
+    assert records("find_return_issues.py", tmp_path, source, "inconsistent_returns") == []
+
+
+@pytest.mark.parametrize("body", [
+    # a handler that logs and carries on
+    "    try:\n        return int(x)\n    except ValueError:\n        print('bad')\n",
+    # a while True with its own break
+    "    while True:\n        if x:\n            return 1\n        break\n",
+    # an elif chain with no else
+    "    if x > 0:\n        return 1\n    elif x < 0:\n        return -1\n",
+    # a for loop over a possibly empty iterable
+    "    for y in x:\n        return y\n",
+])
+def test_bodies_that_can_fall_off_are_flagged(tmp_path, body):
+    found = records("find_return_issues.py", tmp_path, "def f(x):\n" + body, "inconsistent_returns")
+    assert len(findings(found)) == 1
