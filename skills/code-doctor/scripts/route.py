@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import sys
 import tomllib
 from dataclasses import dataclass
@@ -132,6 +133,22 @@ def _package_json_dependencies(text: str) -> list[str]:
     return names
 
 
+_SETUP_IMPORT = re.compile(r"^\s*(?:from|import)\s+(?:setuptools|distutils)\b", re.MULTILINE)
+
+
+def is_setup_script(path: Path) -> bool:
+    """Whether a file named `setup.py` is a packaging script.
+
+    The name alone is not evidence: `app/setup.py` holding a `setup` command
+    is a module of the package it sits in. A packaging script imports
+    setuptools or distutils to call their `setup()`.
+    """
+    try:
+        return bool(_SETUP_IMPORT.search(read_text(path)))
+    except OSError:
+        return False
+
+
 def _gather(root: Path) -> dict[str, list[Path]]:
     """One walk, classifying every file this router might use as evidence."""
     found: dict[str, list[Path]] = {
@@ -143,7 +160,8 @@ def _gather(root: Path) -> dict[str, list[Path]]:
         if name == "pyproject.toml":
             found["pyproject"].append(path)
         elif name == "setup.py":
-            found["setup_py"].append(path)
+            if is_setup_script(path):
+                found["setup_py"].append(path)
         elif name.startswith("requirements") and name.endswith(".txt"):
             found["requirements"].append(path)
         elif name == "package.json":

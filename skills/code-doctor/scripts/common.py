@@ -68,6 +68,13 @@ DOC_DIR_NAMES = frozenset({"docs", "doc", "documentation", "examples", "example"
 # line lengths would dominate every size metric.
 GENERATED_MARKERS = (".min.js", ".min.css", ".bundle.js", "_pb2.py", ".g.dart", ".generated.")
 
+# A bundler does not always say so in the name: Vite writes
+# `assets/index-U_FZj3ND.js`. What it cannot hide is the shape — a file whose
+# lines average this long is machine-written. The mean, not the longest line,
+# so a hand-written module with one embedded base64 constant still reads as
+# source.
+MINIFIED_MEAN_LINE_LENGTH = 500
+
 _BINARY_SNIFF_BYTES = 8192
 
 # UTF-16 is NUL-riddled by construction (every ASCII character is followed by
@@ -155,6 +162,19 @@ def is_source(rel_parts: tuple[str, ...], path: Path) -> bool:
     if not path.suffix and name.split(".")[0] in NON_CODE_BASENAMES:
         return False
     return not any(marker in name for marker in GENERATED_MARKERS)
+
+
+def looks_minified(text: str) -> bool:
+    """Whether ``text`` has the shape of a bundler's output rather than source.
+
+    Name markers catch `app.min.js`; this catches the hashed bundles that carry
+    none. Detectors use it to stop mining such a file for the things a person
+    writes — comments, TODOs, secret-shaped variable names — while the checks
+    that matter in any bytes (key material, recognisable credentials, merge
+    markers) still read it.
+    """
+    lines = text.count("\n") + 1
+    return len(text) / lines > MINIFIED_MEAN_LINE_LENGTH
 
 
 def gitignored_paths(root: Path) -> set[Path]:

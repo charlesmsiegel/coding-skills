@@ -246,3 +246,22 @@ def test_merge_marker_in_a_utf16_file_is_still_detected(repo, run_script):
     (repo.path / "app.txt").write_bytes(content.encode("utf-16"))
     result = run_script(SCRIPT, repo.path, "--format", "json")
     assert "merge_conflict_marker" in types_in(result)
+
+
+def test_a_minified_bundle_does_not_stall_the_scan(repo, run_script):
+    """Backslash runs inside an unterminated quote used to backtrack
+    exponentially in the string-literal blanker; one committed Vite bundle
+    held the whole detector past a ten-minute timeout."""
+    line = "var a='" + "\\\\" * 40 + "x" + ";b=\"\\\\q\"" * 2000
+    repo.write("static/assets/index-U_FZj3ND.js", (line + "\n") * 3)
+    result = run_script(SCRIPT, repo.path, "--format", "json")
+    payload = json.loads(result.stdout)
+    assert payload["findings"] == []
+    # Read for merge markers only, and the report says so.
+    assert "index-U_FZj3ND.js" in payload["completeness"]["generated_files_skipped"]
+
+
+def test_a_todo_comment_on_an_ordinary_line_is_still_inventoried(repo, run_script):
+    repo.write("app.py", "x = 1  # TODO: name this\n")
+    result = run_script(SCRIPT, repo.path, "--format", "json")
+    assert "todo_inventory" in types_in(result)
