@@ -621,3 +621,85 @@ def test_a_function_handed_out_by_another_module_is_a_candidate(tmp_path):
     # parameter is still provably unused.
     assert params == {("path", "candidate"), ("instance", "candidate"),
                       ("path", "finding"), ("verbose", "finding")}
+
+
+# --------------------------------------------------------------------------- #
+# find_coupling_issues
+# --------------------------------------------------------------------------- #
+
+
+def test_reading_a_module_or_a_loop_variable_is_not_feature_envy(tmp_path):
+    write(tmp_path, {"sample.py": """\
+        import ast
+        import httpx
+
+        class Visitor:
+            def names(self, tree):
+                return ast.walk(tree), ast.Name, ast.Attribute, ast.Call
+
+            def client(self):
+                return httpx.AsyncClient(timeout=httpx.Timeout(5), limits=httpx.Limits())
+
+            def rows(self, turn):
+                return [{"id": c.id, "name": c.name, "args": c.args} for c in turn.calls]
+
+            async def cost(self, row):
+                return row.get("a"), row.get("b"), row.get("c"), row.get("d")
+        """})
+    assert of_type(run_detector("find_coupling_issues.py", tmp_path), "feature_envy") == []
+
+
+def test_reading_another_objects_state_is_a_feature_envy_lead(tmp_path):
+    write(tmp_path, {"sample.py": """\
+        class RunView:
+            def __init__(self, loop):
+                self.loop = loop
+
+            async def take_decision(self, loop):
+                if loop.decisions_used < loop.budget and not loop.decisions_capped:
+                    return loop.decisions_used + 1
+        """})
+    found = of_type(run_detector("find_coupling_issues.py", tmp_path), "feature_envy")
+    assert [r["name"] for r in found] == ["RunView.take_decision"]
+    assert_candidate_shape(found[0])
+
+
+def _disjoint_methods(count: int) -> str:
+    return "".join(f"    def use_{n}(self):\n        return self.field_{n}\n\n" for n in range(count))
+
+
+def _init(count: int) -> str:
+    return "    def __init__(self):\n" + "".join(
+        f"        self.field_{n} = {n}\n" for n in range(count)) + "\n"
+
+
+def test_interfaces_value_objects_and_stateless_hooks_are_not_low_cohesion(tmp_path):
+    write(tmp_path, {"sample.py": (
+        "from abc import ABC\nfrom dataclasses import dataclass\nfrom typing import Protocol\n\n"
+        "class Provider(ABC):\n" + _disjoint_methods(6) + "\n"
+        "class View(Protocol):\n" + _disjoint_methods(6) + "\n"
+        "@dataclass(frozen=True)\nclass Target:\n    field_0: int = 0\n\n" + _disjoint_methods(6) + "\n"
+        "class Hook:\n" + "".join(f"    def step_{n}(self, row):\n        return row + {n}\n\n"
+                                  for n in range(6))
+    )})
+    assert of_type(run_detector("find_coupling_issues.py", tmp_path), "low_cohesion") == []
+
+
+def test_low_cohesion_counts_only_methods_that_use_state(tmp_path):
+    # Six disjoint stateful methods are low cohesion; static methods,
+    # classmethods, dunders and stubs beside them do not change the verdict
+    # either way, and async methods count like any other.
+    extras = (
+        "    @staticmethod\n    def helper(x):\n        return x\n\n"
+        "    @classmethod\n    def build(cls):\n        return cls()\n\n"
+        "    def __repr__(self):\n        return 'Grab'\n\n"
+        "    async def fetch(self):\n        return self.field_6\n\n"
+    )
+    write(tmp_path, {"grab.py": "class GrabBag:\n" + _init(7) + _disjoint_methods(6) + extras,
+                     "sub.py": "class Gregorian(CalendarProvider):\n" + _init(7) + _disjoint_methods(6)})
+    found = of_type(run_detector("find_coupling_issues.py", tmp_path), "low_cohesion")
+    by_file = {Path(r["file"]).name: r for r in found}
+    assert by_file["grab.py"]["kind"] == "finding"
+    assert "7 stateful methods" in by_file["grab.py"]["description"]
+    # A subclass's methods may be the base's interface: a lead, not a verdict.
+    assert_candidate_shape(by_file["sub.py"])
