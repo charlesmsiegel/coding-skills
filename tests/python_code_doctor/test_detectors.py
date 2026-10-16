@@ -4737,3 +4737,45 @@ def test_a_nested_repository_is_not_analysed_as_part_of_the_project(tmp_path):
     assert [Path(f).relative_to(tmp_path).as_posix() for f in magic] == ["app.py"]
     assert run_detector("find_dependency_issues.py", tmp_path) == [], \
         "the worktree's import and its unpinned requirement are not this project's"
+
+
+_CLI_COMMANDS = (
+    "import click\n"
+    "import typer\n"
+    "\n"
+    "app = typer.Typer()\n"
+    "\n"
+    "@app.command()\n"
+    "def render(a, b, c, d, e, f, g, h):\n"
+    "    return a\n"
+    "\n"
+    "@app.callback()\n"
+    "def main(a, b, c, d, e, f, g, h):\n"
+    "    return a\n"
+    "\n"
+    "@click.command()\n"
+    "@click.option('--a')\n"
+    "def legacy(a, b, c, d, e, f, g, h):\n"
+    "    return a\n"
+    "\n"
+    "def helper(a, b, c, d, e, f, g, h):  # fires\n"
+    "    return a\n"
+    "\n"
+    "@app.something_else()\n"
+    "def decorated(a, b, c, d, e, f, g, h):  # fires\n"
+    "    return a\n"
+)
+
+
+@pytest.mark.parametrize("script,finding_type,key", [
+    ("analyze_complexity.py", "parameter_count", "issue_type"),
+    ("find_code_smells.py", "long_parameter_list", "smell_type"),
+])
+def test_a_cli_commands_parameters_are_its_flags(tmp_path, script, finding_type, key):
+    """A typer/click command declares one parameter per command-line option; the
+    framework builds the CLI from that signature, so its length is the interface's
+    size rather than a function that wants a parameter object. A plain helper with
+    the same signature still fires."""
+    (tmp_path / "cli.py").write_text(_CLI_COMMANDS)
+    lines = sorted(f["line"] for f in run_detector(script, tmp_path) if f.get(key) == finding_type)
+    assert lines == _lines_marked(_CLI_COMMANDS)

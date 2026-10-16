@@ -11,7 +11,7 @@ import argparse
 from pathlib import Path
 from dataclasses import dataclass, asdict
 from collections import defaultdict
-from common import sort_findings, cached_parse, SEVERITY_ICONS, configure_output, find_python_files, warn_detector_error, warn_unparseable
+from common import signature_is_a_contract, sort_findings, cached_parse, SEVERITY_ICONS, configure_output, find_python_files, warn_detector_error, warn_unparseable
 
 
 @dataclass
@@ -48,24 +48,6 @@ def _unwrap_negative(node: ast.AST) -> ast.AST:
     if isinstance(node, ast.UnaryOp) and isinstance(node.op, (ast.USub, ast.UAdd)):
         return node.operand
     return node
-
-
-def _registers_config(node) -> bool:
-    """An `__init__` under diffusers' `@register_to_config`.
-
-    ConfigMixin serialises the model config from exactly those flat keyword
-    arguments, so the usual fix for a long signature — group them into a
-    dataclass — breaks from_pretrained/save_pretrained. The length is the
-    framework's contract, not a design choice left to make.
-    """
-    if node.name != "__init__":
-        return False
-    for dec in node.decorator_list:
-        target = dec.func if isinstance(dec, ast.Call) else dec
-        name = target.id if isinstance(target, ast.Name) else getattr(target, "attr", None)
-        if name == "register_to_config":
-            return True
-    return False
 
 
 class CodeSmellDetector(ast.NodeVisitor):
@@ -167,7 +149,7 @@ class CodeSmellDetector(ast.NodeVisitor):
 
         # Long parameter list
         total_params = len(node.args.args) + len(node.args.kwonlyargs)
-        if total_params > 6 and not _registers_config(node):
+        if total_params > 6 and not signature_is_a_contract(node):
             self._add(node.lineno, "long_parameter_list",
                 f"{node.name} has {total_params} parameters",
                 "Group into dataclass or config object", "medium")

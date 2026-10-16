@@ -10,7 +10,7 @@ import json
 import argparse
 from pathlib import Path
 from dataclasses import dataclass, asdict
-from common import sort_findings, cached_parse, SEVERITY_ICONS, configure_output, find_python_files, warn_detector_error
+from common import signature_is_a_contract, sort_findings, cached_parse, SEVERITY_ICONS, configure_output, find_python_files, warn_detector_error
 
 
 @dataclass
@@ -34,24 +34,6 @@ class Config:
     max_params: int = 5
     max_class_methods: int = 20
     max_class_lines: int = 300
-
-
-def _registers_config(node) -> bool:
-    """An `__init__` under diffusers' `@register_to_config`.
-
-    ConfigMixin serialises the model config from exactly those flat keyword
-    arguments, so the usual fix for a long signature — group them into a
-    dataclass — breaks from_pretrained/save_pretrained. The length is the
-    framework's contract, not a design choice left to make.
-    """
-    if node.name != "__init__":
-        return False
-    for dec in node.decorator_list:
-        target = dec.func if isinstance(dec, ast.Call) else dec
-        name = target.id if isinstance(target, ast.Name) else getattr(target, "attr", None)
-        if name == "register_to_config":
-            return True
-    return False
 
 
 class ComplexityVisitor(ast.NodeVisitor):
@@ -192,7 +174,7 @@ class ComplexityVisitor(ast.NodeVisitor):
             params += 1
         if node.args.kwarg:
             params += 1
-        if params > self.config.max_params and not _registers_config(node):
+        if params > self.config.max_params and not signature_is_a_contract(node):
             self.issues.append(ComplexityIssue(
                 file=self.filename, line=node.lineno, name=name,
                 issue_type="parameter_count", value=params,

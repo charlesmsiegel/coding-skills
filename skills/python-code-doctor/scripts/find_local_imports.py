@@ -31,7 +31,7 @@ import argparse
 from pathlib import Path
 from dataclasses import dataclass, asdict
 from collections import defaultdict
-from common import sort_findings, cached_parse, SEVERITY_ICONS, configure_output, find_python_files, warn_detector_error, warn_unparseable
+from common import is_cli_command, sort_findings, cached_parse, SEVERITY_ICONS, configure_output, find_python_files, warn_detector_error, warn_unparseable
 
 
 @dataclass
@@ -73,25 +73,6 @@ _CLI_REASONS = (
     "only the command that runs pays for what it imports",
     "the subcommand's dependency is an optional extra the other commands must work without",
 )
-
-# Decorators that make a function a CLI command: typer/click `@app.command()`,
-# `@app.callback()`, and click's module-level `@click.command` / `@click.group`.
-_CLI_ATTRS = frozenset({"command", "callback"})
-_CLICK_ATTRS = frozenset({"command", "group"})
-
-
-def _is_cli_command(func) -> bool:
-    for dec in func.decorator_list:
-        target = dec.func if isinstance(dec, ast.Call) else dec
-        if not isinstance(target, ast.Attribute):
-            continue
-        if target.attr in _CLI_ATTRS:
-            return True
-        if (target.attr in _CLICK_ATTRS and isinstance(target.value, ast.Name)
-                and target.value.id == "click"):
-            return True
-    return False
-
 
 def _imported_packages(node) -> list:
     """Top-level package each name of an import statement loads ('' if relative)."""
@@ -204,7 +185,7 @@ def detect(tree, filename, lines, ignore):
                             "dependency the program must run without belongs in try/except ImportError, at module top.",
                             "medium")
             if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                walk(child, True, in_command or _is_cli_command(child))
+                walk(child, True, in_command or is_cli_command(child))
             elif isinstance(child, ast.Lambda):
                 walk(child, True, in_command)
             else:

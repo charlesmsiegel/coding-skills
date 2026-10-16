@@ -28,6 +28,56 @@ EXCLUDE_DIRS = frozenset({
 })
 
 
+def _decorator_target(dec):
+    """The callable a decorator names: `x` for `@x`, and for `@x(...)` too."""
+    return dec.func if isinstance(dec, ast.Call) else dec
+
+
+def is_cli_command(func) -> bool:
+    """Whether `func` is a typer/click command: `@app.command()`, `@app.callback()`,
+    `@click.command` or `@click.group`.
+
+    Such a function's signature is the command line: one parameter per option,
+    and its body runs only when that command is invoked.
+    """
+    for dec in func.decorator_list:
+        target = _decorator_target(dec)
+        if not isinstance(target, ast.Attribute):
+            continue
+        if target.attr in ("command", "callback"):
+            return True
+        if target.attr in ("command", "group") and isinstance(target.value, ast.Name) and target.value.id == "click":
+            return True
+    return False
+
+
+def registers_config(func) -> bool:
+    """An `__init__` under diffusers' `@register_to_config`.
+
+    ConfigMixin serialises the model config from exactly those flat keyword
+    arguments, so the usual fix for a long signature — group them into a
+    dataclass — breaks from_pretrained/save_pretrained.
+    """
+    if func.name != "__init__":
+        return False
+    for dec in func.decorator_list:
+        target = _decorator_target(dec)
+        name = target.id if isinstance(target, ast.Name) else getattr(target, "attr", None)
+        if name == "register_to_config":
+            return True
+    return False
+
+
+def signature_is_a_contract(func) -> bool:
+    """Whether a framework dictates `func`'s parameter list, so its length is not a design choice.
+
+    A `@register_to_config` `__init__` (the flat kwargs are the serialised
+    config) and a CLI command (each parameter is one of its flags). The
+    parameter-count detectors exempt these; nothing else about them is exempt.
+    """
+    return registers_config(func) or is_cli_command(func)
+
+
 def configure_output() -> None:
     """Keep emoji output from crashing narrow console encodings.
 
