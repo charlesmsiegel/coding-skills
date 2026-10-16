@@ -9,6 +9,7 @@ per script; this module is the single copy.
 
 import ast
 import contextlib
+import functools
 import os
 import sys
 from dataclasses import dataclass
@@ -198,6 +199,49 @@ def find_python_files(path: Path) -> Iterator[Path]:
             if (EXCLUDE_DIRS.isdisjoint(p.relative_to(path).parts)
                     and not in_nested_repository(path, p, nested)):
                 yield p
+
+
+# Files whose presence marks the top of a project.
+_PROJECT_MARKERS = (".git", "pyproject.toml", "setup.py", "setup.cfg")
+
+
+def project_root(path: Path) -> Path:
+    """The project a file belongs to: the nearest enclosing directory holding a
+    project marker (.git, pyproject.toml, setup.py, setup.cfg); failing that,
+    the directory its top-level package sits in.
+
+    A per-file detector knows only the file it was handed, so this is how one
+    finds the tree that first_party_modules describes.
+    """
+    path = path.resolve()
+    start = path if path.is_dir() else path.parent
+    for directory in (start, *start.parents):
+        if any(os.path.lexists(directory / marker) for marker in _PROJECT_MARKERS):
+            return directory
+    base = start
+    while (base / "__init__.py").exists() and base.parent != base:
+        base = base.parent
+    return base
+
+
+@functools.lru_cache(maxsize=None)
+def first_party_modules(root: Path) -> frozenset:
+    """Top-level import names that resolve to this repository's own code.
+
+    The stem of every module and the name of every package anywhere in the
+    tree, plus each directory of modules directly under ``root`` or
+    ``root/src`` (a PEP 420 namespace package, such as ``tests/``). This is
+    find_dependency_issues' rule for an import no manifest has to declare, and
+    the coupling detector's for a type a method could be moved onto.
+    """
+    names = set()
+    for p in find_python_files(root):
+        rel = p.relative_to(root).parts
+        names.add(p.parent.name if p.name == "__init__.py" else p.stem)
+        if len(rel) >= 2:
+            names.add(rel[1] if rel[0] == "src" and len(rel) >= 3 else rel[0])
+    names.discard("src")
+    return frozenset(names)
 
 
 class _ParseCache:

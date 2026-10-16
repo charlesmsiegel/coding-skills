@@ -5260,3 +5260,77 @@ def test_the_diff_lens_lists_one_too_long_signature_once(tmp_path):
                        if (r.get("issue_type") or r.get("smell_type"))
                        in ("parameter_count", "long_parameter_list"))
     assert signature == [(2, "parameter_count"), (5, "parameter_count"), (8, "parameter_count")]
+
+
+# --------------------------------------------------------------------------- #
+# Round three: envy that cannot be acted on, contracts that look like clumps,
+# and signatures a framework dictates.
+# --------------------------------------------------------------------------- #
+
+_EXTERNAL_ENVY = r'''
+import os
+import re
+from pathlib import Path
+
+import torch
+from torch import Tensor, nn
+
+from mypkg.jobs import Job
+
+_TRAILING = re.compile(r"(\d+)$")
+
+
+class Model:
+    def __init__(self):
+        self.scale = 1
+        self.texts = []
+
+    def forward(self, x: Tensor):
+        return x.view(1) + x.float() + x.sum() + x.mean() + self.scale
+
+    def delta(self, params: dict[str, Tensor], target):
+        param = params[target]
+        return param.detach() + param.clone() + param.data + self.scale
+
+    def weight(self):
+        explicit = _TRAILING.match(self.texts[-1]) if self.texts else None
+        return explicit.group(1) + explicit.start() + explicit.end()
+
+    def walk(self, root):
+        entries = list(os.scandir(root))
+        for entry in entries:
+            print(entry.name, entry.path, entry.is_dir(), self.scale)
+
+    def label(self, name: str, path: Path):
+        return name.upper() + name.lower() + name.strip() + path.stem + path.name + path.suffix
+
+    def maybe(self, x: "Tensor | None", p: nn.Parameter):
+        return x.a + x.b + x.c + p.a + p.b + p.c
+
+    def first_party(self, job: Job):  # fires
+        return job.id + job.seed + job.request + self.scale
+
+    def unknown(self, thing):  # fires
+        return thing.a + thing.b + thing.c
+
+    def local_class(self, spec: "Spec"):  # fires
+        return spec.a + spec.b + spec.c
+
+
+class Spec:
+    pass
+'''
+
+
+def test_envy_of_a_library_or_builtin_type_is_not_reported(tmp_path):
+    """The remedy for envy is to move the method onto the envied class, and nobody
+    can move a method onto torch.Tensor, re.Match, os.DirEntry, Path or str."""
+    (tmp_path / "pyproject.toml").write_text('[project]\nname = "x"\nversion = "0"\n')
+    (tmp_path / "mypkg").mkdir()
+    (tmp_path / "mypkg" / "__init__.py").write_text("")
+    (tmp_path / "mypkg" / "jobs.py").write_text("class Job:\n    pass\n")
+    (tmp_path / "model.py").write_text(_EXTERNAL_ENVY)
+
+    envy = sorted(r["line"] for r in run_detector("find_coupling_issues.py", tmp_path)
+                  if r["issue_type"] == "feature_envy")
+    assert envy == _lines_marked(_EXTERNAL_ENVY)
