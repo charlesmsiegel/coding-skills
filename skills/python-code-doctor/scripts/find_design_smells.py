@@ -37,10 +37,21 @@ class DesignSmell:
     suggestion: str
     severity: str
     code_snippet: str = ""
+    kind: str = "finding"
+    also_caused_by: tuple[str, ...] = ()
 
 
 # Public-by-convention namedtuple machinery; touching these is not intimacy.
 NAMEDTUPLE_API = frozenset({"_replace", "_asdict", "_fields", "_make", "_field_defaults"})
+
+# Documented Options operations provide Django context, not proof of the
+# receiver's type. Keep these observations as candidates when identity is unknown.
+DJANGO_META_API = frozenset({
+    "get_field", "get_fields", "db_table", "local_fields", "related_objects",
+    "fields", "concrete_fields", "many_to_many", "model", "model_name",
+    "app_label", "label", "label_lower", "verbose_name", "verbose_name_plural",
+    "abstract", "proxy", "managed", "ordering", "indexes", "constraints", "pk",
+})
 
 # Receivers that mean "my own class", not someone else's internals.
 OWN_RECEIVERS = frozenset({"self", "cls", "mcs", "mcls"})
@@ -171,6 +182,18 @@ class DesignSmellDetector(ast.NodeVisitor):
         self.issues: list[DesignSmell] = []
         self.ignore = ignore or set()
         self.is_test_file = is_test_file
+        self._django_context = any(
+            (isinstance(n, ast.ImportFrom) and n.level == 0 and n.module is not None
+             and (n.module == "django" or n.module.startswith("django.")))
+            or (isinstance(n, ast.Import) and any(
+                a.name == "django" or a.name.startswith("django.") for a in n.names))
+            for n in ast.walk(tree)
+        )
+        self._metadata_operations = {
+            id(n.value) for n in ast.walk(tree)
+            if isinstance(n, ast.Attribute) and isinstance(n.value, ast.Attribute)
+            and n.value.attr == "_meta" and n.attr in DJANGO_META_API
+        }
         self._func_stack: list[tuple[str, frozenset[str], frozenset[str]]] = []
         self._class_depth = 0
         self._ladder_members: set[int] = set()
@@ -552,7 +575,21 @@ class DesignSmellDetector(ast.NodeVisitor):
         if (not self.is_test_file and not in_dunder and private
                 and attr not in NAMEDTUPLE_API):
             receiver = self._foreign_receiver(node.value)
-            if receiver is not None:
+            if (receiver is not None and attr == "_meta" and self._django_context
+                    and id(node) in self._metadata_operations):
+                if "inappropriate_intimacy" not in self.ignore:
+                    self.issues.append(DesignSmell(
+                        file=self.filename, line=node.lineno,
+                        smell_type="inappropriate_intimacy",
+                        description=f"'{receiver}._meta' uses a documented Django metadata operation; "
+                                    "receiver identity is unresolved",
+                        suggestion="", severity="medium", code_snippet=self._get_line(node.lineno),
+                        kind="candidate", also_caused_by=(
+                            "Django Model._meta is a public metadata API despite its leading underscore; "
+                            "this module imports Django, but static analysis cannot prove the receiver "
+                            "is a Django model. Verify its type before treating this as private coupling.",),
+                    ))
+            elif receiver is not None:
                 self._add(node.lineno, "inappropriate_intimacy",
                     f"Reaching into '{receiver}.{node.attr}' — another object's private internals",
                     "Move Method to where the data lives, or expose an intentional API "
@@ -840,22 +877,30 @@ def main():
     if args.format == 'json':
         print(json.dumps([asdict(i) for i in all_issues], indent=2))
     else:
+        proven = [issue for issue in all_issues if issue.kind == "finding"]
+        candidates = [issue for issue in all_issues if issue.kind == "candidate"]
         if not all_issues:
             print("✅ No design smells found!")
             return
 
         by_type = defaultdict(int)
-        for issue in all_issues:
+        for issue in proven:
             by_type[issue.smell_type] += 1
 
-        print(f"Found {len(all_issues)} design smell(s):\n")
+        print(f"Found {len(proven)} design smell(s):\n")
         print("Summary:")
         for smell, count in sorted(by_type.items(), key=lambda x: -x[1]):
             print(f"  {smell}: {count}")
         print()
 
         severity_icons = SEVERITY_ICONS
-        for issue in all_issues:
+        for issue in candidates:
+            print(f"[CANDIDATE] {issue.file}:{issue.line}")
+            print(f"   {issue.description}")
+            for explanation in issue.also_caused_by:
+                print(f"   Context: {explanation}")
+            print()
+        for issue in proven:
             icon = severity_icons[issue.severity]
             print(f"{icon} [{issue.severity.upper()}] {issue.file}:{issue.line}")
             print(f"   {issue.smell_type}: {issue.description}")
