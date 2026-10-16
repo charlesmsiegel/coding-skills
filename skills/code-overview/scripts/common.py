@@ -9,6 +9,7 @@ those findings are worth lives in rubric.py.
 
 from __future__ import annotations
 
+import contextlib
 import html
 import json
 import os
@@ -265,14 +266,31 @@ def _code_doctor_inventory(completeness: dict) -> tuple[dict[str, str], set[str]
     return errors, skipped - ran, ran - set(errors)
 
 
-def finding_identity(finding: dict) -> tuple:
+# One defect, measured by companion doctors under their own names. Every doctor
+# that runs over a file charges "this file is too long" at line 1 — code-doctor
+# as `oversized_file`, typescript-code-doctor as `long_file`, python-code-doctor
+# as `god_module` — so a 4000-line module paid for its length up to twice, in
+# two categories. Folding the names into one identity lets the ordinary merge
+# keep the harsher call and drop the rest. Only names that measure the *same*
+# thing belong here; a detector that merely fires on the same line is a
+# different defect and keeps its own charge.
+SAME_DEFECT = {
+    "long_file": "oversized_file",
+    "god_module": "oversized_file",
+}
+
+
+def finding_identity(finding: dict, repo: Path | None = None) -> tuple:
     """What makes two findings the same defect: same place, same kind.
 
     The *whole* path, not the basename. Merging on basename would collapse
     `src/a/models.py:3` and `src/b/models.py:3` — two different defects that
-    monorepos produce constantly — into one. Different path spellings for the
-    same file (absolute vs relative) instead fail to merge, which only leaves a
-    duplicate counted twice; that is the safe direction to be wrong in.
+    monorepos produce constantly — into one. A path under ``repo`` is compared
+    repo-relative, because doctors spell paths both ways — python-code-doctor's
+    import-cycle detector reports absolute paths while its siblings and
+    code-doctor report relative ones — and two spellings of one file must not
+    read as two defects. A path that cannot be relativized is kept as given,
+    which only leaves a duplicate counted twice: the safe direction.
     """
     for key in ("smell_type", "issue_type", "pattern_type", "type"):
         if finding.get(key):
@@ -280,7 +298,11 @@ def finding_identity(finding: dict) -> tuple:
             break
     else:
         kind = "issue"
+    kind = SAME_DEFECT.get(kind, kind)
     path = str(finding.get("file", ""))
+    if path and repo is not None and Path(path).is_absolute():
+        with contextlib.suppress(ValueError):
+            path = Path(path).resolve().relative_to(repo.resolve()).as_posix()
     normalized = Path(path).as_posix().removeprefix("./") if path else ""
     return (normalized, finding.get("line"), kind)
 
@@ -288,7 +310,7 @@ def finding_identity(finding: dict) -> tuple:
 _SEVERITY_RANK = {"high": 0, "medium": 1, "low": 2}
 
 
-def dedupe(reports: list[dict]) -> tuple[list[dict], int]:
+def dedupe(reports: list[dict], repo: Path | None = None) -> tuple[list[dict], int]:
     """Merge companion doctors' reports without double-charging one defect.
 
     Companion doctors overlap on purpose — django-code-doctor and
@@ -315,7 +337,7 @@ def dedupe(reports: list[dict]) -> tuple[list[dict], int]:
         grouped: dict[tuple, list[dict]] = {}
         for finding in report["findings"]:
             total += 1
-            identity = finding_identity(finding)
+            identity = finding_identity(finding, repo)
             # `order` records first appearance once per identity — appending per
             # occurrence would emit that identity's whole group again for each
             # duplicate, multiplying rather than merging.
