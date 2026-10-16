@@ -92,7 +92,12 @@ Delete the narration; demand a reason where a reason is owed.
 that return `None`/`{}`/`[]` on error instead of raising. It *looks* robust and is the
 opposite: it converts a loud, debuggable failure into a silent wrong answer.
 `find_exception_issues.py` (swallowed_exception) flags the broad-catch-and-discard
-shapes; in review, insist errors are either handled meaningfully or propagated.
+shapes; in review, insist errors are either handled meaningfully or propagated. A
+broad catch the repo's Ruff gate already suppresses *with a stated reason*
+(`# noqa: BLE001 -- the caller reads None as unreadable`) is reported as a
+candidate: someone adjudicated that line and wrote down why — check the reason
+holds rather than re-litigating the catch. A bare `# noqa: BLE001` states nothing
+and stays a finding.
 
 ### Tests that can't fail
 Generated tests over-mock (asserting the code calls the mocks the test set up — i.e.
