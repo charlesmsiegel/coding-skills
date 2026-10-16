@@ -187,6 +187,15 @@ class TsFile:
             return self.lines[line - 1].strip()[:width]
         return ""
 
+    def comments_between(self, open_index: int, close_index: int) -> list[Token]:
+        """Comments lying strictly between the tokens at two indices.
+
+        Comments are not tokens, so they have no token index to compare: their
+        position is a character offset, and so is the boundary each side.
+        """
+        low, high = self.tokens[open_index].end, self.tokens[close_index].start
+        return [c for c in self.comments if low <= c.start < high]
+
     def closer(self, index: int) -> int:
         """The matching bracket for the token at ``index``, or -1."""
         return self.match.get(index, -1)
