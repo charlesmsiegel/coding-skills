@@ -186,7 +186,7 @@ def _parse_import(file: TsFile, index: int) -> Import:
             break
         if token.is_op("{"):
             close = file.closer(cursor)
-            record.names.extend(_named_bindings(file, cursor, close))
+            record.names.extend(_named_bindings(file, cursor, close, record.type_names))
             cursor = close + 1
             continue
         if token.is_op("*"):
@@ -202,18 +202,29 @@ def _parse_import(file: TsFile, index: int) -> Import:
     return record
 
 
-def _named_bindings(file: TsFile, open_index: int, close_index: int) -> list[str]:
-    """The local names bound by a `{ a, b as c }` clause."""
+def _named_bindings(file: TsFile, open_index: int, close_index: int,
+                    type_names: list[str] | None = None) -> list[str]:
+    """The local names bound by a `{ a, b as c, type D }` clause.
+
+    A name after an inline `type` modifier is also added to ``type_names``
+    when the caller passes that list.
+    """
     names: list[str] = []
     cursor = open_index + 1
+    inline_type = False
     while cursor < close_index:
         token = file.tokens[cursor]
-        if token.kind == "name" and not token.is_name("as", "type"):
+        if token.is_name("type") and cursor + 1 < close_index and file.tokens[cursor + 1].kind == "name":
+            inline_type = True  # the modifier, not a binding named `type`
+        elif token.kind == "name" and not token.is_name("as", "type"):
             local = token.value
             if cursor + 2 < close_index and file.tokens[cursor + 1].is_name("as"):
                 local = file.tokens[cursor + 2].value
                 cursor += 2
             names.append(local)
+            if inline_type and type_names is not None:
+                type_names.append(local)
+            inline_type = False
         cursor += 1
     return names
 

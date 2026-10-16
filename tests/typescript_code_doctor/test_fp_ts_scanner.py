@@ -398,3 +398,22 @@ export class View {
     assert definite[0]["also_caused_by"] and not definite[0]["suggestion"]
 
 
+# --------------------------------------------------------------------------- #
+# An inline `type` specifier is already a type-only import
+# --------------------------------------------------------------------------- #
+
+def test_inline_type_specifiers_are_recorded(ts):
+    file = parse(ts, 'import { a, type B, d as e } from "x";\n')
+    (record,) = file.imports
+    assert record.names == ["a", "B", "e"] and record.type_names == ["B"]
+
+
+def test_missing_import_type_skips_an_inline_type_specifier(tmp_path):
+    root = project(tmp_path, {
+        "src/client.ts": "export interface Entry { id: string }\nexport interface Row { id: string }\n"
+                         "export function api(e: { id: string }): string { return e.id; }\n",
+        "src/a.ts": 'import { api, type Entry, Row } from "./client";\n'
+                    "export function f(e: Entry, r: Row): string { return api(e) + r.id; }\n",
+    })
+    found = records("find_module_issues.py", root, "missing_import_type")
+    assert [r["description"] for r in found] == ["`Row` from './client' is only used as a type"]

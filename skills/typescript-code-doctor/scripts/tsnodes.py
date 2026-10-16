@@ -125,6 +125,9 @@ class Import:
     namespace_name: str = ""
     is_type_only: bool = False
     side_effect_only: bool = False
+    # Names bound by an inline `type` specifier: `B` in `import { a, type B }`.
+    # Each is already erased from the emitted import, like `import type`.
+    type_names: list[str] = field(default_factory=list)
 
 
 @dataclass(slots=True)
