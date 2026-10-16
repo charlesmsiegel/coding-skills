@@ -5153,3 +5153,45 @@ def test_fixture_requests_are_dependency_injection_not_a_data_clump(tmp_path):
     clumps = [r["description"] for r in run_detector("find_parameter_objects.py", tmp_path)]
     assert len(clumps) == 1, clumps
     assert "['depth', 'height', 'width']" in clumps[0], "plain helpers, in tests or not, still clump"
+
+
+def test_cli_flags_and_a_fakes_signature_are_not_boolean_flag_smells(tmp_path):
+    """A typer command's booleans are its `--reload` / `--no-aliases` flags; a fake
+    tokenizer's keyword flags are the real tokenizer's. Neither signature is free."""
+    cli = (
+        "import typer\n"
+        "\n"
+        "app = typer.Typer()\n"
+        "\n"
+        "@app.command()\n"
+        "def serve(port: int = 8000, reload: bool = False):\n"
+        "    return port\n"
+        "\n"
+        "@app.command()\n"
+        "def tags_build(aliases: bool = True, gelbooru: bool = False, skip_neighbours: bool = False):\n"
+        "    return aliases\n"
+        "\n"
+        "def helper(path, force=False):  # fires\n"
+        "    return path\n"
+    )
+    fake = (
+        "class FakeTokenizer:\n"
+        "    def __call__(self, text, add_special_tokens=True, return_offsets_mapping=False,\n"
+        "                 truncation=False):\n"
+        "        return text\n"
+        "\n"
+        "def build(text, strict=False, verbose=False):  # fires\n"
+        "    return text\n"
+    )
+    (tmp_path / "cli.py").write_text(cli)
+    (tmp_path / "tests").mkdir()
+    (tmp_path / "tests" / "test_text_encoder.py").write_text(fake)
+
+    found = sorted((Path(r["file"]).name, r["line"], r["smell_type"])
+                   for r in run_detector("find_boolean_params.py", tmp_path))
+    assert found == [
+        ("cli.py", _lines_marked(cli)[0], "boolean_positional_param"),
+        ("test_text_encoder.py", _lines_marked(fake)[0], "boolean_positional_param"),
+        ("test_text_encoder.py", _lines_marked(fake)[0], "boolean_positional_param"),
+        ("test_text_encoder.py", _lines_marked(fake)[0], "multiple_boolean_flags"),
+    ]
