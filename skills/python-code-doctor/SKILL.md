@@ -205,6 +205,8 @@ at a time and the evidence is elsewhere:
 | `sql_injection` on a `PRAGMA` statement | PRAGMA accepts no bound parameters, so a dynamic identifier has no parameterized spelling |
 | `assert_for_validation` on `assert x is not None` / `assert isinstance(...)` | that shape usually narrows a type for the checker and records an invariant the caller guarantees |
 | `local_import` of a slow-to-import package (torch, transformers, ...) or inside a CLI command | deferral to keep startup and `--help` fast is the usual reason, and only the author knows |
+| `unused_parameter` on a method, a nested callback, or a function some module hands out as a value | the base class or the caller that receives it dictates the signature |
+| `unused_import` of an absolute import in a package's `__init__.py` | the import makes the name a package attribute another module may read (a relative import there is never reported) |
 | `sql_injection` on DDL or a `PRAGMA`, on quoted identifiers only, or in a test | a bound parameter cannot fill an identifier position, so interpolation is the only spelling, and a test builds its SQL from its own values; whether a name is attacker-controlled shows only at the call sites |
 | `swallowed_exception` / `catches_baseexception` under a reasoned `# noqa: BLE001 -- why` | the repo's own lint gate adjudicated the line; the reason is what to check, and a bare noqa stays a finding |
 | `global_rebind` under a reasoned `# noqa: PLW0603 -- why` | an at-fork or install-once hook has no caller to return a value to |

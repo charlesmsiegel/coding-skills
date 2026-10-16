@@ -2,6 +2,20 @@
 """
 Detect dead code and unused code in Python.
 Finds: unused imports, unused variables, unreachable code, unused functions/classes.
+
+Three readings that look dead and are not:
+  - an import in a package's `__init__.py` binds the name as a package
+    attribute for other modules (`from . import sub` is what makes `pkg.sub`
+    resolve), so a relative import there is the package's surface, never
+    unused; any other import there is a candidate. Anywhere, a name used only
+    in a string annotation (`def f(x: "Model")`) is used.
+  - a bare `yield` after the last `return` or `raise` of a function with no
+    other `yield` is what makes the function a generator: deleting it changes
+    the function's kind.
+  - a free function's unused parameter is a candidate, not a finding, when the
+    function is handed out as a value (`register(mod.handler)`, through the
+    module's name or an import alias of it) anywhere in the importable tree it
+    lives in — whoever calls it dictates the signature.
 """
 
 import ast
@@ -23,6 +37,79 @@ _NOQA_CODES = re.compile(
     re.IGNORECASE,
 )
 _DJANGO_REGISTRATION_MODULES = {"checks", "signals"}
+
+# `<receiver>.<name>` not followed by a call: a module's function handed out as a
+# value. Found at every start so `pkg.mod.fn` yields (mod, fn) as well.
+_ATTRIBUTE_VALUE = re.compile(r"(?<!\w)(?=([A-Za-z_]\w*)\.([A-Za-z_]\w*)\b(?!\s*\())")
+# `import x as y` / `from p import x as y`: the receiver a module goes by.
+_ALIAS = re.compile(r"\b([A-Za-z_]\w*)\s+as\s+([A-Za-z_]\w*)\b")
+_VALUE_INDEX: dict[Path, tuple[dict, dict]] = {}
+
+
+def _import_root(filepath: Path) -> Path:
+    """The directory a module is imported from: above its top-most package."""
+    directory = filepath.parent
+    while (directory / "__init__.py").exists() and directory.parent != directory:
+        directory = directory.parent
+    return directory
+
+
+def _handed_out_in_tree(filepath: Path, function: str) -> bool:
+    """True when some module under the file's import root loads
+    `<this module>.<function>` without calling it — `register(art.handler)`.
+
+    The receiver must be the module's own name or an alias one of those files
+    gives it (`from . import art as art_ctx`), so an unrelated `lease.source`
+    does not make every function called `source` look handed out. The tree is
+    indexed as text, once per root per process and only when a finding needs
+    it; a file whose text matches is then parsed to confirm the reference is
+    code, not a mention in a docstring or comment.
+    """
+    root = _import_root(filepath)
+    if root not in _VALUE_INDEX:
+        pairs: dict[tuple[str, str], set[Path]] = {}
+        aliases: dict[str, set[str]] = {}
+        for path in find_python_files(root):
+            try:
+                text = path.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                continue
+            for pair in _ATTRIBUTE_VALUE.findall(text):
+                pairs.setdefault(pair, set()).add(path)
+            for original, alias in _ALIAS.findall(text):
+                aliases.setdefault(original, set()).add(alias)
+        _VALUE_INDEX[root] = (pairs, aliases)
+    pairs, aliases = _VALUE_INDEX[root]
+    receivers = {filepath.stem, *aliases.get(filepath.stem, ())}
+    paths = set().union(*(pairs.get((receiver, function), set()) for receiver in receivers))
+    return any(_loads_attribute(path, receivers, function) for path in sorted(paths))
+
+
+def _loads_attribute(path: Path, receivers: set[str], attr: str) -> bool:
+    """True when ``path`` loads `<receiver>.<attr>` other than to call it."""
+    try:
+        tree = ast.parse(path.read_text(encoding="utf-8", errors="replace"))
+    except (OSError, SyntaxError, ValueError):
+        return False
+    called = {id(node.func) for node in ast.walk(tree) if isinstance(node, ast.Call)}
+    return any(isinstance(node, ast.Attribute) and node.attr == attr and id(node) not in called
+               and isinstance(node.value, ast.Name) and node.value.id in receivers
+               for node in ast.walk(tree))
+
+
+def _string_annotation_names(annotation: ast.AST | None) -> set[str]:
+    """Names a string annotation (`"Model"`, `list["Model"]`) refers to."""
+    names: set[str] = set()
+    if annotation is None:
+        return names
+    for node in ast.walk(annotation):
+        if isinstance(node, ast.Constant) and isinstance(node.value, str):
+            try:
+                parsed = ast.parse(node.value.strip(), mode="eval")
+            except (SyntaxError, ValueError):
+                continue
+            names.update(inner.id for inner in ast.walk(parsed) if isinstance(inner, ast.Name))
+    return names
 
 
 def _dotted_name(node) -> str | None:
@@ -82,6 +169,8 @@ _CANDIDATE_REASONS = {
                      "it is registered by name: an ORM model, a plugin, a serializer"),
     "unused_parameter": ("the signature is dictated by the receiver — a callback, a "
                          "registry entry, a dispatch-table row",),
+    "unused_import": ("a package's __init__.py binds what it imports as package "
+                      "attributes, and another module may read it as `package.name`",),
 }
 
 
@@ -114,6 +203,20 @@ class ScopeTracker(ast.NodeVisitor):
         # its parameters. Decided in finalize, once the whole file has been read.
         self.value_references: Set[str] = set()
         self.pending_params: list[tuple[DeadCodeIssue, ast.FunctionDef | ast.AsyncFunctionDef]] = []
+        # Names bound by a relative import (or an absolute import of this
+        # file's own package). In a package `__init__.py` that is a re-export.
+        self.own_package_imports: Set[str] = set()
+        self.is_package_init = Path(filename).name == "__init__.py"
+        self.package_top = self._package_top(Path(filename))
+
+    @staticmethod
+    def _package_top(filepath: Path) -> str | None:
+        root = _import_root(filepath)
+        try:
+            relative = filepath.parent.relative_to(root)
+        except ValueError:
+            return None
+        return relative.parts[0] if relative.parts else None
 
     def _at_module_scope(self, node: ast.AST) -> bool:
         parent = self.parents.get(node)
@@ -290,6 +393,8 @@ class ScopeTracker(ast.NodeVisitor):
                 continue
             name = alias.asname if alias.asname else alias.name.split('.')[0]
             self.imports[name] = node.lineno
+            if alias.name.split('.')[0] == self.package_top:
+                self.own_package_imports.add(name)
         self.generic_visit(node)
 
     def visit_ImportFrom(self, node: ast.ImportFrom):
@@ -305,6 +410,16 @@ class ScopeTracker(ast.NodeVisitor):
                 continue
             name = alias.asname if alias.asname else alias.name
             self.from_imports[name] = node.lineno
+            if node.level or (node.module or "").split(".")[0] == self.package_top:
+                self.own_package_imports.add(name)
+        self.generic_visit(node)
+
+    def visit_arg(self, node: ast.arg):
+        self.used_names.update(_string_annotation_names(node.annotation))
+        self.generic_visit(node)
+
+    def visit_AnnAssign(self, node: ast.AnnAssign):
+        self.used_names.update(_string_annotation_names(node.annotation))
         self.generic_visit(node)
 
     def visit_Name(self, node: ast.Name):
@@ -369,6 +484,7 @@ class ScopeTracker(ast.NodeVisitor):
         self._signature_references(node)
         if node.col_offset == 0:
             self.functions[node.name] = node
+        self.used_names.update(_string_annotation_names(node.returns))
         self._check_unreachable(node)
         self._check_unused_params(node)
         self.function_stack.append(node)
@@ -386,6 +502,7 @@ class ScopeTracker(ast.NodeVisitor):
         self._signature_references(node)
         if node.col_offset == 0:
             self.functions[node.name] = node
+        self.used_names.update(_string_annotation_names(node.returns))
         self._check_unreachable(node)
         self._check_unused_params(node)
         self.function_stack.append(node)
@@ -425,12 +542,39 @@ class ScopeTracker(ast.NodeVisitor):
             self.instantiated_classes.add(node.func.id)
         elif isinstance(node.func, ast.Attribute):
             self.called_functions.add(node.func.attr)
+        # typing.cast("Model", value) names a type in a string, as an annotation does.
+        callee = node.func.id if isinstance(node.func, ast.Name) else getattr(node.func, "attr", None)
+        if callee == "cast" and node.args:
+            self.used_names.update(_string_annotation_names(node.args[0]))
         self.generic_visit(node)
+
+    @staticmethod
+    def _is_generator_marker(tail: list[ast.stmt], node) -> bool:
+        """True when the unreachable tail is a bare yield that makes ``node`` a generator.
+
+        `raise Unavailable(...)` then `yield` is the idiom for a generator that
+        raises when first advanced (a fake stream in a test, an iterator that is
+        never valid). The yield never runs and is still the reason the function
+        is a generator; with another yield anywhere else it is only dead.
+        """
+        if not tail or not all(isinstance(s, ast.Expr) and isinstance(s.value, (ast.Yield, ast.YieldFrom))
+                               for s in tail):
+            return False
+        markers = {id(s.value) for s in tail}
+        stack = list(ast.iter_child_nodes(node))
+        while stack:
+            child = stack.pop()
+            if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda)):
+                continue
+            if isinstance(child, (ast.Yield, ast.YieldFrom)) and id(child) not in markers:
+                return False
+            stack.extend(ast.iter_child_nodes(child))
+        return True
 
     def _check_unreachable(self, node):
         for i, stmt in enumerate(node.body):
             if isinstance(stmt, (ast.Return, ast.Raise)):
-                if i < len(node.body) - 1:
+                if i < len(node.body) - 1 and not self._is_generator_marker(node.body[i + 1:], node):
                     next_stmt = node.body[i + 1]
                     self.issues.append(DeadCodeIssue(
                         file=self.filename, line=next_stmt.lineno,
@@ -511,31 +655,42 @@ class ScopeTracker(ast.NodeVisitor):
         # receiver, exactly like a nested callback. Only now, with the whole
         # file read, is that known.
         for issue, node in self.pending_params:
-            if issue.kind == "finding" and node.name in self.value_references:
+            # Handed out as a value here, or (checked last, because it reads the
+            # tree) as `module.function` by any module importable beside it.
+            if issue.kind == "finding" and (
+                    node.name in self.value_references
+                    or _handed_out_in_tree(Path(self.filename), node.name)):
                 issue.kind = "candidate"
                 issue.also_caused_by = _CANDIDATE_REASONS["unused_parameter"]
             self.issues.append(issue)
         self.pending_params.clear()
 
         # An unused import IS provable inside one file — unless the name is
-        # re-exported via __all__, in which case it is part of the public API.
-        for name, line in self.imports.items():
-            if name not in self.used_names and name not in self.dunder_all:
+        # re-exported via __all__, in which case it is part of the public API,
+        # or the file is a package's __init__.py, whose imports are the
+        # package's attributes: `from . import sub` is what lets `pkg.sub`
+        # resolve for every other module. A relative (own-package) import there
+        # is that surface; any other import there may be too, so it is a lead.
+        for name, line in [*self.imports.items(), *self.from_imports.items()]:
+            if name in self.used_names or name in self.dunder_all:
+                continue
+            if self.is_package_init and name in self.own_package_imports:
+                continue
+            if self.is_package_init:
                 self.issues.append(DeadCodeIssue(
                     file=self.filename, line=line,
                     issue_type="unused_import", name=name,
-                    description=f"Import '{name}' is never used",
-                    confidence=90
+                    description=f"Import '{name}' is never used in this package's __init__.py",
+                    confidence=70, kind="candidate",
+                    also_caused_by=_CANDIDATE_REASONS["unused_import"],
                 ))
-
-        for name, line in self.from_imports.items():
-            if name not in self.used_names and name not in self.dunder_all:
-                self.issues.append(DeadCodeIssue(
-                    file=self.filename, line=line,
-                    issue_type="unused_import", name=name,
-                    description=f"Import '{name}' is never used",
-                    confidence=90
-                ))
+                continue
+            self.issues.append(DeadCodeIssue(
+                file=self.filename, line=line,
+                issue_type="unused_import", name=name,
+                description=f"Import '{name}' is never used",
+                confidence=90
+            ))
 
         # A public module-level function or class cannot be *proven* dead by
         # reading one file: any other module may import and use it. So these are
