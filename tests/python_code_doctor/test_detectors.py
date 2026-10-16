@@ -5096,3 +5096,21 @@ def test_a_test_double_is_shaped_by_the_interface_it_fakes(tmp_path):
     )
     assert [r for r in run_detector("find_coupling_issues.py", tmp_path)
             if r["issue_type"] == "low_cohesion"] == []
+
+
+def test_a_test_module_of_many_cases_is_not_a_god_module(tmp_path):
+    """Each test is an independent case, not a responsibility: 45 of them do not
+    make a module do too much. Size in lines still counts, in tests as anywhere."""
+    cases = "".join(f"def test_case_{i}():\n    assert f({i}) == {i}\n\n" for i in range(45))
+    tests = tmp_path / "tests"
+    tests.mkdir()
+    (tests / "test_api.py").write_text(cases)
+    (tests / "test_huge.py").write_text("def test_long():\n" + "    x = 1\n" * 801)
+    (tmp_path / "helpers.py").write_text(cases.replace("def test_", "def helper_"))
+
+    found = {Path(r["file"]).name: r["description"]
+             for r in run_detector("find_import_cycles.py", tmp_path) if r["smell_type"] == "god_module"}
+
+    assert set(found) == {"helpers.py", "test_huge.py"}
+    assert "45 top-level definitions" in found["helpers.py"]
+    assert "source lines" in found["test_huge.py"] and "definitions" not in found["test_huge.py"]

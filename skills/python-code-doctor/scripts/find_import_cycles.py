@@ -7,7 +7,9 @@ Analyzes the whole directory tree and flags:
                       import under `if TYPE_CHECKING:` never executes, so it
                       is no edge; a deferred import inside a function does
                       execute, so it is one (the cycle is worked around, not gone).
-  - god_module      : a file that is too large or has too many top-level defs (MEDIUM)
+  - god_module      : a file that is too large or has too many top-level defs (MEDIUM).
+                      A test module's definitions are its cases, not
+                      responsibilities, so only its size in lines counts.
   - wildcard_import : a `from x import *` statement (MEDIUM)
   - logic_in_init   : function/class definitions inside __init__.py (LOW)
 """
@@ -20,7 +22,7 @@ from dataclasses import dataclass, asdict
 from typing import Dict, List, Set, Optional
 from collections import defaultdict
 from common import (sort_findings, SEVERITY_ICONS, configure_output, find_python_files,
-                    warn_detector_error, warn_unparseable)
+                    is_test_file, warn_detector_error, warn_unparseable)
 
 
 @dataclass
@@ -343,7 +345,8 @@ def _find_sccs(graph: Dict[str, Set[str]]) -> List[List[str]]:
 # Per-file smell detectors
 # ---------------------------------------------------------------------------
 
-def _check_god_module(tree: ast.AST, filepath: Path, lines: List[str], ignore: Set[str]) -> Optional[CodeSmell]:
+def _check_god_module(tree: ast.AST, filepath: Path, lines: List[str], ignore: Set[str],
+                      in_tests: bool = False) -> Optional[CodeSmell]:
     if "god_module" in ignore:
         return None
     source_lines = sum(1 for ln in lines if ln.strip() and not ln.strip().startswith("#"))
@@ -354,7 +357,7 @@ def _check_god_module(tree: ast.AST, filepath: Path, lines: List[str], ignore: S
     reasons = []
     if source_lines > 800:
         reasons.append(f"{source_lines} source lines")
-    if top_defs > 40:
+    if top_defs > 40 and not in_tests:  # forty test cases are forty cases
         reasons.append(f"{top_defs} top-level definitions")
     if not reasons:
         return None
@@ -440,7 +443,11 @@ def analyze(root: Path, ignore: Set[str]) -> List[CodeSmell]:
     for fp_abs, tree in trees.items():
         fp = Path(fp_abs)
         lines = file_lines[fp_abs]
-        gm = _check_god_module(tree, fp, lines, ignore)
+        try:  # judged below the root, so a checkout under a `tests/` directory is not all tests
+            in_tests = is_test_file(fp.relative_to(root))
+        except ValueError:
+            in_tests = is_test_file(fp)
+        gm = _check_god_module(tree, fp, lines, ignore, in_tests)
         if gm:
             issues.append(gm)
         issues.extend(_check_wildcard_imports(tree, fp, lines, ignore))
