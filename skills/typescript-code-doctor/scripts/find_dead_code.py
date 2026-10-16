@@ -42,10 +42,9 @@ def _check_unused_imports(tsfile, path: Path, add) -> None:
         if record.namespace_name:
             bindings.append(record.namespace_name)
         for name in bindings:
-            used = any(
-                token.kind == "name" and token.value == name and token.line != record.line
-                for token in tsfile.tokens
-            )
+            # `names()` includes the code inside template substitutions: a
+            # helper read only in `` `${seg(id)}` `` is still read.
+            used = any(token.value == name and token.line != record.line for token in tsfile.names())
             in_jsx = tsfile.is_tsx and any(name in t.value for t in tsfile.jsx_text)
             if not used and not in_jsx:
                 add(path, record.line, "unused_import",
@@ -98,10 +97,8 @@ def _check_private_members(tsfile, path: Path, add) -> None:
             if accessibility != "private" or getattr(member, "kind", "") == "constructor":
                 continue
             name = member.name.lstrip("#")
-            uses = sum(
-                1 for index in range(klass.body_open, klass.body_close)
-                if tsfile.tokens[index].kind == "name" and tsfile.tokens[index].value.lstrip("#") == name
-            )
+            uses = sum(1 for token in tsfile.names(klass.body_open, klass.body_close)
+                       if token.value.lstrip("#") == name)
             if uses <= 1:
                 add(path, member.line, "unused_private_member",
                     f"`{klass.name}.{member.name}` is private and referenced nowhere in the class",

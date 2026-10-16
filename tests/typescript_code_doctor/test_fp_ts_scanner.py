@@ -119,6 +119,67 @@ export function five(a: string, b: string, c: string, d: string, e: Map<string, 
 
 
 # --------------------------------------------------------------------------- #
+# Template substitutions are code
+# --------------------------------------------------------------------------- #
+
+def test_template_substitutions_are_tokenized_on_the_side(ts):
+    """The literal stays one token; the code inside `${...}` is read by a
+    nested scanner, which also finds the closing `}` past a regex holding one."""
+    file = parse(ts, "const s = `a ${seg(id)} ${/}/.test(x) ? `in ${deep}` : ''} b`;\nconst after = 1;\n")
+    templates = [i for i, t in enumerate(file.tokens) if t.kind == "template"]
+    assert len(templates) == 1
+    assert any(t.is_name("after") for t in file.tokens)
+    inner = [t.value for t in file.substitutions[templates[0]] if t.kind == "name"]
+    assert inner[:2] == ["seg", "id"] and "deep" in inner
+    assert {"seg", "id", "deep", "after"} <= {t.value for t in file.names()}
+
+
+def test_an_import_read_only_inside_a_template_is_used(tmp_path):
+    root = project(tmp_path, {
+        "src/b.ts": "export function seg(s: string): string { return s; }\n"
+                    "export function other(): number { return 1; }\n",
+        "src/a.ts": 'import { seg, other } from "./b";\n'
+                    "export const path = `/x/${seg(\"id\")}`;\n",
+    })
+    found = records("find_dead_code.py", root, "unused_import")
+    assert [r["description"] for r in found] == ["`other` is imported from './b' and never used"]
+
+
+def test_a_dotted_jsx_tag_reads_its_head_name(tmp_path):
+    """`<Ctx.Provider>` was one token, so the import binding `Ctx` looked unused."""
+    root = project(tmp_path, {"src/a.tsx": """\
+import React from "react";
+import Unused from "./unused";
+export const App = () => <React.StrictMode><p>hi</p></React.StrictMode>;
+"""})
+    found = records("find_dead_code.py", root, "unused_import")
+    assert [r["description"] for r in found] == ["`Unused` is imported from './unused' and never used"]
+
+
+def test_options_read_in_a_template_are_read(tmp_path):
+    root = project(tmp_path, {"src/a.ts": """\
+export function label(options: { prefix: string }): string { return `${options.prefix}:`; }
+export function ignore(options: { prefix: string }): string { return "x"; }
+"""})
+    found = records("find_ai_scaffolding.py", root, "ignored_options_parameter")
+    assert [r["line"] for r in found] == [2]
+
+
+def test_a_private_member_read_in_a_template_is_referenced(tmp_path):
+    root = project(tmp_path, {"src/a.ts": """\
+export class Badge {
+  private label = "x";
+  private unused = 1;
+  show(): string { return `[${this.label}]`; }
+}
+"""})
+    found = records("find_dead_code.py", root, "unused_private_member")
+    assert [r["description"] for r in found] == [
+        "`Badge.unused` is private and referenced nowhere in the class",
+    ]
+
+
+# --------------------------------------------------------------------------- #
 # Comments are located by character offset
 # --------------------------------------------------------------------------- #
 
