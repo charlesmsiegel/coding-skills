@@ -180,7 +180,10 @@ under `tests/`, `__tests__/`, `spec/`, `e2e/` or `cypress/` *below the project
 root* (the outermost `package.json` or tsconfig inside the checkout, bounded by
 the first `.git`), or one named
 `*.test.*` / `*.spec.*` — where the checkout itself lives does not change the
-classification.
+classification. The scaffolding suites share counts as test code too: anything
+under `__mocks__/`, `__fixtures__/`, `testkit/`, `test-utils/`, `testutils/` or
+`test-helpers/` (below the root, by the same rule), and the runner's setup file —
+`test-setup.*`, `setupTests.*`, `vitest.setup.*`, `jest.setup.*`.
 
 Declaration files (`.d.ts`, `.d.mts`, `.d.cts`) carry no implementation, so the
 code detectors skip them. So does any file whose first five lines say
