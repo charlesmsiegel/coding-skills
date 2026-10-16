@@ -49,6 +49,8 @@ def _same_scope_nodes(stmts, stop_types=()):
     stack = list(stmts)
     while stack:
         node = stack.pop()
+        if isinstance(node, _SCOPE_BOUNDARIES) or (stop_types and isinstance(node, stop_types)):
+            continue
         yield node
         for child in ast.iter_child_nodes(node):
             if isinstance(child, _SCOPE_BOUNDARIES) or (stop_types and isinstance(child, stop_types)):
@@ -125,15 +127,25 @@ _MIGRATION_CONFIGURATION = {"dependencies", "operations", "replaces", "run_befor
 # these `tags: list[str] = []` is the documented way to declare a field, not a
 # list every instance shares.
 _COPYING_MODEL_BASES = frozenset({
-    "pydantic.BaseModel", "pydantic.main.BaseModel",
-    "pydantic.RootModel", "pydantic.root_model.RootModel",
-    "pydantic_settings.BaseSettings", "sqlmodel.SQLModel",
+    "pydantic.BaseModel", "pydantic.main.BaseModel", "pydantic.RootModel",
+    "pydantic.root_model.RootModel", "pydantic.BaseSettings",
+    "pydantic.generics.GenericModel",
+    "pydantic.v1.BaseModel", "pydantic.v1.main.BaseModel", "pydantic.v1.BaseSettings",
+    "pydantic.v1.generics.GenericModel",
+    "pydantic_settings.BaseSettings", "pydantic_settings.main.BaseSettings",
+    "sqlmodel.SQLModel", "sqlmodel.main.SQLModel",
 })
 
 # How far a base class is followed into other first-party modules. Deep enough
 # for `Model(FrozenModel)` → `FrozenModel(BaseModel)` through a re-export or
 # two; bounded because each hop parses a file.
 _MAX_RESOLUTION_DEPTH = 8
+
+_CTYPES_BASES = frozenset({
+    "Structure", "Union", "BigEndianStructure", "LittleEndianStructure",
+    "BigEndianUnion", "LittleEndianUnion",
+})
+_CTYPES_DECLARATIONS = frozenset({"_fields_", "_anonymous_", "_pack_", "_align_"})
 
 def _resolver_for(path: Path) -> "ClassFamilyResolver | None":
     """One resolver per first-party module, parsed at most once per process."""
@@ -260,6 +272,8 @@ class ClassFamilyResolver:
         if not canonical:
             return None
         leaf = canonical.rsplit(".", 1)[-1]
+        if canonical.startswith("ctypes.") and leaf in _CTYPES_BASES:
+            return "ctypes"
         if canonical.startswith("django.views.") and leaf.endswith("View"):
             return "view"
         if canonical.startswith("django.forms.") and leaf == "ModelForm":
@@ -359,6 +373,16 @@ class ClassFamilyResolver:
         for base in node.bases:
             binding = self._binding_at(base)
             if binding is None:
+                scope = self.parents.get(node)
+                while scope is not None and not isinstance(scope, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Module)):
+                    scope = self.parents.get(scope)
+                if isinstance(scope, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    imported = {a.asname or a.name for stmt in scope.body if isinstance(stmt, ast.Import)
+                                for a in stmt.names if a.name == "ctypes"}
+                    dotted = _dotted_name(base) or ""
+                    head, _, leaf = dotted.rpartition(".")
+                    if head in imported and leaf in _CTYPES_BASES:
+                        families.add("ctypes")
                 continue
             kind, value = binding
             if kind == "class" and isinstance(value, ast.ClassDef):
@@ -387,6 +411,16 @@ class ClassFamilyResolver:
         for base in node.bases:
             binding = self._binding_at(base)
             if binding is None:
+                scope = self.parents.get(node)
+                while scope is not None and not isinstance(scope, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Module)):
+                    scope = self.parents.get(scope)
+                if isinstance(scope, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    imported = {a.asname or a.name for stmt in scope.body if isinstance(stmt, ast.Import)
+                                for a in stmt.names if a.name == "ctypes"}
+                    dotted = _dotted_name(base) or ""
+                    head, _, leaf = dotted.rpartition(".")
+                    if head in imported and leaf in _CTYPES_BASES:
+                        families.add("ctypes")
                 continue
             kind, value = binding
             if kind == "class" and isinstance(value, ast.ClassDef):
@@ -426,6 +460,8 @@ class MutationHazardDetector(ast.NodeVisitor):
 
     # -- mutable class attribute ------------------------------------------
     def _is_django_declaration(self, node: ast.ClassDef, name: str) -> bool:
+        if name in _CTYPES_DECLARATIONS and self.classes.is_family(node, "ctypes"):
+            return True
         if name == "http_method_names" and self.classes.is_family(node, "view"):
             return True
         if name in _MIGRATION_CONFIGURATION and self.classes.is_family(node, "migration"):

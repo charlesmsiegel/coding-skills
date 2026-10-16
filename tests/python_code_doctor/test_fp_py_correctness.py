@@ -484,3 +484,96 @@ def test_a_nested_functions_global_is_not_charged_to_its_parent(tmp_path):
                     "    return inner\n",
                     "global_rebind")
     assert [r["description"].split("'")[1] for r in found] == ["inner"]
+
+
+# ---- mutable_class_attribute ------------------------------------------------- #
+
+
+@pytest.mark.parametrize("header", [
+    "from pydantic import BaseModel\nclass M(BaseModel):\n",
+    "import pydantic\nclass M(pydantic.BaseModel):\n",
+    "from pydantic.v1 import BaseModel as V1\nclass M(V1):\n",
+    "from pydantic_settings import BaseSettings\nclass M(BaseSettings):\n",
+    "from sqlmodel import SQLModel\nclass M(SQLModel):\n",
+    # inheritance through a local model is followed
+    "from pydantic import BaseModel\nclass Citation(BaseModel):\n    scene: str = ''\nclass M(Citation):\n",
+])
+def test_pydantic_field_defaults_are_copied_not_shared(tmp_path, header):
+    source = header + "    tags: list[str] = []\n    def add(self, t):\n        self.tags.append(t)\n"
+    assert records("find_mutation_hazards.py", tmp_path, source, "mutable_class_attribute") == []
+
+
+def test_a_basemodel_lookalike_is_still_flagged(tmp_path):
+    found = records("find_mutation_hazards.py", tmp_path,
+                    "class BaseModel:\n"
+                    "    pass\n"
+                    "class M(BaseModel):\n"
+                    "    tags = []\n"
+                    "    def add(self, t):\n"
+                    "        self.tags.append(t)\n",
+                    "mutable_class_attribute")
+    assert len(findings(found)) == 1
+
+
+@pytest.mark.parametrize("source", [
+    "import ctypes\nclass S(ctypes.Structure):\n    _fields_ = [('a', ctypes.c_int)]\n",
+    # imported inside the function that declares it, as platform-only code does
+    "def load():\n    import ctypes\n    class S(ctypes.Structure):\n"
+    "        _fields_ = [('a', ctypes.c_int)]\n        _anonymous_ = ['a']\n    return S\n",
+    "from ctypes import Union, c_int\nclass U(Union):\n    _fields_ = [('a', c_int)]\n",
+])
+def test_ctypes_layout_declarations_are_not_shared_state(tmp_path, source):
+    assert records("find_mutation_hazards.py", tmp_path, source, "mutable_class_attribute") == []
+
+
+def test_a_ctypes_class_still_reports_its_other_mutable_state(tmp_path):
+    found = records("find_mutation_hazards.py", tmp_path,
+                    "import ctypes\n"
+                    "class S(ctypes.Structure):\n"
+                    "    _fields_ = [('a', ctypes.c_int)]\n"
+                    "    seen = []\n"
+                    "    def note(self):\n"
+                    "        S.seen.append(self)\n",
+                    "mutable_class_attribute")
+    assert [r["code_snippet"] for r in findings(found)] == ["seen = []"]
+
+
+def test_a_class_mutable_nothing_mutates_is_a_candidate(tmp_path):
+    found = records("find_mutation_hazards.py", tmp_path,
+                    "class Calendar:\n"
+                    "    _MAX_DAYS = {'Tishrei': 30}\n"
+                    "    def days(self, month):\n"
+                    "        return self._MAX_DAYS[month]\n",
+                    "mutable_class_attribute")
+    assert len(found) == 1
+    assert_candidate_shape(found[0])
+
+
+@pytest.mark.parametrize("mutation", [
+    "R.items.append(x)",
+    "self.items.append(x)",
+    "self.items[x] = 1",
+    "del self.items[x]",
+    "self.items += [x]",
+    "heapq.heappush(self.items, x)",
+])
+def test_a_class_mutable_something_mutates_is_a_finding(tmp_path, mutation):
+    found = records("find_mutation_hazards.py", tmp_path,
+                    "import heapq\n"
+                    "class R:\n"
+                    "    items = []\n"
+                    "    def add(self, x):\n"
+                    f"        {mutation}\n",
+                    "mutable_class_attribute")
+    assert len(findings(found)) == 1
+
+
+def test_a_nested_defs_mutation_is_not_charged_to_the_outer_default(tmp_path):
+    """`helper`'s own `acc` is its parameter, not the outer function's default."""
+    found = records("find_mutation_hazards.py", tmp_path,
+                    "def collect(item, acc=[]):\n"
+                    "    def helper(acc):\n"
+                    "        acc.append(item)\n"
+                    "    return helper\n",
+                    "mutated_default_arg")
+    assert found == []
