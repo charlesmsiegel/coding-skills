@@ -14,6 +14,7 @@ from pathlib import Path
 from dataclasses import dataclass, asdict
 from typing import Set
 from collections import defaultdict
+from contextlib import contextmanager
 from common import cached_parse, configure_output, find_python_files, warn_detector_error, warn_unparseable
 
 
@@ -104,6 +105,7 @@ class ScopeTracker(ast.NodeVisitor):
         self.parents = parents
         self.comments = comments
         self.import_origins: dict[str, str] = {}
+        self._annotation_scopes = [("module", {})]
         self.current_app_config_names: set[str] = set()
         self.django_app_config_classes: set[ast.ClassDef] = set()
         self.function_stack: list[ast.FunctionDef | ast.AsyncFunctionDef] = []
@@ -165,7 +167,41 @@ class ScopeTracker(ast.NodeVisitor):
         self._collect_dunder_all(node)
         self.generic_visit(node)
 
+    def _remember_annotation_imports(self, node):
+        origins = self._annotation_scopes[-1][1]
+        for alias in node.names:
+            if alias.name == "*":
+                origins.clear()
+                continue
+            local = alias.asname or alias.name.split(".")[0]
+            if isinstance(node, ast.Import):
+                origins[local] = alias.name if alias.asname else local
+            elif node.level == 0 and node.module:
+                origins[local] = f"{node.module}.{alias.name}"
+            else:
+                origins.pop(local, None)
+
+    @contextmanager
+    def _annotation_scope(self, node):
+        is_class = isinstance(node, ast.ClassDef)
+        # A method body does not close over its class namespace.
+        parent = self._annotation_scopes[-1][1] if is_class else next(
+            origins for kind, origins in reversed(self._annotation_scopes) if kind != "class"
+        )
+        origins = dict(parent)
+        if not is_class:
+            for arg in (*node.args.posonlyargs, *node.args.args, *node.args.kwonlyargs,
+                        node.args.vararg, node.args.kwarg):
+                if arg is not None:
+                    origins.pop(arg.arg, None)
+        self._annotation_scopes.append(("class" if is_class else "function", origins))
+        try:
+            yield
+        finally:
+            self._annotation_scopes.pop()
+
     def _remember_imports(self, node: ast.Import | ast.ImportFrom) -> None:
+        self._remember_annotation_imports(node)
         if not self._at_module_scope(node):
             return
         if isinstance(node, ast.Import):
@@ -184,12 +220,12 @@ class ScopeTracker(ast.NodeVisitor):
                     else:
                         self.import_origins.pop(local, None)
 
-    def _canonical_name(self, node: ast.AST) -> str | None:
+    def _canonical_name(self, node: ast.AST, origins=None) -> str | None:
         dotted = _dotted_name(node)
         if not dotted:
             return None
         first, separator, rest = dotted.partition(".")
-        imported = self.import_origins.get(first)
+        imported = (self.import_origins if origins is None else origins).get(first)
         if not imported:
             return None
         return imported + (separator + rest if separator else "")
@@ -272,6 +308,8 @@ class ScopeTracker(ast.NodeVisitor):
         self.generic_visit(node)
 
     def visit_Name(self, node: ast.Name):
+        if isinstance(node.ctx, (ast.Store, ast.Del)):
+            self._annotation_scopes[-1][1].pop(node.id, None)
         if isinstance(node.ctx, ast.Load):
             self.used_names.add(node.id)
             parent = self.parents.get(node)
@@ -287,30 +325,76 @@ class ScopeTracker(ast.NodeVisitor):
             self.used_names.add(node.value.id)
         self.generic_visit(node)
 
+    def _annotation_references(self, node: ast.AST | None) -> None:
+        """Read forward references only in annotation type positions."""
+        if node is None:
+            return
+        if isinstance(node, ast.Constant) and isinstance(node.value, str):
+            try:
+                expression = ast.parse(node.value, mode="eval").body
+            except (SyntaxError, ValueError):
+                return
+            self._annotation_references(expression)
+            return
+        if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load):
+            # Match the existing file-local, conservative treatment of names.
+            self.used_names.add(node.id)
+            self.value_references.add(node.id)
+        if isinstance(node, ast.Subscript):
+            name = self._canonical_name(node.value, self._annotation_scopes[-1][1])
+            self._annotation_references(node.value)
+            if name in {"typing.Literal", "typing_extensions.Literal"}:
+                return  # String values are data, not forward references.
+            if name in {"typing.Annotated", "typing_extensions.Annotated"}:
+                first = node.slice.elts[0] if isinstance(node.slice, ast.Tuple) else node.slice
+                self._annotation_references(first)
+                return  # Remaining arguments are metadata.
+            self._annotation_references(node.slice)
+            return
+        for child in ast.iter_child_nodes(node):
+            self._annotation_references(child)
+
+    def _signature_references(self, node):
+        self._annotation_references(node.returns)
+        for arg in (*node.args.posonlyargs, *node.args.args, *node.args.kwonlyargs,
+                    node.args.vararg, node.args.kwarg):
+            if arg is not None:
+                self._annotation_references(arg.annotation)
+
+    def visit_AnnAssign(self, node: ast.AnnAssign):
+        self._annotation_references(node.annotation)
+        self.generic_visit(node)
+
     def visit_FunctionDef(self, node: ast.FunctionDef):
+        self._signature_references(node)
         if node.col_offset == 0:
             self.functions[node.name] = node
         self._check_unreachable(node)
         self._check_unused_params(node)
         self.function_stack.append(node)
         try:
-            self.generic_visit(node)
+            with self._annotation_scope(node):
+                self.generic_visit(node)
         finally:
             self.function_stack.pop()
+        self._annotation_scopes[-1][1].pop(node.name, None)
         if self._at_module_scope(node):
             self.import_origins.pop(node.name, None)
             self.current_app_config_names.discard(node.name)
 
     def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef):
+        self._signature_references(node)
         if node.col_offset == 0:
             self.functions[node.name] = node
         self._check_unreachable(node)
         self._check_unused_params(node)
         self.function_stack.append(node)
         try:
-            self.generic_visit(node)
+            with self._annotation_scope(node):
+                self.generic_visit(node)
         finally:
             self.function_stack.pop()
+        self._annotation_scopes[-1][1].pop(node.name, None)
         if self._at_module_scope(node):
             self.import_origins.pop(node.name, None)
             self.current_app_config_names.discard(node.name)
@@ -325,7 +409,9 @@ class ScopeTracker(ast.NodeVisitor):
         )
         if is_app_config:
             self.django_app_config_classes.add(node)
-        self.generic_visit(node)
+        with self._annotation_scope(node):
+            self.generic_visit(node)
+        self._annotation_scopes[-1][1].pop(node.name, None)
         if self._at_module_scope(node):
             self.import_origins.pop(node.name, None)
             if is_app_config:

@@ -36,6 +36,84 @@ DATA_CLASS_MARKERS = frozenset({
     "BaseModel",  # pydantic
 })
 
+# Public concrete generic views; an arbitrary *View name proves no contract.
+DJANGO_GENERIC_VIEWS = {
+    "django.views.generic": frozenset({
+        "View", "TemplateView", "RedirectView", "DetailView", "ListView",
+        "FormView", "CreateView", "UpdateView", "DeleteView", "ArchiveIndexView",
+        "YearArchiveView", "MonthArchiveView", "WeekArchiveView", "DayArchiveView",
+        "TodayArchiveView", "DateDetailView",
+    }),
+    "django.views.generic.base": frozenset({"View", "TemplateView", "RedirectView"}),
+    "django.views.generic.detail": frozenset({"DetailView"}),
+    "django.views.generic.list": frozenset({"ListView"}),
+    "django.views.generic.edit": frozenset({"FormView", "CreateView", "UpdateView", "DeleteView"}),
+    "django.views.generic.dates": frozenset({
+        "ArchiveIndexView", "YearArchiveView", "MonthArchiveView", "WeekArchiveView",
+        "DayArchiveView", "TodayArchiveView", "DateDetailView",
+    }),
+}
+
+
+def _dotted_name(node):
+    if isinstance(node, ast.Name):
+        return node.id
+    if isinstance(node, ast.Attribute):
+        parent = _dotted_name(node.value)
+        return f"{parent}.{node.attr}" if parent else None
+    return None
+
+
+def _stable_imports(tree):
+    """Only trust unconditional imports with no other bindings or mutations.
+
+    Scope-insensitive invalidation deliberately favors reporting a candidate
+    defect over suppressing one when a nested scope shadows an import.
+    """
+    bindings = defaultdict(list)
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.Import, ast.ImportFrom)):
+            for alias in node.names:
+                name = alias.asname or alias.name.split('.')[0]
+                bindings[name].append(node)
+        elif isinstance(node, ast.Name) and isinstance(node.ctx, (ast.Store, ast.Del)):
+            bindings[node.id].append(node)
+        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            bindings[node.name].append(node)
+        elif isinstance(node, ast.arg):
+            bindings[node.arg].append(node)
+        elif isinstance(node, ast.ExceptHandler) and node.name:
+            bindings[node.name].append(node)
+        elif isinstance(node, (ast.MatchAs, ast.MatchStar)) and node.name:
+            bindings[node.name].append(node)
+        elif isinstance(node, ast.MatchMapping) and node.rest:
+            bindings[node.rest].append(node)
+        elif isinstance(node, (ast.Attribute, ast.Subscript)) and isinstance(node.ctx, (ast.Store, ast.Del)):
+            root = node.value
+            while isinstance(root, (ast.Attribute, ast.Subscript)):
+                root = root.value
+            if isinstance(root, ast.Name):
+                bindings[root.id].append(node)
+    imports = {}
+    for node in tree.body:
+        if not isinstance(node, (ast.Import, ast.ImportFrom)):
+            continue
+        if isinstance(node, ast.ImportFrom) and node.level:
+            continue
+        for alias in node.names:
+            name = alias.asname or alias.name.split('.')[0]
+            if bindings[name] != [node]:
+                continue
+            if isinstance(node, ast.ImportFrom):
+                imports[name] = (f"{node.module}.{alias.name}", node.lineno)
+            else:
+                imports[name] = (alias.name if alias.asname else name, node.lineno)
+    # A wildcard can replace any imported identity.
+    if any(isinstance(n, ast.ImportFrom) and any(a.name == '*' for a in n.names)
+           for n in ast.walk(tree)):
+        return {}
+    return imports
+
 
 def _constant_expression(node: ast.AST | None) -> bool:
     """Whether ``node`` is arithmetic over literals only: `4 << 20`, `30 * 60`."""
@@ -84,9 +162,11 @@ class CodeSmellDetector(ast.NodeVisitor):
         self._named_constants: set[int] = set()
         self._hooks: frozenset = frozenset()
         self._in_assert = 0
+        self._framework_imports = {}
 
     def visit_Module(self, node: ast.Module):
         self._hooks = framework_hook_overrides(node)
+        self._framework_imports = _stable_imports(node)
         # A literal is only "magic" when nothing names it. Collect the node
         # ids of literals that already have a name or a self-explaining
         # position, so visit_Constant can skip them:
@@ -262,7 +342,19 @@ class CodeSmellDetector(ast.NodeVisitor):
             elif isinstance(base, ast.Subscript) and isinstance(base.value, ast.Name):
                 marker_names.add(base.value.id)
         is_declared_data = bool(marker_names & DATA_CLASS_MARKERS)
-        if len(attributes) > 3 and len(non_dunder) == 0 and not is_declared_data:
+        is_generic_view = False
+        for base in node.bases:
+            dotted = _dotted_name(base)
+            if not dotted:
+                continue
+            root, _, suffix = dotted.partition('.')
+            imported = self._framework_imports.get(root)
+            if imported and imported[1] < node.lineno:
+                resolved = f"{imported[0]}.{suffix}" if suffix else imported[0]
+                module, _, name = resolved.rpartition('.')
+                if name in DJANGO_GENERIC_VIEWS.get(module, ()):
+                    is_generic_view = True
+        if len(attributes) > 3 and len(non_dunder) == 0 and not is_declared_data and not is_generic_view:
             self._add(node.lineno, "data_class",
                 f"Class {node.name} has only data, no behavior methods",
                 "Consider using @dataclass or namedtuple", "low")
