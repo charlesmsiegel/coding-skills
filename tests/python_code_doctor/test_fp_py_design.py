@@ -774,3 +774,57 @@ def test_a_sibling_modules_private_is_a_lead_and_a_stdlib_one_is_not(tmp_path):
         "characters._card_path", "overlay._strict_ledger"]
     for record in found:
         assert_candidate_shape(record)
+
+
+# --------------------------------------------------------------------------- #
+# find_pattern_issues: try_finally_close
+# --------------------------------------------------------------------------- #
+
+
+def test_a_conditional_acquire_has_no_with_form(tmp_path):
+    write(tmp_path, {"sample.py": """\
+        def drain(lock, no_wait, work):
+            if not lock.acquire(blocking=not no_wait):
+                return False
+            session = None
+            try:
+                return work()
+            finally:
+                lock.release()
+
+        def bounded(lock, work):
+            if lock.acquire(timeout=5):
+                try:
+                    return work()
+                finally:
+                    lock.release()
+
+        def blocking(lane, work):
+            lane.acquire()
+            try:
+                return work()
+            finally:
+                lane.release()
+        """})
+    found = of_type(run_detector("find_pattern_issues.py", tmp_path), "try_finally_close")
+    # A blocking acquire is the case `with lane:` replaces — still a lead.
+    assert [r["line"] for r in found] == [19]
+    assert_candidate_shape(found[0])
+
+
+def test_a_close_in_finally_is_a_lead_naming_its_with_form(tmp_path):
+    write(tmp_path, {"sample.py": """\
+        import sqlite3
+
+        def count(path):
+            conn = sqlite3.connect(path)
+            try:
+                return conn.execute("select 1").fetchone()
+            finally:
+                conn.close()
+        """})
+    found = of_type(run_detector("find_pattern_issues.py", tmp_path), "try_finally_close")
+    assert len(found) == 1
+    assert_candidate_shape(found[0])
+    assert "contextlib.closing()" in found[0]["description"]
+    assert any("sqlite3" in reason for reason in found[0]["also_caused_by"])

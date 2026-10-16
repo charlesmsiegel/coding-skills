@@ -2081,7 +2081,8 @@ def test_exitstack_advice_names_the_actual_receiver(tmp_path):
     )
     findings = [f for f in run_detector("find_pattern_issues.py", tmp_path)
                 if f["smell_type"] == "try_finally_close"]
-    assert findings and "conn.disconnect" in findings[0]["suggestion"]
+    # A candidate carries no fix; its description names the with-form instead.
+    assert findings and "conn.disconnect" in findings[0]["description"]
 
 
 def test_analyze_diff_keeps_cross_definition_finding_on_unchanged_anchor(tmp_path):
