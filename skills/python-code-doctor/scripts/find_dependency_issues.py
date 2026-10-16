@@ -22,7 +22,7 @@ from pathlib import Path
 from dataclasses import dataclass, asdict
 from collections import defaultdict
 from common import (sort_findings, SEVERITY_ICONS, configure_output, find_python_files,
-                    in_nested_repository, warn_detector_error, warn_unparseable)
+                    first_party_modules, in_nested_repository, warn_detector_error, warn_unparseable)
 
 # tomllib is stdlib on 3.11+. On older interpreters we simply skip pyproject.toml
 # parsing rather than depend on a third-party backport (this skill is stdlib-only).
@@ -286,8 +286,7 @@ def _compute_local_packages(root: Path) -> frozenset:
                 names.add(p.stem)
 
     # Any module or package that exists as a file in the repository is first-party.
-    for p in find_python_files(root):
-        names.add(p.parent.name if p.name == "__init__.py" else p.stem)
+    names |= first_party_modules(root)
 
     return frozenset(names)
 

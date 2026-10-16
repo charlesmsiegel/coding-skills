@@ -17,12 +17,13 @@ method is part of that method, so its reads count as the method's.
 """
 
 import ast
+import sys
 import json
 import argparse
 from pathlib import Path
 from dataclasses import dataclass, asdict, field
 from collections import Counter, defaultdict
-from common import is_test_file, sort_findings, cached_parse, SEVERITY_ICONS, configure_output, find_python_files, warn_detector_error, warn_unparseable
+from common import first_party_modules, is_test_file, project_root, sort_findings, cached_parse, SEVERITY_ICONS, configure_output, find_python_files, warn_detector_error, warn_unparseable
 
 
 @dataclass
@@ -128,6 +129,7 @@ class _Derivation:
         self.receiver_key = (id(func), receiver) if receiver else None
         self.bindings: dict[tuple, list] = defaultdict(list)
         self.module_keys: set = set()
+        self.iterated: set = set()  # id() of the iterables a loop or comprehension binds from
         receiver_arg = ([*func.args.posonlyargs, *func.args.args] or [None])[0] if receiver else None
         if self.receiver_key:
             self.bindings[self.receiver_key] = []
@@ -165,12 +167,13 @@ class _Derivation:
                 self._bind(scope, name, value)
 
     def _collect(self, node, receiver_arg) -> None:
-        if isinstance(node, ast.arg):
+        if isinstance(node, ast.arg):  # the node itself, so its annotation can be read
             if node is not receiver_arg:
-                self._bind(self._scope_of(node), node.arg, _FOREIGN)
+                self._bind(self._scope_of(node), node.arg, node)
             return
         if isinstance(node, ast.comprehension):
             scope = self.parent.get(id(node))
+            self.iterated.add(id(node.iter))
             for name in _target_names(node.target):
                 self._bind(scope, name, node.iter)
             return
@@ -181,6 +184,7 @@ class _Derivation:
         elif isinstance(node, (ast.AnnAssign, ast.NamedExpr)) and node.value is not None:
             self._assign(scope, node.target, node.value)
         elif isinstance(node, (ast.For, ast.AsyncFor)):
+            self.iterated.add(id(node.iter))
             for name in _target_names(node.target):
                 self._bind(scope, name, node.iter)
         elif isinstance(node, (ast.Import, ast.ImportFrom)):
@@ -240,6 +244,203 @@ class _Derivation:
                 return False
 
 
+_BUILTIN_TYPES = frozenset({
+    "str", "bytes", "bytearray", "int", "float", "complex", "bool", "list", "dict",
+    "set", "frozenset", "tuple", "range", "slice", "memoryview", "object", "type",
+})
+# Generic containers by what a subscript or an iteration of them yields.
+_MAPPINGS = frozenset({"dict", "Mapping", "MutableMapping", "defaultdict", "OrderedDict", "Counter"})
+_SEQUENCES = frozenset({"list", "tuple", "set", "frozenset", "Sequence", "MutableSequence",
+                        "Iterable", "Iterator", "Collection", "AbstractSet", "MutableSet", "deque"})
+_UNWRAP = frozenset({"Optional", "Annotated", "Final", "ClassVar"})
+
+
+class _ExternalTypes:
+    """What one module proves about a name's type being outside this repository.
+
+    Fowler's remedy for envy is to move the method onto the envied class, which
+    cannot be done to torch.Tensor, re.Match, os.DirEntry or str. A type is
+    *known* external only from evidence in the source:
+
+    - an annotation naming a builtin, or a name imported from a package that is
+      not first-party (common.first_party_modules — the dependency detector's
+      rule), unwrapping Optional / `X | None`; a subscript of a `dict[K, V]` or
+      `list[V]` parameter yields its V;
+    - a value from a call whose callee is such an import, a builtin type, a
+      method of an external value, or a method of a module-level name bound once
+      from such a call (`PATTERN = re.compile(...)` then `PATTERN.match(...)`);
+    - a loop target over such a call, through list/sorted/tuple/... wrappers.
+
+    Anything else is unknown, and an unknown type still counts as envy.
+    """
+
+    def __init__(self, tree: ast.AST, filename: str) -> None:
+        self.filename = filename
+        self._first_party = None
+        self.imports: dict[str, str | None] = {}  # local name -> top-level module (None: relative)
+        self.defined: set = set()
+        self.module_values: dict[str, list] = defaultdict(list)
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                for alias in node.names:
+                    self.imports[alias.asname or alias.name.split(".")[0]] = alias.name.split(".")[0]
+            elif isinstance(node, ast.ImportFrom):
+                top = None if node.level else (node.module or "").split(".")[0]
+                for alias in node.names:
+                    self.imports[alias.asname or alias.name] = top
+        for node in getattr(tree, "body", []):
+            if isinstance(node, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
+                self.defined.add(node.name)
+            elif isinstance(node, ast.Assign):
+                for target in node.targets:
+                    for name in _target_names(target):
+                        self.module_values[name].append(node.value if isinstance(target, ast.Name) else None)
+            elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name) and node.value is not None:
+                self.module_values[node.target.id].append(node.value)
+
+    def _external_module(self, top) -> bool:
+        if not top:
+            return False  # a relative import is this package's own code
+        if top in sys.stdlib_module_names:
+            return True
+        if self._first_party is None:
+            self._first_party = first_party_modules(project_root(Path(self.filename)))
+        return top not in self._first_party
+
+    def _external_name(self, name: str) -> bool:
+        if name in self.imports:
+            return self._external_module(self.imports[name])
+        return name not in self.defined and name not in self.module_values and name in _BUILTIN_TYPES
+
+    @staticmethod
+    def _root_name(expr):
+        while isinstance(expr, ast.Attribute):
+            expr = expr.value
+        return expr.id if isinstance(expr, ast.Name) else None
+
+    # -- annotations ----------------------------------------------------------
+    def annotation(self, ann) -> bool:
+        """The annotated value's own type is external (a `dict[...]` is a dict)."""
+        if isinstance(ann, ast.Constant) and isinstance(ann.value, str):
+            try:
+                ann = ast.parse(ann.value, mode="eval").body
+            except SyntaxError:
+                return False
+        if isinstance(ann, ast.Name):
+            return self._external_name(ann.id)
+        if isinstance(ann, ast.Attribute):
+            root = self._root_name(ann)
+            return root is not None and root in self.imports and self._external_module(self.imports[root])
+        if isinstance(ann, ast.BinOp) and isinstance(ann.op, ast.BitOr):
+            members = [m for m in (ann.left, ann.right)
+                       if not (isinstance(m, ast.Constant) and m.value is None)]
+            return bool(members) and all(self.annotation(m) for m in members)
+        if isinstance(ann, ast.Subscript):
+            head = getattr(ann.value, "id", getattr(ann.value, "attr", None))
+            args = ann.slice.elts if isinstance(ann.slice, ast.Tuple) else [ann.slice]
+            if head in _UNWRAP:
+                return self.annotation(args[0])
+            if head == "Union":
+                members = [m for m in args if not (isinstance(m, ast.Constant) and m.value is None)]
+                return bool(members) and all(self.annotation(m) for m in members)
+            return self.annotation(ann.value)
+        return False
+
+    def _item_annotation(self, ann) -> bool:
+        """What subscripting a value of this annotation yields is external."""
+        if isinstance(ann, ast.Constant) and isinstance(ann.value, str):
+            try:
+                ann = ast.parse(ann.value, mode="eval").body
+            except SyntaxError:
+                return False
+        if isinstance(ann, ast.Subscript):
+            head = getattr(ann.value, "id", getattr(ann.value, "attr", None))
+            args = ann.slice.elts if isinstance(ann.slice, ast.Tuple) else [ann.slice]
+            if head in _UNWRAP:
+                return self._item_annotation(args[0])
+            if head in _MAPPINGS:
+                return self.annotation(args[-1])
+            if head in _SEQUENCES:
+                return self.annotation(args[0])
+            return False
+        # Indexing a library object (a Tensor) gives the library's objects back.
+        return self.annotation(ann) and getattr(ann, "id", None) not in _BUILTIN_TYPES
+
+    # -- values ---------------------------------------------------------------
+    def _callee(self, func, derivation, seen) -> bool:
+        if isinstance(func, ast.Name):
+            if derivation.resolve(func) is not None:
+                return False
+            return self._external_name(func.id)
+        if isinstance(func, ast.Attribute):
+            base = func.value
+            if isinstance(base, ast.Name) and derivation.resolve(base) is None:
+                if base.id in self.imports:
+                    return self._external_module(self.imports[base.id])
+                values = self.module_values.get(base.id, [])
+                return len(values) == 1 and values[0] is not None and self.value(values[0], derivation, seen)
+            return self.value(base, derivation, seen)  # a method of an external value
+        return False
+
+    def value(self, expr, derivation, seen=frozenset()) -> bool:
+        """``expr`` evaluates to an object of external type."""
+        if isinstance(expr, ast.Call):
+            return self._callee(expr.func, derivation, seen)
+        if isinstance(expr, ast.IfExp):
+            branches = [b for b in (expr.body, expr.orelse)
+                        if not (isinstance(b, ast.Constant) and b.value is None)]
+            return bool(branches) and all(self.value(b, derivation, seen) for b in branches)
+        if isinstance(expr, ast.Subscript) and isinstance(expr.value, ast.Name):
+            key = derivation.resolve(expr.value)
+            values = derivation.bindings.get(key, []) if key else []
+            return bool(values) and all(isinstance(v, ast.arg) and v.annotation is not None
+                                        and self._item_annotation(v.annotation) for v in values)
+        if isinstance(expr, ast.Name):
+            return self.name(expr, derivation, seen)
+        return False
+
+    def elements(self, expr, derivation, seen=frozenset()) -> bool:
+        """Iterating ``expr`` yields objects of external type."""
+        if isinstance(expr, ast.Call):
+            func = expr.func
+            if (isinstance(func, ast.Name) and func.id in _TRANSPARENT and expr.args
+                    and derivation.resolve(func) is None):
+                return self.elements(expr.args[0], derivation, seen)
+            if isinstance(func, ast.Name) and func.id in _BUILTIN_TYPES | {"enumerate", "zip", "map", "filter"}:
+                return False  # a builtin wrapper says nothing about what it wraps
+            return self._callee(func, derivation, seen)
+        if isinstance(expr, ast.Name):
+            key = derivation.resolve(expr)
+            if key is None or key in seen:
+                return False
+            values = derivation.bindings.get(key, [])
+            return bool(values) and all(
+                v is not _FOREIGN and not isinstance(v, ast.arg) and id(v) not in derivation.iterated
+                and self.elements(v, derivation, seen | {key}) for v in values)
+        return False
+
+    def name(self, name_node, derivation, seen=frozenset()) -> bool:
+        """Every value ``name_node`` may hold, in the scope it resolves to, is external."""
+        key = derivation.resolve(name_node)
+        if key is None:
+            values = self.module_values.get(name_node.id, [])
+            return len(values) == 1 and values[0] is not None and self.value(values[0], derivation, seen)
+        if key in seen or key in derivation.module_keys:
+            return False
+        values = derivation.bindings.get(key, [])
+        seen = seen | {key}
+
+        def external(v):
+            if v is _FOREIGN:
+                return False
+            if isinstance(v, ast.arg):
+                return v.annotation is not None and self.annotation(v.annotation)
+            if id(v) in derivation.iterated:
+                return self.elements(v, derivation, seen)
+            return self.value(v, derivation, seen)
+        return bool(values) and all(external(v) for v in values)
+
+
 def _chain_length(node: ast.Attribute) -> int:
     length = 1
     current = node.value
@@ -292,7 +493,7 @@ class _Method:
     chains: list = field(default_factory=list)
 
 
-def _read_method(func, module_names: set) -> _Method:
+def _read_method(func, module_names: set, types: "_ExternalTypes | None" = None) -> _Method:
     receiver = _receiver(func)
     derivation = _Derivation(func, receiver)
     method = _Method(func.name, func.lineno, receiver)
@@ -310,6 +511,8 @@ def _read_method(func, module_names: set) -> _Method:
                 method.derived_reads.add(f"{base.id}.{node.attr}")
             elif key is None and base.id in module_names:
                 pass  # a module has no class to move the method to
+            elif types is not None and types.name(base, derivation):
+                pass  # a library or builtin object: nowhere to move the method to
             else:
                 method.other[base.id] = method.other.get(base.id, 0) + 1
         length = _chain_length(node)
@@ -376,20 +579,21 @@ def coupling_issues(tree: ast.AST, filename: str, in_tests: bool = False) -> lis
                     for node in ast.walk(tree) if isinstance(node, (ast.Import, ast.ImportFrom))
                     for alias in node.names}
     issues: list[CouplingIssue] = []
+    types = _ExternalTypes(tree, filename)
     for node in ast.walk(tree):
         if isinstance(node, ast.ClassDef):
-            issues.extend(_analyze_class(node, filename, module_names, in_tests))
+            issues.extend(_analyze_class(node, filename, module_names, in_tests, types))
     return issues
 
 
 def _analyze_class(node: ast.ClassDef, filename: str, module_names: set,
-                   in_tests: bool = False) -> list[CouplingIssue]:
+                   in_tests: bool = False, types: "_ExternalTypes | None" = None) -> list[CouplingIssue]:
     defs = [item for item in node.body if isinstance(item, _METHOD_TYPES)]
     if len(defs) < 2:
         return []
     methods: dict[str, _Method] = {}
     for func in defs:  # a property's getter and setter share a name: one node
-        read = _read_method(func, module_names)
+        read = _read_method(func, module_names, types)
         if func.name in methods:
             merged = methods[func.name]
             merged.self_names += read.self_names
