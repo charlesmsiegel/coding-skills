@@ -577,3 +577,82 @@ def test_a_nested_defs_mutation_is_not_charged_to_the_outer_default(tmp_path):
                     "    return helper\n",
                     "mutated_default_arg")
     assert found == []
+
+
+# ---- placeholder_value ------------------------------------------------------- #
+
+
+@pytest.mark.parametrize("source", [
+    'def apply(rule):\n    return rule["replacement"]\n',
+    'KEY = "replace_messages"\n',
+    'CODE = "replacement_incomplete"\n',
+    # a real domain that merely ends in "example.com"
+    'URL = "https://myexample.com/api"\n',
+    # PEP 257 attribute docstring, and a string used as a block comment
+    'Subject = tuple\n"""A replacement for the old tuple; see example.com."""\n',
+    'def f():\n    "lorem ipsum: notes about the filler below"\n    return 1\n',
+])
+def test_words_that_contain_a_placeholder_token_are_not_placeholders(tmp_path, source):
+    assert records("find_ai_scaffolding.py", tmp_path, source, "placeholder_value") == []
+
+
+@pytest.mark.parametrize("source", [
+    'URL = "https://proxy.example.com/v1"\n',
+    'EMAIL = "someone@example.org"\n',
+    'BODY = "lorem ipsum " * 500\n',
+])
+def test_reserved_hosts_and_filler_are_fixture_values_in_a_test(tmp_path, source):
+    found = records("find_ai_scaffolding.py", tmp_path, source, "placeholder_value",
+                    name="tests/test_client.py")
+    assert found == []
+
+
+@pytest.mark.parametrize("source", [
+    'API_KEY = "CHANGEME"\n',
+    'TOKEN = "your-api-key"\n',
+    'X = "REPLACE_ME"\n',
+    'SECRET = "REPLACE_ME_WITH_A_REAL_KEY"\n',
+    'HINT = "insert-your-token-here"\n',
+])
+@pytest.mark.parametrize("name", ["settings.py", "tests/test_settings.py"])
+def test_a_placeholder_token_is_still_flagged_anywhere(tmp_path, source, name):
+    found = records("find_ai_scaffolding.py", tmp_path, source, "placeholder_value", name=name)
+    assert len(findings(found)) == 1
+
+
+def test_a_reserved_host_in_shipping_code_is_still_flagged(tmp_path):
+    found = records("find_ai_scaffolding.py", tmp_path,
+                    'DEFAULT_ENDPOINT = "https://api.example.com/v1"\n',
+                    "placeholder_value", name="app/settings.py")
+    assert len(findings(found)) == 1
+
+
+# ---- unused_kwargs ----------------------------------------------------------- #
+
+
+@pytest.mark.parametrize("source", [
+    # passed by reference: the callee that will invoke it dictates the signature
+    "def boom(*a, **k):\n    raise RuntimeError\n"
+    "def test(monkeypatch):\n    monkeypatch.setattr(m, 'f', boom)\n",
+    "def on_done(result, **kw):\n    print(result)\nregister(callback=on_done)\n",
+    # the declared-unused convention
+    "def f(x, **_ignored):\n    return x\n",
+    # an override of a base class's method
+    "class Fake(Client):\n    def stream(self, messages, **kwargs):\n        return iter(messages)\n",
+    # an adapter that absorbs any call shape
+    "def done(result, *args, **kwargs):\n    return result\n",
+])
+def test_kwargs_whose_signature_someone_else_chose_are_not_flagged(tmp_path, source):
+    assert records("find_ai_scaffolding.py", tmp_path, source, "unused_kwargs") == []
+
+
+@pytest.mark.parametrize("source", [
+    "def scale(x, **kwargs):\n    return x * 2\nscale(3, factr=2)\n",
+    # *args used, **kwargs not: not an absorb-everything adapter
+    "def total(*args, **kwargs):\n    return sum(args)\n",
+    # a method on a class with no base chooses its own signature
+    "class Thing:\n    def configure(self, x, **options):\n        self.x = x\n",
+])
+def test_kwargs_that_only_swallow_typos_are_still_flagged(tmp_path, source):
+    found = records("find_ai_scaffolding.py", tmp_path, source, "unused_kwargs")
+    assert len(findings(found)) == 1
