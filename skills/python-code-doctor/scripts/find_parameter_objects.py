@@ -12,6 +12,10 @@ under the given path, then reports name-groups that recur in >= 3 functions.
 
 Finds:
   - data_clump : a group of parameters appearing together in multiple functions
+
+In a test file the parameters of a `test*` function or a `@pytest.fixture` are
+fixture requests — pytest's dependency injection — so they are left out: a
+suite whose tests share fixtures repeats their names by design.
 """
 
 import ast
@@ -21,7 +25,7 @@ from pathlib import Path
 from dataclasses import dataclass, asdict
 from itertools import combinations
 from collections import defaultdict
-from common import configure_output, find_python_files, warn_detector_error, warn_unparseable
+from common import configure_output, find_python_files, is_test_file, warn_detector_error, warn_unparseable
 
 
 @dataclass
@@ -49,10 +53,29 @@ def _param_names(args: ast.arguments):
     return names
 
 
+def _is_fixture(node) -> bool:
+    """`@pytest.fixture`, `@pytest.fixture(...)` or a bare imported `@fixture`."""
+    for dec in node.decorator_list:
+        target = dec.func if isinstance(dec, ast.Call) else dec
+        if getattr(target, "id", getattr(target, "attr", None)) == "fixture":
+            return True
+    return False
+
+
+def _requests_fixtures(node) -> bool:
+    """Whether pytest fills this function's parameters with fixtures."""
+    return node.name.startswith("test") or _is_fixture(node)
+
+
 def _collect(path: Path):
     """Return list of (frozenset_of_params, file, line, funcname)."""
     out = []
+    root = path if path.is_dir() else path.parent
     for filepath in find_python_files(path):
+        try:
+            in_tests = is_test_file(filepath.relative_to(root))
+        except ValueError:
+            in_tests = is_test_file(filepath)
         try:
             source = filepath.read_text(encoding="utf-8", errors="replace")
             tree = ast.parse(source, filename=str(filepath))
@@ -64,6 +87,8 @@ def _collect(path: Path):
             continue
         for node in ast.walk(tree):
             if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                if in_tests and _requests_fixtures(node):
+                    continue
                 names = _param_names(node.args)
                 if MIN_GROUP <= len(names) <= MAX_PARAMS:
                     out.append((frozenset(names), str(filepath), node.lineno, node.name))
