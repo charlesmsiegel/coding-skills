@@ -57,9 +57,15 @@ or extract the method object that owns it.
 with different method names. In TypeScript, unify the shape and structural typing
 does the rest — you rarely need a shared interface, only shared names.
 
-**Switch on a boolean flag parameter.** `boolean_flag_parameter`. `f(x, true)`
-tells a reader nothing. Split the function, or take `{ force: true }`, or a union
-of string literals. A React hook (`useX`) is not reported: its parameters are the
+**Switch on a boolean flag parameter.** `boolean_flag_parameter`,
+`boolean_blindness`. `f(x, true)` tells a reader nothing. Split the function, or
+take `{ force: true }`, or a union of string literals. The defect is the
+signature's: the definition is charged as `boolean_flag_parameter`, and the call
+sites as one `boolean_blindness` per callee per file — none when the file declares
+the signature, and none for the expected arguments of a matcher such as
+`toHaveBeenCalledWith(…, true, false)`.
+
+A React hook (`useX`) is not reported: its parameters are the
 reactive inputs its effects depend on, so `useDismiss(open)` follows state rather
 than switching modes, and splitting a hook pushes the choice into callers.
 

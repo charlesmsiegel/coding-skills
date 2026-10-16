@@ -176,3 +176,63 @@ def test_a_catch_binding_any_is_catch_typed_any_only(tmp_path):
         by_type.setdefault(record["smell_type"], []).append(record["line"])
     assert by_type.get("catch_typed_any") == [4]
     assert by_type.get("explicit_any") == [8], "the parameter `any` is still explicit_any"
+
+
+# --------------------------------------------------------------------------- #
+# find_code_smells: boolean_blindness is a signature's, charged once
+# --------------------------------------------------------------------------- #
+
+BLIND_CALLS_IN_A_TEST = """\
+import { useSuggestions } from "./suggest";
+test("suggests", () => {
+  useSuggestions("c", true, false);
+  useSuggestions("d", false, false);
+  expect(spy).toHaveBeenCalledWith("c", 1, false, false);
+  expect(spy).not.toHaveBeenNthCalledWith(1, "c", true, true);
+  sinon.assert.calledWith(spy, true, false);
+});
+"""
+
+
+def test_boolean_blindness_is_charged_once_per_callee_and_not_in_matchers(tmp_path):
+    found = records("find_code_smells.py", tmp_path, {"suggest.test.ts": BLIND_CALLS_IN_A_TEST},
+                    "boolean_blindness")
+    assert lines_of(found) == [3]
+    assert "2 call sites" in found[0]["description"]
+    assert found[0]["related_lines"] == [4]
+
+
+def test_boolean_blindness_defers_to_a_flag_parameter_declared_in_the_file(tmp_path):
+    source = """\
+export function runStream(id: string, retry: boolean, quiet: boolean): void { void id; void retry; void quiet; }
+runStream("x", true, false);
+renderer.paint(true, false);
+"""
+    found = records("find_code_smells.py", tmp_path, {"stream.ts": source}, "boolean_blindness")
+    assert lines_of(found) == [3], "runStream's signature is boolean_flag_parameter's; paint is still blind"
+
+
+# --------------------------------------------------------------------------- #
+# find_design_smells: a type switch has three different arms
+# --------------------------------------------------------------------------- #
+
+TYPE_TESTS = """\
+export function route(draft: { type: string }, scope: unknown, node: { kind: string }): number {
+  if (draft.type === "enum") return 1;
+  if (draft.type === "enum" && scope) return 2;
+  if (draft.type === "enum") return 3;
+  if (typeof scope === "object") return 4;
+  if (typeof scope === "object" && scope) return 5;
+  if (typeof scope === "object") return 6;
+  if (node.kind === "a") return 7;
+  else if (node.kind === "b") return 8;
+  else if (node.kind === "c") return 9;
+  return 0;
+}
+"""
+
+
+def test_type_switch_needs_three_different_literals(tmp_path):
+    found = records("find_design_smells.py", tmp_path, {"route.ts": TYPE_TESTS}, "type_switch")
+    assert lines_of(found) == [8], "only node.kind is tested against three values"
+    assert "`node.kind`" in found[0]["description"]
