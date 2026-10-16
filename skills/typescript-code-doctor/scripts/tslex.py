@@ -171,46 +171,46 @@ class Tokenizer:
         text, n = self.text, len(self.text)
         start, line = self.i, self.line
         j = self.i + 1
-        depth = 0
         while j < n:
             char = text[j]
             if char == "\\":
                 j += 2
                 continue
-            if depth == 0 and char == "`":
+            if char == "`":
                 j += 1
                 break
-            if depth == 0 and char == "$" and j + 1 < n and text[j + 1] == "{":
-                depth = 1
-                j += 2
+            if char == "$" and j + 1 < n and text[j + 1] == "{":
+                j = self._substitution_end(j + 2)
                 continue
-            if depth:
-                if char == "{":
-                    depth += 1
-                elif char == "}":
-                    depth -= 1
-                elif char in "'\"`":
-                    j = self._skip_nested_string(j)
-                    continue
             j += 1
         else:
             j = n
         self._advance(j)
         self._emit("template", start, j, line)
 
-    def _skip_nested_string(self, j: int) -> int:
-        """Skip a string that lives inside a template's `${...}`. Returns the end."""
-        text, n = self.text, len(self.text)
-        quote = text[j]
-        k = j + 1
-        while k < n:
-            if text[k] == "\\":
-                k += 2
-                continue
-            if text[k] == quote:
-                return k + 1
-            k += 1
-        return n
+    def _substitution_end(self, j: int) -> int:
+        """Index just past the `}` that closes a `${` whose interior starts at ``j``.
+
+        The interior is code, so it is scanned by the ordinary token loop on a
+        throwaway tokenizer rather than by hand. A hand scan has to re-implement
+        every literal to find the closing brace, and the one it gets wrong is the
+        regex: in `${v.replace(/"/g, '""')}` the `"` inside `/"/` is not a quote,
+        and only the regex-versus-division rule — which needs the previous
+        token — can know that.
+        """
+        inner = Tokenizer(self.text, self.jsx)
+        inner.i = j
+        depth, seen = 0, 0
+        while inner._step():
+            for token in inner.tokens[seen:]:
+                if token.is_op("{"):
+                    depth += 1
+                elif token.is_op("}"):
+                    if depth == 0:
+                        return token.end
+                    depth -= 1
+            seen = len(inner.tokens)
+        return len(self.text)
 
     def _regex(self) -> None:
         text, n = self.text, len(self.text)

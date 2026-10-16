@@ -5,13 +5,16 @@ switches with no default, god classes, and returns that disagree with themselves
 """
 
 from common import Reporter, is_test_file, run_file_detector
-from tsparse import TsFile, argument_spans, body_indices, iter_calls
+from tsparse import TsFile, argument_spans, body_indices, callback_target, iter_calls
 
 # Values so conventional a name would add nothing.
 MAGIC_NUMBER_ALLOWED = {0, 1, 2, -1, 10, 100, 1000, 24, 60, 365, 12, 7,
                         16, 24, 32, 64, 128, 180, 255, 256, 360, 512, 1024}
 
 GOD_CLASS_METHODS, GOD_CLASS_MEMBERS = 15, 10
+
+# React hooks whose first argument is an effect: it returns nothing, or a cleanup.
+EFFECT_HOOKS = frozenset({"useEffect", "useLayoutEffect", "useInsertionEffect"})
 
 
 def _check_magic_numbers(file: TsFile, report: Reporter) -> None:
@@ -145,9 +148,23 @@ def _check_class_shape(file: TsFile, report: Reporter) -> None:
                        "invariants to defend.", "low")
 
 
+def _is_effect_callback(file: TsFile, func) -> bool:
+    """The setup function of a React effect, whose contract is "return nothing or a cleanup".
+
+    `if (!open) return` beside `return () => clearTimeout(t)` is that contract
+    followed exactly, and the `EffectCallback` type already rejects any other
+    value, so mixing the two is not an inconsistency.
+    """
+    callee, position = callback_target(file, func)
+    return position == 0 and callee.rsplit(".", 1)[-1] in EFFECT_HOOKS
+
+
 def _check_returns(file: TsFile, report: Reporter) -> None:
     for func in file.functions:
         if not func.has_body:
+            continue
+        if _is_effect_callback(file, func):
+            _check_boolean_return(file, func, report)
             continue
         body = body_indices(func)
         nested = [(f.body_open, f.body_close) for f in file.functions
@@ -159,7 +176,10 @@ def _check_returns(file: TsFile, report: Reporter) -> None:
         with_value, bare = [], []
         for index in returns:
             following = file.tokens[index + 1] if index + 1 < len(file) else None
-            if following is None or following.is_op(";", "}"):
+            # A line break straight after `return` is an automatic semicolon
+            # (a restricted production): `if (!x) return` then `const y = …` on
+            # the next line returns undefined, not `const`.
+            if following is None or following.is_op(";", "}") or following.line > file.tokens[index].line:
                 bare.append(file.tokens[index].line)
             else:
                 with_value.append(file.tokens[index].line)
@@ -198,7 +218,7 @@ def _check_empty_bodies(file: TsFile, report: Reporter) -> None:
             continue
         if func.kind == "constructor" and any(p.accessibility for p in func.params):
             continue  # parameter properties: the empty body is the point
-        if any(func.body_open < c.start < func.body_close for c in file.comments):
+        if file.comments_between(func.body_open, func.body_close):
             continue  # an explained no-op
         if func.name in ("<anonymous>",):
             continue

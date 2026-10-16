@@ -1200,3 +1200,443 @@ def test_a_workspace_member_scanned_alone_is_covered_by_the_root_lockfile(tmp_pa
     records = run_detector("find_dependency_issues.py", root / "packages" / "a")
 
     assert not [r for r in records if r["smell_type"] == "no_lockfile"]
+
+
+# --------------------------------------------------------------------------- #
+# False positives found on a real React + zustand + vitest project. Each one
+# is pinned in both directions: the idiom stays quiet, the defect still fires.
+# --------------------------------------------------------------------------- #
+
+def _lines(records, smell):
+    return sorted(r["line"] for r in records if r["smell_type"] == smell)
+
+
+STATEMENTS_AFTER_CLOSED_BLOCKS = """\
+export function emptyState(): { a: number[] } {
+  return {
+    a: [],
+  }
+}
+
+let counter = 0
+
+export async function request<T>(path: string): Promise<T> {
+  const response = await fetch(path)
+  if (!response.ok) {
+    let detail = `${response.status}`
+    try {
+      const body = await response.json()
+      if (body?.detail) detail = String(body.detail)
+    } catch {
+      /* the status line already says enough */
+    }
+    throw new Error(detail)
+  }
+  return response.json() as Promise<T>
+}
+
+export const api = {
+  config: () => request<string>('/api/config'),
+  next: () => {
+    counter += 1
+    return counter
+  },
+}
+
+export function nothing(): void {
+  return
+}
+
+export const after = 1
+"""
+
+
+def test_a_statement_after_a_closed_block_is_not_unreachable(tmp_path):
+    """The exit ends its own block; what follows that block's `}` runs."""
+    root = write(tmp_path, {"main.ts": STATEMENTS_AFTER_CLOSED_BLOCKS})
+    assert _lines(run_detector("find_dead_code.py", root), "unreachable_code") == []
+
+
+def test_a_statement_after_an_exit_in_the_same_block_is_still_unreachable(tmp_path):
+    root = write(tmp_path, {"main.ts": """\
+export function f(a: number): number {
+  return compute(a)
+  log(a)
+}
+
+export function g(ok: boolean): void {
+  if (!ok) {
+    throw new Error("no")
+    cleanup()
+  }
+}
+
+function compute(a: number): number { return a }
+function log(a: number): void { void a }
+function cleanup(): void { void 0 }
+"""})
+    assert _lines(run_detector("find_dead_code.py", root), "unreachable_code") == [3, 9]
+
+
+def test_a_bare_return_on_its_own_line_returns_nothing(tmp_path):
+    """ASI: `return` followed by a line break returns undefined, whatever the next line holds."""
+    root = write(tmp_path, {
+        "push.ts": """\
+export const push = (tag: string, out: string[]): void => {
+  if (!tag) return
+  const clean = tag.trim()
+  if (!clean) {
+    return
+  }
+  out.push(clean)
+}
+""",
+        "Editor.tsx": """\
+export function Editor({ onSave }: { onSave: (n: number) => Promise<void> }) {
+  const save = async () => {
+    const context = document.createElement('canvas').getContext('2d')
+    if (!context) return
+    await onSave(1)
+  }
+  return (
+    <button onClick={save}>Save</button>
+  )
+}
+""",
+    })
+    assert _lines(run_detector("find_code_smells.py", root), "inconsistent_returns") == []
+
+
+def test_a_value_return_mixed_with_a_bare_one_is_still_inconsistent(tmp_path):
+    root = write(tmp_path, {"find.ts": """\
+export function find(xs: string[], key: string) {
+  for (const x of xs) {
+    if (x === key) return x
+  }
+  return
+}
+"""})
+    assert _lines(run_detector("find_code_smells.py", root), "inconsistent_returns") == [3]
+
+
+def test_an_effect_that_returns_a_cleanup_on_one_path_is_not_inconsistent(tmp_path):
+    """React's effect contract is "return nothing, or a cleanup function"."""
+    root = write(tmp_path, {"Editor.tsx": """\
+import * as React from 'react'
+import { useEffect, useLayoutEffect, useMemo } from 'react'
+
+export function Editor({ open, tick }: { open: boolean; tick: () => () => void }) {
+  useEffect(() => {
+    if (!open) return
+    const timer = window.setTimeout(tick, 200)
+    return () => window.clearTimeout(timer)
+  }, [open, tick])
+
+  useLayoutEffect(() => {
+    if (!open) {
+      return
+    }
+    let live = true
+    tick()
+    return () => {
+      live = false
+    }
+  }, [open, tick])
+
+  React.useEffect(function subscribe() {
+    if (!open) return
+    return tick()
+  }, [open, tick])
+
+  const label = useMemo(() => {
+    if (!open) return
+    return 'open'
+  }, [open])
+  return <p>{label}</p>
+}
+"""})
+    # The effects are quiet; the memo, whose value a caller reads, still fires.
+    assert _lines(run_detector("find_code_smells.py", root), "inconsistent_returns") == [28]
+
+
+def test_a_human_readable_label_is_not_a_hardcoded_secret(tmp_path):
+    root = write(tmp_path, {"labels.ts": """\
+export const LABELS: Record<string, string> = {
+  gelbooru_api_key: 'Gelbooru API key',
+  password: 'Enter your password',
+  auth_token: 'Session token expired, sign in again',
+}
+export const AUTH_TOKEN = 'auth_token'
+export const githubToken = 'GITHUB_TOKEN'
+"""})
+    assert _lines(run_detector("find_security_issues.py", root), "hardcoded_secret") == []
+
+
+def test_a_credential_shaped_value_is_still_a_hardcoded_secret(tmp_path):
+    root = write(tmp_path, {"config.ts": """\
+export const config = {
+  apiKey: 'sk_live_abc123def456ghi789',
+  token: 'ghp_16C7e42F292c6912E7710c838347Ae178B4a',
+  password: 'hunter2hunter2',
+  authToken: 'Bearer abc123def456ghi789jkl',
+}
+export const password = 'password1'
+"""})
+    assert _lines(run_detector("find_security_issues.py", root), "hardcoded_secret") == [2, 3, 4, 5, 7]
+
+
+def test_a_catch_that_explains_itself_is_not_an_empty_catch(tmp_path):
+    root = write(tmp_path, {"load.ts": """\
+export async function load(): Promise<string[]> {
+  try {
+    return await fetchPresets()
+  } catch {
+    /* no presets is a normal state */
+  }
+  try {
+    return await fetchPresets()
+  } catch (err) {
+    // a missing file is the first-run case; the caller shows the empty list
+  }
+  return []
+}
+
+async function fetchPresets(): Promise<string[]> { return [] }
+"""})
+    records = run_detector("find_exception_issues.py", root)
+    assert _lines(records, "empty_catch") == [] and _lines(records, "swallowed_error") == []
+
+
+def test_a_catch_with_no_explanation_is_still_an_empty_catch(tmp_path):
+    root = write(tmp_path, {"parse.ts": """\
+export function parse(raw: string): unknown {
+  try {
+    return JSON.parse(raw)
+  } catch {}
+  try {
+    return JSON.parse(raw)
+  } catch (e) {
+  }
+  try {
+    return JSON.parse(raw)
+  } catch {
+    // TODO
+  }
+  return null
+}
+"""})
+    records = run_detector("find_exception_issues.py", root)
+    assert _lines(records, "empty_catch") == [4, 7, 11]
+    assert {r["severity"] for r in records if r["smell_type"] == "empty_catch"} == {"high"}
+
+
+def test_exact_null_and_undefined_matchers_are_not_weak(tmp_path):
+    """`toBeNull()` passes for `null` alone, `toBeUndefined()` for `undefined` alone."""
+    root = write(tmp_path, {"lookup.test.ts": """\
+import { describe, it, expect } from "vitest";
+
+describe("lookup", () => {
+  it("returns null for a missing key", () => {
+    expect(lookup("missing")).toBeNull();
+  });
+  it("sends no sweep", () => {
+    expect(lookup("sweep")).toBeUndefined();
+  });
+  it("is gone", () => {
+    expect(lookup("sweep")).not.toBeDefined();
+  });
+});
+
+function lookup(key: string): string | null | undefined { return key === "missing" ? null : undefined; }
+"""})
+    assert _lines(run_detector("find_test_smells.py", root), "weak_assertion_only") == []
+
+
+def test_matchers_that_pass_for_almost_anything_are_still_weak(tmp_path):
+    root = write(tmp_path, {"lookup.test.ts": """\
+import { describe, it, expect } from "vitest";
+
+describe("lookup", () => {
+  it("finds it", () => {
+    expect(lookup("a")).not.toBeNull();
+  });
+  it("has it", () => {
+    expect(lookup("a")).not.toBeUndefined();
+  });
+  it("is truthy", () => {
+    expect(lookup("a")).toBeTruthy();
+  });
+  it("is an object", () => {
+    expect(lookup("a")).toBeInstanceOf(Object);
+  });
+  it("resolves to something", async () => {
+    await expect(Promise.resolve(lookup("a"))).resolves.toBeDefined();
+  });
+});
+
+function lookup(key: string): string | null | undefined { return key || null; }
+"""})
+    assert _lines(run_detector("find_test_smells.py", root), "weak_assertion_only") == [4, 7, 10, 13, 16]
+
+
+def test_typeof_narrowing_and_keyboard_keys_are_not_type_switches(tmp_path):
+    root = write(tmp_path, {"Row.tsx": """\
+export function Row({ values }: { values: string | string[] | number | boolean }) {
+  const a = typeof values === 'string' ? values : String(values)
+  const b = typeof values === 'number' ? values : 0
+  const c = typeof values === 'boolean' ? values : false
+  return <p>{a}{b}{String(c)}</p>
+}
+
+export function onKey(event: KeyboardEvent): void {
+  if (event.key === 'Enter') submit()
+  if (event.key === 'Escape') cancel()
+  if (event.key === 'ArrowLeft') cancel()
+}
+
+export function onPress(press: React.KeyboardEvent<HTMLInputElement>): void {
+  if (press.code === 'Enter') submit()
+  if (press.code === 'Escape') cancel()
+  if (press.code === 'Space') cancel()
+}
+
+export const Input = () => (
+  <input onKeyDown={(e) => {
+    if (e.key === 'Enter') submit()
+    if (e.key === 'Escape') cancel()
+    if (e.key === 'Tab') cancel()
+  }} />
+)
+
+function submit(): void {}
+function cancel(): void {}
+"""})
+    assert _lines(run_detector("find_design_smells.py", root), "type_switch") == []
+
+
+def test_a_ladder_over_an_owned_discriminant_is_still_a_type_switch(tmp_path):
+    root = write(tmp_path, {"shape.ts": """\
+export function area(shape: { kind: string; size: number }, event: { key: string }): number {
+  if (shape.kind === 'square') return shape.size ** 2
+  if (shape.kind === 'circle') return 3 * shape.size ** 2
+  if (shape.kind === 'line') return 0
+  if (event.key === 'a') return 1
+  if (event.key === 'b') return 2
+  if (event.key === 'c') return 3
+  return -1
+}
+
+export function same(row: { kind: string }): number {
+  let n = 0
+  if (row.kind === 'grid') n += 1
+  if (row.kind === 'grid') n += 2
+  if (row.kind === 'grid') n += 3
+  return n
+}
+"""})
+    # `shape.kind` is the code's own tag; `event` here is a plain parameter of the
+    # code's own type, not a DOM event. Three checks of one case are not a switch.
+    assert _lines(run_detector("find_design_smells.py", root), "type_switch") == [2, 5]
+
+
+def _many_tests(count: int) -> str:
+    return "\n".join(
+        '  it("case %d", () => {\n    expect(add(%d, 1)).toEqual(%d);\n  });' % (n, n, n + 1)
+        for n in range(count)
+    )
+
+
+def test_a_describe_block_is_not_a_long_function(tmp_path):
+    """A suite body groups tests; its length is the number of tests, not complexity."""
+    tests = _many_tests(45)  # 135 lines per suite
+    source = (
+        'import { describe, it, expect } from "vitest";\n'
+        'import { add } from "./add";\n\n'
+        'describe("add", () => {\n' + tests + "\n});\n\n"
+        'describe.each([[1], [2]])("add %i", () => {\n' + tests + "\n});\n\n"
+        'describe.skip("skipped", function () {\n' + tests + "\n});\n"
+    )
+    root = write(tmp_path, {"add.test.ts": source, "add.ts": "export const add = (a: number, b: number) => a + b;\n"})
+    assert _lines(run_detector("analyze_complexity.py", root), "long_function") == []
+
+
+def test_a_long_test_body_is_still_a_long_function(tmp_path):
+    body = "\n".join("    expect(add(%d, 1)).toEqual(%d);" % (n, n + 1) for n in range(70))
+    source = (
+        'import { describe, it, expect } from "vitest";\n'
+        'import { add } from "./add";\n\n'
+        'describe("add", () => {\n'
+        '  it("adds", () => {\n' + body + "\n  });\n});\n"
+    )
+    root = write(tmp_path, {"add.test.ts": source, "add.ts": "export const add = (a: number, b: number) => a + b;\n"})
+    assert _lines(run_detector("analyze_complexity.py", root), "long_function") == [5]
+
+
+def test_an_empty_function_that_explains_itself_is_not_reported(tmp_path):
+    """Comments are located by character offset; brace positions are token indices."""
+    root = write(tmp_path, {"noop.ts": """\
+export function noop(): void {
+  // the default handler deliberately does nothing
+}
+
+export function stub(): void {}
+"""})
+    assert _lines(run_detector("find_code_smells.py", root), "empty_function_body") == [5]
+
+
+def test_generic_type_arguments_are_not_extra_parameters(tmp_path):
+    """`Record<string, number>` used to read as two parameters, the second untyped."""
+    root = write(tmp_path, {"merge.ts": """\
+export function merge(a: Map<string, number>, b: Map<string, number>, c: Record<string, boolean>): void {
+  void a; void b; void c
+}
+"""})
+    assert _lines(run_detector("analyze_complexity.py", root), "long_parameter_list") == []
+    assert _lines(run_detector("find_type_gaps.py", root), "untyped_parameter") == []
+
+
+def test_a_long_or_untyped_parameter_list_still_fires(tmp_path):
+    root = write(tmp_path, {"wide.ts": """\
+export function wide(a: Map<string, number>, b: string, c: string, d: string, e: string, f) {
+  void a; void b; void c; void d; void e; void f
+}
+"""})
+    assert _lines(run_detector("analyze_complexity.py", root), "long_parameter_list") == [1]
+    records = run_detector("find_type_gaps.py", root)
+    assert [r["description"] for r in records if r["smell_type"] == "untyped_parameter"] == [
+        "Exported function `wide` takes `f` with no type"]
+
+
+def test_every_member_of_a_semicolon_less_interface_is_checked(tmp_path):
+    """Every other member used to be skipped, so the second member was never seen."""
+    root = write(tmp_path, {"props.ts": """\
+export interface Props {
+  title: string
+  open: boolean
+  isActive: boolean
+}
+
+export interface Patch {
+  a?: string
+  b: number
+  c?: string
+  d: number
+}
+"""})
+    naming = run_detector("find_naming_issues.py", root)
+    assert [r["description"] for r in naming if r["smell_type"] == "boolean_without_predicate_name"] == [
+        "`Props.open` is a boolean but does not read as a question"]
+    # Half of Patch is required; reading only a and c made it look all-optional.
+    assert _lines(run_detector("find_type_gaps.py", root), "all_optional_type") == []
+
+
+def test_an_all_optional_semicolon_less_interface_is_still_a_candidate(tmp_path):
+    root = write(tmp_path, {"loose.ts": """\
+export interface Loose {
+  a?: string
+  b?: number
+  c?: boolean
+  d?: Date
+}
+"""})
+    assert _lines(run_detector("find_type_gaps.py", root), "all_optional_type") == [1]

@@ -7,8 +7,8 @@ Cyclomatic counts decisions. Cognitive counts how hard the decisions are to
 is the number that tracks how a reader actually experiences the function.
 """
 
-from common import Reporter, run_file_detector
-from tsparse import TsFile
+from common import SUITE_DEFINERS, Reporter, is_test_file, run_file_detector
+from tsparse import TsFile, callback_target
 
 # Thresholds. Deliberately loose: the point is to rank files, not to fail a
 # build, and a detector that fires on everything gets ignored on everything.
@@ -88,6 +88,19 @@ def _block_after(file: TsFile, keyword_index: int, stop: int) -> int:
     return -1
 
 
+def _is_suite_body(file: TsFile, func) -> bool:
+    """True for the callback of `describe(...)` and its spellings, in a test file.
+
+    A suite body is a list of tests: it grows by one `it` per behaviour, and
+    each of those is measured on its own. Its line count is the size of the
+    suite, not the length of a function anyone has to hold in their head.
+    `test.describe` (Playwright) is the same thing under a different head.
+    """
+    callee, _ = callback_target(file, func)
+    parts = callee.split(".")
+    return parts[0] in SUITE_DEFINERS or parts[:2] == ["test", "describe"]
+
+
 def _grade(value: int, medium: int, high: int) -> str | None:
     if value >= high:
         return "high"
@@ -98,9 +111,11 @@ def _grade(value: int, medium: int, high: int) -> str | None:
 
 def analyze(file: TsFile, ignore: set[str]) -> list:
     report = Reporter(file, ignore)
+    in_tests = is_test_file(file.path)
     for func in file.functions:
         if not func.has_body:
             continue
+        suite_body = in_tests and _is_suite_body(file, func)
         name = func.qualname if func.name != "<anonymous>" else f"anonymous {func.kind}"
         metrics = _measure(file, func)
 
@@ -126,7 +141,7 @@ def analyze(file: TsFile, ignore: set[str]) -> list:
 
         lines = file.line_of(func.body_close) - func.line
         severity = _grade(lines, LINES_MEDIUM, LINES_HIGH)
-        if severity:
+        if severity and not suite_body:
             report.add(func.line, "long_function",
                        f"{name} is {lines} lines long",
                        "Split it along the seams already there — the comment headers inside it are "

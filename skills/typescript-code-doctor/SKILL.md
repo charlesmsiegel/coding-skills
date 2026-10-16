@@ -334,7 +334,7 @@ Keep `SKILL.md` lean; pull in depth only when a review needs it.
 | `x && x.y` / `x \|\| 0` | `x?.y` / `x ?? 0` |
 | `require()` / `module.exports` / `namespace` | ESM `import` / `export` |
 | `<T>value` cast | `value as T` |
-| `if/else if` ladder on `typeof x` or `x.kind` | Discriminated union + exhaustive `switch` with `assertNever` |
+| `if/else if` ladder on `x.kind` | Discriminated union + exhaustive `switch` with `assertNever` |
 | Boolean flag parameter | Split the function, or take a named option |
 | 3+ adjacent `string` parameters | Options object, or branded types |
 | Index loop over an array | `for…of`, `map`, `filter` |

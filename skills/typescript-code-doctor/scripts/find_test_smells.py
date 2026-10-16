@@ -8,11 +8,10 @@ A test with no assertion passes as long as nothing throws. A missing `await` on
 the slot where a real one would go and report the code as covered.
 """
 
-from common import Reporter, is_test_file, run_file_detector
+from common import SUITE_DEFINERS, Reporter, is_test_file, run_file_detector
 from tsparse import TsFile, argument_spans, body_indices, iter_calls
 
 TEST_DEFINERS = frozenset({"it", "test", "specify", "bench"})
-SUITE_DEFINERS = frozenset({"describe", "suite", "context"})
 ASSERTION_NAMES = frozenset({"expect", "assert", "should", "chai", "toThrow", "verify", "assertThat"})
 # Testing Library's `getBy*` / `findBy*` queries throw when nothing matches, so
 # they assert even though no `expect` appears. Treating them as non-assertions
@@ -20,8 +19,15 @@ ASSERTION_NAMES = frozenset({"expect", "assert", "should", "chai", "toThrow", "v
 QUERY_PREFIXES = ("getBy", "getAllBy", "findBy", "findAllBy")
 MOCK_CALLS = frozenset({"mock", "spyOn", "doMock", "mockRestore", "unstable_mockModule"})
 
-# Assertions that pass for almost any value.
-WEAK_MATCHERS = frozenset({"toBeDefined", "toBeTruthy", "toBeFalsy", "toBeNull", "toBeUndefined"})
+# Assertions that pass for almost any value, spelled as the chain after `expect(x)`
+# with `resolves`/`rejects` dropped. `toBeNull()` and `toBeUndefined()` are not
+# here: each passes for exactly one value, so it is as exact as `toBe(null)`.
+# Their negations are the weak ones — `not.toBeNull()` passes for 0, "", {}, [].
+WEAK_MATCHERS = frozenset({
+    "toBeDefined", "toBeTruthy", "toBeFalsy",
+    "not.toBeNull", "not.toBeUndefined", "not.toBeTruthy", "not.toBeFalsy",
+    "toBeInstanceOf(Object)",
+})
 # Matchers that return a promise and are useless without `await`.
 PROMISE_MATCHERS = frozenset({"resolves", "rejects"})
 MOCK_LIMIT = 12
@@ -45,6 +51,30 @@ def _test_calls(file: TsFile):
         yield paren, callee, title, callback
 
 
+def _matcher_chain(file: TsFile, index: int) -> str:
+    """The matcher an assertion applies, as written after `expect(...)`.
+
+    `expect(x).not.toBeNull()` yields "not.toBeNull" — the negation is part of
+    the claim, and reading the words separately loses it. A matcher whose
+    argument decides its strength keeps that argument:
+    `toBeInstanceOf(Object)` is weak where `toBeInstanceOf(Date)` is not.
+    """
+    cursor = index + 1
+    if cursor < len(file) and file.tokens[cursor].is_op("("):
+        cursor = file.skip_group(cursor)  # step over expect(...)
+    words: list[str] = []
+    while cursor + 1 < len(file) and file.tokens[cursor].is_op(".", "?."):
+        word = file.tokens[cursor + 1].value
+        cursor += 2
+        if cursor < len(file) and file.tokens[cursor].is_op("("):
+            if word == "toBeInstanceOf":
+                word += "(" + file.slice(cursor + 1, file.closer(cursor)).strip() + ")"
+            cursor = file.skip_group(cursor)
+        if word not in PROMISE_MATCHERS:  # they change what is awaited, not what is asserted
+            words.append(word)
+    return ".".join(words)
+
+
 def _check_assertionless(file: TsFile, report: Reporter) -> None:
     for paren, callee, title, callback in _test_calls(file):
         if callback is None:
@@ -64,16 +94,7 @@ def _check_assertionless(file: TsFile, report: Reporter) -> None:
                        "It passes as long as nothing throws, which is a much weaker claim than the "
                        "name promises. Assert the value the code is supposed to produce.", "high")
             continue
-        matchers = set()
-        for index in asserts:
-            cursor = index + 1
-            if cursor < len(file) and file.tokens[cursor].is_op("("):
-                cursor = file.skip_group(cursor)  # step over expect(...)
-            while cursor + 1 < len(file) and file.tokens[cursor].is_op(".", "?."):
-                matchers.add(file.tokens[cursor + 1].value)
-                cursor += 2
-                if cursor < len(file) and file.tokens[cursor].is_op("("):
-                    cursor = file.skip_group(cursor)
+        matchers = {_matcher_chain(file, index) for index in asserts} - {""}
         weak = matchers & WEAK_MATCHERS
         if matchers and matchers <= WEAK_MATCHERS:
             report.add(file.tokens[paren].line, "weak_assertion_only",

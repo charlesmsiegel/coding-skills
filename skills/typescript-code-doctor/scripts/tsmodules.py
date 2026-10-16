@@ -47,12 +47,16 @@ def extract_types(file: TsFile) -> None:
                 members = []
                 if body >= 0 and file.closer(body) >= 0:
                     members = _parse_type_members(file, body, file.closer(body))
+                # `end` is exclusive — the next statement's first token. The
+                # declaration's own last token is what `end` means on an
+                # interface or an enum, and what the type span must stop at.
+                last = max(end - 1, cursor)
                 file.types.append(TypeDecl(
                     kind="type", name=tokens[index + 1].value, line=token.line,
-                    start=start, end=end, is_exported="export" in words,
+                    start=start, end=last, is_exported="export" in words,
                     members=members, text=file.slice(cursor + 1, end),
                 ))
-                file.type_spans.append((start, end))
+                file.type_spans.append((start, last))
                 index = end
                 continue
         elif token.is_name("enum") and index + 1 < len(tokens) and tokens[index + 1].kind == "name":
@@ -109,7 +113,11 @@ def _parse_type_members(file: TsFile, open_index: int, close_index: int) -> list
                 type_text += ": " + extra
         members.append(TypeMember(name=name, type_text=type_text, line=token.line,
                                   optional=optional, readonly=readonly))
-        cursor = max(cursor, cursor)
+        # Without `;` or `,` separators the type ends at a line break, and the
+        # cursor already stands on the next member. Skipping "to the separator"
+        # from there consumed that member, so every other one went missing.
+        if cursor < close_index and file.tokens[cursor].line > file.tokens[cursor - 1].line:
+            continue
         while cursor < close_index and not file.tokens[cursor].is_op(";", ","):
             if file.tokens[cursor].kind == "op" and file.tokens[cursor].value in OPENERS:
                 cursor = file.skip_group(cursor)

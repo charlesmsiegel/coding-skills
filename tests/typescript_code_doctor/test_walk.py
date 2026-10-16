@@ -80,3 +80,34 @@ def test_coverage_files_finds_a_nested_workspace_package_report(run_external_too
     nested.parent.mkdir(parents=True, exist_ok=True)
     nested.write_text("{}", encoding="utf-8")
     assert run_external_tools._coverage_files(tmp_path) == nested
+
+
+def _nested_checkouts(root: Path) -> Path:
+    """A repo with a git worktree (`.git` file) and a nested clone (`.git` directory) inside it."""
+    for rel, content in {
+        ".git/HEAD": "ref: refs/heads/main\n",
+        "package.json": "{}\n",
+        "src/a.ts": "export {};\n",
+        ".worktrees/feature/.git": "gitdir: ../../.git/worktrees/feature\n",
+        ".worktrees/feature/src/a.ts": "export {};\n",
+        "vendor-clone/.git/HEAD": "ref: refs/heads/main\n",
+        "vendor-clone/index.ts": "export {};\n",
+        "sub/.git": "gitdir: /elsewhere\n",
+        "sub/deep/x.ts": "export {};\n",
+    }.items():
+        path = root / rel
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(content, encoding="utf-8")
+    return root
+
+
+def test_a_nested_git_checkout_is_a_different_repository(common, tmp_path):
+    """A worktree or a nested clone below the root is not part of this repo's code."""
+    found = [p.relative_to(tmp_path).as_posix() for p in common.walk_tree(_nested_checkouts(tmp_path))]
+    assert found == ["package.json", "src/a.ts"]
+
+
+def test_a_nested_checkout_scanned_directly_is_still_scanned(common, tmp_path):
+    """Pointing the scanner at the worktree itself analyses it: only checkouts *below* the root are skipped."""
+    worktree = _nested_checkouts(tmp_path) / ".worktrees" / "feature"
+    assert [p.relative_to(worktree).as_posix() for p in common.find_ts_files(worktree)] == ["src/a.ts"]

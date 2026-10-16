@@ -5,18 +5,23 @@ where a discriminated union belongs, boolean flag parameters, data clumps,
 primitive obsession, temporary fields and refused bequest.
 
 The TypeScript-specific one is the type switch. An `if/else if` ladder on
-`typeof x` or `x.type === '…'` is checking at runtime what the type system could
-check at compile time — and unlike the ladder, an exhaustive `switch` over a
-discriminated union fails the build when a new case is added.
+`x.type === '…'` is checking at runtime what the type system could check at
+compile time — and unlike the ladder, an exhaustive `switch` over a
+discriminated union fails the build when a new case is added. (`typeof x` is
+not one: on a union of primitives it is the narrowing the compiler checks.)
 """
 
 from collections import defaultdict
 from itertools import combinations
 
 from common import Reporter, is_test_file, run_file_detector
-from tsparse import TsFile, argument_spans, body_indices, iter_calls
+from tsparse import TsFile, argument_spans, body_indices, iter_calls, statement_end
 
 TYPE_SWITCH_BRANCHES = 3
+# Parameter names that, by convention, hold a DOM event.
+EVENT_PARAMETER_NAMES = frozenset({"event", "e", "evt", "ev"})
+# Keyboard-event properties: strings the platform defines, not a tag the code owns.
+EVENT_KEY_PROPERTIES = frozenset({"key", "code"})
 CLUMP_SIZE = 3
 CLUMP_OCCURRENCES = 3
 PRIMITIVE_TYPES = frozenset({"string", "number", "boolean"})
@@ -24,44 +29,70 @@ PRIMITIVE_RUN = 3
 
 
 def _check_type_switches(file: TsFile, report: Reporter) -> None:
-    """`typeof x === '…'` / `x.kind === '…'` ladders with three or more arms."""
-    ladders: dict[str, list[int]] = defaultdict(list)
+    """`x.kind === '…'` ladders with three or more distinct arms.
+
+    Two ladders look like this one and are not it. `typeof x === 'string'` is
+    how TypeScript narrows a union of primitives: there is no discriminant to
+    switch on, `typeof` *is* the discriminant, and the compiler already checks
+    each arm. And `event.key === 'Enter'` compares a string the platform
+    defines — the code does not own that set of values and cannot make it a
+    union. Neither is reported. Three checks of the *same* literal are not a
+    switch either: a switch needs three cases.
+    """
+    ladders: dict[str, list[tuple[int, str]]] = defaultdict(list)
     for index, token in enumerate(file.tokens):
         if not token.is_op("===", "==") or index + 1 >= len(file):
             continue
         right = file.tokens[index + 1]
         if right.kind != "str":
             continue
-        subject = ""
         cursor = index - 1
-        if cursor >= 0 and file.tokens[cursor].is_op(")"):
-            opener = file.closer(cursor)
-            if opener > 0 and file.tokens[opener - 1].is_name("typeof"):
-                subject = "typeof " + file.slice(opener + 1, cursor)
-        elif cursor >= 0 and file.tokens[cursor].kind == "name":
-            parts = [file.tokens[cursor].value]
-            while cursor >= 2 and file.tokens[cursor - 1].is_op(".") and file.tokens[cursor - 2].kind == "name":
-                cursor -= 2
-                parts.append(file.tokens[cursor].value)
-            if cursor >= 1 and file.tokens[cursor - 1].is_name("typeof"):
-                subject = "typeof " + ".".join(reversed(parts))
-            elif len(parts) >= 2:
-                subject = ".".join(reversed(parts))
-        if subject:
-            ladders[subject].append(token.line)
+        if cursor < 0 or file.tokens[cursor].kind != "name":
+            continue  # `typeof (x)`, a call result, an index: not a tag read off a value
+        parts = [file.tokens[cursor].value]
+        while cursor >= 2 and file.tokens[cursor - 1].is_op(".") and file.tokens[cursor - 2].kind == "name":
+            cursor -= 2
+            parts.append(file.tokens[cursor].value)
+        parts.reverse()
+        if len(parts) < 2 or (cursor >= 1 and file.tokens[cursor - 1].is_name("typeof")):
+            continue
+        if len(parts) == 2 and parts[1] in EVENT_KEY_PROPERTIES and _is_keyboard_event(file, index, parts[0]):
+            continue
+        ladders[".".join(parts)].append((token.line, right.value.strip("'\"")))
 
-    for subject, lines in ladders.items():
-        distinct = sorted(set(lines))
-        if len(distinct) < TYPE_SWITCH_BRANCHES:
+    for subject, arms in ladders.items():
+        distinct = sorted({line for line, _ in arms})
+        cases = {literal for _, literal in arms}
+        if len(distinct) < TYPE_SWITCH_BRANCHES or len(cases) < TYPE_SWITCH_BRANCHES:
             continue
         if max(distinct) - min(distinct) > 120:
             continue  # spread across the file: not one ladder
         report.add(distinct[0], "type_switch",
-                   f"`{subject}` is compared against a string literal on {len(distinct)} lines",
+                   f"`{subject}` is compared against {len(cases)} string literals on {len(distinct)} lines",
                    "Model the cases as a discriminated union and `switch` on the discriminant with "
                    "an exhaustive `default: assertNever(x)`. The compiler then tells you every place "
                    "to update when a new case appears — the ladder never will.",
                    "medium", related=distinct[1:6])
+
+
+def _is_keyboard_event(file: TsFile, index: int, name: str) -> bool:
+    """True when ``name`` is a parameter, of a function around ``index``, holding a DOM event.
+
+    An annotation decides when there is one (`KeyboardEvent`,
+    `React.KeyboardEvent<…>`), so `event: { key: Mode }` — the code's own type —
+    is still checked. Unannotated, as in an inline `onKeyDown={(e) => …}`, the
+    conventional name (`event`, `e`, `evt`) is the evidence.
+    """
+    verdict = False
+    for func in file.functions:  # ordered by start, so an inner (shadowing) parameter decides last
+        if func.has_body:
+            inside = func.body_open < index < func.body_close
+        else:  # a concise arrow: its body is the expression after `=>`
+            inside = func.params_close < index < statement_end(file, func.params_close + 1)
+        for param in func.params if inside else ():
+            if param.name == name:
+                verdict = "KeyboardEvent" in param.type_text if param.type_text else name in EVENT_PARAMETER_NAMES
+    return verdict
 
 
 def _check_boolean_parameters(file: TsFile, report: Reporter) -> None:

@@ -196,6 +196,18 @@ class TsFile:
         end = self.match.get(index, -1)
         return end + 1 if end >= 0 else index + 1
 
+    def comments_between(self, open_index: int, close_index: int) -> list[Token]:
+        """Comments lying between two tokens, e.g. inside a `{ }` pair.
+
+        Comments are not in the token stream, so they are located by character
+        offset; the arguments are token indices and are converted here, once,
+        rather than compared against comment offsets by each caller.
+        """
+        if not (0 <= open_index < close_index < len(self.tokens)):
+            return []
+        low, high = self.tokens[open_index].end, self.tokens[close_index].start
+        return [c for c in self.comments if low <= c.start and c.end <= high]
+
     def enclosing_function(self, index: int) -> Func | None:
         found = None
         for func in self.functions:

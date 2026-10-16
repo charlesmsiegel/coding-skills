@@ -43,6 +43,13 @@ SECRET_NAMES = re.compile(
 # Values that are obviously placeholders rather than live credentials.
 PLACEHOLDER = re.compile(r"^(?:|x+|\*+|\.{3}|changeme|placeholder|your[_-].*|<.*>|\$\{.*\}|"
                          r"process\.env.*|todo|none|null|test|dummy|example|fake|secret)$", re.IGNORECASE)
+# Two words with whitespace between them: what a label or a message has and a key does not.
+WORD_GAP = re.compile(r"[A-Za-z]\s+[A-Za-z]")
+# One whitespace-free chunk that reads as key material: long, or letters and digits mixed.
+TOKEN_LIKE = re.compile(r"^\S{20,}$|^(?=\S*[A-Za-z])(?=\S*\d)\S{8,}$")
+# Letters and word separators only — how an identifier is spelled, in any case convention.
+NAME_SPELLING = re.compile(r"^[A-Za-z][A-Za-z _.-]*$")
+NAME_WORDS = re.compile(r"[A-Z]?[a-z]+|[A-Z]+(?![a-z])")
 
 
 def _check_eval(file: TsFile, report: Reporter) -> None:
@@ -125,6 +132,39 @@ def _check_weak_crypto(file: TsFile, report: Reporter) -> None:
                        "`crypto.getRandomValues()` for anything an attacker must not guess.", "high")
 
 
+def _is_prose(literal: str) -> bool:
+    """True for a human-readable sentence or label rather than a credential.
+
+    `gelbooru_api_key: 'Gelbooru API key'` in a labels map, or `password:
+    'Enter your password'` as a placeholder, is words separated by spaces. Keys
+    and tokens are one unbroken run of characters, so a value counts as prose
+    only when it has at least two words and none of its chunks looks like a
+    token — `'Bearer abc123def456…'` still reports. A passphrase written as
+    plain words is the cost of this rule.
+    """
+    chunks = literal.split()
+    if len(chunks) < 2 or not WORD_GAP.search(literal):
+        return False
+    return not any(TOKEN_LIKE.search(chunk) for chunk in chunks)
+
+
+def _words(text: str) -> list[str]:
+    return [word.lower() for word in NAME_WORDS.findall(text)]
+
+
+def _restates_name(literal: str, name: str) -> bool:
+    """True when the value is only the name's own words: `AUTH_TOKEN = 'auth_token'`.
+
+    That is a storage key, a header name or an environment-variable name — the
+    place a secret is looked up, not the secret. Digits disqualify it, so
+    `password = 'password1'` still reports.
+    """
+    if not NAME_SPELLING.match(literal):
+        return False
+    words = _words(literal)
+    return bool(words) and set(words) <= set(_words(name))
+
+
 def _check_hardcoded_secrets(file: TsFile, report: Reporter) -> None:
     for index, token in enumerate(file.tokens):
         if token.kind != "name" or not SECRET_NAMES.search(token.value):
@@ -143,7 +183,8 @@ def _check_hardcoded_secrets(file: TsFile, report: Reporter) -> None:
         if value is None or value.kind != "str":
             continue
         literal = value.value.strip("'\"")
-        if len(literal) < 8 or PLACEHOLDER.match(literal):
+        if len(literal) < 8 or PLACEHOLDER.match(literal) or _is_prose(literal) \
+                or _restates_name(literal, token.value):
             continue
         report.add(token.line, "hardcoded_secret",
                    f"`{token.value}` is assigned a string literal in source",
