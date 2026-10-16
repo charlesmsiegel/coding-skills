@@ -60,6 +60,13 @@ import { type User, formatUser } from "./x"; // mixed, also fine
 
 Marking type imports also breaks type-only cycles for free.
 
+`missing_import_type` reports an unmarked type-only import only where the mark
+changes the output: under `verbatimModuleSyntax`, or `isolatedModules` with
+`preserveValueImports` or `importsNotUsedAsValues: preserve|error`, the import is
+kept as written (or refused). Anywhere else the compiler elides it and nothing
+that runs would change; turning on `verbatimModuleSyntax` is the decision, and
+`find_tsconfig_issues.py` is what suggests it.
+
 ## Side-effect imports
 
 `import "./setup"` runs a module body for what it does, not what it exports. That

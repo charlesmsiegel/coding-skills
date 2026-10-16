@@ -13,6 +13,7 @@ accident, and they also defeat tree shaking.
 from pathlib import Path
 
 from common import Finding, is_test_file, run_tree_detector
+from find_tsconfig_issues import compiler_options
 from tsproject import load_project
 
 GOD_MODULE_EXPORTS = 25
@@ -152,8 +153,32 @@ def analyze(root: Path, ignore: set[str], _args) -> list[Finding]:
     return findings
 
 
+def _keeps_unmarked_imports(path: Path) -> str:
+    """The tsconfig setting under which an unmarked type import changes the output, or "".
+
+    By default TypeScript (and esbuild, swc and Babel after it) elides an
+    import specifier that is only used as a type, so leaving off `type`
+    changes nothing that runs. Only these settings make the compiler keep the
+    import as written, or reject it: `verbatimModuleSyntax`, and the two
+    older flags it replaced when combined with `isolatedModules`. An unknown
+    tsconfig is not one of them.
+    """
+    options = compiler_options(path)
+    if options is None:
+        return ""
+    if options.get("verbatimModuleSyntax") is True:
+        return "verbatimModuleSyntax"
+    if options.get("isolatedModules") is True:
+        if options.get("preserveValueImports") is True:
+            return "isolatedModules + preserveValueImports"
+        if str(options.get("importsNotUsedAsValues", "")).lower() in ("preserve", "error"):
+            return f"isolatedModules + importsNotUsedAsValues: {options['importsNotUsedAsValues']}"
+    return ""
+
+
 def _check_type_imports(tsfile, path: Path, add) -> None:
-    """Imports used only in type positions should say `import type`."""
+    """Imports used only in type positions should say `import type` — where it matters."""
+    setting = ""
     for record in tsfile.imports:
         if record.is_type_only or record.kind != "import" or not record.names:
             continue
@@ -165,11 +190,15 @@ def _check_type_imports(tsfile, path: Path, add) -> None:
             if not uses:
                 continue
             if all(tsfile.in_type_position(i) for i in uses):
+                setting = setting or _keeps_unmarked_imports(path) or "-"
+                if setting == "-":
+                    return  # the compiler elides it: nothing that runs would change
                 add(path, record.line, "missing_import_type",
                     f"`{name}` from '{record.module}' is only used as a type",
-                    f"Write `import type {{ {name} }} from '{record.module}'`. The runtime import "
-                    "otherwise survives into the bundle and can drag a whole module in with it — "
-                    "and `verbatimModuleSyntax` requires the annotation anyway.", "low")
+                    f"Write `import type {{ {name} }} from '{record.module}'`. Under this "
+                    f"tsconfig's `{setting}` an import not marked `type` is kept as written — "
+                    "a runtime import that can drag a whole module into the bundle, or a "
+                    "compile error.", "low")
 
 
 if __name__ == "__main__":

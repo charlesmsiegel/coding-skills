@@ -602,3 +602,27 @@ def test_class_names_and_union_members_are_not_repeated_literals(tmp_path):
     files = {"view.tsx": LITERALS + 'export const C = () => <p className="field-hint" />;\n'}
     found = records("find_duplicates.py", tmp_path, files, "repeated_string_literal")
     assert [r["description"].split("`")[1] for r in found] == ["Generating the summary"]
+
+
+# --------------------------------------------------------------------------- #
+# find_module_issues: a missing `import type` matters only where the compiler
+# keeps the import
+# --------------------------------------------------------------------------- #
+
+TYPE_IMPORT = {
+    "src/types.ts": "export interface User { id: string }\nexport const VERSION = 1;\n",
+    "src/use.ts": 'import { User } from "./types";\nexport function id(u: User): string { return u.id; }\n',
+}
+
+
+def test_missing_import_type_is_quiet_where_the_compiler_elides_it(tmp_path):
+    files = {**TYPE_IMPORT, "tsconfig.json": '{ "compilerOptions": { "strict": true } }'}
+    assert records("find_module_issues.py", tmp_path, files, "missing_import_type") == []
+
+
+def test_missing_import_type_is_reported_under_verbatim_module_syntax(tmp_path):
+    files = {**TYPE_IMPORT,
+             "tsconfig.json": '{ "compilerOptions": { "strict": true, "verbatimModuleSyntax": true } }'}
+    found = records("find_module_issues.py", tmp_path, files, "missing_import_type")
+    assert lines_of(found) == [1]
+    assert "verbatimModuleSyntax" in found[0]["suggestion"]
