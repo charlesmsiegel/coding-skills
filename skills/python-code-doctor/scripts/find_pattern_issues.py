@@ -18,7 +18,11 @@ Direction 2 — a pattern (or stronger type) is missing where forces demand one:
   string_state_machine       - self.attr compared/assigned across methods as string literals
                                (use an Enum; consider State/dispatch if behavior branches)
   try_finally_close          - try/finally whose only job is .close()/.release()
-                               (use with / contextlib.closing)
+                               (use with / contextlib.closing). A candidate:
+                               whether the object is a context manager is not
+                               in this file, and a conditional acquire
+                               (`acquire(blocking=False)`, a timeout) has no
+                               `with` form at all, so it is not reported.
 
 Complements find_overengineering.py (single-impl ABCs, one-type factories, thin
 wrappers) and find_design_smells.py (type_switch → polymorphism/dispatch). Each
@@ -50,6 +54,20 @@ class PatternIssue:
     # diff tooling can keep the finding when *any* participant changed even
     # though `line` anchors at one (possibly unchanged) definition.
     related_lines: list[int] = field(default_factory=list)
+    kind: str = "finding"
+    also_caused_by: tuple[str, ...] = ()
+
+
+_TRY_FINALLY_REASONS = (
+    "the object is not a context manager — a test gate, an event, a handle whose "
+    "class defines the cleanup method without __enter__ — so `with` cannot hold it",
+    "the resource was acquired conditionally (non-blocking, with a timeout) or in "
+    "another function, which a `with` block cannot express",
+)
+_SQLITE_CLOSE_REASON = (
+    "a sqlite3.Connection's `with` commits or rolls back but does not close; "
+    "contextlib.closing() is its with-form"
+)
 
 
 CLEANUP_METHODS = frozenset({"close", "release", "disconnect", "shutdown", "terminate"})
@@ -662,9 +680,40 @@ def analyze_file(filepath: Path, ignore: set[str]) -> list[PatternIssue]:
         return []
 
 
+def _conditional_acquire(node: ast.AST | None, receiver: str) -> bool:
+    """True when ``node`` holds `<receiver>.acquire(...)` called with arguments.
+
+    `acquire(blocking=False)`, `acquire(timeout=...)` or a positional flag may
+    not take the lock, so the release that follows is conditional on it — and
+    `with lock:` always blocks.
+    """
+    if node is None:
+        return False
+    return any(isinstance(call, ast.Call) and isinstance(call.func, ast.Attribute)
+               and call.func.attr == "acquire" and (call.args or call.keywords)
+               and ast.unparse(call.func.value) == receiver
+               for call in ast.walk(node))
+
+
+def _statement_context(tree: ast.Module) -> dict[int, tuple[ast.AST, ast.AST | None]]:
+    """id(statement) -> (the statements before it in its block, the `if` test
+    whose body holds it)."""
+    context: dict[int, tuple[ast.AST, ast.AST | None]] = {}
+    for parent in ast.walk(tree):
+        for field_name in ("body", "orelse", "finalbody"):
+            stmts = getattr(parent, field_name, None)
+            if not isinstance(stmts, list):
+                continue
+            guard = parent.test if isinstance(parent, ast.If) and field_name == "body" else None
+            for index, stmt in enumerate(stmts):
+                context[id(stmt)] = (ast.Module(body=stmts[:index], type_ignores=[]), guard)
+    return context
+
+
 def _function_level_checks(filepath: Path, tree: ast.Module, lines: list[str],
                            detector: PatternIssueDetector) -> list[PatternIssue]:
     issues: list[PatternIssue] = []
+    context = _statement_context(tree)
 
     def get_line(lineno: int) -> str:
         return lines[lineno - 1].strip()[:60] if 0 < lineno <= len(lines) else ""
@@ -741,19 +790,26 @@ def _function_level_checks(filepath: Path, tree: ast.Module, lines: list[str],
                     and not (isinstance(stmt.value.func.value, ast.Name)
                              and stmt.value.func.value.id in ("self", "cls")):
                 cleanup = stmt.value.func.attr
-                receiver = ast.unparse(stmt.value.func.value)[:40]
-                # contextlib.closing() only ever calls .close() — suggesting it
-                # for .release()/.shutdown() would run the wrong (or no) cleanup.
-                fallback = (
-                    "wrap it in contextlib.closing()" if cleanup == "close"
-                    else f"register the call with contextlib.ExitStack "
-                         f"(stack.callback({receiver}.{cleanup})) or write a small context manager"
+                full_receiver = ast.unparse(stmt.value.func.value)
+                receiver = full_receiver[:40]
+                before, guard = context.get(id(node), (None, None))  # earlier siblings, `if` test
+                if cleanup == "release" and (_conditional_acquire(before, full_receiver)
+                                             or _conditional_acquire(guard, full_receiver)):
+                    continue  # a lock that may not have been taken has no `with` form
+                # contextlib.closing() only ever calls .close(); .release() and
+                # the rest go through ExitStack or a small context manager.
+                with_form = (
+                    "`with` or contextlib.closing()" if cleanup == "close"
+                    else f"`with`, or contextlib.ExitStack (stack.callback({receiver}.{cleanup}))"
                 )
-                add(node.lineno, "try_finally_close",
-                    f"try/finally exists only to call .{cleanup}()",
-                    f"Use a with block — the object is probably already a context manager; "
-                    f"if not, {fallback}. The cleanup then cannot be "
-                    "forgotten on the next edit", "low")
+                reasons = _TRY_FINALLY_REASONS + ((_SQLITE_CLOSE_REASON,) if cleanup == "close" else ())
+                if "try_finally_close" not in detector.ignore:
+                    issues.append(PatternIssue(
+                        str(filepath), node.lineno, "try_finally_close",
+                        f"try/finally exists only to call {receiver}.{cleanup}(); "
+                        f"its with-form would be {with_form}",
+                        "", "low", get_line(node.lineno),
+                        kind="candidate", also_caused_by=reasons))
 
     return issues
 
@@ -796,12 +852,18 @@ def main():
 
         severity_icons = SEVERITY_ICONS
         for issue in all_issues:
-            icon = severity_icons[issue.severity]
-            print(f"{icon} [{issue.severity.upper()}] {issue.file}:{issue.line}")
+            if issue.kind == "candidate":
+                print(f"? [CANDIDATE] {issue.file}:{issue.line}")
+            else:
+                print(f"{severity_icons[issue.severity]} [{issue.severity.upper()}] {issue.file}:{issue.line}")
             print(f"   {issue.smell_type}: {issue.description}")
             if issue.code_snippet:
                 print(f"   Code: {issue.code_snippet}")
-            print(f"   → {issue.suggestion}\n")
+            if issue.suggestion:
+                print(f"   → {issue.suggestion}")
+            for reason in issue.also_caused_by:
+                print(f"   ? also caused by: {reason}")
+            print()
 
 
 if __name__ == '__main__':
