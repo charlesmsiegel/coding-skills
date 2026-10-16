@@ -192,7 +192,7 @@ The forces, with their deterministic tripwires:
 | if/elif ladder on a type tag or kind string (`find_design_smells.py: type_switch`) | Dispatch dict → `match` → polymorphism, in that order of escalation |
 | Same conditional on object state in several methods (`string_state_machine`) | Enum, then state-keyed dispatch, then State classes (see above) |
 | Massive conditional choosing algorithm variants; near-duplicate functions differing in one step | Callable parameter / dispatch dict (Strategy-as-functions); Template-as-callable-params |
-| Telescoping constructor, long parameter list (`find_code_smells.py: long_parameter_list`, `find_parameter_objects.py`) | Keyword args + dataclass (parameter object); not a Builder class |
+| Telescoping constructor, long parameter list (`analyze_complexity.py: parameter_count`, `find_parameter_objects.py`) | Keyword args + dataclass (parameter object); not a Builder class |
 | Subclass explosion across two independent axes | Bridge-shape: composition, pass the implementation in |
 | Hard-coded notification calls / cross-module polling | Callback list (Observer) |
 | Undo/redo, audit log, or task queue requirements | Command-as-callables + Memento snapshots |
