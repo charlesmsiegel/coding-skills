@@ -22,6 +22,24 @@ CONTINUATIONS = frozenset({
     ",", "+", "-", "*", "/", "%", "=", "==", "===", "!=", "!==", "<", ">", "<=",
     ">=", "&&", "||", "??", "?", ":", "=>", "|", "&", ".", "(", "[", "{", "...",
 })
+# Keyword operators that need an operand after them, so a line ending in one
+# continues: `return rows as\n  Record<K, V>` is one statement. `return`,
+# `throw`, `yield`, `break` and `continue` are deliberately absent — a line
+# break after those ends the statement.
+KEYWORD_CONTINUATIONS = frozenset({
+    "as", "satisfies", "instanceof", "in", "typeof", "keyof", "new", "await",
+    "void", "delete", "extends",
+})
+
+
+def continues_line(file: TsFile, index: int) -> bool:
+    """True when the token at ``index`` cannot end an expression at a line end."""
+    token = file.tokens[index]
+    if token.kind == "op":
+        return token.value in CONTINUATIONS
+    # `x.new` and `x.in` are property names, not operators.
+    return token.kind == "name" and token.value in KEYWORD_CONTINUATIONS \
+        and not (index and file.tokens[index - 1].is_op(".", "?."))
 
 
 # Tokens that cannot appear inside a type-argument list at its own level.
@@ -124,7 +142,7 @@ def read_type_after_colon(file: TsFile, colon: int, stop: int) -> tuple[str, int
         # A newline followed by something that cannot continue a type ends it.
         # The `>` closing type arguments ends a type rather than continuing it.
         previous = file.tokens[cursor - 1]
-        continued = previous.value in CONTINUATIONS and cursor != after_arguments
+        continued = continues_line(file, cursor - 1) and cursor != after_arguments
         if cursor > start and token.line > previous.line and not continued \
                 and token.value not in CONTINUATIONS and token.kind == "name":
             break
@@ -581,8 +599,11 @@ def _parse_class_body(file: TsFile, klass: Class) -> None:
             init_start = cursor + 1
             cursor = skip_to_statement_end(file, cursor + 1, klass.body_close)
             prop.initializer = file.slice(init_start, cursor)[:200].rstrip(";").strip()
-        else:
+        elif cursor < klass.body_close and tokens[cursor].line == tokens[cursor - 1].line:
             cursor = skip_to_statement_end(file, cursor, klass.body_close)
+        # Otherwise a line break ended the declaration (`x: number` with no
+        # `;`), and the token here starts the next member: skipping a
+        # statement from it would swallow that member.
         klass.props.append(prop)
 
 
@@ -596,30 +617,37 @@ def _accessibility(modifiers: set[str], name: str) -> str | None:
 def skip_to_statement_end(file: TsFile, index: int, stop: int) -> int:
     """Advance past the end of a statement: a `;`, or an ASI-style line break.
 
-    Two things end a statement without being part of it. A closing bracket that
-    was not opened inside the statement belongs to the enclosing block, so the
-    statement stops *at* it: `return {…}` as a body's last line ends at the
-    body's `}`, not past it. And a bracket group is still followed by a line
-    break the ASI rule must see — `g(a)` then `log(a)` on the next line is two
-    statements, which stepping over the group in one jump used to hide.
+    A bracket group and a JSX element are each stepped over whole, and the line
+    break after one is then judged like any other. The scan used to jump a
+    group without looking at the break behind it, so in code written without
+    semicolons `throw new Error("x")` ran on into the next line's statement, or
+    past the block's `}`, and whatever followed was called unreachable. A
+    closer this scan did not open ends the statement as well: it belongs to
+    the enclosing block or call.
     """
     cursor = index
     while cursor < stop:
         token = file.tokens[cursor]
-        if token.kind == "op" and token.value in OPENERS:
-            closer = file.closer(cursor)
-            cursor = file.skip_group(cursor)
-            if 0 <= closer and cursor < stop and _breaks_statement(file.tokens[closer], file.tokens[cursor]):
+        if token.kind == "op":
+            if token.value == ";":
+                return cursor + 1
+            if token.value in CLOSERS:
                 return cursor
-            continue
-        if token.kind == "op" and token.value in CLOSERS:
-            return cursor  # closes the enclosing block, not this statement
-        if token.is_op(";"):
-            return cursor + 1
-        nxt = file.tokens[cursor + 1] if cursor + 1 < stop else None
-        if nxt is not None and _breaks_statement(token, nxt):
-            return cursor + 1
-        cursor += 1
+        # `last` is the token whose line end decides the break: the group's
+        # closer or the element's final `>` when one starts here. Either ends a
+        # complete value, so it never continues the line the way a bare `>` does.
+        last = cursor
+        if token.kind == "op" and token.value in OPENERS:
+            last = max(file.closer(cursor), cursor)
+        elif cursor in file.jsx_spans:
+            last = file.jsx_spans[cursor]
+        if last + 1 >= stop:
+            return stop
+        nxt = file.tokens[last + 1]
+        continued = last == cursor and continues_line(file, last)
+        if nxt.line > file.tokens[last].line and not continued and nxt.value not in CONTINUATIONS:
+            return last + 1
+        cursor = last + 1
     return stop
 
 

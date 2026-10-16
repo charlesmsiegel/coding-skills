@@ -149,6 +149,7 @@ class TsFile:
         self.comments = tokenizer.comments
         self.jsx_text = tokenizer.jsx_text
         self.substitutions = tokenizer.substitutions
+        self.jsx_spans = tokenizer.jsx_spans
         self.jsx_attributes = tokenizer.jsx_attributes
         self.match = match_brackets(self.tokens)
 
