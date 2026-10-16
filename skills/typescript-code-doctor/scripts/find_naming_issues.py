@@ -25,6 +25,17 @@ BROWSER_GLOBALS = frozenset({
 })
 
 BOOLEAN_PREFIXES = ("is", "has", "should", "can", "will", "did", "was", "are", "no", "allow", "enable", "disable")
+# The platform's own boolean attributes (HTML and ARIA) are named as states, not
+# questions, and a prop mirroring one reads correctly to anyone who has written
+# `<input disabled>`.
+DOM_STATE_WORDS = frozenset({
+    "open", "disabled", "hidden", "checked", "selected", "required", "readonly",
+    "multiple", "busy", "pressed", "expanded", "loading",
+})
+# A participle or adjective ending already says which way `true` points:
+# `truncated`, `pending`, `available`, `visible`, `active`.
+STATE_SUFFIXES = ("ed", "ing", "able", "ible", "ive")
+_WORDS = re.compile(r"[A-Z]?[a-z0-9]+|[A-Z]+(?![a-z])")
 
 # The platform's boolean names — HTML boolean attributes and ARIA states, in
 # React's spelling, lower-cased for comparison. A component prop that mirrors
@@ -156,21 +167,41 @@ def _reads_as_a_statement(name: str) -> bool:
     return len(last) > 3 and last.endswith("ed") and last not in NOT_PARTICIPLES
 
 
+def _reads_as_state(name: str) -> bool:
+    """True for a name whose last word is a platform state or a participle/adjective."""
+    words = _WORDS.findall(name)
+    last = words[-1].lower() if words else name.lower()
+    return last not in NOT_ADJECTIVES | NOT_PARTICIPLES and (
+        name.lower() in DOM_STATE_WORDS or last in DOM_STATE_WORDS or last.endswith(STATE_SUFFIXES))
+
+
 def _check_boolean_names(file: TsFile, report: Reporter) -> None:
+    """Boolean members named neither as a question nor as a state.
+
+    The defect is a boolean named like a bare noun (`prefill`, `grid`), where
+    nothing says which way `true` points. Telling a noun from an adjective
+    needs a dictionary this scanner does not carry — `ok`, `stale` and `due`
+    are as clear as `isStale` — so what survives the prefix, platform and
+    suffix tests is a lead, not a finding.
+    """
     for decl in file.types:
         for member in decl.members:
             if member.type_text.strip() != "boolean" or member.name == "[index]":
                 continue
-            if member.name.lower().startswith(BOOLEAN_PREFIXES):
+            if member.name.lower().startswith(BOOLEAN_PREFIXES) or _reads_as_state(member.name):
                 continue
             if (_mirrors_a_wire_name(member.name) or _is_dom_boolean_attribute(member.name)
                     or _reads_as_a_statement(member.name)):
                 continue
-            report.add(member.line, "boolean_without_predicate_name",
-                       f"`{decl.name}.{member.name}` is a boolean but does not read as a question",
-                       f"Name it `is{member.name[:1].upper()}{member.name[1:]}` / `has…` / `should…`. "
-                       "A bare noun leaves the call site ambiguous about which way `true` points.",
-                       "low")
+            report.candidate(member.line, "boolean_without_predicate_name",
+                             f"`{decl.name}.{member.name}` is a boolean whose name is neither a "
+                             "question nor an obvious state",
+                             ("the name is an adjective that already reads as a state (`ok`, "
+                              "`stale`, `due`, `ready`)",
+                              "the field mirrors a wire format or external API the TypeScript "
+                              "side cannot rename",
+                              "it follows a library's or the platform's own name for the flag"),
+                             "low")
 
 
 def _check_private_naming(file: TsFile, report: Reporter) -> None:

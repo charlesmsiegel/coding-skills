@@ -513,3 +513,28 @@ export async function sweep(api: Api, ids: string[]): Promise<string> {
 def test_a_catch_that_records_the_failure_is_not_swallowed(tmp_path):
     found = records("find_exception_issues.py", tmp_path, {"sweep.ts": CATCHES}, "swallowed_error")
     assert lines_of(found) == [13, 14], "a write nothing reads, or a reset, still loses the failure"
+
+
+# --------------------------------------------------------------------------- #
+# find_naming_issues: a boolean that reads as a state is fine; a bare noun is a lead
+# --------------------------------------------------------------------------- #
+
+BOOLEANS = """\
+export interface Wire {
+  truncated: boolean;
+  rewrite_stored: boolean;
+  busy: boolean;
+  menuOpen: boolean;
+  readOnly: boolean;
+  available: boolean;
+  isReady: boolean;
+  prefill: boolean;
+  ok: boolean;
+}
+"""
+
+
+def test_a_state_shaped_boolean_is_named_well_and_a_noun_is_a_lead(tmp_path):
+    found = records("find_naming_issues.py", tmp_path, {"wire.ts": BOOLEANS}, "boolean_without_predicate_name")
+    assert lines_of(found) == [9, 10]
+    assert all(r["kind"] == "candidate" and r["also_caused_by"] for r in found)
