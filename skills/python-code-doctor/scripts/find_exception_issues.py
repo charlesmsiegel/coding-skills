@@ -191,8 +191,9 @@ def _parameter_names(fn) -> set:
 
 
 def _is_narrowing(test) -> bool:
-    """`x is not None`, `isinstance(...)`, or an and/or of those: a type
-    checker's narrowing, which holds by construction once the code type-checks."""
+    """`x is not None`, `isinstance(...)`, or an and/or of those: the shape of a
+    type checker's narrowing, which usually restates what the annotations and a
+    check upstream already promise. A lead to confirm, not proof of validation."""
     if isinstance(test, ast.BoolOp):
         return all(_is_narrowing(v) for v in test.values)
     if isinstance(test, ast.Compare):
