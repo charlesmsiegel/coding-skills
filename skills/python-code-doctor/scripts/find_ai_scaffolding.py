@@ -187,8 +187,12 @@ _PLACEHOLDER_STARTSWITH = [
     "<your",
 ]
 
+# The replace-me words count only as whole tokens: "a very long replacement"
+# contains `replaceme` and is prose. Underscore and hyphen separate tokens here
+# (`API_KEY_CHANGEME` is a placeholder), letters and digits do not.
 _PLACEHOLDER_REGEX = re.compile(
-    r"(your[_\-]api[_\-]key|api[_\-]key[_\-]here|insert_.+_here|replace_me|replaceme|changeme|change_me|<your)",
+    r"(your[_\-]api[_\-]key|api[_\-]key[_\-]here|insert_.+_here|<your"
+    r"|(?<![a-z0-9])(?:replace_me|replaceme|changeme|change_me)(?![a-z0-9]))",
     re.IGNORECASE,
 )
 
@@ -245,6 +249,47 @@ def _is_stub_body(func_node):
     return _is_only_pass_or_ellipsis(func_node) or _is_only_raise_not_implemented(func_node)
 
 
+def _build_override_map(tree):
+    """id(method) for every method that overrides a same-named method of a base
+    class defined in this file. An override has to accept what its base accepts,
+    so an unused **kwargs there is the signature contract, not a catch-all.
+
+    A base this file cannot see (an import) proves nothing either way, so its
+    subclasses' methods are not exempted.
+    """
+    classes = defaultdict(list)
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ClassDef):
+            classes[node.name].append(node)
+
+    def methods_of(class_node):
+        return {item.name for item in class_node.body
+                if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef))}
+
+    def inherited(class_node, seen):
+        names = set()
+        for base in class_node.bases:
+            if not isinstance(base, ast.Name):
+                continue
+            for base_node in classes.get(base.id, ()):
+                if id(base_node) in seen:
+                    continue
+                seen.add(id(base_node))
+                names |= methods_of(base_node) | inherited(base_node, seen)
+        return names
+
+    overrides = set()
+    for nodes in classes.values():
+        for class_node in nodes:
+            if not class_node.bases:
+                continue
+            from_bases = inherited(class_node, {id(class_node)})
+            for item in class_node.body:
+                if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef)) and item.name in from_bases:
+                    overrides.add(id(item))
+    return overrides
+
+
 # ---------------------------------------------------------------------------
 # detect
 # ---------------------------------------------------------------------------
@@ -258,6 +303,7 @@ def detect(tree, filename, lines, ignore):
         issues.append(CodeSmell(filename, line, st, desc, sug, sev, _get_line(lines, line)))
 
     class_map = _build_class_map(tree)
+    overrides = _build_override_map(tree)
 
     # -----------------------------------------------------------------------
     # stub_not_implemented, empty_stub, unused_kwargs
@@ -300,10 +346,13 @@ def detect(tree, filename, lines, ignore):
                 "low",
             )
 
-        # unused_kwargs
+        # unused_kwargs — a leading underscore (`**_kwargs`) is the convention
+        # for "deliberately unused", and an override keeps its base's signature.
         if (
             "unused_kwargs" not in ignore
             and node.args.kwarg is not None
+            and not node.args.kwarg.arg.startswith("_")
+            and id(node) not in overrides
             and not _is_stub_body(node)
             and not node.decorator_list
         ):

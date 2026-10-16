@@ -3,8 +3,10 @@
 Detect return-statement problems in Python code via AST analysis.
 
 Finds:
-  - inconsistent_returns : a function mixes `return <value>` with a bare `return`
-                           (or `return None`), so callers can't trust the result
+  - inconsistent_returns : a function mixes `return <value>` with a bare `return`,
+                           so a reader can't tell "no result" from "forgot one".
+                           An explicit `return None` is not bare: PEP 8 asks for
+                           exactly that spelling once any return has a value.
   - return_bool_condition : `if cond: return True` / `return False`, which is just
                             `return bool(cond)`
 
@@ -53,7 +55,8 @@ def _same_scope_nodes(stmts):
 
 
 def _is_bare_return(r: ast.Return) -> bool:
-    return r.value is None or (isinstance(r.value, ast.Constant) and r.value.value is None)
+    """A `return` with no expression at all. `return None` names its value."""
+    return r.value is None
 
 
 def _bool_value(node):
@@ -84,8 +87,9 @@ class ReturnIssueDetector(ast.NodeVisitor):
         has_bare = any(_is_bare_return(r) for r in returns)
         if has_value and has_bare:
             self._add(node.lineno, "inconsistent_returns",
-                f"{node.name} mixes 'return <value>' with a bare 'return'/'return None'",
-                "Return a consistent type on every path. If 'no result' is meaningful, return None explicitly everywhere and document it.",
+                f"{node.name} mixes 'return <value>' with a bare 'return'",
+                "Write each bare 'return' as 'return None' (PEP 8: once any return statement "
+                "returns an expression, every return that has no value says so explicitly).",
                 "medium")
 
     def visit_FunctionDef(self, node):

@@ -14,7 +14,11 @@ Finds:
   - catches_baseexception : `except BaseException` (also traps KeyboardInterrupt,
                             SystemExit, GeneratorExit)
   - assert_for_validation : `assert` used for runtime validation in non-test code
-                            (assertions are stripped under `python -O`)
+                            (assertions are stripped under `python -O`). An
+                            assert whose whole test is `<expr> is not None` or
+                            `isinstance(...)` is a candidate instead: that shape
+                            is how an Optional is narrowed for a type checker
+                            and an internal invariant written down.
 """
 
 import ast
@@ -35,6 +39,32 @@ class CodeSmell:
     suggestion: str
     severity: str
     code_snippet: str = ""
+    # A scored defect by default; "candidate" for a lead the downstream merge
+    # must not score. A candidate carries no fix and names, in also_caused_by,
+    # the ways a healthy codebase produces the same observation.
+    kind: str = "finding"
+    also_caused_by: tuple[str, ...] = ()
+
+
+# Why `assert x is not None` / `assert isinstance(x, T)` is usually not validation.
+_NARROWING_ASSERT_REASONS = (
+    "type narrowing for a checker: the assert tells mypy/pyright an Optional or a "
+    "union is the narrower type from here on, and -O stripping it changes no behaviour",
+    "an internal invariant rather than validation: the caller already guarantees it "
+    "(the value was checked or set on the only path that reaches here), and the assert "
+    "documents that rather than guarding input",
+)
+
+
+def _is_narrowing_assert(test: ast.expr) -> bool:
+    """`assert <expr> is not None` or `assert isinstance(...)`, and nothing more."""
+    if (isinstance(test, ast.Compare) and len(test.ops) == 1
+            and isinstance(test.ops[0], ast.IsNot)
+            and isinstance(test.comparators[0], ast.Constant)
+            and test.comparators[0].value is None):
+        return True
+    return (isinstance(test, ast.Call) and isinstance(test.func, ast.Name)
+            and test.func.id == "isinstance")
 
 
 _SCOPE_BOUNDARIES = (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)
@@ -168,13 +198,15 @@ class ExceptionIssueDetector(ast.NodeVisitor):
             return self.source_lines[lineno - 1].strip()[:80]
         return ""
 
-    def _add(self, line, smell_type, desc, suggestion, severity="medium"):
+    def _add(self, line, smell_type, desc, suggestion, severity="medium",
+             kind="finding", also_caused_by=()):
         if smell_type in self.ignore:
             return
         self.issues.append(CodeSmell(
             file=self.filename, line=line, smell_type=smell_type,
             description=desc, suggestion=suggestion, severity=severity,
             code_snippet=self._get_line(line),
+            kind=kind, also_caused_by=tuple(also_caused_by),
         ))
 
     # -- unreachable except (ordering across handlers) --------------------
@@ -323,7 +355,14 @@ class ExceptionIssueDetector(ast.NodeVisitor):
 
     # -- assert used for validation ---------------------------------------
     def visit_Assert(self, node: ast.Assert):
-        if not self.is_test_file:
+        if self.is_test_file:
+            pass
+        elif _is_narrowing_assert(node.test):
+            self._add(node.lineno, "assert_for_validation",
+                "assert narrows a value's type or states an invariant; -O removes it, which "
+                "matters only if a caller can actually break it",
+                "", "low", kind="candidate", also_caused_by=_NARROWING_ASSERT_REASONS)
+        else:
             self._add(node.lineno, "assert_for_validation",
                 "assert is removed when Python runs with -O, so it must not be relied on for validation or security checks",
                 "Replace with an explicit check that raises, e.g. `if not cond: raise ValueError(...)`.")
@@ -345,6 +384,17 @@ def analyze_file(filepath: Path, ignore: set) -> list:
         return []
 
 
+def to_record(issue: "CodeSmell") -> dict:
+    """The JSON shape this detector emits, shared with the runner.
+
+    `kind` is always present, so a consumer never reads an absent key as a
+    classification; the reasons tuple serialises as a list.
+    """
+    record = asdict(issue)
+    record["also_caused_by"] = list(record["also_caused_by"])
+    return record
+
+
 def main():
     configure_output()
     parser = argparse.ArgumentParser(description="Detect exception-handling hazards in Python")
@@ -362,7 +412,7 @@ def main():
     sort_findings(all_issues)
 
     if args.format == "json":
-        print(json.dumps([asdict(i) for i in all_issues], indent=2))
+        print(json.dumps([to_record(i) for i in all_issues], indent=2))
     else:
         if not all_issues:
             print("✅ No exception-handling issues found!")
@@ -372,7 +422,10 @@ def main():
         for issue in all_issues:
             by_type[issue.smell_type] += 1
 
-        print(f"Found {len(all_issues)} exception-handling issue(s):\n")
+        # A candidate is a lead, not a defect, so it is counted apart.
+        leads = sum(1 for i in all_issues if i.kind == "candidate")
+        print(f"Found {len(all_issues) - leads} exception-handling finding(s), "
+              f"{leads} candidate(s):\n")
         print("Summary:")
         for smell, count in sorted(by_type.items(), key=lambda x: -x[1]):
             print(f"  {smell}: {count}")
@@ -380,12 +433,18 @@ def main():
 
         severity_icons = SEVERITY_ICONS
         for issue in all_issues:
-            icon = severity_icons[issue.severity]
-            print(f"{icon} [{issue.severity.upper()}] {issue.file}:{issue.line}")
+            # A severity icon on a lead reads as a verdict the evidence does not support.
+            marker = ("? [CANDIDATE]" if issue.kind == "candidate"
+                      else f"{severity_icons[issue.severity]} [{issue.severity.upper()}]")
+            print(f"{marker} {issue.file}:{issue.line}")
             print(f"   {issue.smell_type}: {issue.description}")
             if issue.code_snippet:
                 print(f"   Code: {issue.code_snippet}")
-            print(f"   → {issue.suggestion}\n")
+            if issue.suggestion:
+                print(f"   → {issue.suggestion}")
+            for reason in issue.also_caused_by:
+                print(f"   ? also caused by: {reason}")
+            print()
 
 
 if __name__ == "__main__":

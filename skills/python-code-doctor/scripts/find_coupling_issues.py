@@ -38,6 +38,19 @@ class ClassAnalyzer(ast.NodeVisitor):
         self.method_accesses_self: dict[str, Set[str]] = defaultdict(set)
         self.method_accesses_other: dict[str, dict[str, int]] = defaultdict(lambda: defaultdict(int))
         self.method_calls: dict[str, list[str]] = defaultdict(list)
+        # Where each method is defined, and the names its signature binds.
+        self.method_lines: dict[str, int] = {}
+        self.method_params: dict[str, Set[str]] = {}
+        # Names an import binds anywhere in the module. `torch.cat` is a call
+        # into a library, not envy of an object a method could move to.
+        self.module_names: Set[str] = set()
+
+    def visit_Module(self, node: ast.Module):
+        for stmt in ast.walk(node):
+            if isinstance(stmt, (ast.Import, ast.ImportFrom)):
+                for alias in stmt.names:
+                    self.module_names.add(alias.asname or alias.name.split(".")[0])
+        self.generic_visit(node)
 
     def visit_ClassDef(self, node: ast.ClassDef):
         old_class = self.current_class
@@ -61,6 +74,11 @@ class ClassAnalyzer(ast.NodeVisitor):
             self.class_methods[self.current_class].append(node.name)
             old_method = self.current_method
             self.current_method = f"{self.current_class}.{node.name}"
+            self.method_lines.setdefault(self.current_method, node.lineno)
+            arguments = node.args
+            self.method_params.setdefault(self.current_method, {
+                a.arg for a in [*arguments.posonlyargs, *arguments.args, *arguments.kwonlyargs,
+                                arguments.vararg, arguments.kwarg] if a is not None})
             self.generic_visit(node)
             self.current_method = old_method
         else:
@@ -124,19 +142,24 @@ class ClassAnalyzer(ast.NodeVisitor):
                 severity="medium" if lcom < len(methods) * 2 else "high"
             ))
         
-        # Feature Envy
-        for method in methods:
+        # Feature Envy — reported at the envious method, which is what moves.
+        for method in dict.fromkeys(methods):
             full_name = f"{class_name}.{method}"
             self_accesses = len(self.method_accesses_self.get(full_name, set()))
             other_accesses = self.method_accesses_other.get(full_name, {})
-            
+            params = self.method_params.get(full_name, set())
+
             for other_obj, count in other_accesses.items():
+                # A module has no class to move the method to — unless a
+                # parameter of the same name shadows it, which is an object.
+                if other_obj in self.module_names and other_obj not in params:
+                    continue
                 if count > self_accesses and count >= 3:
                     self.issues.append(CouplingIssue(
-                        file=self.filename, line=node.lineno,
+                        file=self.filename, line=self.method_lines.get(full_name, node.lineno),
                         issue_type="feature_envy",
                         name=f"{class_name}.{method}",
-                        description=f"Method accesses '{other_obj}' ({count}x) more than self ({self_accesses}x)",
+                        description=f"Method '{method}' accesses '{other_obj}' ({count}x) more than self ({self_accesses}x)",
                         metric_value=count,
                         suggestion=f"Consider moving method to {other_obj}'s class",
                         severity="medium"

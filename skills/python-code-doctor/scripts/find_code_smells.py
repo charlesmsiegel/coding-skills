@@ -34,11 +34,38 @@ DATA_CLASS_MARKERS = frozenset({
 })
 
 
+def _is_test_file(filepath: Path) -> bool:
+    """A test module or test infrastructure: test_*.py, *_test.py, conftest.py,
+    or anything under a tests/ (or test/) directory — find_test_smells' rule."""
+    name = filepath.name
+    if name.startswith("test_") or name.endswith("_test.py") or name == "conftest.py":
+        return True
+    return "tests" in filepath.parts or "test" in filepath.parts
+
+
 def _unwrap_negative(node: ast.AST) -> ast.AST:
     """-5 parses as UnaryOp(USub, Constant(5)); return the inner constant."""
     if isinstance(node, ast.UnaryOp) and isinstance(node.op, (ast.USub, ast.UAdd)):
         return node.operand
     return node
+
+
+def _registers_config(node) -> bool:
+    """An `__init__` under diffusers' `@register_to_config`.
+
+    ConfigMixin serialises the model config from exactly those flat keyword
+    arguments, so the usual fix for a long signature — group them into a
+    dataclass — breaks from_pretrained/save_pretrained. The length is the
+    framework's contract, not a design choice left to make.
+    """
+    if node.name != "__init__":
+        return False
+    for dec in node.decorator_list:
+        target = dec.func if isinstance(dec, ast.Call) else dec
+        name = target.id if isinstance(target, ast.Name) else getattr(target, "attr", None)
+        if name == "register_to_config":
+            return True
+    return False
 
 
 class CodeSmellDetector(ast.NodeVisitor):
@@ -48,11 +75,15 @@ class CodeSmellDetector(ast.NodeVisitor):
         16, 32, 64, 128, 255, 256, 512, 1024,
     })
 
-    def __init__(self, filename: str, source_lines: list[str], ignore: set[str] = None):
+    def __init__(self, filename: str, source_lines: list[str], ignore: set[str] = None,
+                 is_test_file: bool = False):
         self.filename = filename
         self.source_lines = source_lines
         self.issues: list[CodeSmell] = []
         self.ignore = ignore or set()
+        # In a test a literal is fixture data or an expected value — the number
+        # *is* the specification, and naming it would only move it a line up.
+        self.is_test_file = is_test_file
         self.current_class = None
         self.class_info: dict[str, dict] = {}
         self._named_constants: set[int] = set()
@@ -136,7 +167,7 @@ class CodeSmellDetector(ast.NodeVisitor):
 
         # Long parameter list
         total_params = len(node.args.args) + len(node.args.kwonlyargs)
-        if total_params > 6:
+        if total_params > 6 and not _registers_config(node):
             self._add(node.lineno, "long_parameter_list",
                 f"{node.name} has {total_params} parameters",
                 "Group into dataclass or config object", "medium")
@@ -149,7 +180,8 @@ class CodeSmellDetector(ast.NodeVisitor):
         self.generic_visit(node)
 
     def visit_Constant(self, node: ast.Constant):
-        if (isinstance(node.value, (int, float)) and not isinstance(node.value, bool)
+        if (not self.is_test_file
+                and isinstance(node.value, (int, float)) and not isinstance(node.value, bool)
                 and id(node) not in self._named_constants
                 and node.value not in self.MAGIC_NUMBER_WHITELIST
                 and abs(node.value) > 2):
@@ -251,7 +283,7 @@ def analyze_file(filepath: Path, ignore: set[str]) -> list[CodeSmell]:
     try:
         source, tree = cached_parse(filepath)
         lines = source.splitlines()
-        detector = CodeSmellDetector(str(filepath), lines, ignore)
+        detector = CodeSmellDetector(str(filepath), lines, ignore, _is_test_file(filepath))
         detector.visit(tree)
         return detector.issues
     except (SyntaxError, ValueError) as exc:

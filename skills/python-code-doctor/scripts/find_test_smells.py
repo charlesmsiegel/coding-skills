@@ -363,11 +363,33 @@ def _all_assertions_trivial(func_node: ast.FunctionDef | ast.AsyncFunctionDef) -
 # Logic-in-test detection
 # ---------------------------------------------------------------------------
 
+_PYTEST_OUTCOMES = frozenset({"skip", "xfail", "fail", "importorskip"})
+
+
+def _is_outcome_guard(stmt: ast.If) -> bool:
+    """`if <precondition>: pytest.skip(...)` — a guard, not logic.
+
+    An `if` with no `else` whose body only ends the test (pytest.skip / xfail /
+    fail / importorskip, optionally followed by `return`) cannot hide a bug in
+    what the test checks: either the test runs linearly or it does not run.
+    """
+    if stmt.orelse:
+        return False
+    calls = [s for s in stmt.body if not isinstance(s, ast.Return)]
+    return bool(calls) and all(
+        isinstance(s, ast.Expr) and isinstance(s.value, ast.Call)
+        and isinstance(s.value.func, ast.Attribute)
+        and isinstance(s.value.func.value, ast.Name) and s.value.func.value.id == "pytest"
+        and s.value.func.attr in _PYTEST_OUTCOMES
+        for s in calls)
+
+
 def _has_logic(func_node: ast.FunctionDef | ast.AsyncFunctionDef) -> tuple[bool, int]:
     """
     Return (has_logic, first_line) where logic = For / While / If node
     directly within the test function body (recursively, but skipping
-    nested function/class definitions and comprehension scopes).
+    nested function/class definitions and comprehension scopes). A skip
+    guard (see _is_outcome_guard) is not logic.
     """
     def walk_body(stmts):
         for stmt in stmts:
@@ -376,6 +398,8 @@ def _has_logic(func_node: ast.FunctionDef | ast.AsyncFunctionDef) -> tuple[bool,
             if isinstance(stmt, (ast.For, ast.While)):
                 yield stmt
             elif isinstance(stmt, ast.If):
+                if _is_outcome_guard(stmt):
+                    continue  # its body only ends the test; nothing to recurse into
                 yield stmt
             # Recurse into statement bodies (try/except, with, etc.)
             for child in ast.iter_child_nodes(stmt):

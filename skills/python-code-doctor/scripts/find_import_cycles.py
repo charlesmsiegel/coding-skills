@@ -3,7 +3,10 @@
 Detect import-graph structural problems across a Python project.
 
 Analyzes the whole directory tree and flags:
-  - circular_import : a cycle in the intra-project import graph (HIGH)
+  - circular_import : a cycle in the intra-project import graph (HIGH). An
+                      import under `if TYPE_CHECKING:` never executes, so it
+                      is no edge; a deferred import inside a function does
+                      execute, so it is one (the cycle is worked around, not gone).
   - god_module      : a file that is too large or has too many top-level defs (MEDIUM)
   - wildcard_import : a `from x import *` statement (MEDIUM)
   - logic_in_init   : function/class definitions inside __init__.py (LOW)
@@ -185,6 +188,28 @@ def _resolve_relative_import(
 # Import extraction
 # ---------------------------------------------------------------------------
 
+def _is_type_checking(test: ast.expr) -> bool:
+    """`if TYPE_CHECKING:` or `if typing.TYPE_CHECKING:` (any module alias)."""
+    if isinstance(test, ast.Name):
+        return test.id == "TYPE_CHECKING"
+    return isinstance(test, ast.Attribute) and test.attr == "TYPE_CHECKING"
+
+
+def _runtime_nodes(tree: ast.AST):
+    """Every node that can execute: all of the tree except the bodies of
+    `if TYPE_CHECKING:` blocks, which only a type checker ever reads. Their
+    `else` branch is exactly what runs, so it is kept."""
+    stack = [tree]
+    while stack:
+        node = stack.pop()
+        yield node
+        if isinstance(node, ast.If) and _is_type_checking(node.test):
+            stack.append(node.test)
+            stack.extend(node.orelse)
+        else:
+            stack.extend(ast.iter_child_nodes(node))
+
+
 def _collect_imported_modules(
     tree: ast.AST,
     file_path: Path,
@@ -197,7 +222,7 @@ def _collect_imported_modules(
     # The package-boundary-derived module name for this file (may be None if unmapped)
     file_mod_name: Optional[str] = mod_map.get(file_path.resolve())
 
-    for node in ast.walk(tree):
+    for node in _runtime_nodes(tree):
         if isinstance(node, ast.Import):
             for alias in node.names:
                 name = alias.name
