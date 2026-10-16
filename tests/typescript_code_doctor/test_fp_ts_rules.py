@@ -484,3 +484,32 @@ it("renders", async () => { await render(props); expect(await slowly()).toBe(1);
 """
     found = records("find_async_issues.py", tmp_path, {"panel.test.ts": source}, "async_without_await")
     assert lines_of(found) == [3], "a named async helper with a body and no await is still reported"
+
+
+# --------------------------------------------------------------------------- #
+# find_exception_issues: a catch that records the failure is handling it
+# --------------------------------------------------------------------------- #
+
+CATCHES = """\
+export async function sweep(api: Api, ids: string[]): Promise<string> {
+  let undiscoverable = false;
+  let failed = 0;
+  let message = "";
+  try { await api.find(); } catch { undiscoverable = true; }
+  for (const id of ids) {
+    try { await api.localize(id); } catch { failed += 1; }
+  }
+  try { await api.refresh(); } catch (err: unknown) { message = `failed: ${describe(err)}`; }
+  try { await api.reload(); } catch { setError("reload failed"); }
+  try { await api.select(); } catch { this.stale = true; }
+  let unused = 0;
+  try { await api.ping(); } catch { unused = 1; }
+  try { await api.ping(); } catch { resetForm(); }
+  return `${undiscoverable} ${failed} ${message}`;
+}
+"""
+
+
+def test_a_catch_that_records_the_failure_is_not_swallowed(tmp_path):
+    found = records("find_exception_issues.py", tmp_path, {"sweep.ts": CATCHES}, "swallowed_error")
+    assert lines_of(found) == [13, 14], "a write nothing reads, or a reset, still loses the failure"

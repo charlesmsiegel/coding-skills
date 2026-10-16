@@ -19,6 +19,78 @@ COMMENT_MARKS = re.compile(r"^/[/*]+|\*+/$")
 # Comments that mark a handler as not written yet, rather than explain why there is none.
 UNFINISHED = re.compile(r"(?:todo|fixme|xxx|hack)\b|(?:handle|process)\s+(?:the\s+)?(?:error|exception)s?\W*$",
                         re.IGNORECASE)
+_ASSIGNMENTS = frozenset({"=", "+=", "-=", "*=", "/=", "||=", "&&=", "??="})
+# A React state setter: what the catch puts there is what the user sees next.
+_STATE_SETTER = re.compile(r"set[A-Z]")
+
+
+def _substitutions(template: str) -> str:
+    """The `${…}` interiors of a template literal, joined."""
+    parts, depth, start = [], 0, 0
+    index = 0
+    while index < len(template):
+        char = template[index]
+        if char == "\\":
+            index += 2
+            continue
+        if depth == 0 and template.startswith("${", index):
+            depth, start = 1, index + 2
+            index += 2
+            continue
+        if depth:
+            if char == "{":
+                depth += 1
+            elif char == "}":
+                depth -= 1
+                if depth == 0:
+                    parts.append(template[start:index])
+        index += 1
+    return " ".join(parts)
+
+
+def _mentions(file: TsFile, start: int, stop: int, name: str) -> bool:
+    """True when ``name`` is used in [start, stop), template substitutions included."""
+    pattern = re.compile(rf"(?<![\w$.]){re.escape(name)}(?![\w$])")
+    for index in range(start, stop):
+        token = file.tokens[index]
+        if token.kind == "name" and token.value == name and not file.tokens[index - 1].is_op(".", "?."):
+            return True
+        if token.kind == "template" and pattern.search(_substitutions(token.value)):
+            return True
+    return False
+
+
+def _records_the_failure(file: TsFile, binding: str, body_open: int, body_close: int) -> bool:
+    """A catch that writes the failure down somewhere is handling it.
+
+    `catch (err) { msg = `failed: ${errorText(err)}` }` shows the error;
+    `catch { undiscoverable = true }`, `catch { next = null }` and
+    `catch { failed += 1 }` set a flag, a sentinel or a count that the code
+    after the `try` reads; `catch { setError(…) }` puts it in state the user
+    sees; `catch { this.failed = true }` records it on an object. None of
+    these is the failure disappearing — that is a catch whose writes, if any,
+    nothing ever reads.
+    """
+    if binding and _mentions(file, body_open + 1, body_close, binding):
+        return True
+    owner = file.enclosing_function(body_open)
+    scope_end = owner.body_close if owner is not None else len(file)
+    for index in range(body_open + 1, body_close):
+        token = file.tokens[index]
+        following = file.tokens[index + 1] if index + 1 < body_close else None
+        if token.kind != "name" or following is None:
+            continue
+        if following.is_op("(") and _STATE_SETTER.match(token.value):
+            return True
+        assigned = following.kind == "op" and (following.value in _ASSIGNMENTS
+                                               or following.value in ("++", "--"))
+        if not assigned:
+            continue
+        if file.tokens[index - 1].is_op(".", "?."):
+            return True  # a member write: state on an object that outlives the catch
+        if _mentions(file, body_close + 1, scope_end, token.value):
+            return True  # a local the code after the `try` reads
+    return False
 
 
 def _catch_clauses(file: TsFile):
@@ -79,7 +151,8 @@ def _check_catch_bodies(file: TsFile, report: Reporter) -> None:
                        "`console.log` is not error handling. Re-throw (with context), return a "
                        "typed failure the caller must handle, or report to the error channel that "
                        "is actually watched.", "medium")
-        elif not rethrows and not returns and not reports and len(body) <= 4:
+        elif not rethrows and not returns and not reports and len(body) <= 4 \
+                and not _records_the_failure(file, binding, body_open, body_close):
             report.add(line, "swallowed_error",
                        "`catch` neither re-throws, returns, nor reports — the failure disappears",
                        "Decide what the failure means here. Silently continuing turns an exception "
