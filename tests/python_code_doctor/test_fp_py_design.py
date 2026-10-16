@@ -979,3 +979,38 @@ def test_a_route_handlers_flags_are_bound_by_name(tmp_path):
     assert [(r["smell_type"], r["line"]) for r in of_type(found, "boolean_positional_param")] == [
         ("boolean_positional_param", 5)]
     assert all(r["kind"] == "candidate" for r in of_type(found, "multiple_boolean_flags"))
+
+
+# --------------------------------------------------------------------------- #
+# find_comment_smells: commented_out_code
+# --------------------------------------------------------------------------- #
+
+
+def test_a_trailing_comment_annotates_code_and_is_not_dead_code(tmp_path):
+    write(tmp_path, {"sample.py": """\
+        def sync(overlay, cid, node):
+            overlay.update(cid, body="mine")  # diverge (materializes)
+            if node.level == 1 and node.module:  # from .llm import x
+                return cid  # secrecy=None
+            # result = compute(cid)
+            # return result.value
+            return None
+        """})
+    found = of_type(run_detector("find_comment_smells.py", tmp_path), "commented_out_code")
+    assert sorted((r["line"], r["kind"]) for r in found) == [(5, "finding"), (6, "finding")]
+
+
+def test_a_lone_commented_import_is_a_lead(tmp_path):
+    write(tmp_path, {"sample.py": """\
+        def resolve(alias, tail):
+            if tail:
+                # from .appearances import cast as appearances_cast
+                return alias
+            # import pdb
+            # pdb.set_trace()
+            return None
+        """})
+    found = of_type(run_detector("find_comment_smells.py", tmp_path), "commented_out_code")
+    assert sorted((r["line"], r["kind"]) for r in found) == [
+        (3, "candidate"), (5, "finding"), (6, "finding")]
+    assert_candidate_shape(next(r for r in found if r["kind"] == "candidate"))

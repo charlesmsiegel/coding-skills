@@ -3,8 +3,13 @@
 Detect comment smells via tokenisation + AST validation.
 
 Finds:
-  - commented_out_code : a comment whose contents parse as real Python code
-                         (dead code left behind; delete it, git remembers)
+  - commented_out_code : a comment on a line of its own whose contents parse as
+                         real Python code (dead code left behind; delete it, git
+                         remembers). A trailing comment annotates the code it
+                         follows — `update(cid, body="x")  # diverge (materializes)`
+                         — and was never a line somebody disabled. A lone
+                         commented import is a candidate: a comment quoting the
+                         import syntax nearby code matches reads the same way.
   - todo_comment       : TODO / FIXME / HACK / XXX / BUG markers (an inventory of
                          deferred work to triage)
 
@@ -35,6 +40,14 @@ class CodeSmell:
     suggestion: str
     severity: str
     code_snippet: str = ""
+    kind: str = "finding"
+    also_caused_by: tuple[str, ...] = ()
+
+
+_LONE_IMPORT_REASONS = (
+    "the comment quotes import syntax to document what nearby code matches or "
+    "expects (an AST guard, an import rewriter), rather than disabling an import",
+)
 
 
 _PRAGMA_PREFIXES = ("!", "type:", "noqa", "pragma", "pylint:", "mypy:",
@@ -72,7 +85,8 @@ _STRUCTURAL = (
 )
 
 
-def _looks_like_code(text: str) -> bool:
+def _code_statement(text: str) -> ast.stmt | None:
+    """The first statement ``text`` parses to, when that reads as code."""
     # The text is a comment, usually prose, so CPython's complaints about it
     # ("500ing" is a numeric literal glued to `in`; "\d" an invalid escape) are
     # about nothing in the user's code. Left unfiltered they reach stderr as
@@ -83,38 +97,47 @@ def _looks_like_code(text: str) -> bool:
             warnings.simplefilter("ignore", DeprecationWarning)
             tree = ast.parse(text)
     except (SyntaxError, ValueError):
-        return False
+        return None
     if not tree.body:
-        return False
+        return None
     first = tree.body[0]
     # Structural statements are convincing on their own.
     if isinstance(first, _STRUCTURAL):
-        return True
+        return first
     # Calls / subscripts etc. need a code-ish character to avoid matching prose
     # ("return early" parses as a Return of a Name -- not real code).
     has_code_char = any(c in text for c in "=(){}[].")
     if isinstance(first, ast.Expr) and isinstance(first.value, ast.Call):
-        return has_code_char
+        return first if has_code_char else None
     if isinstance(first, _CODE_NODES):
-        return has_code_char
-    return False
+        return first if has_code_char else None
+    return None
+
+
+def _looks_like_code(text: str) -> bool:
+    return _code_statement(text) is not None
 
 
 def detect(source: str, filename: str, ignore: set):
     issues = []
     lines = source.splitlines()
 
-    def add(line, st, desc, sug, sev):
+    def add(line, st, desc, sug, sev, reasons=()):
         if st in ignore:
             return
         snippet = lines[line - 1].strip()[:80] if 0 < line <= len(lines) else ""
-        issues.append(CodeSmell(filename, line, st, desc, sug, sev, snippet))
+        if reasons:
+            issues.append(CodeSmell(filename, line, st, desc, "", "low", snippet,
+                                    kind="candidate", also_caused_by=tuple(reasons)))
+        else:
+            issues.append(CodeSmell(filename, line, st, desc, sug, sev, snippet))
 
     try:
         tokens = list(tokenize.generate_tokens(io.StringIO(source).readline))
     except (tokenize.TokenError, IndentationError, SyntaxError, Exception):
         return issues
 
+    code_lines: dict[int, ast.stmt] = {}
     for tok in tokens:
         if tok.type != tokenize.COMMENT:
             continue
@@ -133,11 +156,20 @@ def detect(source: str, filename: str, ignore: set):
                 "low")
             continue
 
-        if _looks_like_code(text):
-            add(line, "commented_out_code",
-                "Commented-out code left in the source",
-                "Delete it -- version control already preserves the history. Dead comments rot and mislead.",
-                "medium")
+        # Disabled code is a line of its own; a comment after code on the same
+        # line annotates that code, however much it looks like code itself.
+        standalone = 0 < line <= len(lines) and not lines[line - 1][:tok.start[1]].strip()
+        statement = _code_statement(text) if standalone else None
+        if statement is not None:
+            code_lines[line] = statement
+
+    for line, statement in code_lines.items():
+        in_run = (line - 1) in code_lines or (line + 1) in code_lines
+        lone_import = isinstance(statement, (ast.Import, ast.ImportFrom)) and not in_run
+        add(line, "commented_out_code",
+            "Commented-out code left in the source",
+            "Delete it -- version control already preserves the history. Dead comments rot and mislead.",
+            "medium", reasons=_LONE_IMPORT_REASONS if lone_import else ())
 
     issues.sort(key=lambda x: (x.severity != "high", x.severity != "medium", x.line))
     return issues
@@ -184,11 +216,18 @@ def main():
         print()
         icons = SEVERITY_ICONS
         for i in all_issues:
-            print(f"{icons[i.severity]} [{i.severity.upper()}] {i.file}:{i.line}")
+            if i.kind == "candidate":
+                print(f"? [CANDIDATE] {i.file}:{i.line}")
+            else:
+                print(f"{icons[i.severity]} [{i.severity.upper()}] {i.file}:{i.line}")
             print(f"   {i.smell_type}: {i.description}")
             if i.code_snippet:
                 print(f"   Code: {i.code_snippet}")
-            print(f"   → {i.suggestion}\n")
+            if i.suggestion:
+                print(f"   → {i.suggestion}")
+            for reason in i.also_caused_by:
+                print(f"   ? also caused by: {reason}")
+            print()
 
 
 if __name__ == "__main__":
