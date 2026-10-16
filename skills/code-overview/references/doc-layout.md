@@ -142,6 +142,7 @@ Root-scope `packages[]` rows carry `generated: false` when a package has no
 health page — the documented "codemap only" answer. Those rows stay in the table
 rather than being dropped, so a roll-up missing a whole package cannot look
 complete.
+| `candidates_total`, `candidates_shown` | all unscored leads and the bounded number rendered in the Candidates tab; omitted rows never affect grades or coverage |
 | `top_findings[]` | the worst N, with repo-relative paths |
 | `packages[]` | root scope only: one row per package, with its grade |
 

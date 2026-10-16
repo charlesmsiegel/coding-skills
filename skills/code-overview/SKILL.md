@@ -89,6 +89,14 @@ python "$DOCTOR/scripts/merge_reports.py" \
   --out $WORK/merged.json --format json
 ```
 
+**Audit the project's declared Django version.** For a health review, pass
+`--target-version <declared major.minor>` to `django-code-doctor`'s
+`analyze_django.py`. Its default target is the newest release in its upgrade
+table; that is an upgrade-readiness question, not evidence that the installed
+project is broken. Use a newer target only when the user requested an upgrade,
+and name that target in the report. If no version can be established, state the
+gap rather than silently treating upgrade findings as current defects.
+
 **Not once per package directory.** This is the step that is easy to get wrong
 and expensive to get wrong, because the failure is silent. Pointed at
 `src/billing` instead, a doctor cannot see the repo's `pyproject.toml` or its
@@ -205,6 +213,13 @@ one line, so an identity's count is the maximum any report gave it, not the sum.
 ungrades its *whole* rubric category — skipping `exception_issues` ungrades
 Correctness — because a partly-measured category can only miss findings, never
 invent them. That is correct behaviour, but it shrinks what the grade covers.
+
+**Candidate display is bounded, analysis is not.** `build_health.py` renders at
+most 100 candidate rows by default (`--candidate-limit N`). The Candidates tab
+states shown, total and omitted counts, and metadata records `candidates_shown`
+beside `candidates_total`. This does not change findings, grades or coverage.
+Retain the complete merged JSON when an audit needs every candidate location;
+raising the display limit is not required to preserve the audit evidence.
 
 **The summary.** Write a short HTML fragment first — what this package is, why it
 is shaped this way, what you noticed reading it — and pass it as `--intro-file`.
