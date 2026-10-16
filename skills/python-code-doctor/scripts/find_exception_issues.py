@@ -311,10 +311,28 @@ class ExceptionIssueDetector(ast.NodeVisitor):
 
         return False
 
+    @staticmethod
+    def _reraises(node: ast.ExceptHandler) -> bool:
+        """Whether the handler passes the caught exception on.
+
+        `except BaseException: cleanup(); raise` is how cleanup is made to run
+        on Ctrl+C as well; nothing is trapped. A bare `raise`, or raising the
+        name the handler bound, re-raises (the same exemption Ruff's BLE001
+        makes). Raising something else, or nothing, does trap it.
+        """
+        for n in _same_scope_nodes(node.body, stop_types=(ast.ExceptHandler,)):
+            if not isinstance(n, ast.Raise):
+                continue
+            if n.exc is None:
+                return True
+            if node.name and isinstance(n.exc, ast.Name) and n.exc.id == node.name:
+                return True
+        return False
+
     # -- BaseException + raise-without-from (per handler) -----------------
     def visit_ExceptHandler(self, node: ast.ExceptHandler):
         names, _ = _handler_type_names(node)
-        if "BaseException" in names:
+        if "BaseException" in names and not self._reraises(node):
             self._add(node.lineno, "catches_baseexception",
                 "Catching BaseException also traps KeyboardInterrupt, SystemExit and GeneratorExit",
                 "Catch 'Exception' (or a specific subclass) unless you truly need to intercept interpreter-level signals.")

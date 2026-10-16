@@ -2,7 +2,10 @@
 """
 Detect code smells in Python code via AST analysis.
 Finds: magic numbers, bare excepts, mutable defaults, type comparisons,
-       god classes, data classes, long parameter lists.
+       god classes, data classes.
+
+Long parameter lists are analyze_complexity.py's `parameter_count`; reporting
+the same count here as well charged one signature twice in a merged report.
 """
 
 import ast
@@ -32,6 +35,17 @@ DATA_CLASS_MARKERS = frozenset({
     "Enum", "IntEnum", "StrEnum", "Flag", "IntFlag",
     "BaseModel",  # pydantic
 })
+
+
+def _constant_expression(node: ast.AST | None) -> bool:
+    """Whether ``node`` is arithmetic over literals only: `4 << 20`, `30 * 60`."""
+    if isinstance(node, ast.Constant):
+        return isinstance(node.value, (int, float)) and not isinstance(node.value, bool)
+    if isinstance(node, ast.UnaryOp):
+        return _constant_expression(node.operand)
+    if isinstance(node, ast.BinOp):
+        return _constant_expression(node.left) and _constant_expression(node.right)
+    return False
 
 
 def _unwrap_negative(node: ast.AST) -> ast.AST:
@@ -84,9 +98,13 @@ class CodeSmellDetector(ast.NodeVisitor):
         for parent in ast.walk(node):
             if isinstance(parent, (ast.Assign, ast.AnnAssign)):
                 targets = parent.targets if isinstance(parent, ast.Assign) else [parent.target]
-                value = _unwrap_negative(getattr(parent, "value", None))
-                if isinstance(value, ast.Constant) and any(isinstance(t, ast.Name) for t in targets):
-                    self._named_constants.add(id(value))
+                value = getattr(parent, "value", None)
+                # `MAX_BODY = 4 << 20` names the expression, and with it every
+                # literal the expression is built from.
+                if _constant_expression(value) and any(isinstance(t, ast.Name) for t in targets):
+                    for sub in ast.walk(value):
+                        if isinstance(sub, ast.Constant):
+                            self._named_constants.add(id(sub))
             elif isinstance(parent, ast.keyword):
                 value = _unwrap_negative(parent.value)
                 if isinstance(value, ast.Constant):

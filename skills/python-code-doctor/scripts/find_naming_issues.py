@@ -48,6 +48,20 @@ _BUILTINS = {
 }
 
 _SNAKE = re.compile(r"^_{0,2}[a-z][a-z0-9_]*_{0,2}$")
+
+# Names a framework calls, so the override must spell them its way:
+# BaseHTTPRequestHandler dispatches `do_GET`, ast.NodeVisitor `visit_ClassDef`,
+# unittest `setUp`, logging and SAX their camelCase hooks. Renaming one to
+# snake_case would silently stop it being called.
+_FRAMEWORK_HOOK = re.compile(r"^(?:do_[A-Z]+|visit_[A-Z]\w*|depart_[A-Z]\w*)$")
+_FRAMEWORK_NAMES = frozenset({
+    "setUp", "tearDown", "setUpClass", "tearDownClass", "asyncSetUp", "asyncTearDown",
+    "setUpModule", "tearDownModule",
+    "handleError", "createLock",
+    "startDocument", "endDocument", "startElement", "endElement", "startElementNS",
+    "endElementNS", "startPrefixMapping", "endPrefixMapping", "ignorableWhitespace",
+    "processingInstruction", "setDocumentLocator", "skippedEntity",
+})
 _PASCAL = re.compile(r"^_?[A-Z][a-zA-Z0-9]*$")
 
 
@@ -69,6 +83,7 @@ class NamingDetector(ast.NodeVisitor):
         self.issues = []
         self._reported = set()   # (line, name, type) to avoid duplicate shadow reports
         self._namespace_classes = set()  # id() of classes defined directly in a class body
+        self._methods: set[int] = set()   # ids of defs directly in a class body
 
     def _add(self, line, st, desc, sug, sev):
         if st in self.ignore:
@@ -84,26 +99,36 @@ class NamingDetector(ast.NodeVisitor):
                 "medium")
 
     def visit_FunctionDef(self, node):
-        self._check_func(node)
+        self._check_func(node, method=id(node) in self._methods)
         self.generic_visit(node)
 
     def visit_AsyncFunctionDef(self, node):
-        self._check_func(node)
+        self._check_func(node, method=id(node) in self._methods)
         self.generic_visit(node)
 
-    def _check_func(self, node):
+    def _check_func(self, node, method=False):
         if not _is_dunder(node.name):
-            self._shadow(node.name, node.lineno)
-            if not _SNAKE.match(node.name):
+            # A method is reached as `obj.list`, never as a bare `list`, so
+            # naming one after a builtin hides nothing outside its class body.
+            if not method:
+                self._shadow(node.name, node.lineno)
+            if not _SNAKE.match(node.name) and not (
+                    node.name in _FRAMEWORK_NAMES or _FRAMEWORK_HOOK.match(node.name)):
                 self._add(node.lineno, "non_snake_case_function",
                     f"Function '{node.name}' is not snake_case",
                     "Rename to snake_case (PEP 8), e.g. 'parse_value' not 'parseValue'.",
                     "low")
-        for a in list(getattr(node.args, "posonlyargs", [])) + list(node.args.args) + list(node.args.kwonlyargs):
+        # Keyword-only parameters are left out: their name is the caller's
+        # spelling, the way the standard library's own `print(file=...)`,
+        # `sorted(key=...)` and `subprocess.run(input=...)` are, and renaming
+        # one is an API change made for the function body's sake.
+        for a in list(getattr(node.args, "posonlyargs", [])) + list(node.args.args):
             if a.arg not in {"self", "cls"}:
                 self._shadow(a.arg, node.lineno)
 
     def visit_ClassDef(self, node):
+        self._methods.update(id(item) for item in node.body
+                             if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef)))
         self._namespace_classes.update(id(item) for item in node.body
                                        if isinstance(item, ast.ClassDef))
         if id(node) not in self._namespace_classes and not _PASCAL.match(node.name):

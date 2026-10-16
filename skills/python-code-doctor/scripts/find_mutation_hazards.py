@@ -97,11 +97,59 @@ def _dotted_name(node) -> str | None:
 _MIGRATION_CONFIGURATION = {"dependencies", "operations", "replaces", "run_before"}
 
 
-class DjangoClassResolver:
-    """Resolve only classes whose ancestry reaches an imported Django class."""
+# Model bases whose metaclass copies every field default per instance. On
+# these `tags: list[str] = []` is the documented way to declare a field, not a
+# list every instance shares.
+_COPYING_MODEL_BASES = frozenset({
+    "pydantic.BaseModel", "pydantic.main.BaseModel",
+    "pydantic.RootModel", "pydantic.root_model.RootModel",
+    "pydantic_settings.BaseSettings", "sqlmodel.SQLModel",
+})
 
-    def __init__(self, tree: ast.Module, parents: dict[ast.AST, ast.AST]):
+# How far a base class is followed into other first-party modules. Deep enough
+# for `Model(FrozenModel)` → `FrozenModel(BaseModel)` through a re-export or
+# two; bounded because each hop parses a file.
+_MAX_RESOLUTION_DEPTH = 8
+
+_RESOLVERS: dict[Path, "ClassFamilyResolver | None"] = {}
+
+
+def _resolver_for(path: Path) -> "ClassFamilyResolver | None":
+    """One resolver per first-party module, parsed at most once per process."""
+    path = path.resolve()
+    if path not in _RESOLVERS:
+        try:
+            _source, tree = cached_parse(path)
+        except (OSError, SyntaxError, ValueError):
+            _RESOLVERS[path] = None
+        else:
+            parents = {child: parent for parent in ast.walk(tree)
+                       for child in ast.iter_child_nodes(parent)}
+            _RESOLVERS[path] = ClassFamilyResolver(tree, parents, path)
+    return _RESOLVERS[path]
+
+
+def _module_file(directory: Path, parts: list[str]) -> Path | None:
+    target = directory.joinpath(*parts)
+    for candidate in ((target.with_suffix(".py") if parts else None), target / "__init__.py"):
+        if candidate is not None and candidate.is_file():
+            return candidate
+    return None
+
+
+class ClassFamilyResolver:
+    """Resolve classes whose ancestry reaches a recognised framework base.
+
+    Django families (views, model forms, migrations) are resolved within the
+    file. Model families are followed into first-party modules too: hardy's
+    `class Baseline(FrozenModel)` is a pydantic model only because
+    `FrozenModel(BaseModel)` says so in another file, and a per-file answer
+    charged every one of its fields as shared mutable state.
+    """
+
+    def __init__(self, tree: ast.Module, parents: dict[ast.AST, ast.AST], path: Path | None = None):
         self.parents = parents
+        self.path = path
         self.bindings: dict[str, list[tuple[tuple[int, int], str, object]]] = defaultdict(list)
         self._families: dict[ast.ClassDef, set[str]] = {}
         for node in ast.walk(tree):
@@ -123,7 +171,8 @@ class DjangoClassResolver:
                                 f"{node.module}.{alias.name}",
                             )
                         else:
-                            self._bind(alias.asname or alias.name, node, "other", None)
+                            self._bind(alias.asname or alias.name, node, "relimport",
+                                       (node.level, node.module or "", alias.name))
             elif isinstance(node, ast.ClassDef):
                 self._bind(node.name, node, "class", node, use_end=True)
             elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
@@ -170,6 +219,10 @@ class DjangoClassResolver:
         _event_position, kind, value = active
         if kind == "import":
             return kind, value + (separator + rest if separator else "")
+        if kind == "relimport":
+            level, module, name = value
+            return kind, (level, [*module.split("."), name] if module else [name],
+                          rest.split(".") if separator else [])
         if kind == "class" and not separator:
             return kind, value
         return kind, None
@@ -185,13 +238,58 @@ class DjangoClassResolver:
             return "modelform"
         if canonical.startswith("django.db.migrations.") and leaf == "Migration":
             return "migration"
+        if canonical in _COPYING_MODEL_BASES:
+            return "copying_model"
         return None
 
-    def families(self, node: ast.ClassDef, visiting=None) -> set[str]:
+    def _external_families(self, directories: list[Path], parts: list[str], depth: int) -> set[str]:
+        """Families of the class `parts` names, found as a module path plus one
+        class name under the first of ``directories`` that holds the module."""
+        if depth > _MAX_RESOLUTION_DEPTH or len(parts) < 2:
+            return set()
+        for directory in directories:
+            for split in range(len(parts) - 1, 0, -1):
+                module = _module_file(directory, parts[:split])
+                if module is None or len(parts) - split != 1:
+                    continue
+                resolver = _resolver_for(module)
+                return resolver.named_families(parts[-1], depth + 1) if resolver else set()
+        return set()
+
+    def named_families(self, name: str, depth: int) -> set[str]:
+        """Families of the module-level class ``name`` — defined here or re-exported."""
+        events = self.bindings.get(name)
+        if not events:
+            return set()
+        _position, kind, value = events[-1]
+        if kind == "class" and isinstance(value, ast.ClassDef):
+            return self.families(value, depth=depth)
+        return self._binding_families(kind, value, depth)
+
+    def _binding_families(self, kind: str, value, depth: int) -> set[str]:
+        if kind == "import":
+            imported = self._imported_family(value)
+            if imported:
+                return {imported}
+            if self.path is None:
+                return set()
+            # An absolute first-party import is found the way the interpreter
+            # would find it from a source root: under some ancestor directory.
+            return self._external_families([self.path.parent, *self.path.parent.parents],
+                                           value.split("."), depth)
+        if kind == "relimport" and self.path is not None:
+            level, parts, rest = value
+            anchor = self.path.parent
+            for _ in range(level - 1):
+                anchor = anchor.parent
+            return self._external_families([anchor], [*parts, *rest], depth)
+        return set()
+
+    def families(self, node: ast.ClassDef, visiting=None, depth: int = 0) -> set[str]:
         if node in self._families:
             return self._families[node]
         visiting = set() if visiting is None else visiting
-        if node in visiting:
+        if node in visiting or depth > _MAX_RESOLUTION_DEPTH:
             return set()
         visiting.add(node)
         families = set()
@@ -200,12 +298,10 @@ class DjangoClassResolver:
             if binding is None:
                 continue
             kind, value = binding
-            if kind == "import":
-                imported = self._imported_family(value)
-                if imported:
-                    families.add(imported)
-            elif kind == "class" and isinstance(value, ast.ClassDef):
-                families.update(self.families(value, visiting))
+            if kind == "class" and isinstance(value, ast.ClassDef):
+                families.update(self.families(value, visiting, depth))
+            else:
+                families.update(self._binding_families(kind, value, depth))
         visiting.remove(node)
         self._families[node] = families
         return families
@@ -215,13 +311,13 @@ class DjangoClassResolver:
 
 
 class MutationHazardDetector(ast.NodeVisitor):
-    def __init__(self, filename: str, source_lines: list, parents, django_classes, ignore=None):
+    def __init__(self, filename: str, source_lines: list, parents, classes, ignore=None):
         self.filename = filename
         self.source_lines = source_lines
         self.issues = []
         self.ignore = ignore or set()
         self.parents = parents
-        self.django_classes = django_classes
+        self.classes = classes
 
     def _get_line(self, lineno: int) -> str:
         if 0 < lineno <= len(self.source_lines):
@@ -239,16 +335,20 @@ class MutationHazardDetector(ast.NodeVisitor):
 
     # -- mutable class attribute ------------------------------------------
     def _is_django_declaration(self, node: ast.ClassDef, name: str) -> bool:
-        if name == "http_method_names" and self.django_classes.is_family(node, "view"):
+        if name == "http_method_names" and self.classes.is_family(node, "view"):
             return True
-        if name in _MIGRATION_CONFIGURATION and self.django_classes.is_family(node, "migration"):
+        if name in _MIGRATION_CONFIGURATION and self.classes.is_family(node, "migration"):
             return True
         parent = self.parents.get(node)
         if name == "fields" and node.name == "Meta" and isinstance(parent, ast.ClassDef):
-            return self.django_classes.is_family(parent, "modelform")
+            return self.classes.is_family(parent, "modelform")
         return False
 
     def visit_ClassDef(self, node: ast.ClassDef):
+        if self.classes.is_family(node, "copying_model"):
+            # pydantic and friends copy each field default per instance.
+            self.generic_visit(node)
+            return
         for item in node.body:
             if isinstance(item, ast.Assign) and _is_mutable_value(item.value):
                 for target in item.targets:
@@ -384,8 +484,8 @@ def analyze_file(filepath: Path, ignore: set) -> list:
             for parent in ast.walk(tree)
             for child in ast.iter_child_nodes(parent)
         }
-        django_classes = DjangoClassResolver(tree, parents)
-        detector = MutationHazardDetector(str(filepath), lines, parents, django_classes, ignore)
+        classes = ClassFamilyResolver(tree, parents, Path(filepath))
+        detector = MutationHazardDetector(str(filepath), lines, parents, classes, ignore)
         detector.visit(tree)
         return detector.issues
     except (SyntaxError, ValueError) as exc:

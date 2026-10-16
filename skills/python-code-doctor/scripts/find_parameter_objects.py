@@ -108,6 +108,37 @@ def _collect(path: Path):
     return out
 
 
+def _families(clumps: list[dict]) -> list[dict]:
+    """Join clumps that are one group of parameters seen through different subsets.
+
+    `(name, binders, conclusion, imports)` travelling through five functions,
+    some of which drop `name` and some `imports`, yields three overlapping
+    clumps with three different supports — and one refactoring (a single
+    parameter object) answers all of them. Two clumps are one family when
+    they share at least MIN_GROUP - 1 names and at least one function.
+    """
+    parent = list(range(len(clumps)))
+
+    def root(i: int) -> int:
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
+
+    for i, first in enumerate(clumps):
+        for j in range(i + 1, len(clumps)):
+            second = clumps[j]
+            if len(first["names"] & second["names"]) >= MIN_GROUP - 1 \
+                    and set(first["locs"]) & set(second["locs"]):
+                parent[root(j)] = root(i)
+    joined: dict[int, dict] = {}
+    for i, clump in enumerate(clumps):
+        family = joined.setdefault(root(i), {"names": set(), "locs": set()})
+        family["names"] |= clump["names"]
+        family["locs"] |= set(clump["locs"])
+    return list(joined.values())
+
+
 def detect(path: Path, ignore: set):
     if "data_clump" in ignore:
         return []
@@ -133,7 +164,7 @@ def detect(path: Path, ignore: set):
         by_support[key]["functions"] = len(identities[t])
 
     issues = []
-    for key, data in by_support.items():
+    for data in _families(list(by_support.values())):
         names = sorted(data["names"])
         locs = data["locs"]
         f0, ln0, _ = sorted(locs)[0]
