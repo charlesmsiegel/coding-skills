@@ -65,7 +65,8 @@ python "$SKILL/scripts/analyze_all.py" . --skip duplicates # drop the slowest ca
 Installed skills under `.codex/skills`, `.claude/skills`, `.kiro/skills`, and
 `.agents/skills` are tooling, not application source. Source walks omit those
 payloads while retaining neighboring agent configuration; explicitly scanning a
-skill still works. The raw doctor's wider credential scan remains independent.
+skill still works. The raw doctor's wider credential scan still inspects installed
+payloads for credentials; source exclusions do not hide secrets from that scan.
 
 A mutable class declaration alone is a candidate: framework configuration and
 read-only registries share that shape. A demonstrated instance mutation of
