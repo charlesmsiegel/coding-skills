@@ -24,6 +24,47 @@ CONTINUATIONS = frozenset({
 })
 
 
+# Tokens that cannot appear inside a type-argument list at its own level.
+# Meeting one means the `<` was a comparison after all.
+_NOT_IN_TYPE_ARGUMENTS = frozenset({
+    ";", "=", "==", "===", "!=", "!==", "&&", "||", "??", ")", "]", "}",
+    ">=", ">>=", ">>>=",
+})
+_STATEMENT_KEYWORDS = frozenset({"const", "let", "var", "function", "class", "return", "if", "for", "while"})
+
+
+def angle_group_end(file: TsFile, index: int, stop: int) -> int:
+    """Index just past the `>` closing the `<` at ``index``; -1 if it is no type-argument list.
+
+    `<` and `>` are not bracket-matched — they are comparisons too — so this
+    counts them, stepping over bracket groups, and gives up at a token that
+    cannot sit inside a list of types. The lexer reads `>>` and `>>>` as one
+    token, which is how `Map<string, Array<number>>` ends, so those close two
+    and three levels at once. `Array<T>= x` (no space) lexes `>=` as one token
+    and is treated as no list; formatted code never writes it.
+    """
+    depth = 0
+    cursor = index
+    while cursor < stop:
+        token = file.tokens[cursor]
+        if token.kind == "op":
+            if token.value in OPENERS:
+                cursor = file.skip_group(cursor)
+                continue
+            if token.value in _NOT_IN_TYPE_ARGUMENTS:
+                return -1
+            if token.value == "<":
+                depth += 1
+            elif token.value in (">", ">>", ">>>"):
+                depth -= len(token.value)
+                if depth <= 0:
+                    return cursor + 1
+        elif token.kind == "name" and token.value in _STATEMENT_KEYWORDS:
+            return -1
+        cursor += 1
+    return -1
+
+
 def modifiers_before(file: TsFile, index: int) -> tuple[int, set[str]]:
     """Walk left over declaration modifiers. Returns (first index, modifiers)."""
     words: set[str] = set()
@@ -53,18 +94,20 @@ def read_type_after_colon(file: TsFile, colon: int, stop: int) -> tuple[str, int
 
     The span is recorded on the file so `in_type_position` can later tell a
     function type from a function.
-
-    `<` and `>` are not in the bracket map (outside a type they compare), so the
-    generic depth is counted here: the `,` in `Record<string, number>` separates
-    type arguments, not parameters, and ending the type there loses the body
-    `{` that follows the `>`.
     """
     cursor = colon + 1
     start = cursor
-    angle = 0
+    after_arguments = -1  # the index just past the last `<...>` stepped over
     while cursor < stop:
         token = file.tokens[cursor]
         if token.kind == "op":
+            if token.value == "<":
+                # In a type every `<` opens type arguments, and their commas
+                # are not the end of the type: `Record<string, X>` is one type.
+                end = angle_group_end(file, cursor, stop)
+                if end > 0:
+                    cursor = after_arguments = end
+                    continue
             if token.value == "{":
                 previous = file.tokens[cursor - 1]
                 if previous.value not in _TYPE_CONTINUING and not previous.is_name("extends", "keyof", "infer"):
@@ -74,22 +117,15 @@ def read_type_after_colon(file: TsFile, colon: int, stop: int) -> tuple[str, int
             if token.value in OPENERS:
                 cursor = file.skip_group(cursor)
                 continue
-            if token.value == "<":
-                angle += 1
-            elif token.value in (">", ">>", ">>>"):
-                angle = max(0, angle - len(token.value))
-            elif token.value == "," and angle:
-                pass  # between type arguments
-            elif token.value in (",", ";", ")", "]", "}", "=", ">=", ">>="):
-                break  # `>=` is a closing `>` fused with the initializer's `=`
+            if token.value in (",", ";", ")", "]", "}", "="):
+                break
         if token.kind == "name" and token.value in ("const", "let", "var", "function", "class", "return"):
             break
         # A newline followed by something that cannot continue a type ends it.
-        # In a type a `>` only ever closes a generic, so unlike the comparison
-        # it is in CONTINUATIONS for, nothing has to follow it.
+        # The `>` closing type arguments ends a type rather than continuing it.
         previous = file.tokens[cursor - 1]
-        if cursor > start and not angle and token.line > previous.line \
-                and (previous.value not in CONTINUATIONS or previous.is_op(">")) \
+        continued = previous.value in CONTINUATIONS and cursor != after_arguments
+        if cursor > start and token.line > previous.line and not continued \
                 and token.value not in CONTINUATIONS and token.kind == "name":
             break
         cursor += 1
@@ -102,7 +138,7 @@ def _parse_params(file: TsFile, open_index: int, close_index: int) -> list[Param
     params: list[Param] = []
     cursor = open_index + 1
     while cursor < close_index:
-        chunk_end = _param_end(file, cursor, close_index)
+        chunk_end = _parameter_end(file, cursor, close_index)
         param = _parse_one_param(file, cursor, chunk_end)
         if param is not None:
             params.append(param)
@@ -110,34 +146,36 @@ def _parse_params(file: TsFile, open_index: int, close_index: int) -> list[Param
     return params
 
 
-def _param_end(file: TsFile, start: int, stop: int) -> int:
-    """Index of the `,` that ends the parameter starting at ``start`` (or ``stop``).
+def _parameter_end(file: TsFile, start: int, stop: int) -> int:
+    """Index of the `,` ending the parameter that starts at ``start`` (``stop`` for the last).
 
-    A comma inside a bracket group belongs to the group, and so does one inside
-    the `<…>` of a generic in the parameter's *type* — `m: Map<string, number>`
-    is one parameter. `<` and `>` are not bracket-matched, so they are counted,
-    but only between the annotation's `:` and the default's `=`: in a default
-    value (`n = a < b`) they compare, and counting them would swallow the comma.
+    Bracket groups are stepped over, and so is a `<...>` wherever it opens
+    type arguments rather than comparing: anywhere in the annotation, and in
+    the default value when a call follows it (`= new Map<string, number>()`).
+    Splitting at every comma made `fields: Record<string, number>` two
+    parameters, the second one named `number` and untyped.
     """
     cursor = start
-    state = "name"  # → "type" at the annotation's `:`, → "default" at the `=`
-    angle = 0
+    annotated = defaulted = False
     while cursor < stop:
         token = file.tokens[cursor]
         if token.kind == "op":
             if token.value in OPENERS:
                 cursor = file.skip_group(cursor)
                 continue
-            if token.value == "," and not angle:
+            if token.value == ",":
                 return cursor
-            if token.value in ("=", ">=", ">>="):  # `>=` is a closing `>` fused with the `=`
-                state, angle = "default", 0
-            elif state == "name" and token.value == ":":
-                state = "type"
-            elif state == "type" and token.value == "<":
-                angle += 1
-            elif state == "type" and token.value in (">", ">>", ">>>"):
-                angle = max(0, angle - len(token.value))
+            if token.value == ":" and not defaulted:
+                annotated = True
+            elif token.value == "=":
+                defaulted = True
+            elif token.value == "<":
+                end = angle_group_end(file, cursor, stop)
+                generic_call = defaulted and 0 < end < stop and file.tokens[end].is_op("(") \
+                    and file.tokens[cursor - 1].kind == "name"
+                if end > 0 and ((annotated and not defaulted) or generic_call):
+                    cursor = end
+                    continue
         cursor += 1
     return stop
 
