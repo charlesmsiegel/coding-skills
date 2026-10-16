@@ -12,7 +12,8 @@ Finds:
   - old_typing_alias    : typing.List/Dict/Optional/Union etc. — use builtins
   - super_with_args     : super(Cls, self) — use bare super()
   - os_path_join        : os.path.join/exists/isfile/isdir/dirname/basename
-                          — use pathlib.Path
+                          — use pathlib.Path (once per line: nested calls such as
+                          os.path.join(os.path.dirname(f), x) are one migration)
 """
 
 import ast
@@ -75,6 +76,9 @@ def detect(tree, filename, lines, ignore):
         issues.append(CodeSmell(filename, line, st, desc, sug, sev, _get_line(lines, line)))
 
     typing_imports, typing_module_imported = _collect_typing_imports(tree)
+    # os.path calls nest — os.path.join(os.path.dirname(__file__), "x") — and
+    # the remedy is one Path expression for the line, so the line is charged once.
+    os_path_lines: set[int] = set()
 
     for node in ast.walk(tree):
 
@@ -113,7 +117,9 @@ def detect(tree, filename, lines, ignore):
                   and isinstance(func.value, ast.Attribute)
                   and func.value.attr == "path"
                   and isinstance(func.value.value, ast.Name)
-                  and func.value.value.id == "os"):
+                  and func.value.value.id == "os"
+                  and node.lineno not in os_path_lines):
+                os_path_lines.add(node.lineno)
                 add(node.lineno, "os_path_join",
                     f"os.path.{func.attr}() is verbose for path operations",
                     "Use pathlib.Path — it offers an object-oriented, cross-platform API "

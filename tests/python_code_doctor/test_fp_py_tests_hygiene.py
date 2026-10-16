@@ -140,3 +140,18 @@ def test_a_naming_candidate_prints_no_fix_arrow(tmp_path):
     text = run_detector_text("find_naming_issues.py", tmp_path)
     assert "[CANDIDATE]" in text and "also caused by" in text
     assert not [line for line in text.splitlines() if line.strip() == "→"]
+
+
+# --------------------------------------------------------------------------- #
+# os_path_join
+# --------------------------------------------------------------------------- #
+
+
+def test_nested_os_path_calls_are_one_finding_per_line(tmp_path):
+    write(tmp_path, {"m.py": (
+        "import os\n"
+        "HERE = os.path.join(os.path.dirname(__file__), 'data')\n"
+        "def f(p):\n"
+        "    return os.path.exists(p)\n"
+    )})
+    assert lines_of(run_detector("find_outdated_idioms.py", tmp_path), "os_path_join") == [2, 4]
