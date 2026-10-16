@@ -55,7 +55,8 @@ loose `(x, y)` tuple passed everywhere.
 Array with Object → a dataclass instead of a positional tuple or stringly-keyed
 dict. Validation and behavior move onto the type; the rest of the code stops
 re-checking it.
-**Detector:** partial — `find_code_smells.py` (magic numbers),
+**Detector:** partial — `find_code_smells.py` (magic numbers; not in tests, where
+a literal is the expected value, nor an HTTP status where a status belongs),
 `find_parameter_objects.py` (primitives travelling together). The single
 meaning-laden primitive is found by reading.
 
@@ -68,7 +69,8 @@ function could just take?"
 Parameter with Method Call when the callee could fetch the value itself; Introduce
 Parameter Object when the group recurs. Boolean steering flags: split the function
 (see `find_boolean_params.py`).
-**Detector:** `find_code_smells.py`, `analyze_complexity.py`.
+**Detector:** `analyze_complexity.py` (`parameter_count`: `self`/`cls` and pytest
+tests and fixtures, whose parameters are fixtures resolved by name, are not counted).
 **Ignore when:** bundling would couple modules that are deliberately independent —
 explicit parameters are sometimes the honest dependency injection.
 

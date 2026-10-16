@@ -4,8 +4,16 @@ Detect code smells in Python code via AST analysis.
 Finds: magic numbers, bare excepts, mutable defaults, type comparisons,
        god classes, data classes.
 
-Long parameter lists are analyze_complexity.py's `parameter_count`; reporting
-the same count here as well charged one signature twice in a merged report.
+A long parameter list is analyze_complexity's `parameter_count`; it is not
+reported here too, because one signature is one defect.
+
+A magic number is a bare literal that encodes meaning a name should carry. A
+test file is not checked: the literal in `assert total == 3` is the expected
+value, the specification itself, and naming it would only restate it or import
+the production constant the test exists to check. In production code an HTTP
+status code where a status is expected (`HTTPException(404)`,
+`resp.status_code == 409`) and a mode written in octal (`0o755`) already say
+what they are.
 """
 
 import ast
@@ -15,6 +23,35 @@ from pathlib import Path
 from dataclasses import dataclass, asdict
 from collections import defaultdict
 from common import count_parameters, framework_hook_overrides, is_test_file, parameter_severity, signature_is_a_contract, sort_findings, cached_parse, SEVERITY_ICONS, configure_output, find_python_files, warn_detector_error, warn_unparseable
+
+
+def _looks_like_test(path: Path) -> bool:
+    """A test module or test scaffolding, judged by its path alone."""
+    if path.name == "conftest.py":
+        return True
+    if path.stem.startswith("test_") or path.stem.endswith("_test"):
+        return True
+    return bool({part.lower() for part in path.parts} & {"tests", "test"})
+
+
+# Callables whose first positional argument is an HTTP status code.
+_STATUS_CALLEES = frozenset({"HTTPException", "HTTPError", "abort"})
+_HTTP_STATUS = range(100, 600)
+
+
+def _callee_name(call: ast.Call) -> str | None:
+    if isinstance(call.func, ast.Name):
+        return call.func.id
+    if isinstance(call.func, ast.Attribute):
+        return call.func.attr
+    return None
+
+
+def _names_a_status(node: ast.AST) -> bool:
+    """`status`, `status_code`, `resp.status_code`, `http_status`, ..."""
+    name = node.id if isinstance(node, ast.Name) else (
+        node.attr if isinstance(node, ast.Attribute) else None)
+    return bool(name) and (name.lower().endswith("status") or name.lower().endswith("status_code"))
 
 
 @dataclass
@@ -197,6 +234,7 @@ class CodeSmellDetector(ast.NodeVisitor):
         self._framework_imports = {}
         self._object_is_builtin = True
         self._framework_meta_nodes = set()
+        self.is_test_file = _looks_like_test(Path(filename))
 
     def visit_Module(self, node: ast.Module):
         self._hooks = framework_hook_overrides(node)
@@ -247,7 +285,38 @@ class CodeSmellDetector(ast.NodeVisitor):
                     elt = _unwrap_negative(elt) if elt else elt
                     if isinstance(elt, ast.Constant):
                         self._named_constants.add(id(elt))
+            # An HTTP status where a status is expected names itself:
+            #   HTTPException(404, ...)   raise/abort with a status
+            #   JSONResponse(body, 201)   a *Response's positional status
+            #   resp.status_code == 409   compared against a status
+            elif isinstance(parent, ast.Call) and parent.args:
+                callee = _callee_name(parent) or ""
+                if callee in _STATUS_CALLEES:
+                    self._name_status(parent.args[0])
+                elif callee.endswith("Response"):
+                    # Frameworks disagree on where the status sits (second for
+                    # Starlette and Flask, third for Django), and a response's
+                    # body is not an int in the status range.
+                    for arg in parent.args:
+                        self._name_status(arg)
+            elif isinstance(parent, ast.Compare):
+                operands = [parent.left, *parent.comparators]
+                if any(_names_a_status(o) for o in operands):
+                    for operand in operands:
+                        self._name_status(operand)
         self.generic_visit(node)
+
+    def _name_status(self, node: ast.AST) -> None:
+        if isinstance(node, ast.Constant) and isinstance(node.value, int) \
+                and not isinstance(node.value, bool) and node.value in _HTTP_STATUS:
+            self._named_constants.add(id(node))
+
+    def _written_in_octal(self, node: ast.Constant) -> bool:
+        """`0o755` is a permission mode by its spelling; nobody writes a count in octal."""
+        if 0 < node.lineno <= len(self.source_lines):
+            text = self.source_lines[node.lineno - 1][node.col_offset:node.col_offset + 2]
+            return text.lower() == "0o"
+        return False
 
     def _get_line(self, lineno: int) -> str:
         if 0 < lineno <= len(self.source_lines):
@@ -287,14 +356,6 @@ class CodeSmellDetector(ast.NodeVisitor):
                         f"Mutable default from {default.func.id}() in {node.name}",
                         "Use None and create inside function", "high")
 
-        # Long parameter list — counted and graded as analyze_complexity's
-        # parameter_count is, which analyze_all keeps in its place when both fire.
-        total_params = count_parameters(node)
-        if total_params > 6 and not signature_is_a_contract(node, self._hooks):
-            self._add(node.lineno, "long_parameter_list",
-                f"{node.name} has {total_params} parameters",
-                "Group into dataclass or config object", parameter_severity(total_params))
-
     def visit_ExceptHandler(self, node: ast.ExceptHandler):
         if node.type is None:
             self._add(node.lineno, "bare_except",
@@ -307,7 +368,8 @@ class CodeSmellDetector(ast.NodeVisitor):
                 and isinstance(node.value, (int, float)) and not isinstance(node.value, bool)
                 and id(node) not in self._named_constants
                 and node.value not in self.MAGIC_NUMBER_WHITELIST
-                and abs(node.value) > 2):
+                and abs(node.value) > 2
+                and not self._written_in_octal(node)):
             self._add(node.lineno, "magic_number",
                 f"Magic number {node.value}",
                 "Extract to named constant", "low")

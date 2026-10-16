@@ -330,3 +330,71 @@ def test_pytest_fixture_requests_are_not_a_parameter_list(tmp_path):
     found = run_detector("analyze_complexity.py", tmp_path)
     # A helper in a test file is still called by somebody.
     assert [(r["name"], r["issue_type"]) for r in found] == [("build", "parameter_count")]
+
+
+# --------------------------------------------------------------------------- #
+# find_code_smells
+# --------------------------------------------------------------------------- #
+
+
+def test_a_long_signature_is_reported_once(tmp_path):
+    write(tmp_path, {"sample.py": "def f(a, b, c, d, e, g, h):\n    return a\n"})
+    smells = run_detector("find_code_smells.py", tmp_path)
+    assert not of_type(smells, "long_parameter_list"), "parameter_count already reports it"
+    complexity = run_detector("analyze_complexity.py", tmp_path)
+    assert [r["issue_type"] for r in complexity] == ["parameter_count"]
+
+
+def test_a_literal_in_a_test_is_the_expected_value(tmp_path):
+    write(tmp_path, {
+        "tests/test_totals.py": """\
+            def test_total(client):
+                resp = client.get("/total")
+                assert resp.status_code == 200
+                assert resp.json()["total"] == 10 + 100 + 5
+                assert compute(7) == 49
+            """,
+        "totals.py": """\
+            def blocks(hi):
+                return [hi // 5, hi % 5]
+            """,
+    })
+    found = of_type(run_detector("find_code_smells.py", tmp_path), "magic_number")
+    assert [(Path(r["file"]).name, r["description"]) for r in found] == [
+        ("totals.py", "Magic number 5"), ("totals.py", "Magic number 5")]
+
+
+def test_an_http_status_where_a_status_belongs_is_not_magic(tmp_path):
+    write(tmp_path, {"routes.py": """\
+        import os
+
+        def handler(resp, path):
+            if resp.status_code == 409:
+                raise HTTPException(404, detail="missing")
+            if status == 429:
+                return JSONResponse({"ok": False}, 503)
+            os.chmod(path, 0o755)
+            return retry(resp, 404)
+        """})
+    found = of_type(run_detector("find_code_smells.py", tmp_path), "magic_number")
+    # A 404 handed to an arbitrary function is still an unexplained number.
+    assert [r["description"] for r in found] == ["Magic number 404"]
+    assert found[0]["line"] == 9
+
+
+def test_type_is_comparison_is_the_exact_check_not_a_smell(tmp_path):
+    write(tmp_path, {"sample.py": """\
+        def kinds(x, a, b):
+            if type(x) is int:
+                return 1
+            if type(a) is type(b):
+                return 2
+            if type(x) is not bool:
+                return 3
+            if type(x) == list:
+                return 4
+            return type(a) != type(b)
+        """})
+    found = of_type(run_detector("find_code_smells.py", tmp_path), "type_comparison")
+    # Two `==`/`!=` comparisons, one finding each, even when both sides call type().
+    assert [r["line"] for r in found] == [8, 10]
