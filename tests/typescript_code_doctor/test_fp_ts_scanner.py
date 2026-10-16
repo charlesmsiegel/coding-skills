@@ -271,3 +271,90 @@ def test_as_any_in_a_testkit_is_low_and_in_production_high(tmp_path):
     ]
 
 
+# --------------------------------------------------------------------------- #
+# Statements end where JavaScript ends them
+# --------------------------------------------------------------------------- #
+
+def unreachable(tmp_path: Path, source: str, name: str = "src/a.ts") -> list[int]:
+    root = project(tmp_path, {name: source})
+    return [r["line"] for r in records("find_dead_code.py", root, "unreachable_code")]
+
+
+def test_a_hoisted_async_function_after_a_throw_is_reachable(tmp_path):
+    assert unreachable(tmp_path, """\
+export async function g(ok: boolean): Promise<boolean> {
+  if (ok) return moved();
+  throw new Error("no");
+  async function moved(): Promise<boolean> { return true; }
+}
+""") == []
+
+
+def test_a_statement_after_a_throw_is_still_unreachable(tmp_path):
+    assert unreachable(tmp_path, """\
+export function g(): number {
+  throw new Error("no");
+  const x = 1;
+  return x;
+}
+""") == [3]
+
+
+def test_a_return_continued_after_as_is_one_statement(tmp_path):
+    assert unreachable(tmp_path, """\
+export function h(x: number | null): Record<string, number> | null {
+  if (!x) return null;
+  return Object.fromEntries([["a", x]]) as
+    Record<string, number>;
+}
+""") == []
+
+
+def test_a_multiline_jsx_element_in_a_returned_ternary_is_one_statement(tmp_path):
+    assert unreachable(tmp_path, """\
+export function Tile(props: { on: boolean; label: string }) {
+  return props.on ? <Card label={props.label} kind="tile"
+    selected={props.on} />
+    : <button className="tile">
+      {props.label}
+    </button>;
+}
+""", "src/a.tsx") == []
+
+
+def test_code_without_semicolons_ends_each_statement_at_its_line(tmp_path):
+    """`throw new Error("x")` followed by a newline and `}` used to run on past
+    the `}` — the scan stepped over the call's parentheses without looking at
+    the break behind them — and the next function was called unreachable."""
+    assert unreachable(tmp_path, """\
+export function f(x: number) {
+  if (x) {
+    throw new Error("x")
+  }
+  if (!x) {
+    return
+  }
+  if (x > 1) { return x }
+  return g(x)
+}
+export function g(x: number) {
+  return x
+}
+""") == []
+
+
+def test_code_without_semicolons_still_has_unreachable_statements(tmp_path):
+    assert unreachable(tmp_path, """\
+export function f(x: number) {
+  throw new Error("x")
+  console.log(x)
+}
+""") == [3]
+
+
+def test_class_fields_without_semicolons_are_each_a_member(ts):
+    file = parse(ts, "class A {\n  x: number\n  y: string\n  constructor() { this.x = 1; this.y = '' }\n}\n")
+    assert [p.name for p in file.classes[0].props] == ["x", "y"]
+    assert [m.name for m in file.classes[0].methods] == ["constructor"]
+
+

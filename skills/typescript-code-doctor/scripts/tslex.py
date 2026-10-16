@@ -103,8 +103,12 @@ class Tokenizer:
         # each keyed by an index into `tokens`:
         # - the code inside a template literal's `${...}`, keyed by the
         #   template token (see _template);
+        # - the last token of each JSX element, keyed by its opening `<`, so
+        #   a statement scan can step over an element the way it steps over a
+        #   bracket group;
         # - the JSX attribute names, which are neither variables nor writes.
         self.substitutions: dict[int, list[Token]] = {}
+        self.jsx_spans: dict[int, int] = {}
         self.jsx_attributes: set[int] = set()
 
     # -- low level ---------------------------------------------------------- #
@@ -303,7 +307,19 @@ class Tokenizer:
         return not _IDENT.match(self.text, k) or self.text[k:k + 7] != "extends"
 
     def _jsx_element(self) -> None:
-        """Consume one JSX element (assumes the cursor sits on its `<`)."""
+        """Consume one JSX element (assumes the cursor sits on its `<`).
+
+        The element's extent is recorded in `jsx_spans`: its attributes sit on
+        lines that end in neither an operator nor a `;`, so a statement scan
+        that cannot step over the element whole reads each line as a new
+        statement.
+        """
+        opener = len(self.tokens)
+        self._element_body()
+        if len(self.tokens) > opener:
+            self.jsx_spans[opener] = len(self.tokens) - 1
+
+    def _element_body(self) -> None:
         self._punct("<")
         self._jsx_tag_name()
         while self.i < len(self.text):
