@@ -313,3 +313,119 @@ def test_an_async_test_is_charged_as_a_race_only_when_a_promise_is_left_behind(t
 def test_a_throw_guard_and_a_finally_restore_are_not_logic_in_a_test(tmp_path):
     found = _test_smells(tmp_path).get("logic_in_test", [])
     assert lines_of(found) == [30, 33], "a guard with an else, and an if around an expect, still branch"
+
+
+# --------------------------------------------------------------------------- #
+# find_code_smells: effect cleanups, separate-expression ternaries, switches
+# the compiler already checks, and self-describing numbers
+# --------------------------------------------------------------------------- #
+
+EFFECTS = """\
+export function Ticker({ live }: { live: boolean }) {
+  useEffect(() => {
+    if (!live) return;
+    const id = setInterval(tick, 10);
+    return () => clearInterval(id);
+  }, [live]);
+  React.useLayoutEffect(() => {
+    if (!live) return;
+    return () => undefined;
+  });
+  const flush = async () => {
+    if (!live) return;
+    return void await save();
+  };
+  void flush;
+  return null;
+}
+export function pick(live: boolean) {
+  if (!live) return;
+  return 5;
+}
+"""
+
+
+def test_an_effect_callback_may_return_a_cleanup_on_some_paths(tmp_path):
+    found = records("find_code_smells.py", tmp_path, {"ticker.tsx": EFFECTS}, "inconsistent_returns")
+    assert lines_of(found) == [19], "only `pick` really returns a value on one path and nothing on another"
+
+
+TERNARIES = """\
+export function View({ x, items, editing, saving, y, a, b }: Props) {
+  const m = x ? items.map((i) => i.a ? 1 : 2) : [];
+  const n = x ? items.map((i) => { return i.a ? 1 : 2; }) : [];
+  const j = editing ? <><b>{saving ? "Saving" : "Save"}</b></> : <i>no</i>;
+  const k = x ? <A p={y ? 1 : 2} /> : null;
+  const real = a ? (b ? 1 : 2) : 3;
+  const bare = a ? b ? 1 : 2 : 3;
+  const obj = a ? { v: b ? 1 : 2 } : null;
+  const sibling = a ? f((i) => i, b ? 1 : 2) : null;
+  return [m, n, j, k, real, bare, obj, sibling];
+}
+"""
+
+
+def test_a_ternary_in_a_callback_or_jsx_container_is_not_nested(tmp_path):
+    found = records("find_code_smells.py", tmp_path, {"view.tsx": TERNARIES}, "nested_ternary")
+    assert lines_of(found) == [6, 7, 8, 9]
+
+
+SWITCHES = """\
+type Scope = "world" | "campaign";
+export function path(scope: Scope): string {
+  switch (scope) {
+    case "world":
+      return "/w";
+    case "campaign": {
+      return "/c";
+    }
+  }
+}
+export const shape = (scope: Scope): { v: number } => {
+  switch (scope) {
+    case "world":
+    case "campaign":
+      return { v: 1 };
+  }
+};
+export function notTail(scope: Scope): string {
+  switch (scope) {
+    case "world": return "x";
+  }
+  return "y";
+}
+export function maybe(scope: Scope): string | undefined {
+  switch (scope) {
+    case "world": return "x";
+  }
+}
+"""
+
+
+def test_a_tail_switch_the_compiler_checks_is_not_reported(tmp_path):
+    files = {"tsconfig.json": '{ "compilerOptions": { "strict": true } }', "paths.ts": SWITCHES}
+    found = records("find_code_smells.py", tmp_path, files, "switch_without_default")
+    assert lines_of(found) == [19, 25]
+    assert all(r["kind"] == "candidate" and r["also_caused_by"] for r in found)
+
+
+def test_without_strict_null_checks_a_tail_switch_is_still_a_lead(tmp_path):
+    files = {"tsconfig.json": '{ "compilerOptions": { "strict": false } }', "paths.ts": SWITCHES}
+    found = records("find_code_smells.py", tmp_path, files, "switch_without_default")
+    assert lines_of(found) == [3, 12, 19, 25]
+
+
+MAGIC = """\
+export function classify(err: { status: number }, bytes: number, step: number): string {
+  if (err.status === 404 || err.status === 410) return "gone";
+  if (err.status >= 500 && bytes > 0) return "server";
+  const mb = bytes / 1_048_576 + 0;
+  if (step === 4 || step > 9) return "last";
+  return String(mb * 37 + 1);
+}
+"""
+
+
+def test_status_codes_and_unit_constants_are_not_magic(tmp_path):
+    found = records("find_code_smells.py", tmp_path, {"classify.ts": MAGIC}, "magic_number")
+    assert lines_of(found) == [5, 6], "`step === 4` and `* 37` still need names"
