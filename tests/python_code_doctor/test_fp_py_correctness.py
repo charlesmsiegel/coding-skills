@@ -379,3 +379,108 @@ def test_a_raise_inside_a_def_in_a_handler_belongs_to_the_def(tmp_path):
                     "        register(later)\n",
                     "raise_without_from")
     assert found == []
+
+
+# ---- mutated_global / global_rebind ---------------------------------------- #
+
+
+def test_a_global_mutated_only_under_a_module_lock_is_medium(tmp_path):
+    found = records("find_global_state.py", tmp_path,
+                    "import threading\n"
+                    "_L = threading.Lock()\n"
+                    "_C = {}\n"
+                    "def get(k):\n"
+                    "    with _L:\n"
+                    "        return _C.setdefault(k, object())\n",
+                    "mutated_global")
+    assert [(r["kind"], r["severity"]) for r in found] == [("finding", "medium")]
+
+
+@pytest.mark.parametrize("source", [
+    # no lock at all
+    "_C = {}\ndef bump(k):\n    _C[k] = 1\n",
+    # one site under the lock, one outside it
+    "from threading import RLock\n_L = RLock()\n_C = {}\n"
+    "def get(k):\n    with _L:\n        _C[k] = 1\n"
+    "def drop(k):\n    _C.pop(k)\n",
+    # a lock that is not module-level does not count
+    "import threading\n_C = {}\n"
+    "def get(k):\n    lock = threading.Lock()\n    with lock:\n        _C[k] = 1\n",
+])
+def test_an_unguarded_global_mutation_stays_high(tmp_path, source):
+    found = records("find_global_state.py", tmp_path, source, "mutated_global")
+    assert [(r["kind"], r["severity"]) for r in found] == [("finding", "high")]
+
+
+@pytest.mark.parametrize("source", [
+    # a local of the same spelling
+    "cache = {}\ndef f(k, v):\n    cache = {}\n    cache[k] = v\n    return cache\n",
+    # a parameter of the same spelling
+    "cache = {}\ndef f(cache, k):\n    cache[k] = 1\n",
+    # an enclosing function's local, reached by closure
+    "cache = {}\ndef outer():\n    cache = {}\n    def inner(k):\n        cache[k] = 1\n    return inner\n",
+    # a pure `global` rebind is global_rebind's, not also mutated_global's
+    "cache = {}\ndef reset():\n    global cache\n    cache = {}\n",
+])
+def test_a_mutation_of_another_object_with_the_same_name_is_not_charged(tmp_path, source):
+    assert records("find_global_state.py", tmp_path, source, "mutated_global") == []
+
+
+@pytest.mark.parametrize("source", [
+    "cache = {}\ndef put(k, v):\n    cache[k] = v\n",
+    # declared global and mutated in place
+    "cache = {}\ndef put(k, v):\n    global cache\n    cache.update({k: v})\n",
+    # a closure that does NOT shadow the name mutates the module's
+    "cache = {}\ndef outer():\n    def inner(k):\n        cache[k] = 1\n    return inner\n",
+    # a comprehension variable of the same spelling is the comprehension's own
+    "cache = {}\ndef put(xs):\n    _ = [cache for cache in xs]\n    cache['k'] = 1\n",
+])
+def test_a_mutation_of_the_module_object_is_still_charged(tmp_path, source):
+    found = records("find_global_state.py", tmp_path, source, "mutated_global")
+    assert len(findings(found)) == 1
+
+
+def test_global_rebind_is_one_record_per_function_naming_every_global(tmp_path):
+    found = records("find_global_state.py", tmp_path,
+                    "a = b = None\n"
+                    "def f():\n"
+                    "    global a, b\n"
+                    "    a = 1\n"
+                    "    b = 2\n",
+                    "global_rebind")
+    assert len(findings(found)) == 1
+    assert "'a'" in found[0]["description"] and "'b'" in found[0]["description"]
+
+
+def test_global_rebind_with_a_reasoned_noqa_is_a_candidate(tmp_path):
+    found = records("find_global_state.py", tmp_path,
+                    "a = None\n"
+                    "def g():\n"
+                    "    global a  # noqa: PLW0603 -- fork hook\n"
+                    "    a = 1\n",
+                    "global_rebind")
+    assert len(found) == 1
+    assert_candidate_shape(found[0])
+
+
+@pytest.mark.parametrize("comment", ["", "  # noqa: PLW0603"])
+def test_global_rebind_without_a_reason_is_still_a_finding(tmp_path, comment):
+    found = records("find_global_state.py", tmp_path,
+                    "counter = 0\n"
+                    "def bump():\n"
+                    f"    global counter{comment}\n"
+                    "    counter += 1\n",
+                    "global_rebind")
+    assert len(findings(found)) == 1
+
+
+def test_a_nested_functions_global_is_not_charged_to_its_parent(tmp_path):
+    found = records("find_global_state.py", tmp_path,
+                    "a = None\n"
+                    "def outer():\n"
+                    "    def inner():\n"
+                    "        global a\n"
+                    "        a = 1\n"
+                    "    return inner\n",
+                    "global_rebind")
+    assert [r["description"].split("'")[1] for r in found] == ["inner"]
