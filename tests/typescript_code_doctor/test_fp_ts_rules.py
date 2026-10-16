@@ -722,3 +722,43 @@ def test_a_module_reached_through_several_imports_is_tested(tmp_path):
     }
     found = records("find_untested_modules.py", tmp_path, files, "untested_module")
     assert [Path(r["file"]).name for r in found] == ["orphan.ts"]
+
+
+# --------------------------------------------------------------------------- #
+# find_outdated_idioms: `?.` only where it is a drop-in; `||` defaults are leads
+# --------------------------------------------------------------------------- #
+
+GUARDS = """\
+export function f(budget: B | null, camp: C | null, x: X | null, obj: O, a: string): unknown[] {
+  const one = budget && budget.level !== "off";
+  const two = camp && camp.open.length > 0;
+  const three = x && x.name;
+  const four = x && x.items[0].id === "a";
+  const five = x && x.value !== undefined;
+  const six = x && x.value === undefined;
+  const seven = obj.x && x.y;
+  return [one, two, three, four, five, six, seven];
+}
+"""
+
+
+def test_manual_optional_chaining_only_where_the_chain_means_the_same(tmp_path):
+    found = records("find_outdated_idioms.py", tmp_path, {"f.ts": GUARDS}, "manual_optional_chaining")
+    assert lines_of(found) == [4, 5, 6]
+
+
+DEFAULTS = """\
+export function g(pinTtl: string, label: string | null, cfg: { days: number }): unknown[] {
+  const ttl = parseInt(pinTtl, 10) || 0;
+  const n = Number(pinTtl) || 0;
+  const shown = label || "";
+  const days = cfg.days || "";
+  return [ttl, n, shown, days];
+}
+"""
+
+
+def test_a_nan_guard_is_not_a_falsy_default_and_the_rest_are_leads(tmp_path):
+    found = records("find_outdated_idioms.py", tmp_path, {"g.ts": DEFAULTS}, "falsy_default_with_or")
+    assert lines_of(found) == [4, 5]
+    assert all(r["kind"] == "candidate" and r["also_caused_by"] for r in found)

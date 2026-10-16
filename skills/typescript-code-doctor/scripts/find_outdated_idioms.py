@@ -10,7 +10,7 @@ every bundler's tree shaking.
 """
 
 from common import Reporter, run_file_detector
-from tsparse import TsFile, argument_spans, iter_calls
+from tsparse import TsFile, argument_spans, callee_of, iter_calls
 
 ASSIGN_OPS = frozenset({"=", "+=", "-=", "*=", "/=", "%=", "**=", "||=", "&&=", "??=", "++", "--"})
 
@@ -105,8 +105,59 @@ def _check_const_candidates(file: TsFile, report: Reporter) -> None:
                        "accidental later write a compile error.", "low")
 
 
+# Tokens after which a name starts an operand of `&&` rather than ending a
+# tighter-binding expression: `a === x && x.y` tests `a === x`, not `x`.
+_OPERAND_START = frozenset({"(", "[", "{", ",", ";", "=", "&&", "||", "?", ":", "=>",
+                            "+=", "-=", "||=", "&&=", "??="})
+# Operators after `x.y` that make `x?.y` mean something else (or not compile):
+# `x && x.n > 0` is falsy when `x` is null, while `x?.n > 0` is a TS18048 error
+# under strictNullChecks; `x && x.y + 1` likewise.
+_NOT_DROP_IN = frozenset({"<", ">", "<=", ">=", "+", "-", "*", "/", "%", "**"})
+_NULLISH = frozenset({"null", "undefined"})
+
+
+def _member_chain_end(file: TsFile, index: int) -> int:
+    """Index just past `x.a.b[c](d)…` starting at the name at ``index``."""
+    cursor = index + 1
+    while cursor < len(file):
+        token = file.tokens[cursor]
+        if token.is_op(".", "?.") and cursor + 1 < len(file) and file.tokens[cursor + 1].kind == "name":
+            cursor += 2
+        elif token.is_op("[", "("):
+            cursor = file.skip_group(cursor)
+        elif token.is_op("!") and cursor + 1 < len(file) and file.tokens[cursor + 1].is_op(".", "?.", "["):
+            cursor += 1  # a non-null assertion inside the chain
+        else:
+            break
+    return cursor
+
+
+def _is_drop_in(file: TsFile, right: int) -> bool:
+    """Whether `x?.…` means what `x && x.…` meant, in the comparison that follows.
+
+    The guard yields a falsy value when `x` is null; the chain yields
+    `undefined`. Those agree in a truthiness test, in `=== value`, and in
+    `!== null`/`!= undefined`. They disagree in `!== value` (`budget?.level !==
+    "off"` is *true* for a null budget), in `=== undefined`, and a relational
+    or arithmetic operator on a possibly-undefined value does not compile.
+    """
+    after = _member_chain_end(file, right)
+    if after >= len(file):
+        return True
+    operator = file.tokens[after]
+    if operator.kind != "op":
+        return True
+    if operator.value in _NOT_DROP_IN:
+        return False
+    if operator.value in ("!==", "!=", "===", "=="):
+        other = file.tokens[after + 1] if after + 1 < len(file) else None
+        nullish = other is not None and other.is_name(*_NULLISH)
+        return nullish if operator.value in ("!==", "!=") else not nullish
+    return True
+
+
 def _check_optional_chaining(file: TsFile, report: Reporter) -> None:
-    """`x && x.y` and `x !== null && x.y` predate `?.`."""
+    """`x && x.y` and `x !== null && x.y` predate `?.` — where `?.` is a drop-in."""
     for index, token in enumerate(file.tokens):
         if not token.is_op("&&") or index == 0 or index + 2 >= len(file):
             continue
@@ -116,27 +167,63 @@ def _check_optional_chaining(file: TsFile, report: Reporter) -> None:
             continue
         if left.value != right.value:
             continue
+        before = file.tokens[index - 2] if index >= 2 else None
+        if before is not None and not (before.kind == "op" and before.value in _OPERAND_START) \
+                and not before.is_name("return", "yield"):
+            continue  # `obj.x && x.y`, `!x && x.y`, `a === x && x.y`: the guard is not `x`
+        if not _is_drop_in(file, index + 1):
+            continue
         report.add(token.line, "manual_optional_chaining",
                    f"`{left.value} && {left.value}.…` is what `?.` is for",
                    f"Write `{left.value}?.…`. The manual form also treats `0` and `''` as absent, "
                    "which `?.` does not.", "low")
 
 
+# Calls whose result is a number that may be NaN: `|| 0` is the guard that turns
+# NaN into 0, which `?? 0` would not.
+_NAN_SOURCES = frozenset({"parseInt", "parseFloat", "Number", "Number.parseInt", "Number.parseFloat"})
+
+
+def _nan_guard(file: TsFile, index: int) -> bool:
+    """True when the operand left of the `||` at ``index`` is a parse or Math call."""
+    previous = file.tokens[index - 1] if index else None
+    if previous is None or not previous.is_op(")"):
+        return False
+    opener = file.closer(index - 1)
+    callee = callee_of(file, opener) if opener > 0 else ""
+    return callee in _NAN_SOURCES or callee.startswith("Math.")
+
+
 def _check_nullish_default(file: TsFile, report: Reporter) -> None:
-    """`x || 0` and `x || ''` silently replace legitimate falsy values."""
+    """`x || 0`, `x || ''` and `x || false` — which are only wrong for some `x`.
+
+    Each default is the falsy value of its own type, so when the left operand
+    has that type (a string with `|| ''`, a number with `|| 0`) `||` and `??`
+    give the same answer, and for a number `|| 0` also turns NaN into 0. The
+    defect is a left operand of a *different* type — a count with `|| ''` turns
+    0 into an empty string — and telling which needs the type checker. So this
+    is a lead, except where the left side is visibly a parse that may give NaN,
+    where `||` is the right operator.
+    """
     for index, token in enumerate(file.tokens):
         if not token.is_op("||") or index + 1 >= len(file):
             continue
         default = file.tokens[index + 1]
-        risky = (default.kind == "num" and default.value in ("0", "0.0")) \
-            or (default.kind == "str" and default.value.strip("'\"") == "") \
+        zero = default.kind == "num" and default.value in ("0", "0.0")
+        risky = zero or (default.kind == "str" and default.value.strip("'\"") == "") \
             or default.is_name("false")
         if not risky:
             continue
-        report.add(token.line, "falsy_default_with_or",
-                   f"`… || {default.value}` treats `0`, `''` and `false` as missing",
-                   "Use `??` when you mean 'null or undefined'. `||` is right only when every falsy "
-                   "value really should take the default.", "medium")
+        if zero and _nan_guard(file, index):
+            continue
+        report.candidate(token.line, "falsy_default_with_or",
+                         f"`… || {default.value}` replaces every falsy value, not only null and "
+                         "undefined",
+                         (f"the left operand has the default's own type, so its falsy value "
+                          f"already is `{default.value}` and `??` would give the same result",
+                          "every falsy value really should take the default (an empty string "
+                          "shown as a placeholder, a NaN treated as 0)"),
+                         "low")
 
 
 def _check_legacy_calls(file: TsFile, report: Reporter) -> None:
