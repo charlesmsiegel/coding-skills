@@ -3930,15 +3930,19 @@ def test_blocks_that_differ_only_in_literals_are_a_candidate(tmp_path):
             f"    trailer = build_trailer({tag!r}, checksum)\n"
             f"    return header + body + trailer\n"
         )
+    # Three identical copies: two would be below the rule of three, which is a
+    # candidate for a different reason than the one this test is about.
     (tmp_path / "same.py").write_text(make("environment", "environment_digest")
-                                      + "\n" + make("environment", "environment_copy"))
+                                      + "\n" + make("environment", "environment_copy")
+                                      + "\n" + make("environment", "environment_again"))
     (tmp_path / "other.py").write_text(make("procedure", "procedure_digest"))
     findings = run_detector("find_duplicates.py", tmp_path)
     by_kind = {f["kind"]: sorted(o["name"] for o in f["occurrences"]) for f in findings}
 
     assert by_kind == {
-        "finding": ["environment_copy", "environment_digest"],
-        "candidate": ["environment_copy", "environment_digest", "procedure_digest"],
+        "finding": ["environment_again", "environment_copy", "environment_digest"],
+        "candidate": ["environment_again", "environment_copy", "environment_digest",
+                      "procedure_digest"],
     }
     lead = next(f for f in findings if f["kind"] == "candidate")
     assert "literal" in lead["description"]

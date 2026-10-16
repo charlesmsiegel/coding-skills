@@ -13,6 +13,11 @@ Two tiers, because a hash cannot tell "same code" from "same shape":
     are erased too. A string or number that differs is often the whole meaning
     — `_digest("environment", x)` and `_digest("procedure", x)` are two
     identities, not one — so this is a lead for a reader, never a scored defect.
+  - Also a **candidate**: exactly two identical blocks. The rule of three
+    (references/overengineering-and-abstraction.md) says leave two copies
+    alone until the third shows what actually varies; a scored finding for the
+    pair would tell the reader to do what the guide tells them not to. Three or
+    more copies are the finding.
 
 Size is measured in executable lines (docstrings and comments excluded), and a
 block nested inside a reported duplicate is not reported again: the same copy
@@ -39,14 +44,37 @@ _BLOCK_TYPES = {
 }
 
 
+# Copies of one block before extracting it is the advice rather than a guess.
+RULE_OF_THREE = 3
+
+_RULE_OF_THREE_REASONS = [
+    'two copies are below the rule of three: until a third occurrence shows what '
+    'actually varies, an extraction guesses at the abstraction, and the wrong '
+    'abstraction costs more than the duplicate',
+    'the two blocks implement one protocol for two backends, or one step of two '
+    'workflows, and are expected to diverge',
+]
+_LOOK_ALIKE_REASONS = [
+    'a literal that differs is the whole meaning — a tag, a message, a mode — '
+    'and one function with a flag parameter would be worse than the copy',
+    'the blocks implement one protocol for two backends and are expected to '
+    'diverge',
+]
+
+
 @dataclass
 class DuplicateGroup:
     hash: str
     occurrences: list[dict]
     lines: int
-    # True when the members are identical up to renaming (a finding); False
-    # when they match only with literals erased (a candidate).
+    # True when the members are identical up to renaming; False when they
+    # match only with literals erased (always a candidate).
     exact: bool
+
+    @property
+    def is_finding(self) -> bool:
+        """Identical copies, at least RULE_OF_THREE of them: a scored defect."""
+        return self.exact and len(self.occurrences) >= RULE_OF_THREE
 
 
 class _DocstringStripper(ast.NodeTransformer):
@@ -250,7 +278,7 @@ def find_duplicates(path: Path, min_lines: int) -> list[DuplicateGroup]:
              if _members(g) not in exact_members]
 
     duplicates = _collapse_nested(exact + loose)
-    duplicates.sort(key=lambda x: (not x.exact, -len(x.occurrences), -x.lines))
+    duplicates.sort(key=lambda x: (not x.is_finding, not x.exact, -len(x.occurrences), -x.lines))
     return duplicates
 
 
@@ -263,11 +291,16 @@ def to_findings(duplicates: list[DuplicateGroup]) -> list[dict]:
         first, rest = dup.occurrences[0], dup.occurrences[1:]
         others = ", ".join(f"{o['file']}:{o['line']}" for o in rest)
         count = len(dup.occurrences)
-        if dup.exact:
+        if dup.is_finding:
             description = (f"{count} {first['type']} blocks identical up to renaming "
                            f"(~{dup.lines} executable lines each); also at {others}")
             suggestion = 'Extract the shared logic into one function/class.'
-            severity = 'high' if count >= 3 else 'medium'
+            severity = 'high'
+        elif dup.exact:
+            description = (f"{count} {first['type']} blocks identical up to renaming "
+                           f"(~{dup.lines} executable lines each); also at {others}")
+            suggestion = ''
+            severity = 'medium'
         else:
             description = (f"{count} {first['type']} blocks with one shape but different literals "
                            f"(~{dup.lines} executable lines each); also at {others}")
@@ -284,14 +317,10 @@ def to_findings(duplicates: list[DuplicateGroup]) -> list[dict]:
             'code_snippet': first['preview'].split('\n')[0][:80],
             'occurrences': [{k: v for k, v in o.items() if k != 'end_line'} for o in dup.occurrences],
         }
-        finding['kind'] = 'finding' if dup.exact else 'candidate'
-        if not dup.exact:
-            finding['also_caused_by'] = [
-                'a literal that differs is the whole meaning — a tag, a message, a mode — '
-                'and one function with a flag parameter would be worse than the copy',
-                'the blocks implement one protocol for two backends and are expected to '
-                'diverge',
-            ]
+        finding['kind'] = 'finding' if dup.is_finding else 'candidate'
+        if not dup.is_finding:
+            finding['also_caused_by'] = list(
+                _RULE_OF_THREE_REASONS if dup.exact else _LOOK_ALIKE_REASONS)
         findings.append(finding)
     return findings
 
@@ -328,16 +357,18 @@ def main():
             print("✅ No duplicate code found!")
             return
 
-        findings = [d for d in duplicates if d.exact]
-        candidates = [d for d in duplicates if not d.exact]
+        findings = [d for d in duplicates if d.is_finding]
+        candidates = [d for d in duplicates if not d.is_finding]
         total_occurrences = sum(len(d.occurrences) for d in findings)
         total_duplicate_lines = sum(d.lines * (len(d.occurrences) - 1) for d in findings)
 
-        print(f"Found {len(findings)} duplicate code pattern(s) and {len(candidates)} look-alike candidate(s)")
+        print(f"Found {len(findings)} duplicate code pattern(s) and {len(candidates)} candidate(s)")
         print(f"Duplicates: {total_occurrences} occurrences, ~{total_duplicate_lines} redundant executable lines\n")
 
         for i, dup in enumerate(duplicates, 1):
-            label = "Duplicate" if dup.exact else "Candidate (same shape, different literals)"
+            label = ("Duplicate" if dup.is_finding
+                     else "Candidate (two copies, below the rule of three)" if dup.exact
+                     else "Candidate (same shape, different literals)")
             print(f"{'='*60}")
             print(f"{label} #{i} ({len(dup.occurrences)} occurrences, ~{dup.lines} executable lines each)")
             print(f"{'='*60}")
