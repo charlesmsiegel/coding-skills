@@ -60,6 +60,15 @@ SECRET_NAME = re.compile(
 
 MIN_ENTROPY_BITS = 3.5
 
+# An unquoted value is a literal in `.env` and YAML, and an expression in code:
+# `token = revision.current(cid)`, `max_tokens=budget.max_output_tokens)`,
+# `token: ++req.current.token`. Its entropy is the entropy of some identifiers,
+# not of a credential. A bracket of any kind, a leading operator, or a dotted
+# chain of names marks the expression; a real credential has none of them
+# (a JWT's dots separate base64 segments starting `eyJ`, and it is matched as a
+# credential pattern before this rule is reached).
+_EXPRESSION_VALUE = re.compile(r"[()\[\]{}]|^[+\-!~*&]|^[A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)+$")
+
 # also_caused_by prose, shared between the private-key and cloud-credential
 # paths since the underlying tracking states (and the reasoning behind them)
 # are identical — only the header line naming what was found differs.
@@ -279,7 +288,9 @@ def analyze(path: Path, text: str, report: Reporter, tracked_here: bool | None =
             # deserves its own candidate.
             overlaps_reported = any(value_span[0] < end and start < value_span[1]
                                     for start, end in credential_spans)
-            if not overlaps_reported and shannon_entropy(value) >= MIN_ENTROPY_BITS:
+            is_expression = group_index == 3 and _EXPRESSION_VALUE.search(value)
+            if (not overlaps_reported and not is_expression
+                    and shannon_entropy(value) >= MIN_ENTROPY_BITS):
                 report.candidate(
                     number, "hardcoded_secret_assignment",
                     f"High-entropy value assigned to `{assignment.group(1)}`",

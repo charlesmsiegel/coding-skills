@@ -108,6 +108,24 @@ def test_unquoted_dotenv_assignment_is_detected(repo, run_script):
     assert records_of(result, "hardcoded_secret_assignment")
 
 
+def test_an_unquoted_expression_is_not_a_hardcoded_value(repo, run_script):
+    """Bare values are literals in .env and YAML; in code they are expressions,
+    and the entropy of `revision.current(cid)` is the entropy of its names."""
+    repo.write("app.py", "token = revision.current(campaign_identifier)\n"
+                         "chain = call(resolved, max_tokens=budget.max_output_tokens)\n"
+                         "secret_holder = settings.provider_credentials.primary\n")
+    repo.write("view.ts", "const req = { token: ++altsReq.current.token, cid };\n")
+    result = run_script(SCRIPT, repo.path, "--format", "json")
+    assert not records_of(result, "hardcoded_secret_assignment")
+
+
+def test_an_unquoted_credential_in_yaml_is_still_reported(repo, run_script):
+    """The narrowing is about expressions — a bare base64 value still counts."""
+    repo.write("deploy.yaml", "api_token: hJ8s0Kd93LwmZq2Xv/Rt7YbNc4PfGh6Aa+==\n")
+    result = run_script(SCRIPT, repo.path, "--format", "json")
+    assert records_of(result, "hardcoded_secret_assignment")
+
+
 def test_low_entropy_placeholder_is_not_reported(repo, run_script):
     repo.write("settings.py", 'API_SECRET = "changeme"\n')
     result = run_script(SCRIPT, repo.path, "--format", "json")
