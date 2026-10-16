@@ -8,9 +8,19 @@ over-broad annotations, and source lines with unscoped type: ignore comments.
 
 Finds:
   - missing_return_annotation : public function/method lacks a return annotation
+                                (and, when its parameters are bare too, says so —
+                                one signature is one finding, not two)
   - missing_param_annotation  : public function/method has un-annotated parameters
+                                but does annotate its return
   - any_overuse               : annotation uses `Any` or `typing.Any`, defeating static checks
   - broad_type_ignore         : bare `# type: ignore` without an error code in brackets
+
+"Public" means a surface other code calls. Not reported for missing annotations:
+closures and anything else defined inside a function, methods of a `_Private`
+class, and web route handlers (`@router.get("/x")`, `@app.route(...)`). The
+framework calls a handler, not other code, and in FastAPI a return annotation
+becomes the response model — adding one changes validation and the published
+schema, which is not a typing chore.
 """
 
 import ast
@@ -73,6 +83,50 @@ def _is_stub_body(node) -> bool:
     return False
 
 
+# The verbs a router or app object registers a handler under: FastAPI and
+# Starlette (get/post/.../api_route/websocket), Flask and friends (route).
+_ROUTE_VERBS = frozenset({"get", "post", "put", "patch", "delete", "head", "options",
+                          "api_route", "route", "websocket"})
+
+
+def _is_route_handler(node) -> bool:
+    """True for a function registered by a decorator call like `@router.get(...)`."""
+    for dec in node.decorator_list:
+        if (isinstance(dec, ast.Call) and isinstance(dec.func, ast.Attribute)
+                and dec.func.attr in _ROUTE_VERBS):
+            return True
+    return False
+
+
+def _api_functions(tree):
+    """Yield (function, is_method) for every def that is part of an API surface.
+
+    Excluded: anything nested in a function (a closure, or a method of a class
+    defined inside one), whose only callers are in that function; and methods
+    of a `_Private` class, at any depth, which callers outside the module
+    cannot name.
+    """
+    def walk(body, in_class: bool, private: bool):
+        for node in body:
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                if not private:
+                    yield node, in_class
+                # Its body is a closure scope: nothing below is API surface.
+            elif isinstance(node, ast.ClassDef):
+                yield from walk(node.body, True, private or node.name.startswith("_"))
+            else:
+                # if TYPE_CHECKING / try-except-ImportError / with blocks at
+                # module or class level still define module- or class-level names.
+                for field in ("body", "orelse", "finalbody", "handlers"):
+                    for child in getattr(node, field, None) or ():
+                        if isinstance(child, ast.ExceptHandler):
+                            yield from walk(child.body, in_class, private)
+                        elif isinstance(child, ast.stmt):
+                            yield from walk([child], in_class, private)
+
+    yield from walk(tree.body, False, False)
+
+
 def _is_any_annotation(annotation) -> bool:
     """Return True if the annotation node is exactly `Any` or `typing.Any`."""
     if annotation is None:
@@ -100,25 +154,8 @@ def detect(tree, filename, lines, ignore):
                 "Narrow to '# type: ignore[specific-error-code]' (run mypy/pyright to get the code), or fix the underlying type error.",
                 "medium")
 
-    # --- Walk functions, tracking whether they are inside a class ---
-    # We do a two-pass approach: collect all ClassDef bodies at top level and
-    # nested, then walk all FunctionDef nodes and decide context.
-
-    # Build a set of function AST node ids that are direct children of a ClassDef
-    method_ids: set = set()
-    for node in ast.walk(tree):
-        if isinstance(node, ast.ClassDef):
-            for item in node.body:
-                if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                    method_ids.add(id(item))
-
-    # Walk all function definitions
-    for node in ast.walk(tree):
-        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            continue
-
+    for node, is_method in _api_functions(tree):
         fname = node.name
-        is_method = id(node) in method_ids
 
         # Skip all dunder methods
         if fname.startswith("__") and fname.endswith("__"):
@@ -142,13 +179,9 @@ def detect(tree, filename, lines, ignore):
             if first_name in ("self", "cls"):
                 exclude_first = True
 
-        # --- missing_return_annotation ---
-        if node.returns is None:
-            kind = "method" if is_method else "function"
-            add(node.lineno, "missing_return_annotation",
-                f"Public {kind} '{fname}' has no return type annotation",
-                f"Add a return annotation to '{fname}' (e.g. '-> None' or '-> SomeType'). Enable mypy/pyright incrementally with per-module ignores.",
-                "low")
+        # Missing annotations are judged below, with the parameters, so a bare
+        # signature is charged once. A route handler is exempt from both.
+        missing_return = node.returns is None and not _is_route_handler(node)
 
         # --- any_overuse in return annotation ---
         if _is_any_annotation(node.returns):
@@ -179,9 +212,28 @@ def detect(tree, filename, lines, ignore):
                     f"Replace 'Any' with a specific type for '{param.arg}' in '{fname}'. Consider using a TypeVar, Union, or Protocol if the type is polymorphic.",
                     "medium")
 
-        if unannotated:
-            kind = "method" if is_method else "function"
-            param_list = ", ".join(unannotated)
+        if _is_route_handler(node):
+            unannotated = []
+
+        kind = "method" if is_method else "function"
+        param_list = ", ".join(unannotated)
+        # One signature, one remedy: type it. Two findings would charge the
+        # same gap twice — unless the return type is --ignore'd, when the
+        # parameters must still be reported on their own.
+        if missing_return and unannotated and "missing_return_annotation" not in ignore:
+            add(node.lineno, "missing_return_annotation",
+                f"Public {kind} '{fname}' has no return type annotation and un-annotated "
+                f"parameter(s): {param_list}",
+                f"Annotate the signature of '{fname}': '{param_list}' and the return "
+                "(e.g. '-> None' or '-> SomeType'). Enable mypy/pyright incrementally; "
+                "start with the public API surface.",
+                "low")
+        elif missing_return and not unannotated:
+            add(node.lineno, "missing_return_annotation",
+                f"Public {kind} '{fname}' has no return type annotation",
+                f"Add a return annotation to '{fname}' (e.g. '-> None' or '-> SomeType'). Enable mypy/pyright incrementally with per-module ignores.",
+                "low")
+        elif unannotated:
             add(node.lineno, "missing_param_annotation",
                 f"Public {kind} '{fname}' has un-annotated parameter(s): {param_list}",
                 f"Add type annotations for '{param_list}' in '{fname}'. Enable mypy/pyright incrementally; start with the public API surface.",
