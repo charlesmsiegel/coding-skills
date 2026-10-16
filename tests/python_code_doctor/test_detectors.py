@@ -5114,3 +5114,42 @@ def test_a_test_module_of_many_cases_is_not_a_god_module(tmp_path):
     assert set(found) == {"helpers.py", "test_huge.py"}
     assert "45 top-level definitions" in found["helpers.py"]
     assert "source lines" in found["test_huge.py"] and "definitions" not in found["test_huge.py"]
+
+
+def test_fixture_requests_are_dependency_injection_not_a_data_clump(tmp_path):
+    """`def test_x(service, settings, swept)` asks pytest for three fixtures; the
+    names recur because the tests share fixtures, not because they want an object."""
+    tests = tmp_path / "tests"
+    tests.mkdir()
+    (tests / "test_service.py").write_text(
+        "import pytest\n"
+        "\n"
+        "@pytest.fixture\n"
+        "def swept(service, settings, tmp_path):\n"
+        "    return 1\n"
+        "\n"
+        "@pytest.fixture(scope='module')\n"
+        "def other(service, settings, swept):\n"
+        "    return 2\n"
+        "\n"
+        "def test_a(service, settings, swept):\n"
+        "    assert service\n"
+        "\n"
+        "def test_b(service, settings, swept):\n"
+        "    assert settings\n"
+        "\n"
+        "class TestGroup:\n"
+        "    def test_c(self, service, settings, swept):\n"
+        "        assert swept\n"
+        "\n"
+        "def make(width, height, depth):\n"
+        "    return width\n"
+        "\n"
+        "def grow(width, height, depth):\n"
+        "    return height\n"
+    )
+    (tmp_path / "shapes.py").write_text("def area(width, height, depth):\n    return depth\n")
+
+    clumps = [r["description"] for r in run_detector("find_parameter_objects.py", tmp_path)]
+    assert len(clumps) == 1, clumps
+    assert "['depth', 'height', 'width']" in clumps[0], "plain helpers, in tests or not, still clump"
