@@ -134,7 +134,7 @@ def _is_jsx_container(file: TsFile, brace: int) -> bool:
     return False
 
 
-def _separate_expression(file: TsFile, outer: int, inner: int) -> bool:
+def _separate_expression(file: TsFile, outer: int, inner: int, bodies: set[int]) -> bool:
     """True when the ternary at ``inner`` belongs to a different expression than
     the branch of the one at ``outer`` it sits in.
 
@@ -157,7 +157,6 @@ def _separate_expression(file: TsFile, outer: int, inner: int) -> bool:
             openers.append(cursor)
         cursor -= 1
     openers.reverse()
-    bodies = {func.body_open for func in file.functions if func.has_body}
     for opener in openers:
         if file.tokens[opener].is_op("{") and (opener in bodies or _is_jsx_container(file, opener)):
             return True
@@ -182,6 +181,7 @@ def _separate_expression(file: TsFile, outer: int, inner: int) -> bool:
 
 
 def _check_nested_ternary(file: TsFile, report: Reporter) -> None:
+    bodies = {func.body_open for func in file.functions if func.has_body}
     for index, token in enumerate(file.tokens):
         if not _is_ternary(file, index):
             continue
@@ -189,7 +189,7 @@ def _check_nested_ternary(file: TsFile, report: Reporter) -> None:
         if colon < 0:
             continue
         nested = any(
-            _is_ternary(file, probe) and not _separate_expression(file, index, probe)
+            _is_ternary(file, probe) and not _separate_expression(file, index, probe, bodies)
             for probe in range(index + 1, colon)
         )
         if nested:
