@@ -28,7 +28,7 @@ import ast
 import json
 import argparse
 from pathlib import Path
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass, asdict, field
 from itertools import combinations
 from collections import defaultdict
 from common import configure_output, find_python_files, is_test_file, warn_detector_error, warn_unparseable
@@ -43,6 +43,8 @@ class CodeSmell:
     suggestion: str
     severity: str
     code_snippet: str = ""
+    related_lines: list[int] = field(default_factory=list)
+    occurrences: list[str] = field(default_factory=list)
 
 
 MIN_GROUP = 3        # smallest clump size to consider
@@ -50,6 +52,33 @@ MIN_FUNCS = 3        # how many functions must share the group
 MAX_PARAMS = 8       # skip very long signatures (already flagged elsewhere)
 _SKIP = {"self", "cls"}
 _INITIALIZERS = {"__init__", "__new__", "__post_init__"}
+
+
+ROUTE_DECORATORS = frozenset({
+    "get", "post", "put", "patch", "delete", "head", "options",
+    "api_route", "route", "websocket",
+})
+
+def _decorator_name(decorator: ast.AST) -> str | None:
+    target = decorator.func if isinstance(decorator, ast.Call) else decorator
+    if isinstance(target, ast.Attribute):
+        return target.attr
+    if isinstance(target, ast.Name):
+        return target.id
+    return None
+
+
+def _framework_called(node, in_test_file: bool) -> bool:
+    """True when the framework, not a caller, supplies this function's arguments."""
+    if in_test_file and node.name.startswith("test"):
+        return True  # pytest test: fixtures by name
+    for decorator in node.decorator_list:
+        if _decorator_name(decorator) == "fixture":
+            return True
+        if isinstance(decorator, ast.Call) and isinstance(decorator.func, ast.Attribute) \
+                and decorator.func.attr in ROUTE_DECORATORS:
+            return True  # route handler: bound from the request
+    return False
 
 
 def _param_names(args: ast.arguments):
@@ -97,7 +126,7 @@ def _collect(path: Path):
                    for item in node.body if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef))}
         for node in ast.walk(tree):
             if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                if in_tests and _requests_fixtures(node):
+                if _framework_called(node, in_tests):
                     continue
                 names = _param_names(node.args)
                 if MIN_GROUP <= len(names) <= MAX_PARAMS:
@@ -181,6 +210,8 @@ def detect(path: Path, ignore: set):
                          + f": {where}{more}"),
             suggestion="Group them into a dataclass (e.g. a single typed object) and pass that instead of the loose parameters.",
             severity="medium", code_snippet="",
+            related_lines=sorted({ln for f, ln, _ in locs if f == f0 and ln != ln0}),
+            occurrences=[f"{f}:{ln} {fn}()" for f, ln, fn in sorted(locs)],
         ))
     issues.sort(key=lambda x: (x.file, x.line))
     return issues

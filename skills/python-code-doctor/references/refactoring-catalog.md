@@ -82,7 +82,9 @@ others still make sense? If not, it's a clump.
 **Fix:** Extract Class / Introduce Parameter Object → a (frozen) dataclass; then
 Preserve Whole Object at the call sites. Watch the behavior that follows the data —
 it often wants to move onto the new class.
-**Detector:** `find_parameter_objects.py`.
+**Detector:** `find_parameter_objects.py` — each clump once, each function's
+parameters charged to one clump; pytest tests and fixtures and web route handlers
+are skipped, because the framework, not a caller, supplies their arguments.
 
 ## Object-Orientation Abusers
 
