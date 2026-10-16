@@ -265,3 +265,17 @@ def test_a_todo_comment_on_an_ordinary_line_is_still_inventoried(repo, run_scrip
     repo.write("app.py", "x = 1  # TODO: name this\n")
     result = run_script(SCRIPT, repo.path, "--format", "json")
     assert "todo_inventory" in types_in(result)
+
+
+def test_a_prose_template_is_not_held_to_code_line_lengths(repo, run_script):
+    """`chat.md.j2` is Markdown with Jinja in it; its paragraphs are lines."""
+    repo.write("prompts/chat.md.j2", "{{ intro }}\n\n" + "A long paragraph of prose. " * 40 + "\n")
+    repo.write("templates/notice.txt.jinja", "Dear {{ name }}, " + "word " * 120 + "\n")
+    result = run_script(SCRIPT, repo.path, "--format", "json")
+    assert "oversized_line" not in types_in(result)
+
+
+def test_a_template_of_code_is_still_source(repo, run_script):
+    repo.write("gen/module.py.j2", "x = " + "1 + " * 120 + "1\n")
+    result = run_script(SCRIPT, repo.path, "--format", "json")
+    assert "oversized_line" in types_in(result)

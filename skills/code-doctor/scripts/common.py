@@ -148,6 +148,23 @@ def read_text(path: Path) -> str:
     return data.decode("utf-8", errors="replace")
 
 
+# A template engine's suffix says how a file is rendered, not what it holds:
+# `chat.md.j2` is Markdown, `module.py.j2` is code. Such a file is classified
+# by its inner suffix, exactly as the rendered file would be.
+TEMPLATE_SUFFIXES = frozenset({
+    ".j2", ".jinja", ".jinja2", ".tmpl", ".tpl", ".mustache", ".hbs", ".handlebars",
+    ".liquid", ".njk", ".ejs", ".erb", ".mako",
+})
+
+
+def _content_suffix(path: Path) -> str:
+    """The suffix naming what a file holds — the inner one, for a template."""
+    suffixes = [suffix.lower() for suffix in path.suffixes]
+    if len(suffixes) >= 2 and suffixes[-1] in TEMPLATE_SUFFIXES:
+        return suffixes[-2]
+    return path.suffix.lower()
+
+
 def is_source(rel_parts: tuple[str, ...], path: Path) -> bool:
     """Whether the code-only detectors should read this file.
 
@@ -156,7 +173,7 @@ def is_source(rel_parts: tuple[str, ...], path: Path) -> bool:
     """
     if any(part.lower() in DOC_DIR_NAMES for part in rel_parts[:-1]):
         return False
-    if path.suffix.lower() in NON_CODE_SUFFIXES:
+    if _content_suffix(path) in NON_CODE_SUFFIXES:
         return False
     name = path.name.lower()
     if not path.suffix and name.split(".")[0] in NON_CODE_BASENAMES:
