@@ -2,23 +2,35 @@
 """
 Detect exception-handling hazards in Python code via AST analysis.
 
-Complements the existing detectors: bare `except:` lives in find_code_smells,
-and `except: pass` / `except E: pass` live in find_unpythonic. This script
-covers the cases those miss.
+Complements the existing detectors: bare `except:` lives in find_code_smells.
+This script covers the cases it misses, and is the single owner of swallowed
+exceptions (find_unpythonic defers to it).
 
 Finds:
-  - raise_without_from    : raising a new exception inside an `except` block
-                            without `from`, which discards the original cause
-  - unreachable_except    : an `except` clause that can never run because an
-                            earlier clause already catches a base class
-  - catches_baseexception : `except BaseException` (also traps KeyboardInterrupt,
-                            SystemExit, GeneratorExit)
-  - assert_for_validation : `assert` used for runtime validation in non-test code
-                            (assertions are stripped under `python -O`). An
-                            assert whose whole test is `<expr> is not None` or
-                            `isinstance(...)` is a candidate instead: that shape
-                            is how an Optional is narrowed for a type checker
-                            and an internal invariant written down.
+  - raise_without_from     : raising a new exception inside an `except` block
+                             without `from`. Nothing is lost — implicit chaining
+                             keeps the original as `__context__` — but the
+                             traceback then reads "During handling of the above
+                             exception, another exception occurred" rather than
+                             "was the direct cause", so the intent goes unstated
+                             (Ruff B904). Low severity; a framework HTTPException
+                             is only a candidate, since the framework renders it
+                             as a response and never prints the chain.
+  - unreachable_except     : an `except` clause that can never run because an
+                             earlier clause already catches a base class
+  - catches_baseexception  : `except BaseException` that neither re-raises nor
+                             hands the exception on — it traps KeyboardInterrupt,
+                             SystemExit and GeneratorExit
+  - swallowed_exception    : a broad catch (bare / Exception / BaseException) that
+                             discards the error without logging or re-raising
+  - suppressible_exception : a narrow `try: ... except X: pass`, which is
+                             `contextlib.suppress(X)` spelled long-hand (Ruff SIM105)
+  - assert_for_validation  : `assert` validating a public function's argument in
+                             non-test code (assertions are stripped under `python -O`)
+
+A broad catch that the repo's Ruff gate suppresses *with a stated reason*
+(`# noqa: BLE001 -- why`) is a candidate rather than a finding: the reason is the
+benign explanation, already written down by whoever adjudicated the line.
 """
 
 import ast
@@ -27,7 +39,8 @@ import argparse
 from pathlib import Path
 from dataclasses import dataclass, asdict
 from collections import defaultdict
-from common import project_parts, sort_findings, cached_parse, SEVERITY_ICONS, configure_output, find_python_files, warn_detector_error, warn_unparseable
+from common import (sort_findings, cached_parse, SEVERITY_ICONS, configure_output, find_python_files,
+                    looks_like_test, reasoned_noqa, warn_detector_error, warn_unparseable)
 
 
 @dataclass
@@ -39,32 +52,11 @@ class CodeSmell:
     suggestion: str
     severity: str
     code_snippet: str = ""
-    # A scored defect by default; "candidate" for a lead the downstream merge
-    # must not score. A candidate carries no fix and names, in also_caused_by,
-    # the ways a healthy codebase produces the same observation.
+    # A scored defect by default. "candidate" marks a lead the downstream merge
+    # must not score: it carries no fix and names, in also_caused_by, the ways
+    # a healthy codebase produces the same observation.
     kind: str = "finding"
     also_caused_by: tuple[str, ...] = ()
-
-
-# Why `assert x is not None` / `assert isinstance(x, T)` is usually not validation.
-_NARROWING_ASSERT_REASONS = (
-    "type narrowing for a checker: the assert tells mypy/pyright an Optional or a "
-    "union is the narrower type from here on, and -O stripping it changes no behaviour",
-    "an internal invariant rather than validation: the caller already guarantees it "
-    "(the value was checked or set on the only path that reaches here), and the assert "
-    "documents that rather than guarding input",
-)
-
-
-def _is_narrowing_assert(test: ast.expr) -> bool:
-    """`assert <expr> is not None` or `assert isinstance(...)`, and nothing more."""
-    if (isinstance(test, ast.Compare) and len(test.ops) == 1
-            and isinstance(test.ops[0], ast.IsNot)
-            and isinstance(test.comparators[0], ast.Constant)
-            and test.comparators[0].value is None):
-        return True
-    return (isinstance(test, ast.Call) and isinstance(test.func, ast.Name)
-            and test.func.id == "isinstance")
 
 
 _SCOPE_BOUNDARIES = (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)
@@ -164,11 +156,12 @@ def _handler_type_names(handler):
 def _same_scope_nodes(stmts, stop_types=()):
     """Yield descendants of `stmts` in the same lexical scope (not descending
     into nested functions/lambdas, nor into `stop_types`)."""
-    stack = list(stmts)
+    # The seeds obey the same rule as the children; a `def` written directly in
+    # the block is a scope boundary whether or not it is nested in an `if`.
+    stack = [s for s in stmts
+             if not isinstance(s, _SCOPE_BOUNDARIES) and not (stop_types and isinstance(s, stop_types))]
     while stack:
         node = stack.pop()
-        if isinstance(node, _SCOPE_BOUNDARIES) or (stop_types and isinstance(node, stop_types)):
-            continue
         yield node
         for child in ast.iter_child_nodes(node):
             if isinstance(child, _SCOPE_BOUNDARIES) or (stop_types and isinstance(child, stop_types)):
@@ -176,16 +169,38 @@ def _same_scope_nodes(stmts, stop_types=()):
             stack.append(child)
 
 
-def _looks_like_test(path_str: str) -> bool:
-    p = Path(path_str)
-    if p.name == "conftest.py":
-        return True
-    stem = p.stem
-    if stem.startswith("test_") or stem.endswith("_test"):
-        return True
-    # Below its project, not wherever the project is checked out.
-    parts = {part.lower() for part in project_parts(p)[:-1]}
-    return "tests" in parts or "test" in parts
+def _callee_leaf(call) -> str | None:
+    func = call.func
+    if isinstance(func, ast.Name):
+        return func.id
+    if isinstance(func, ast.Attribute):
+        return func.attr
+    return None
+
+
+def _is_public(name: str) -> bool:
+    """No leading underscore, or a dunder (``__init__`` validates a caller's input too)."""
+    return not name.startswith("_") or (name.startswith("__") and name.endswith("__"))
+
+
+def _parameter_names(fn) -> set:
+    args = fn.args
+    every = list(getattr(args, "posonlyargs", [])) + list(args.args) + list(args.kwonlyargs)
+    every += [a for a in (args.vararg, args.kwarg) if a is not None]
+    return {a.arg for a in every} - {"self", "cls"}
+
+
+def _is_narrowing(test) -> bool:
+    """`x is not None`, `isinstance(...)`, or an and/or of those: a type
+    checker's narrowing, which holds by construction once the code type-checks."""
+    if isinstance(test, ast.BoolOp):
+        return all(_is_narrowing(v) for v in test.values)
+    if isinstance(test, ast.Compare):
+        return (len(test.ops) == 1 and isinstance(test.ops[0], ast.IsNot)
+                and isinstance(test.comparators[0], ast.Constant) and test.comparators[0].value is None)
+    if isinstance(test, ast.Call):
+        return isinstance(test.func, ast.Name) and test.func.id == "isinstance"
+    return False
 
 
 class ExceptionIssueDetector(ast.NodeVisitor):
@@ -194,26 +209,46 @@ class ExceptionIssueDetector(ast.NodeVisitor):
         self.source_lines = source_lines
         self.issues = []
         self.ignore = ignore or set()
-        self.is_test_file = _looks_like_test(filename)
+        self.is_test_file = looks_like_test(filename)
+        # The try statement each handler belongs to, and the innermost function
+        # each statement sits in — both are context a single node does not carry.
+        self._try_of = {}
+        self._functions = []
 
     def _get_line(self, lineno: int) -> str:
         if 0 < lineno <= len(self.source_lines):
             return self.source_lines[lineno - 1].strip()[:80]
         return ""
 
-    def _add(self, line, smell_type, desc, suggestion, severity="medium",
-             kind="finding", also_caused_by=()):
+    def _add(self, line, smell_type, desc, suggestion, severity="medium", also_caused_by=()):
         if smell_type in self.ignore:
             return
+        # A record with benign readings is a candidate, and a candidate carries
+        # no fix: the caller passes one or the other, never both.
         self.issues.append(CodeSmell(
             file=self.filename, line=line, smell_type=smell_type,
-            description=desc, suggestion=suggestion, severity=severity,
+            description=desc, suggestion="" if also_caused_by else suggestion, severity=severity,
             code_snippet=self._get_line(line),
-            kind=kind, also_caused_by=tuple(also_caused_by),
+            kind="candidate" if also_caused_by else "finding",
+            also_caused_by=tuple(also_caused_by),
         ))
 
+    def visit_FunctionDef(self, node):
+        self._functions.append(node)
+        self.generic_visit(node)
+        self._functions.pop()
+
+    visit_AsyncFunctionDef = visit_FunctionDef
+
     # -- unreachable except (ordering across handlers) --------------------
+    def visit_TryStar(self, node):
+        for handler in node.handlers:
+            self._try_of[handler] = node
+        self.generic_visit(node)
+
     def visit_Try(self, node: ast.Try):
+        for handler in node.handlers:
+            self._try_of[handler] = node
         caught_names = []        # names caught by earlier handlers
         catch_all_label = None   # label of an earlier catch-all (bare / Exception / BaseException)
         for handler in node.handlers:
@@ -313,83 +348,161 @@ class ExceptionIssueDetector(ast.NodeVisitor):
 
         return False
 
-    @staticmethod
-    def _reraises(node: ast.ExceptHandler) -> bool:
-        """Whether the handler passes the caught exception on.
+    # -- helpers for catches_baseexception --------------------------------
+    # Calls that read an exception rather than deliver it: passing the bound
+    # name to one of these still leaves the exception trapped right here.
+    _INSPECTS = frozenset({
+        "str", "repr", "type", "isinstance", "issubclass", "print", "format", "id", "hash",
+        "getattr", "hasattr", "vars", "dir", "bool",
+        "format_exception", "format_exception_only", "print_exception", "format_tb", "print_tb",
+    }) | _LOG_ATTRS | {"debug", "info", "log"}
 
-        `except BaseException: cleanup(); raise` is how cleanup is made to run
-        on Ctrl+C as well; nothing is trapped. A bare `raise`, or raising the
-        name the handler bound, re-raises (the same exemption Ruff's BLE001
-        makes). Raising something else, or nothing, does trap it.
+    @staticmethod
+    def _hands_on(handler: ast.ExceptHandler) -> bool:
+        """True when the handler re-raises or passes the exception on.
+
+        `except BaseException: <cleanup>; raise` traps nothing — catching
+        BaseException there is *required*, so the cleanup also runs on Ctrl-C and
+        on asyncio.CancelledError. Nor does `fut.set_exception(exc)` or
+        `errors.append(exc)`: the exception object is delivered to whoever waits
+        on it, the shape of the stdlib's own concurrent.futures worker. Ruff's
+        BLE001 exempts a re-raise for the same reason. Logging or formatting the
+        exception (`log.warning(..., exc)`, `str(exc)`) is not delivery: the
+        Ctrl-C still stops here.
         """
-        # A raise in just one branch does not establish propagation. Require a
-        # terminal re-raise, with no earlier path returning or leaving a loop.
-        # More involved control flow stays visible for review.
-        last = node.body[-1] if node.body else None
-        if not isinstance(last, ast.Raise):
-            return False
-        if any(isinstance(n, (ast.Return, ast.Break, ast.Continue))
-               for n in _same_scope_nodes(node.body[:-1])):
-            return False
-        return last.exc is None or (
-            node.name is not None and isinstance(last.exc, ast.Name) and last.exc.id == node.name)
+        bound = handler.name
+        for n in _same_scope_nodes(handler.body, stop_types=(ast.ExceptHandler,)):
+            if isinstance(n, ast.Raise):
+                if n.exc is None:
+                    return True
+                if bound and isinstance(n.exc, ast.Name) and n.exc.id == bound:
+                    return True
+            if bound and isinstance(n, ast.Call) and _callee_leaf(n) not in ExceptionIssueDetector._INSPECTS:
+                values = list(n.args) + [kw.value for kw in n.keywords]
+                if any(isinstance(v, ast.Name) and v.id == bound for v in values):
+                    return True
+        return False
 
     # -- BaseException + raise-without-from (per handler) -----------------
     def visit_ExceptHandler(self, node: ast.ExceptHandler):
         names, _ = _handler_type_names(node)
-        if "BaseException" in names and not self._reraises(node):
+        if "BaseException" in names and not self._hands_on(node):
+            reasons = ()
+            if reasoned_noqa(self.source_lines, node.lineno, "BLE001"):
+                reasons = ("the repo's BLE001 lint gate suppresses this catch with a stated reason "
+                           "(an interpreter-level signal is meant to be caught here)",)
             self._add(node.lineno, "catches_baseexception",
-                "Catching BaseException also traps KeyboardInterrupt, SystemExit and GeneratorExit",
-                "Catch 'Exception' (or a specific subclass) unless you truly need to intercept interpreter-level signals.")
+                "Catching BaseException without re-raising also traps KeyboardInterrupt, SystemExit and GeneratorExit",
+                "Catch 'Exception' (or a specific subclass), or re-raise after the cleanup, unless you truly "
+                "need to intercept interpreter-level signals.",
+                also_caused_by=reasons)
 
         for n in _same_scope_nodes(node.body, stop_types=(ast.ExceptHandler,)):
             if isinstance(n, ast.Raise) and n.exc is not None and n.cause is None:
                 if isinstance(n.exc, ast.Call):
-                    self._add(getattr(n, "lineno", node.lineno), "raise_without_from",
-                        "Raising a new exception inside 'except' without 'from' discards the original traceback and cause",
-                        "Use 'raise NewError(...) from err' to chain the original, or 'from None' to deliberately suppress it.")
+                    leaf = _callee_leaf(n.exc) or ""
+                    if leaf.endswith("HTTPException"):
+                        # The handler turns it into a response; nobody reads
+                        # its traceback, so the missing `from` changes nothing
+                        # anyone sees.
+                        self._add(getattr(n, "lineno", node.lineno), "raise_without_from",
+                            f"'{leaf}' is raised inside 'except' without 'from'",
+                            "", severity="low",
+                            also_caused_by=(
+                                "web-framework handlers render an HTTPException as a response and "
+                                "never print its chain, so the implicit __context__ is never read",
+                            ))
+                    else:
+                        self._add(getattr(n, "lineno", node.lineno), "raise_without_from",
+                            "Raising a new exception inside 'except' without 'from': the original survives "
+                            "only as implicit __context__, so the traceback reads 'During handling of the "
+                            "above exception, another exception occurred' instead of 'was the direct cause'",
+                            "State the intent: 'raise NewError(...) from err' when the original is the cause, "
+                            "or 'from None' to hide it deliberately.",
+                            severity="low")
                 elif isinstance(n.exc, ast.Name) and (node.name is None or n.exc.id != node.name):
                     self._add(getattr(n, "lineno", node.lineno), "raise_without_from",
-                        "Raising a different exception inside 'except' without 'from' discards the original cause",
-                        "Use 'raise ... from err' to chain the original exception, or 'from None' to suppress it.")
+                        "Raising a different exception inside 'except' without 'from': the original survives "
+                        "only as implicit __context__, and the traceback does not say it was the cause",
+                        "State the intent: 'raise ... from err' when the original is the cause, or 'from None' "
+                        "to hide it deliberately.",
+                        severity="low")
 
         # ---------------------------------------------------------------- #
-        # swallowed_exception — a catch that silently discards the error.
-        # This is the single owner of swallow detection (broad and narrow).
+        # swallowed_exception — a broad catch that silently discards the
+        # error. This is the single owner of swallow detection.
         # ---------------------------------------------------------------- #
         if (not self._body_has_raise(node.body)
                 and not self._body_has_log_call(node.body)
                 and self._is_silent_body(node.body)):
             if self._is_broad_catch(node):
                 catch_label = "bare except" if node.type is None else f"except {node.type.id}"
+                # Ruff names a broad `except Exception` BLE001 and a bare
+                # `except:` E722; a stated reason on either is the repo's own
+                # adjudication of this exact line.
+                codes = ("BLE001", "E722") if node.type is None else ("BLE001",)
+                reasons = ()
+                if any(reasoned_noqa(self.source_lines, node.lineno, code) for code in codes):
+                    reasons = (
+                        "the repo's lint gate suppresses this broad catch with a stated reason — "
+                        "typically a fail-soft boundary whose caller reads the fallback as 'unavailable'",
+                    )
                 self._add(node.lineno, "swallowed_exception",
                     f"Broad '{catch_label}:' silently discards the exception without logging or re-raising",
                     "Don't silently swallow — log with context and re-raise, "
                     "or catch a narrow exception type you can actually handle.",
-                    "medium")
-            elif all(isinstance(s, ast.Pass) for s in node.body):
-                # narrow `except X: pass` — less dangerous, but still a silent ignore
-                self._add(node.lineno, "swallowed_exception",
-                    f"'except {' / '.join(names)}:' silently ignores the exception",
-                    "If ignoring is intentional, say so explicitly with "
-                    "contextlib.suppress(...) and a comment; otherwise log or handle it.",
+                    "medium", also_caused_by=reasons)
+            elif all(isinstance(s, ast.Pass) for s in node.body) and self._suppress_rewrites(node):
+                # A narrow `except X: pass` is the handling: the error is
+                # expected and ignoring it is the decision. What is left to
+                # say is how it is spelled — contextlib.suppress says the same
+                # thing in one line, so this is an idiom item, not a defect.
+                listed = ", ".join(names)
+                self._add(node.lineno, "suppressible_exception",
+                    f"'try: ... except {' / '.join(names)}: pass' is contextlib.suppress spelled long-hand",
+                    f"Use `with contextlib.suppress({listed}):` around the guarded statements.",
                     "low")
 
         self.generic_visit(node)
 
+    def _suppress_rewrites(self, handler: ast.ExceptHandler) -> bool:
+        """True when `with contextlib.suppress(X):` says exactly what the try says.
+
+        Only a plain `try` with this one handler and no `else`/`finally` (Ruff
+        SIM105's shape). With another handler, an `else` or a `finally`, or under
+        `except*`, suppress is not a faithful one-step rewrite, and a fix that
+        does not apply is not a fix.
+        """
+        owner = self._try_of.get(handler)
+        return (isinstance(owner, ast.Try) and len(owner.handlers) == 1
+                and not owner.orelse and not owner.finalbody)
+
     # -- assert used for validation ---------------------------------------
     def visit_Assert(self, node: ast.Assert):
-        if self.is_test_file:
-            pass
-        elif _is_narrowing_assert(node.test):
-            self._add(node.lineno, "assert_for_validation",
-                "assert narrows a value's type or states an invariant; -O removes it, which "
-                "matters only if a caller can actually break it",
-                "", "low", kind="candidate", also_caused_by=_NARROWING_ASSERT_REASONS)
-        else:
-            self._add(node.lineno, "assert_for_validation",
-                "assert is removed when Python runs with -O, so it must not be relied on for validation or security checks",
-                "Replace with an explicit check that raises, e.g. `if not cond: raise ValueError(...)`.")
+        if not self.is_test_file:
+            fn = self._functions[-1] if self._functions else None
+            validates_input = (
+                fn is not None
+                and _is_public(fn.name)
+                and not _is_narrowing(node.test)
+                and any(isinstance(n, ast.Name) and n.id in _parameter_names(fn)
+                        for n in ast.walk(node.test))
+            )
+            if validates_input:
+                self._add(node.lineno, "assert_for_validation",
+                    f"'{fn.name}' validates its argument with assert, which is removed when Python runs with -O",
+                    "Replace with an explicit check that raises, e.g. `if not cond: raise ValueError(...)`.")
+            else:
+                self._add(node.lineno, "assert_for_validation",
+                    "assert is removed when Python runs with -O; confirm it states an invariant "
+                    "rather than validating input",
+                    "",
+                    also_caused_by=(
+                        "an internal invariant or a type checker's narrowing after a real check — the "
+                        "condition already holds, so the code behaves the same under -O",
+                        "a precondition on a private helper whose every caller is in this codebase",
+                        "a self-check in a build, eval or benchmark harness that never runs under -O",
+                    ))
         self.generic_visit(node)
 
 
@@ -411,8 +524,8 @@ def analyze_file(filepath: Path, ignore: set) -> list:
 def to_record(issue: "CodeSmell") -> dict:
     """The JSON shape this detector emits, shared with the runner.
 
-    `kind` is always present, so a consumer never reads an absent key as a
-    classification; the reasons tuple serialises as a list.
+    `kind` is always present, so a consumer never has to read an absent key as
+    a classification; the reasons tuple serialises as a list.
     """
     record = asdict(issue)
     record["also_caused_by"] = list(record["also_caused_by"])
@@ -446,10 +559,8 @@ def main():
         for issue in all_issues:
             by_type[issue.smell_type] += 1
 
-        # A candidate is a lead, not a defect, so it is counted apart.
-        leads = sum(1 for i in all_issues if i.kind == "candidate")
-        print(f"Found {len(all_issues) - leads} exception-handling finding(s), "
-              f"{leads} candidate(s):\n")
+        proven = sum(1 for i in all_issues if i.kind != "candidate")
+        print(f"Found {proven} exception-handling issue(s), {len(all_issues) - proven} candidate(s):\n")
         print("Summary:")
         for smell, count in sorted(by_type.items(), key=lambda x: -x[1]):
             print(f"  {smell}: {count}")

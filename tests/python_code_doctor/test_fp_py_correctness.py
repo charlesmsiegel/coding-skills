@@ -193,3 +193,189 @@ def test_bodies_that_cannot_fall_off_are_not_flagged(tmp_path, body):
 def test_bodies_that_can_fall_off_are_flagged(tmp_path, body):
     found = records("find_return_issues.py", tmp_path, "def f(x):\n" + body, "inconsistent_returns")
     assert len(findings(found)) == 1
+
+
+# ---- raise_without_from ----------------------------------------------------- #
+
+
+def test_an_http_exception_raised_without_from_is_a_candidate(tmp_path):
+    """The framework renders it as a response; the chain is never printed."""
+    found = records("find_exception_issues.py", tmp_path,
+                    "def get(d, k):\n"
+                    "    try:\n"
+                    "        return d[k]\n"
+                    "    except KeyError:\n"
+                    "        raise HTTPException(status_code=404)\n",
+                    "raise_without_from")
+    assert len(found) == 1
+    assert_candidate_shape(found[0])
+
+
+def test_a_domain_translation_without_from_is_a_low_finding(tmp_path):
+    """The true positive stays, at the severity of the clarity issue it is."""
+    found = records("find_exception_issues.py", tmp_path,
+                    "import json\n"
+                    "def load(s):\n"
+                    "    try:\n"
+                    "        return json.loads(s)\n"
+                    "    except ValueError as e:\n"
+                    "        raise BundleError(f'bad: {e}')\n",
+                    "raise_without_from")
+    assert len(findings(found)) == 1
+    assert found[0]["severity"] == "low"
+    # The description no longer claims the cause is discarded: it is kept as __context__.
+    assert "discards" not in found[0]["description"]
+    assert "__context__" in found[0]["description"]
+
+
+# ---- swallowed_exception / suppressible_exception --------------------------- #
+
+
+def test_a_broad_catch_with_a_reasoned_noqa_is_a_candidate(tmp_path):
+    found = records("find_exception_issues.py", tmp_path,
+                    "def warm():\n"
+                    "    try:\n"
+                    "        f()\n"
+                    "    except Exception:  # noqa: BLE001 -- best-effort cache warm\n"
+                    "        pass\n",
+                    "swallowed_exception")
+    assert len(found) == 1
+    assert_candidate_shape(found[0])
+
+
+@pytest.mark.parametrize("comment", ["", "  # noqa: BLE001"])
+def test_a_broad_catch_with_no_reason_stays_a_finding(tmp_path, comment):
+    """No noqa, or a bare one, proves nothing: the swallow is still the defect."""
+    found = records("find_exception_issues.py", tmp_path,
+                    "def warm():\n"
+                    "    try:\n"
+                    "        f()\n"
+                    f"    except Exception:{comment}\n"
+                    "        pass\n",
+                    "swallowed_exception")
+    assert len(findings(found)) == 1
+    assert found[0]["severity"] == "medium"
+
+
+def test_a_narrow_pass_is_a_suppress_idiom_not_a_swallow(tmp_path):
+    (tmp_path / "sample.py").write_text(
+        "import os\n"
+        "def drop(p):\n"
+        "    try:\n"
+        "        os.remove(p)\n"
+        "    except FileNotFoundError:\n"
+        "        pass\n")
+    found = run_detector("find_exception_issues.py", tmp_path)
+    assert [r["smell_type"] for r in found] == ["suppressible_exception"]
+    assert found[0]["severity"] == "low"
+    assert "contextlib.suppress(FileNotFoundError)" in found[0]["suggestion"]
+
+
+@pytest.mark.parametrize("tail", [
+    "    else:\n        g()\n",
+    "    finally:\n        g()\n",
+    "    except KeyError:\n        g()\n",
+])
+def test_a_narrow_pass_suppress_cannot_rewrite_is_not_reported(tmp_path, tail):
+    """With an else, a finally or another handler, suppress is not the same code."""
+    (tmp_path / "sample.py").write_text(
+        "import os\n"
+        "def drop(p):\n"
+        "    try:\n"
+        "        os.remove(p)\n"
+        "    except FileNotFoundError:\n"
+        "        pass\n" + tail)
+    assert run_detector("find_exception_issues.py", tmp_path) == []
+
+
+# ---- catches_baseexception -------------------------------------------------- #
+
+
+@pytest.mark.parametrize("body", [
+    "    except BaseException:\n        cleanup()\n        raise\n",
+    "    except BaseException as e:\n        cleanup()\n        raise e\n",
+    "    except BaseException as e:\n        fut.set_exception(e)\n",
+    "    except BaseException as e:\n        errors.append(e)\n",
+])
+def test_a_baseexception_handler_that_hands_the_error_on_is_not_flagged(tmp_path, body):
+    found = records("find_exception_issues.py", tmp_path,
+                    "def work():\n    try:\n        w()\n" + body,
+                    "catches_baseexception")
+    assert found == []
+
+
+@pytest.mark.parametrize("body", [
+    "    except BaseException:\n        log.warning('x')\n",
+    # logging or formatting the exception is not delivering it: the Ctrl-C stops here
+    "    except BaseException as e:\n        log.warning('failed: %s', e)\n",
+    "    except BaseException as e:\n        print(str(e))\n",
+])
+def test_a_baseexception_handler_that_traps_the_error_is_still_flagged(tmp_path, body):
+    found = records("find_exception_issues.py", tmp_path,
+                    "def work():\n    try:\n        w()\n" + body,
+                    "catches_baseexception")
+    assert len(findings(found)) == 1
+
+
+def test_a_baseexception_trap_with_a_reasoned_noqa_is_a_candidate(tmp_path):
+    found = records("find_exception_issues.py", tmp_path,
+                    "def child():\n"
+                    "    try:\n"
+                    "        w()\n"
+                    "    except BaseException as e:  # noqa: BLE001 -- a forked child must exit, never resume\n"
+                    "        report(type(e).__name__)\n",
+                    "catches_baseexception")
+    assert len(found) == 1
+    assert_candidate_shape(found[0])
+
+
+# ---- assert_for_validation -------------------------------------------------- #
+
+
+@pytest.mark.parametrize("source", [
+    # a private helper's precondition
+    "def _f(x):\n    assert x > 0\n",
+    # narrowing, even on a parameter of a public function
+    "def f(x):\n    assert x is not None\n    return x.y\n",
+    "def f(x):\n    assert isinstance(x, int) and x is not None\n    return x\n",
+    # an invariant on a local, not on an argument
+    "def g():\n    y = h()\n    assert y\n    return y\n",
+    # module scope
+    "assert VERSION\n",
+])
+def test_an_assert_that_states_an_invariant_is_a_candidate(tmp_path, source):
+    found = records("find_exception_issues.py", tmp_path, source, "assert_for_validation")
+    assert len(found) == 1
+    assert_candidate_shape(found[0])
+
+
+@pytest.mark.parametrize("source", [
+    "def withdraw(amount):\n    assert amount > 0\n",
+    "def delete(user):\n    assert user.is_admin\n",
+    # a dunder is public: __init__ validates a caller's input as much as any method
+    "class Account:\n    def __init__(self, balance):\n        assert balance >= 0\n",
+])
+def test_an_assert_validating_a_public_argument_is_a_finding(tmp_path, source):
+    found = records("find_exception_issues.py", tmp_path, source, "assert_for_validation")
+    assert len(findings(found)) == 1
+
+
+def test_an_assert_in_a_test_file_is_not_reported(tmp_path):
+    found = records("find_exception_issues.py", tmp_path,
+                    "def withdraw(amount):\n    assert amount > 0\n",
+                    "assert_for_validation", name="tests/test_bank.py")
+    assert found == []
+
+
+def test_a_raise_inside_a_def_in_a_handler_belongs_to_the_def(tmp_path):
+    """The nested function raises later, when called — not inside this handler."""
+    found = records("find_exception_issues.py", tmp_path,
+                    "def f():\n"
+                    "    try:\n"
+                    "        g()\n"
+                    "    except KeyError:\n"
+                    "        def later():\n"
+                    "            raise RuntimeError('x')\n"
+                    "        register(later)\n",
+                    "raise_without_from")
+    assert found == []

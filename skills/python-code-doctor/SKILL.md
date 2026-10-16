@@ -146,7 +146,7 @@ python "$SKILL/scripts/find_unpythonic.py" .            # range(len), == True/No
 
 # Correctness bugs (these find real bugs, not style)
 python "$SKILL/scripts/find_mutation_hazards.py" .      # Mutable class attrs, modify-during-iteration, mutated defaults
-python "$SKILL/scripts/find_exception_issues.py" .      # raise-without-from, unreachable except, BaseException, assert-validation
+python "$SKILL/scripts/find_exception_issues.py" .      # Swallowed errors, unreachable except, BaseException traps, assert-validation, raise-without-from
 python "$SKILL/scripts/find_global_state.py" .          # Mutated module globals, global-rebinding functions
 python "$SKILL/scripts/find_resource_leaks.py" .        # open()/socket/tempfile not used as a context manager (fd leaks)
 python "$SKILL/scripts/find_security_issues.py" .       # eval/exec, shell=True, unsafe yaml/pickle, weak hash, hardcoded secrets
@@ -205,6 +205,9 @@ at a time and the evidence is elsewhere:
 | `sql_injection` on a `PRAGMA` statement | PRAGMA accepts no bound parameters, so a dynamic identifier has no parameterized spelling |
 | `assert_for_validation` on `assert x is not None` / `assert isinstance(...)` | that shape usually narrows a type for the checker and records an invariant the caller guarantees |
 | `local_import` of a slow-to-import package (torch, transformers, ...) or inside a CLI command | deferral to keep startup and `--help` fast is the usual reason, and only the author knows |
+| `swallowed_exception` / `catches_baseexception` under a reasoned `# noqa: BLE001 -- why` | the repo's own lint gate adjudicated the line; the reason is what to check, and a bare noqa stays a finding |
+| `raise_without_from` on an `HTTPException` | the framework renders it as a response and never prints the chain |
+| `assert_for_validation` outside a public function's argument check | an invariant or type narrowing holds under `-O` too; only the call sites show whether input reaches it |
 
 Confirm one before acting on it — deleting a "dead" public function on a
 single-file verdict deletes live code. `format_findings.py` files candidates as
@@ -385,3 +388,10 @@ unawaited coroutines, data clumps, coupling, duplication), the **repo-level chec
 (dependency hygiene, untested-module and test-smell detection that scaffold a safety
 net), the **AI-code tells** (scaffolding, duplicate definitions, fake robustness),
 plus the **judgment guides** — which no linter provides.
+
+Where a detector mirrors a Ruff rule the repo already enforces, a suppression of
+that rule **with a stated reason** — `# noqa: BLE001 -- the caller reads None as
+unreadable`, on the flagged line or a comment line directly below it — is read as
+the repo's own adjudication: the record becomes a candidate, and the reason is
+what to check. A bare `# noqa: BLE001` says nothing and stays a finding. The
+detectors that read it: `swallowed_exception` and `catches_baseexception` (BLE001).
