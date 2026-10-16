@@ -10,6 +10,12 @@ the definition.
 Finds:
   - multiple_boolean_flags : a function with >= 2 boolean-default parameters
   - boolean_positional_param : a boolean parameter that can be passed positionally
+
+Not checked, because the signature is not the author's to choose:
+  - a CLI command (`@app.command()`, `@click.command`, ...): each boolean is a
+    command-line flag, and the framework builds the CLI from the signature
+  - a method of a class defined in a test file: a fake mirrors the signature of
+    the production object it stands in for
 """
 
 import ast
@@ -18,7 +24,7 @@ import argparse
 from pathlib import Path
 from dataclasses import dataclass, asdict
 from collections import defaultdict
-from common import sort_findings, cached_parse, SEVERITY_ICONS, configure_output, find_python_files, warn_detector_error, warn_unparseable
+from common import is_cli_command, is_test_file, sort_findings, cached_parse, SEVERITY_ICONS, configure_output, find_python_files, warn_detector_error, warn_unparseable
 
 
 @dataclass
@@ -46,11 +52,13 @@ def _get_line(lines, lineno):
 
 
 class BooleanParamDetector(ast.NodeVisitor):
-    def __init__(self, filename, lines, ignore):
+    def __init__(self, filename, lines, ignore, in_tests=False):
         self.filename = filename
         self.lines = lines
         self.ignore = ignore
         self.issues = []
+        self.in_tests = in_tests
+        self._methods: set[int] = set()  # id() of defs directly in a class body
 
     def _add(self, line, st, desc, sug, sev):
         if st in self.ignore:
@@ -58,6 +66,8 @@ class BooleanParamDetector(ast.NodeVisitor):
         self.issues.append(CodeSmell(self.filename, line, st, desc, sug, sev, _get_line(self.lines, line)))
 
     def _check(self, node):
+        if is_cli_command(node) or (self.in_tests and id(node) in self._methods):
+            return
         args = node.args
         positional = list(getattr(args, "posonlyargs", [])) + list(args.args)
         defaults = list(args.defaults)
@@ -84,6 +94,11 @@ class BooleanParamDetector(ast.NodeVisitor):
                 "Make it keyword-only by adding '*,' before it so call sites are self-documenting, or split the function.",
                 "low")
 
+    def visit_ClassDef(self, node):
+        self._methods.update(id(item) for item in node.body
+                             if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef)))
+        self.generic_visit(node)
+
     def visit_FunctionDef(self, node):
         self._check(node)
         self.generic_visit(node)
@@ -96,7 +111,7 @@ class BooleanParamDetector(ast.NodeVisitor):
 def analyze_file(filepath: Path, ignore: set) -> list:
     try:
         source, tree = cached_parse(filepath)
-        d = BooleanParamDetector(str(filepath), source.splitlines(), ignore)
+        d = BooleanParamDetector(str(filepath), source.splitlines(), ignore, is_test_file(filepath))
         d.visit(tree)
         return d.issues
     except (SyntaxError, ValueError) as exc:
