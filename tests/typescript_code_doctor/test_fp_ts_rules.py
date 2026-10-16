@@ -150,3 +150,29 @@ export function Component(): number {{
     assert lines_of(found) == [1, 73]
     outer = next(r for r in found if r["line"] == 1)
     assert "outside the long functions nested in it" in outer["description"]
+
+
+# --------------------------------------------------------------------------- #
+# find_type_gaps: one `any` token, one finding
+# --------------------------------------------------------------------------- #
+
+CATCH_ANY = """\
+export function load(read: () => string): string {
+  try {
+    return read();
+  } catch (err: any) {
+    return String(err.detail);
+  }
+}
+export function walk(node: any): number { return node.children.length; }
+"""
+
+
+def test_a_catch_binding_any_is_catch_typed_any_only(tmp_path):
+    root = write(tmp_path / "proj", {"load.ts": CATCH_ANY})
+    found = run_detector("find_type_gaps.py", root)
+    by_type = {}
+    for record in found:
+        by_type.setdefault(record["smell_type"], []).append(record["line"])
+    assert by_type.get("catch_typed_any") == [4]
+    assert by_type.get("explicit_any") == [8], "the parameter `any` is still explicit_any"
