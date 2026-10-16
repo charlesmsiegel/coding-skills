@@ -60,6 +60,19 @@ python "$SKILL/scripts/analyze_all.py" . --jobs 1          # one process
 python "$SKILL/scripts/analyze_all.py" . --skip duplicates # drop the slowest category
 ```
 
+## Project boundaries and evidence
+
+Installed skills under `.codex/skills`, `.claude/skills`, `.kiro/skills`, and
+`.agents/skills` are tooling, not application source. Source walks omit those
+payloads while retaining neighboring agent configuration; explicitly scanning a
+skill still works. The raw doctor's wider credential scan remains independent.
+
+A mutable class declaration alone is a candidate: framework configuration and
+read-only registries share that shape. A demonstrated instance mutation of
+unshadowed shared state is a finding. Quoted constant SQL identifiers are also
+candidates, since identifiers cannot be passed as query parameters; ordinary
+interpolated SQL values remain findings.
+
 ## Workflow
 
 **Cleaning up a whole poorly-written repo from cold?** The steps below assume the

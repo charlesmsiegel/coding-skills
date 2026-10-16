@@ -2,14 +2,15 @@
 """
 Detect mutation hazards in Python code via AST analysis.
 
-These are correctness bugs, not style nits. None overlap with the existing
+Findings identify mutation hazards; declarations without mutation evidence are
+candidates with benign explanations. None overlap with the existing
 detectors: find_code_smells flags the *declaration* of a mutable default
 argument; this script flags the *bug* of actually mutating shared or aliased
 state.
 
 Finds:
-  - mutable_class_attribute : a mutable value bound at class scope and therefore
-                              shared by every instance of the class
+  - mutable_class_attribute : demonstrated instance mutation of a shared class
+                              value, or a candidate when only its declaration is known
   - modify_during_iteration : mutating a list/dict/set while iterating over it
   - mutated_default_arg     : a mutable default argument that is mutated in the
                               body, so its contents leak across calls
@@ -20,20 +21,9 @@ import functools
 import json
 import argparse
 from pathlib import Path
-from dataclasses import dataclass, asdict
+from dataclasses import asdict
 from collections import defaultdict
-from common import sort_findings, cached_parse, SEVERITY_ICONS, configure_output, find_python_files, warn_detector_error, warn_unparseable
-
-
-@dataclass
-class CodeSmell:
-    file: str
-    line: int
-    smell_type: str
-    description: str
-    suggestion: str
-    severity: str
-    code_snippet: str = ""
+from common import Finding as CodeSmell, sort_findings, cached_parse, SEVERITY_ICONS, configure_output, find_python_files, warn_detector_error, warn_unparseable
 
 
 _SCOPE_BOUNDARIES = (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)
@@ -445,6 +435,68 @@ class MutationHazardDetector(ast.NodeVisitor):
             return self.classes.is_family(parent, "modelform")
         return False
 
+    def _shared_instance_mutation(self, node, name):
+        """A deliberately narrow proof: direct mutation via an instance method,
+        with no visible instance shadowing or unresolved inherited initializer.
+        Aliases, decorators, and interprocedural writes remain candidates.
+        """
+        if node.bases or node.decorator_list or node.keywords:
+            return None
+        mutations = []
+        for method in node.body:
+            if not isinstance(method, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            if method.decorator_list:
+                # A decorated initializer could shadow the attribute too.
+                return None
+            params = list(method.args.posonlyargs) + list(method.args.args)
+            if not params:
+                continue
+            receiver = params[0].arg
+
+            def attribute(expr):
+                return (isinstance(expr, ast.Attribute) and expr.attr == name
+                        and isinstance(expr.value, ast.Name) and expr.value.id == receiver)
+
+            for child in _same_scope_nodes(method.body, stop_types=(ast.ClassDef,)):
+                if isinstance(child, ast.Name) and child.id == receiver and isinstance(child.ctx, ast.Store):
+                    return None
+                # Assignment/deletion of the attribute itself changes lookup.
+                if attribute(child) and isinstance(child.ctx, (ast.Store, ast.Del)):
+                    return None
+                if (isinstance(child, ast.Call) and isinstance(child.func, ast.Attribute)
+                        and child.func.attr in _MUTATING_METHODS and attribute(child.func.value)):
+                    mutations.append(child.lineno)
+                if (isinstance(child, ast.Subscript) and attribute(child.value)
+                        and isinstance(child.ctx, (ast.Store, ast.Del))):
+                    mutations.append(child.lineno)
+        return min(mutations) if mutations else None
+
+    def _class_attribute(self, node, item, target):
+        if _is_dunder(target.id) or self._is_django_declaration(node, target.id):
+            return
+        if "mutable_class_attribute" in self.ignore:
+            return
+        mutation = self._shared_instance_mutation(node, target.id)
+        if mutation:
+            self._add(item.lineno, "mutable_class_attribute",
+                f"Instance method mutates shared class attribute '{target.id}' on line {mutation}; "
+                f"instances of {node.name} use the same mutable object",
+                "Create a fresh collection for each instance in __init__ if this is instance state. "
+                "For an intentional shared registry, declare and document it as ClassVar.")
+        else:
+            self.issues.append(CodeSmell(
+                file=self.filename, line=item.lineno, smell_type="mutable_class_attribute",
+                description=f"Class attribute '{target.id}' holds a mutable value; "
+                            "no mutation of shared instance state is established here",
+                severity="low", kind="candidate", code_snippet=self._get_line(item.lineno),
+                also_caused_by=(
+                    "Declarative framework configuration, including inherited Django ModelForm Meta options.",
+                    "A read-only lookup table or an intentionally shared registry.",
+                    "Instance initialization or inherited behavior may replace or copy the value before mutation.",
+                ),
+            ))
+
     def visit_ClassDef(self, node: ast.ClassDef):
         copying_model = self.classes.is_family(node, "copying_model")
         ignored_types = (self.classes.ignored_model_types(node) or set()) if copying_model else set()
@@ -457,23 +509,15 @@ class MutationHazardDetector(ast.NodeVisitor):
                 for target in item.targets:
                     if copying_model and isinstance(target, ast.Name) and target.id == "model_config":
                         continue
-                    if isinstance(target, ast.Name) and not _is_dunder(target.id) \
-                            and not self._is_django_declaration(node, target.id):
-                        self._add(item.lineno, "mutable_class_attribute",
-                            f"Class attribute '{target.id}' is a mutable value shared by every instance of {node.name}",
-                            "Assign it in __init__ instead, or use an immutable constant (tuple/frozenset). "
-                            "If a shared class variable is truly intended, annotate it ClassVar and document it.")
+                    if isinstance(target, ast.Name):
+                        self._class_attribute(node, item, target)
             elif isinstance(item, ast.AnnAssign) and item.value is not None and _is_mutable_value(item.value):
                 if copying_model:
                     continue
                 if _annotation_is_classvar_or_final(item.annotation):
                     continue
-                if isinstance(item.target, ast.Name) and not _is_dunder(item.target.id) \
-                        and not self._is_django_declaration(node, item.target.id):
-                    self._add(item.lineno, "mutable_class_attribute",
-                        f"Class attribute '{item.target.id}' is a mutable default shared by every instance of {node.name}",
-                        "Use dataclasses.field(default_factory=...) in dataclasses, assign in __init__, "
-                        "or annotate ClassVar if a shared value is genuinely intended.")
+                if isinstance(item.target, ast.Name):
+                    self._class_attribute(node, item, item.target)
         self.generic_visit(node)
 
     # -- modify during iteration ------------------------------------------
@@ -630,7 +674,8 @@ def main():
         for issue in all_issues:
             by_type[issue.smell_type] += 1
 
-        print(f"Found {len(all_issues)} mutation hazard(s):\n")
+        proven = sum(issue.kind == "finding" for issue in all_issues)
+        print(f"Found {proven} mutation hazard(s), {len(all_issues) - proven} candidate(s):\n")
         print("Summary:")
         for smell, count in sorted(by_type.items(), key=lambda x: -x[1]):
             print(f"  {smell}: {count}")
@@ -639,11 +684,16 @@ def main():
         severity_icons = SEVERITY_ICONS
         for issue in all_issues:
             icon = severity_icons[issue.severity]
-            print(f"{icon} [{issue.severity.upper()}] {issue.file}:{issue.line}")
+            marker = "CANDIDATE" if issue.kind == "candidate" else issue.severity.upper()
+            print(f"{icon} [{marker}] {issue.file}:{issue.line}")
             print(f"   {issue.smell_type}: {issue.description}")
             if issue.code_snippet:
                 print(f"   Code: {issue.code_snippet}")
-            print(f"   → {issue.suggestion}\n")
+            if issue.suggestion:
+                print(f"   → {issue.suggestion}")
+            for reason in issue.also_caused_by:
+                print(f"   ? also caused by: {reason}")
+            print()
 
 
 if __name__ == "__main__":
