@@ -29,6 +29,12 @@ alone.
 | Duplication & dead code | 10% | 10 | Duplicate blocks, dead code, commented-out code |
 | Dependencies & hygiene | 8% | 25 | Dependency reconciliation, dated idioms, naming, docstrings, type gaps, debug leftovers |
 
+A finding lands in its detector's category unless its own type is listed in
+`TYPE_CATEGORY_OVERRIDES`: an exception detector's `raise` without `from` (the
+cause survives as implicit `__context__`) and its narrow `except X: pass`
+(`contextlib.suppress(X)` is the same behaviour) are Hygiene items, not
+Correctness ones, though the detector that finds them is about correctness.
+
 Weights total 100. They encode a single opinion: **a bug outranks a smell.**
 Correctness and security together are 40% of the grade; naming and docstrings
 are 8% and cannot sink a package on their own.
