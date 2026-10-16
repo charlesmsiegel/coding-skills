@@ -626,3 +626,24 @@ def test_missing_import_type_is_reported_under_verbatim_module_syntax(tmp_path):
     found = records("find_module_issues.py", tmp_path, files, "missing_import_type")
     assert lines_of(found) == [1]
     assert "verbatimModuleSyntax" in found[0]["suggestion"]
+
+
+# --------------------------------------------------------------------------- #
+# find_debug_leftovers: a dialog whose answer is used is UI
+# --------------------------------------------------------------------------- #
+
+DIALOGS = """\
+export function remove(id: string): void {
+  if (!window.confirm("Delete this tag?")) return;
+  const name = prompt("New name?")?.trim();
+  if (name && confirm(`Rename to ${name}?`)) rename(id, name);
+  confirm("debug?");
+  alert("Could not delete the tag.");
+}
+"""
+
+
+def test_a_dialog_whose_answer_gates_an_action_is_not_a_leftover(tmp_path):
+    found = records("find_debug_leftovers.py", tmp_path, {"tags.ts": DIALOGS}, "browser_dialog")
+    by_line = {r["line"]: r["kind"] for r in found}
+    assert by_line == {5: "finding", 6: "candidate"}
