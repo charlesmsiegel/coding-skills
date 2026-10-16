@@ -15,7 +15,8 @@ import sys
 from pathlib import Path
 
 from common import (Reporter, ScanPathError, build_parser, committed_or_staged_text,
-                    configure_output, coverage_gaps, emit, fail_on_bad_path, parse_ignore,
+                    configure_output, coverage_gaps, emit, fail_on_bad_path, looks_minified,
+                    parse_ignore,
                     read_text, tracked_paths, walk_files, warn_detector_error,
                     warn_unreadable)
 
@@ -68,6 +69,18 @@ MIN_ENTROPY_BITS = 3.5
 # (a JWT's dots separate base64 segments starting `eyJ`, and it is matched as a
 # credential pattern before this rule is reached).
 _EXPRESSION_VALUE = re.compile(r"[()\[\]{}]|^[+\-!~*&]|^[A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)+$")
+# Languages in which the right-hand side of `=` or `:` is an *expression*.
+# There a credential is a string literal, and an unquoted value is code —
+# `tokens = _fields(event)`, `reserve_tokens = config.RESERVE`,
+# `const TOKEN_RE = /…/g` — whose punctuation reads as entropy. Everywhere
+# else (.env, YAML, INI, shell, Dockerfiles, unknown extensions) a bare value
+# is the literal itself, so the bare form keeps its recall there.
+EXPRESSION_LANGUAGE_SUFFIXES = frozenset({
+    ".py", ".pyi", ".js", ".jsx", ".mjs", ".cjs", ".ts", ".tsx", ".mts", ".cts",
+    ".java", ".kt", ".kts", ".scala", ".groovy", ".go", ".rs", ".rb", ".php",
+    ".cs", ".fs", ".swift", ".dart", ".c", ".h", ".cc", ".cpp", ".cxx", ".hpp",
+    ".m", ".mm", ".lua", ".vue", ".svelte", ".ex", ".exs", ".jl", ".zig",
+})
 
 # also_caused_by prose, shared between the private-key and cloud-credential
 # paths since the underlying tracking states (and the reasoning behind them)
@@ -219,6 +232,12 @@ def _uncertain_reasons(verdict: str) -> tuple[str, ...]:
 def analyze(path: Path, text: str, report: Reporter, tracked_here: bool | None = None,
            get_committed_text=lambda: None) -> None:
     lines = text.splitlines()
+    # The name heuristic asks what a person typed beside a secret-shaped
+    # variable. In code only a quoted value is a literal; in a bundler's output
+    # nobody typed anything, and `tokens=` recurs hundreds of times per line.
+    # Key material and recognisable credentials are matched regardless.
+    bare_values_are_literals = path.suffix.lower() not in EXPRESSION_LANGUAGE_SUFFIXES
+    check_names = not looks_minified(text)
     for index, line in enumerate(lines):
         number = index + 1
         key_match = KEY_BLOCK.search(line)
@@ -277,7 +296,13 @@ def analyze(path: Path, text: str, report: Reporter, tracked_here: bool | None =
                     severity="high", snippet=value[:12] + "…",
                 )
 
-        assignment = SECRET_NAME.search(line)
+        if not check_names:
+            continue
+        # The first secret-shaped name on a line may be an expression the
+        # rules below set aside; a quoted literal later on the same line
+        # (`call(token=t, api_secret="…")`) is still owed its candidate.
+        assignment = next((match for match in SECRET_NAME.finditer(line)
+                           if match.group(2) or bare_values_are_literals), None)
         if assignment:
             group_index = 2 if assignment.group(2) else 3
             value = assignment.group(group_index)
@@ -301,7 +326,6 @@ def analyze(path: Path, text: str, report: Reporter, tracked_here: bool | None =
                     ],
                     severity="high", snippet=assignment.group(1) + " = …",
                 )
-
 
 def main() -> int:
     configure_output()

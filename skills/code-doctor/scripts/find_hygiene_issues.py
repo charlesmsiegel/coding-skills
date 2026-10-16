@@ -18,7 +18,7 @@ from pathlib import Path
 
 from common import (Reporter, ScanPathError, build_parser, configure_output,
                     coverage_gaps, emit, fail_on_bad_path, is_probably_binary,
-                    parse_ignore, read_text, tracked_paths, unmerged_paths,
+                    looks_minified, parse_ignore, read_text, tracked_paths, unmerged_paths,
                     walk_files, walk_paths, warn_detector_error, warn_unreadable)
 
 MERGE_MARKERS = ("<<<<<<< ", "=======", ">>>>>>> ")
@@ -40,7 +40,15 @@ MAX_COMMITTED_BYTES = 10 * 1024 * 1024
 # prefix allows.
 LINE_COMMENT_PREFIXES = ("//", "#", "--", ";")
 
-_STRING_LITERAL = re.compile(r"""(["'`])(?:\\.|(?!\1).)*\1""")
+# `[^\\]`, not `.`: with `.` a backslash could be consumed either as the
+# start of an escape or as an ordinary character, and an unterminated quote
+# followed by a run of backslashes then backtracks through every split of the
+# run — exponential in its length. One committed Vite bundle held the whole
+# detector past a ten-minute timeout that way.
+_STRING_LITERAL = re.compile(r"""(["'`])(?:\\.|(?!\1)[^\\])*\1""")
+# Past this a line is data or a bundle, not a place a person writes a comment.
+# Bounding it also bounds the quadratic cost of a line full of unmatched quotes.
+MAX_COMMENT_SCAN = 4096
 _TODO = re.compile(r"\b(TODO|FIXME|HACK|XXX)\b")
 # A commented line that looks like code: ends in a statement terminator or
 # opener, or contains an assignment or a call. A call is a name *touching* its
@@ -115,6 +123,8 @@ def blank_literals(line: str) -> str:
 
 def comment_body(line: str) -> str | None:
     """The text after a line-comment prefix, or None if there is no comment."""
+    if len(line) > MAX_COMMENT_SCAN:
+        return None
     blanked = blank_literals(line)
     for prefix in LINE_COMMENT_PREFIXES:
         index = blanked.find(prefix)
@@ -139,15 +149,21 @@ def whole_line_comment_body(line: str) -> str | None:
 
 
 def check_text_file(path: Path, text: str, report: Reporter,
-                    unmerged: set[Path] | None) -> None:
-    """Checks that are valid in any text file, source or not."""
+                    unmerged: set[Path] | None, *, generated: bool = False) -> None:
+    """Checks that are valid in any text file, source or not.
+
+    A ``generated`` file still gets the merge-marker check — a conflict in a
+    committed bundle breaks the build like any other — but not the TODO
+    inventory: a bundler's output carries its dependencies' TODOs, and none of
+    them is this repository's debt.
+    """
     is_conflicted = unmerged is not None and path.resolve() in unmerged
 
     for number, line in enumerate(text.splitlines(), 1):
         # The TODO inventory belongs here, not in the source pass: a TODO in
         # deployment.yaml or settings.toml is debt exactly like one in a .go
         # file, and the design's stated scope for it is all text.
-        body = comment_body(line)
+        body = None if generated else comment_body(line)
         if body is not None:
             todo = _TODO.search(body)
             if todo:
@@ -300,7 +316,7 @@ def main() -> int:
     root = Path(args.path)
 
     findings = []
-    unreadable, failed = [], []
+    unreadable, failed, generated_files = [], [], []
     try:
         text_files = set(walk_files(root, source_only=False))
         source_files = set(walk_files(root, source_only=True))
@@ -322,8 +338,14 @@ def main() -> int:
                     unreadable.append(str(filepath))
                     findings.extend(report.findings)
                     continue
-                check_text_file(filepath, text, report, unmerged)
-                if filepath in source_files:
+                generated = looks_minified(text)
+                if generated:
+                    generated_files.append(str(filepath))
+                check_text_file(filepath, text, report, unmerged, generated=generated)
+                # Line length, file length and commented-out code are
+                # questions about what a person wrote; a bundle answers every
+                # one of them with noise.
+                if filepath in source_files and not generated:
                     check_source_file(filepath, text, report)
         except Exception as exc:
             warn_detector_error(filepath, exc)
@@ -332,6 +354,14 @@ def main() -> int:
         findings.extend(report.findings)
 
     completeness = coverage_gaps(unreadable, failed)
+    if generated_files:
+        # Named, not silently dropped: a reader comparing two runs should see
+        # that these were read for merge markers only.
+        names = sorted(generated_files)
+        completeness["generated_files_skipped"] = (
+            f"{len(names)} generated file(s) checked for merge markers only: "
+            + ", ".join(names[:5]) + ("…" if len(names) > 5 else "")
+        )
     if unmerged is None:
         completeness["merge_state"] = (
             "git unavailable — conflict markers reported as candidates, "
