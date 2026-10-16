@@ -525,3 +525,99 @@ def test_three_identical_blocks_are_a_finding(tmp_path):
     found = run_detector("find_duplicates.py", tmp_path)
     assert [(r["kind"], r["severity"], len(r["occurrences"])) for r in found] == [("finding", "high", 3)]
     assert found[0]["suggestion"]
+
+
+# --------------------------------------------------------------------------- #
+# find_dead_code
+# --------------------------------------------------------------------------- #
+
+
+def _dead(found: list[dict], kind: str) -> list[tuple[str, str]]:
+    return [(Path(r["file"]).name, r["name"]) for r in found
+            if r["issue_type"] == kind and r["kind"] == "finding"]
+
+
+def test_a_package_init_reexports_what_it_imports(tmp_path):
+    write(tmp_path, {
+        "pkg/__init__.py": """\
+            import json
+            from . import atomic, overlay
+            from .tracker import fields as _tracker_fields
+            """,
+        "pkg/atomic.py": "X = 1\n", "pkg/overlay.py": "Y = 1\n",
+        "pkg/tracker/__init__.py": "", "pkg/tracker/fields.py": "Z = 1\n",
+        "pkg/plain.py": "import json\nfrom . import atomic\n",
+    })
+    found = run_detector("find_dead_code.py", tmp_path)
+    # A regular module's unused imports are still provably unused.
+    assert sorted(_dead(found, "unused_import")) == [("plain.py", "atomic"), ("plain.py", "json")]
+    leads = [r for r in found if r["issue_type"] == "unused_import" and r["kind"] == "candidate"]
+    assert [(Path(r["file"]).name, r["name"]) for r in leads] == [("__init__.py", "json")]
+    assert_candidate_shape(leads[0])
+
+
+def test_a_name_used_only_in_a_string_annotation_is_used(tmp_path):
+    write(tmp_path, {"sample.py": """\
+        from typing import TYPE_CHECKING, cast
+
+        if TYPE_CHECKING:
+            from models import Order, Invoice, Receipt, Unused
+
+        def total(order: "Order") -> "list[Invoice]":
+            receipt = cast("Receipt", order)
+            return [receipt]
+        """})
+    assert _dead(run_detector("find_dead_code.py", tmp_path), "unused_import") == [("sample.py", "Unused")]
+
+
+def test_a_yield_that_makes_a_generator_is_not_unreachable(tmp_path):
+    write(tmp_path, {"sample.py": """\
+        async def failing_stream():
+            raise ConnectionError("down")
+            yield  # unreachable; it is what makes this an async generator
+
+        def empty():
+            return
+            yield
+
+        def dead_after_yield(items):
+            for item in items:
+                yield item
+            return
+            yield None
+
+        def leftover():
+            raise ValueError("no")
+            cleanup()
+        """})
+    found = run_detector("find_dead_code.py", tmp_path)
+    assert [r["line"] for r in found if r["issue_type"] == "unreachable_code"] == [13, 17]
+
+
+def test_a_function_handed_out_by_another_module_is_a_candidate(tmp_path):
+    write(tmp_path, {
+        "producers/__init__.py": "",
+        "producers/art.py": """\
+            def projection_texts(path, data, instance):
+                return [data]
+
+            def describe(path, data, verbose):
+                return data
+            """,
+        "registry.py": """\
+            \"\"\"Projections; `art.describe` is called, not registered.\"\"\"
+            from producers import art as art_producer
+
+            PROJECTIONS = {"art": art_producer.projection_texts}
+            print(art_producer.describe("p", b"d", True))
+            """,
+        "unrelated.py": "def lease(source):\n    return source.describe, source.verbose\n",
+    })
+    found = run_detector("find_dead_code.py", tmp_path)
+    params = {(r["name"], r["kind"]) for r in found if r["issue_type"] == "unused_parameter"}
+    # Handed to a registry (through an import alias): the registry calls it
+    # with its own signature. Called directly, mentioned in a docstring, or
+    # sharing its name with an unrelated object's attribute: the unused
+    # parameter is still provably unused.
+    assert params == {("path", "candidate"), ("instance", "candidate"),
+                      ("path", "finding"), ("verbose", "finding")}
