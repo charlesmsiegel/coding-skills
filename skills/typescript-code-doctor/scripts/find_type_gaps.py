@@ -11,7 +11,7 @@ spot — the escape hatch is written down in the source.
 import re
 
 from common import Reporter, is_test_file, run_file_detector
-from tsparse import RESERVED, TsFile
+from tsparse import RESERVED, TsFile, is_definite_assignment
 
 # Types that accept more than the author means. `Function` accepts any callable
 # and returns `any`; the boxed wrappers are not the primitives; `{}` means
@@ -110,7 +110,7 @@ def _in_type_guard(file: TsFile, index: int) -> bool:
     return func is not None and " is " in f" {func.return_type} "
 
 
-def _check_non_null(file: TsFile, report: Reporter) -> None:
+def _check_non_null(file: TsFile, report: Reporter, test: bool) -> None:
     for index, token in enumerate(file.tokens):
         if not token.is_op("!") or index == 0:
             continue
@@ -118,10 +118,27 @@ def _check_non_null(file: TsFile, report: Reporter) -> None:
         postfix = previous.kind in ("name", "num", "str", "template") or previous.is_op(")", "]")
         if not postfix or previous.is_name(*RESERVED - {"this", "super", "null", "undefined"}):
             continue
+        if is_definite_assignment(file, index):
+            # `let x!: T` is a different construct: it promises an assignment
+            # the compiler cannot see, not a value at a use site. In a test it
+            # is the idiom for capturing a Promise's resolver, so it is left out.
+            if not test:
+                report.candidate(token.line, "definite_assignment_assertion",
+                                 f"Definite-assignment assertion `{previous.value}!:` — the "
+                                 "compiler is told this is assigned before it is read",
+                                 ("a framework assigns the field — dependency injection, an ORM, "
+                                  "a view query — which is the one use the assertion exists for",
+                                  "the value is assigned inside a callback the compiler cannot "
+                                  "follow, such as a Promise executor handing out its resolver"),
+                                 "low")
+            continue
+        # In a test a wrong `!` throws and fails the test, which is the same
+        # lighter claim the other escape hatches make there.
         report.add(token.line, "non_null_assertion",
                    "Non-null assertion `!` — claims a value is present without checking",
                    "If it can be absent, handle it (`?.`, a guard, a default). If it truly cannot, "
-                   "make the type say so rather than overriding it at every use site.", "medium")
+                   "make the type say so rather than overriding it at every use site.",
+                   "low" if test else "medium")
 
 
 def _check_directives(file: TsFile, report: Reporter) -> None:
@@ -242,7 +259,7 @@ def analyze(file: TsFile, ignore: set[str]) -> list:
     test = is_test_file(file.path)
     _check_any(file, report, test)
     _check_assertions(file, report, test)
-    _check_non_null(file, report)
+    _check_non_null(file, report, test)
     _check_directives(file, report)
     _check_builtin_types(file, report)
     _check_empty_object_type(file, report)

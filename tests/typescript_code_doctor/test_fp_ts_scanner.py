@@ -358,3 +358,43 @@ def test_class_fields_without_semicolons_are_each_a_member(ts):
     assert [m.name for m in file.classes[0].methods] == ["constructor"]
 
 
+# --------------------------------------------------------------------------- #
+# `!`: a non-null assertion, or a definite-assignment assertion
+# --------------------------------------------------------------------------- #
+
+def test_non_null_assertion_is_low_in_a_test_and_medium_in_production(tmp_path):
+    root = project(tmp_path, {
+        "src/a.test.ts": "export const first = (m: Map<string, number>) => m.get('a')!;\n",
+        "src/a.ts": "export const first = (m: Map<string, number>) => m.get('a')!;\n",
+    })
+    found = records("find_type_gaps.py", root, "non_null_assertion")
+    assert sorted((Path(r["file"]).name, r["severity"]) for r in found) == [
+        ("a.test.ts", "low"), ("a.ts", "medium"),
+    ]
+
+
+def test_a_definite_assignment_is_not_a_non_null_assertion(tmp_path):
+    root = project(tmp_path, {
+        "src/a.test.ts": """\
+export function capture(): Promise<void> {
+  let finish!: () => void, fail!: (e: unknown) => void;
+  const done = new Promise<void>((resolve, reject) => { finish = resolve; fail = reject; });
+  finish();
+  return done;
+}
+""",
+        "src/a.ts": """\
+export class View {
+  host!: HTMLElement;
+  pick(on: boolean, a: string | null, b: string): string { return on ? a! : b; }
+}
+""",
+    })
+    found = run_detector("find_type_gaps.py", root)
+    non_null = [(Path(r["file"]).name, r["line"]) for r in found if r["smell_type"] == "non_null_assertion"]
+    assert non_null == [("a.ts", 3)], "the ternary's `a!` is a non-null assertion; the declarations are not"
+    definite = [r for r in found if r["smell_type"] == "definite_assignment_assertion"]
+    assert [(Path(r["file"]).name, r["line"], r["kind"]) for r in definite] == [("a.ts", 2, "candidate")]
+    assert definite[0]["also_caused_by"] and not definite[0]["suggestion"]
+
+

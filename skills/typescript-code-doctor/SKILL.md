@@ -200,9 +200,10 @@ one file at a time and the evidence that settles it is elsewhere. A candidate
 carries `also_caused_by`, the benign readings a healthy codebase produces, and
 **no `suggestion`**: there is nothing to fix until the lead is confirmed.
 
-Nine heuristics are reported this way: `type_assertion`, `missing_return_type`,
-`all_optional_type`, `await_in_loop`, `single_implementation_interface`,
-`barrel_file`, `data_clump`, `primitive_obsession` and `public_mutable_field`.
+Ten heuristics are reported this way: `type_assertion`, `missing_return_type`,
+`all_optional_type`, `definite_assignment_assertion`, `await_in_loop`,
+`single_implementation_interface`, `barrel_file`, `data_clump`,
+`primitive_obsession` and `public_mutable_field`.
 Each is ordinary, correct TypeScript often enough that only a reader with the
 surrounding context can tell. Confirm one before acting on it — an `as` at a
 boundary where the value really was checked is the honest spelling, not a defect.

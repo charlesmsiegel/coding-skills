@@ -9,10 +9,10 @@ tsmodules (imports, exports and type declarations).
 from pathlib import Path
 
 from tsextract import (
-    extract_arrows, extract_classes, extract_functions, extract_object_methods,
+    continues_line, extract_arrows, extract_classes, extract_functions, extract_object_methods,
     extract_variable_annotations, skip_to_statement_end,
 )
-from tslex import CLOSERS, CONTROL_KEYWORDS, OPENERS, RESERVED, Token, TsSyntaxError
+from tslex import CLOSERS, CONTROL_KEYWORDS, MEMBER_MODIFIERS, OPENERS, RESERVED, Token, TsSyntaxError
 from tsmodules import extract_modules, extract_types
 from tsnodes import (
     Class, Export, Func, Import, Param, Prop, TsFile, TypeDecl, TypeMember,
@@ -23,6 +23,7 @@ __all__ = [
     "TypeDecl", "TypeMember", "Import", "Export", "RESERVED",
     "parse_file", "parse_source", "callee_of", "iter_calls", "argument_spans",
     "callback_target", "body_indices", "names_in", "statement_start", "statement_end", "line_indent",
+    "is_definite_assignment",
 ]
 
 
@@ -210,3 +211,29 @@ def line_indent(file: TsFile, line: int) -> int:
         raw = file.lines[line - 1]
         return len(raw) - len(raw.lstrip())
     return 0
+
+
+# What may stand right before the name in `NAME!:` for it to be a declaration.
+_DECLARATION_LEADS = frozenset({"let", "var", "const", "declare"}) | MEMBER_MODIFIERS
+
+
+def is_definite_assignment(file: TsFile, bang: int) -> bool:
+    """True when the `!` at ``bang`` is a definite-assignment assertion, `let x!: T`.
+
+    That `!` says "assigned before use" about a declaration; the postfix `x!` in
+    an expression says "not null" about a value. Both are a `!` after a name,
+    and only what surrounds them differs: a declaration's name opens a `let` /
+    `var` list or a class member, and its `!` is followed by the annotation's
+    `:`. The one expression shape with `!` before `:` — the ternary
+    `c ? x! : y` — always has `?` or another operator in front of the name.
+    """
+    if bang < 2 or bang + 1 >= len(file.tokens) or not file.tokens[bang + 1].is_op(":"):
+        return False
+    name, lead = file.tokens[bang - 1], file.tokens[bang - 2]
+    if name.kind != "name":
+        return False
+    if lead.is_op(",", ";", "{", "}") or lead.is_name(*_DECLARATION_LEADS):
+        return True
+    # A class field in code without semicolons starts its own line after the
+    # previous member's last token, which is not an operator.
+    return name.line > lead.line and not continues_line(file, bang - 2)
