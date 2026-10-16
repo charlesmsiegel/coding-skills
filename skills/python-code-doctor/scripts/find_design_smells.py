@@ -12,9 +12,22 @@ catalog that the other detectors don't already handle:
   refused_bequest                 - subclass no-ops or raises on inherited concrete behavior
   lazy_class                      - subclass that adds nothing over its base
 
-Each finding names the catalog refactoring to apply. These are candidates: the
-judgment call (and the subtler instances no parser can see) belongs to
-references/refactoring-catalog.md and references/refactoring-techniques.md.
+Each finding names the catalog refactoring to apply; the judgment call (and the
+subtler instances no parser can see) belongs to references/refactoring-catalog.md
+and references/refactoring-techniques.md.
+
+type_switch is a finding when the ladder is long (six or more branches) or its
+subject is switched on in more than one ladder in the module — the catalog's
+smell is complexity and repetition. One short ladder in one place "is often the
+clearest form", so it is a candidate.
+
+inappropriate_intimacy is cross-module reaching. A private name some class in
+this module defines (`self._x = ...`, `def _x`) is read as same-module access,
+which the catalog calls conventional. A private name of a module this file
+imports relatively (`from . import overlay; overlay._ledger`) is a candidate:
+it is a sibling module's internals unless the package spells package-internal
+with an underscore, which one file cannot tell. Absolute imports stay exempt:
+`sys._getframe` and `os._exit` are documented API spelled with an underscore.
 """
 
 import ast
@@ -39,6 +52,19 @@ class DesignSmell:
     code_snippet: str = ""
     kind: str = "finding"
     also_caused_by: tuple[str, ...] = ()
+
+
+_SHORT_SWITCH_REASONS = (
+    "one short switch in one place is often the clearest form — a factory "
+    "choosing what to build, or a test dispatching on a parametrize value",
+    "the cases are fixed by an external format or protocol and will not grow",
+)
+_SIBLING_PRIVATE_REASONS = (
+    "the package uses a leading underscore for package-internal rather than "
+    "module-internal names, and sibling modules share these helpers by design",
+)
+# A ladder this long is a finding even when it is the only one on its subject.
+LONG_SWITCH_BRANCHES = 6
 
 
 # Public-by-convention namedtuple machinery; touching these is not intimacy.
@@ -197,6 +223,18 @@ class DesignSmellDetector(ast.NodeVisitor):
         self._func_stack: list[tuple[str, frozenset[str], frozenset[str]]] = []
         self._class_depth = 0
         self._ladder_members: set[int] = set()
+        # Qualifying type switches, held until the whole module is read: whether
+        # one is a finding depends on whether its subject is switched elsewhere.
+        self._switches: list[tuple[ast.If, str, str, int]] = []
+        # Private members some class in this module defines. Reading one is
+        # same-module access, whatever the receiver is called.
+        self.module_privates: set[str] = self._collect_module_privates(tree)
+        # Names a relative import binds: sibling modules of this package.
+        self.relative_imports: set[str] = {
+            alias.asname or alias.name.split(".")[0]
+            for node in ast.walk(tree) if isinstance(node, ast.ImportFrom) and node.level
+            for alias in node.names}
+        self._reported: set[tuple[int, str]] = set()
         # Names that are module-scope imports or module-scope classes: touching
         # their _private members is module-internal by convention. Function-local
         # imports exempt only their own scope (tracked on the function stack).
@@ -209,6 +247,36 @@ class DesignSmellDetector(ast.NodeVisitor):
         self._class_env: dict[int, dict[str, ast.ClassDef]] = {}
         self._all_classes: list[ast.ClassDef] = []
         self._index_classes(tree.body, {})
+
+    @staticmethod
+    def _collect_module_privates(tree: ast.Module) -> set[str]:
+        """`_x` names a class here defines: `self._x = ...`, `def _x`, `_x = ...`.
+
+        Double-underscore names are left out: a class's `self.__x` is mangled to
+        `_Class__x`, so the same spelling elsewhere does not reach it.
+        """
+        names: set[str] = set()
+        for klass in ast.walk(tree):
+            if not isinstance(klass, ast.ClassDef):
+                continue
+            for item in klass.body:
+                if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    names.add(item.name)
+                elif isinstance(item, (ast.Assign, ast.AnnAssign)):
+                    targets = item.targets if isinstance(item, ast.Assign) else [item.target]
+                    names.update(t.id for t in targets if isinstance(t, ast.Name))
+            for inner in ast.walk(klass):
+                targets = []
+                if isinstance(inner, ast.Assign):
+                    targets = inner.targets
+                elif isinstance(inner, (ast.AnnAssign, ast.AugAssign)):
+                    targets = [inner.target]
+                for target in targets:
+                    for sub in ast.walk(target):
+                        if isinstance(sub, ast.Attribute) and isinstance(sub.value, ast.Name) \
+                                and sub.value.id == "self":
+                            names.add(sub.attr)
+        return {n for n in names if n.startswith("_") and not n.startswith("__")}
 
     def _collect_module_names(self, body: list[ast.stmt]):
         """Imports and class names bound at module scope, in execution order
@@ -440,14 +508,40 @@ class DesignSmellDetector(ast.NodeVisitor):
 
         if len({case_of(t) for t in tests}) != len(tests):
             return
-        subject_src = ast.unparse(next(s for s, k in candidates[0]
-                                       if ast.dump(s) == subject_dump and k == kind))
-        via = "isinstance checks on" if kind == "isinstance" else "comparisons against"
-        self._add(node.lineno, "type_switch",
-            f"if/elif ladder with {len(tests)} branches dispatching via {via} '{subject_src}'",
-            "Replace Conditional with Polymorphism, a dispatch dict, or match — "
-            "adding a case should mean adding an entry, not editing a ladder",
-            "high" if len(tests) >= 6 else "medium")
+        self._switches.append((node, subject_dump, kind, len(tests)))
+
+    def visit_Module(self, node: ast.Module):
+        self.generic_visit(node)
+        self._report_type_switches()
+
+    def _report_type_switches(self):
+        """A long ladder, or a subject switched in several ladders, is the smell;
+        one short ladder alone is a lead."""
+        ladders_per_subject = defaultdict(int)
+        for _, subject_dump, kind, _ in self._switches:
+            ladders_per_subject[(subject_dump, kind)] += 1
+        for node, subject_dump, kind, branches in self._switches:
+            subject_src = ast.unparse(next(
+                s for t in [node.test] for s, k in self._switch_candidates(t)
+                if ast.dump(s) == subject_dump and k == kind))
+            via = "isinstance checks on" if kind == "isinstance" else "comparisons against"
+            description = f"if/elif ladder with {branches} branches dispatching via {via} '{subject_src}'"
+            repeated = ladders_per_subject[(subject_dump, kind)]
+            # The description depends on the ladder alone, never on its siblings:
+            # analyze_diff matches a pre-existing finding by its description, and
+            # a new ladder elsewhere must not make an unchanged one look new.
+            if branches >= LONG_SWITCH_BRANCHES or repeated >= 2:
+                self._add(node.lineno, "type_switch", description,
+                    "Replace Conditional with Polymorphism, a dispatch dict, or match — "
+                    "adding a case should mean adding an entry, not editing a ladder",
+                    "high" if branches >= LONG_SWITCH_BRANCHES else "medium")
+            elif "type_switch" not in self.ignore:
+                self.issues.append(DesignSmell(
+                    file=self.filename, line=node.lineno, smell_type="type_switch",
+                    description=description, suggestion="", severity="low",
+                    code_snippet=self._get_line(node.lineno),
+                    kind="candidate", also_caused_by=_SHORT_SWITCH_REASONS,
+                ))
 
     def _check_duplicate_fragments(self, node: ast.If, bodies: list[list[ast.stmt]], final_else: bool):
         if not final_else or len(bodies) < 2 or any(not b for b in bodies):
@@ -573,7 +667,7 @@ class DesignSmellDetector(ast.NodeVisitor):
         if attr.startswith("__") and self._class_depth > 0:
             private = False
         if (not self.is_test_file and not in_dunder and private
-                and attr not in NAMEDTUPLE_API):
+                and attr not in NAMEDTUPLE_API and attr not in self.module_privates):
             receiver = self._foreign_receiver(node.value)
             if (receiver is not None and attr == "_meta" and self._django_context
                     and id(node) in self._metadata_operations):
@@ -595,7 +689,24 @@ class DesignSmellDetector(ast.NodeVisitor):
                     "Move Method to where the data lives, or expose an intentional API "
                     "(Hide Delegate); classes should know as little about each other as possible",
                     "medium")
+            elif self._reaches_sibling_module(node.value) and "inappropriate_intimacy" not in self.ignore:
+                self._reported.add(key)
+                self.issues.append(DesignSmell(
+                    file=self.filename, line=node.lineno, smell_type="inappropriate_intimacy",
+                    description=f"Reaching into '{ast.unparse(node.value)}.{attr}' — a sibling "
+                                "module's private name",
+                    suggestion="", severity="low", code_snippet=self._get_line(node.lineno),
+                    kind="candidate", also_caused_by=_SIBLING_PRIVATE_REASONS,
+                ))
         self.generic_visit(node)
+
+    def _reaches_sibling_module(self, value: ast.expr) -> bool:
+        """True for `mod._x` / `mod.sub._x` where `mod` is a relative import
+        that resolves here as the imported module."""
+        while isinstance(value, ast.Attribute):
+            value = value.value
+        return (isinstance(value, ast.Name) and value.id in self.relative_imports
+                and self._is_exempt_name(value.id))
 
     # ----------------------------------------------------------------- #
     # Temporary Field, Refused Bequest, Lazy Class
@@ -894,19 +1005,19 @@ def main():
         print()
 
         severity_icons = SEVERITY_ICONS
-        for issue in candidates:
-            print(f"[CANDIDATE] {issue.file}:{issue.line}")
-            print(f"   {issue.description}")
-            for explanation in issue.also_caused_by:
-                print(f"   Context: {explanation}")
-            print()
-        for issue in proven:
-            icon = severity_icons[issue.severity]
-            print(f"{icon} [{issue.severity.upper()}] {issue.file}:{issue.line}")
+        for issue in all_issues:
+            if issue.kind == "candidate":
+                print(f"? [CANDIDATE] {issue.file}:{issue.line}")
+            else:
+                print(f"{severity_icons[issue.severity]} [{issue.severity.upper()}] {issue.file}:{issue.line}")
             print(f"   {issue.smell_type}: {issue.description}")
             if issue.code_snippet:
                 print(f"   Code: {issue.code_snippet}")
-            print(f"   → {issue.suggestion}\n")
+            if issue.suggestion:
+                print(f"   → {issue.suggestion}")
+            for reason in issue.also_caused_by:
+                print(f"   ? also caused by: {reason}")
+            print()
 
 
 if __name__ == '__main__':
