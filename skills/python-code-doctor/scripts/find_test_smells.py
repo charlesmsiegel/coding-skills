@@ -88,19 +88,11 @@ def _is_assert_call(node: ast.expr) -> bool:
     return False
 
 
-def _is_pytest_raises_with(node: ast.stmt) -> bool:
-    """Return True if `node` is `with pytest.raises(...):` or `with pytest.warns(...)`."""
-    if not isinstance(node, ast.With):
-        return False
-    for item in node.items:
-        ctx = item.context_expr
-        if isinstance(ctx, ast.Call):
-            func = ctx.func
-            if isinstance(func, ast.Attribute):
-                if isinstance(func.value, ast.Name) and func.value.id == "pytest":
-                    if func.attr in ("raises", "warns"):
-                        return True
-    return False
+def _is_assertion_with(node: ast.stmt) -> bool:
+    """Recognize pytest and assert-style assertion context managers."""
+    return isinstance(node, ast.With) and any(
+        _is_assert_call(item.context_expr) for item in node.items
+    )
 
 
 def _has_assertion(func_node: ast.FunctionDef | ast.AsyncFunctionDef) -> bool:
@@ -315,9 +307,9 @@ def _is_trivial_assertion(node: ast.stmt) -> bool:
 
 def _collect_assertions(func_node: ast.FunctionDef | ast.AsyncFunctionDef) -> list[ast.stmt]:
     """
-    Return a flat list of every statement that is an assertion (ast.Assert or
-    an assert* call expression) within the function body, without descending
-    into nested function/class definitions.
+    Return assertion statements, assert* call expressions, and assertion context
+    managers within the function body, without descending into nested
+    function/class definitions.
     """
     results: list[ast.stmt] = []
 
@@ -330,7 +322,7 @@ def _collect_assertions(func_node: ast.FunctionDef | ast.AsyncFunctionDef) -> li
             elif isinstance(stmt, ast.Expr) and isinstance(stmt.value, ast.Call):
                 if _is_assert_call(stmt.value):
                     results.append(stmt)
-            elif _is_pytest_raises_with(stmt):
+            elif _is_assertion_with(stmt):
                 results.append(stmt)
             # Recurse into compound-statement children
             for child in ast.iter_child_nodes(stmt):
@@ -346,14 +338,14 @@ def _all_assertions_trivial(func_node: ast.FunctionDef | ast.AsyncFunctionDef) -
     Return True iff the function has at least one assertion AND every assertion
     in it is trivial per _is_trivial_assertion.
 
-    pytest.raises/warns `with` blocks are treated as meaningful (non-trivial).
+    Assertion context managers are treated as meaningful (non-trivial).
     """
     assertions = _collect_assertions(func_node)
     if not assertions:
         return False
     for stmt in assertions:
-        if _is_pytest_raises_with(stmt):
-            return False  # meaningful — tests that an exception is raised
+        if _is_assertion_with(stmt):
+            return False  # assertion context managers verify behavior
         if not _is_trivial_assertion(stmt):
             return False
     return True

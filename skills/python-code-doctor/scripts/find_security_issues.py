@@ -45,9 +45,9 @@ class CodeSmell:
     # A scored defect by default. Set to "candidate" for a lead the downstream
     # merge must NOT score — a candidate carries no fix and names, in
     # also_caused_by, the ways a healthy codebase produces the same
-    # observation. Used for interpolation that is not provably unsafe here: a
-    # PRAGMA takes no bound parameters, so a dynamic-table PRAGMA can only be
-    # written by interpolation and is not, on its own, injection.
+    # observation. Used for PRAGMA interpolation and quoted constant SQL
+    # identifiers: identifiers cannot be passed as bound query parameters,
+    # and interpolation alone does not establish injection in these cases.
     kind: str = "finding"
     also_caused_by: tuple[str, ...] = ()
 
@@ -461,6 +461,94 @@ class _LiteralProof:
         if isinstance(value, ast.AugAssign):  # name += <literal-derived>
             return isinstance(value.op, ast.Add) and self.literal(value.value, assuming)
         return self.literal(value, assuming)
+def _quoted_constant_sql_checker(tree):
+    """Recognize constant identifier quoting, without treating arbitrary calls as safe.
+
+    This is deliberately bounded: unique lexical bindings, including tuple
+    unpacking, are followed; additional binding writes remain findings. Quoting is
+    evidence for a candidate, never proof that a query is safe.
+    """
+    scopes = {}
+    bindings = defaultdict(lambda: defaultdict(list))
+    assigned_targets = set()
+
+    def bind(target, value, scope):
+        if isinstance(target, ast.Name):
+            assigned_targets.add(target)
+            bindings[scope][target.id].append(value)
+        elif (isinstance(target, (ast.Tuple, ast.List))
+              and isinstance(value, (ast.Tuple, ast.List))
+              and len(target.elts) == len(value.elts)):
+            for left, right in zip(target.elts, value.elts):
+                bind(left, right, scope)
+
+    def visit(node, scope):
+        scopes[node] = scope
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda)):
+            if hasattr(node, "name"):
+                bindings[scope][node.name].append(None)
+            scope = node
+        if isinstance(node, ast.Name) and isinstance(node.ctx, (ast.Store, ast.Del)):
+            if node not in assigned_targets:
+                bindings[scope][node.id].append(None)
+        elif isinstance(node, (ast.Import, ast.ImportFrom)):
+            for alias in node.names:
+                name = alias.asname or (alias.name.split(".")[0]
+                                        if isinstance(node, ast.Import) else alias.name)
+                bindings[scope][name].append(None)
+        elif isinstance(node, ast.ExceptHandler) and node.name:
+            bindings[scope][node.name].append(None)
+        if isinstance(node, ast.Assign):
+            for target in node.targets:
+                bind(target, node.value, scope)
+        elif isinstance(node, ast.AnnAssign):
+            bind(node.target, node.value, scope)
+        for child in ast.iter_child_nodes(node):
+            visit(child, scope)
+
+    visit(tree, tree)
+
+    def resolve(node, seen=frozenset()):
+        if not isinstance(node, ast.Name) or node in seen:
+            return node
+        scope = scopes[node]
+        values = bindings[scope].get(node.id)
+        if values is None and scope is not tree:
+            # A function parameter shadows module constants.
+            args = getattr(scope, "args", None)
+            if args and any(arg.arg == node.id for arg in ast.walk(args)
+                            if isinstance(arg, ast.arg)):
+                return node
+            values = bindings[tree].get(node.id)
+        if not values or len(values) != 1 or values[0] is None:
+            return node
+        return resolve(values[0], seen | {node})
+
+    def quoted_constant(node):
+        node = resolve(node)
+        if not isinstance(node, ast.Call) or len(node.args) != 1 or node.keywords:
+            return False
+        func = resolve(node.func)
+        value = resolve(node.args[0])
+        return (isinstance(func, ast.Attribute) and func.attr == "quote_name"
+                and isinstance(func.value, ast.Attribute) and func.value.attr == "ops"
+                and isinstance(value, ast.Constant) and isinstance(value.value, str))
+
+    def check(node):
+        if isinstance(node, ast.JoinedStr):
+            values = [v.value for v in node.values if isinstance(v, ast.FormattedValue)]
+        elif isinstance(node, ast.BinOp) and isinstance(node.op, ast.Mod):
+            values = node.right.elts if isinstance(node.right, ast.Tuple) else [node.right]
+        elif isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
+            values = [v for v in (node.left, node.right)
+                      if not (isinstance(v, ast.Constant) and isinstance(v.value, str))]
+        elif isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr == "format":
+            values = [*node.args, *(kw.value for kw in node.keywords)]
+        else:
+            return False
+        return bool(values) and all(quoted_constant(value) for value in values)
+
+    return check
 
 
 _SQL_EXECUTE_ATTRS = {"execute", "executemany", "executescript", "raw", "mogrify"}
@@ -471,6 +559,7 @@ _SUBPROCESS_FUNCS = {"run", "call", "check_call", "check_output", "Popen"}
 def detect(tree, filename, lines, ignore):
     issues = []
     proof = _LiteralProof(tree)
+    quoted_constant_sql = _quoted_constant_sql_checker(tree)
 
     def add(line, st, desc, sug, sev, kind="finding", also_caused_by=()):
         if st in ignore:
@@ -517,6 +606,14 @@ def detect(tree, filename, lines, ignore):
                             "only be interpolated — this is the only spelling",
                             "the interpolated value is validated against a known set of table "
                             "names before it reaches the statement",
+                        ))
+                elif quoted_constant_sql(node.args[0]):
+                    add(node.lineno, "sql_injection",
+                        f"Call to .{func.attr}() interpolates quoted constant SQL identifiers",
+                        "", "high", kind="candidate",
+                        also_caused_by=(
+                            "SQL identifiers cannot be passed as bound query parameters",
+                            "constant table and column names are quoted using the database backend",
                         ))
                 else:
                     add(node.lineno, "sql_injection",
