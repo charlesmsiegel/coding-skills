@@ -64,6 +64,61 @@ def parse(ts, source: str, name: str = "sample.ts"):
 
 
 # --------------------------------------------------------------------------- #
+# Type arguments: the commas inside `<...>` do not separate anything
+# --------------------------------------------------------------------------- #
+
+def test_a_generic_parameter_type_is_one_parameter(ts):
+    file = parse(ts, """\
+export function f(a: Record<string, number>, b: Map<string, Array<number>>,
+                  c = new Map<string, number>(), d = x < y, e = 2): void {}
+""")
+    (func,) = file.functions
+    assert [(p.name, p.type_text) for p in func.params] == [
+        ("a", "Record<string, number>"), ("b", "Map<string, Array<number>>"),
+        ("c", ""), ("d", ""), ("e", ""),
+    ]
+
+
+def test_a_generic_return_type_keeps_the_function_body(ts):
+    """`): Record<string, number> {` used to stop the return type at the comma,
+    so the `{` after it was never reached and the function had no body at all
+    — its complexity, length and contents went unmeasured."""
+    file = parse(ts, "export function h(x: number): Record<string, number> | null {\n  return null;\n}\n")
+    (func,) = file.functions
+    assert func.return_type == "Record<string, number> | null"
+    assert func.has_body
+
+
+def test_a_generic_member_type_is_one_member(ts):
+    file = parse(ts, "interface I { fragments: Record<string, unknown>; ready: boolean }\n"
+                     "class K { cache: Map<string, number> = new Map(); size = 2 }\n")
+    assert [m.name for m in file.types[0].members] == ["fragments", "ready"]
+    assert [(p.name, p.type_text, p.initializer) for p in file.classes[0].props] == [
+        ("cache", "Map<string, number>", "new Map()"), ("size", "", "2"),
+    ]
+
+
+def test_untyped_parameter_ignores_a_generic_annotation_and_keeps_a_missing_one(tmp_path):
+    root = project(tmp_path, {"src/a.ts": """\
+export function counts(table: Record<string, number>): number { return Object.keys(table).length; }
+export function loose(input, table: Record<string, number>): number { return table[input]; }
+"""})
+    found = records("find_type_gaps.py", root, "untyped_parameter")
+    assert [(r["line"], r["description"]) for r in found] == [
+        (2, "Exported function `loose` takes `input` with no type"),
+    ]
+
+
+def test_long_parameter_list_counts_parameters_not_type_arguments(tmp_path):
+    root = project(tmp_path, {"src/a.ts": """\
+export function three(a: Map<string, number>, b: Record<string, Array<number>>, c: Set<string>): void {}
+export function five(a: string, b: string, c: string, d: string, e: Map<string, number>): void {}
+"""})
+    found = records("analyze_complexity.py", root, "long_parameter_list")
+    assert [r["description"] for r in found] == ["five takes 5 parameters"]
+
+
+# --------------------------------------------------------------------------- #
 # Comments are located by character offset
 # --------------------------------------------------------------------------- #
 
