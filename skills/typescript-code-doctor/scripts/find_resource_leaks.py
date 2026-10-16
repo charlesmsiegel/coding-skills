@@ -36,6 +36,23 @@ RELEASE_ALIASES = {
 # useEffect callback is the release path.
 EFFECT_HOOKS = frozenset({"useEffect", "useLayoutEffect", "useInsertionEffect"})
 
+# `open` is the one acquire name that is also an everyday verb: a dialog's
+# `open()`, a drawer state setter, a viewer's `open(id)`. Only a file-system
+# `open` returns a handle that must be closed, so that is the only one counted:
+# called on an fs module (`fs.open`, `fs.promises.open`, `fsPromises.open`), or
+# bare when this file imports `open` from one.
+FS_MODULES = frozenset({"fs", "node:fs", "fs/promises", "node:fs/promises"})
+FS_RECEIVERS = frozenset({"fs", "fsp", "fsPromises", "promises"})
+
+
+def _is_resource_call(file: TsFile, callee: str, method: str) -> bool:
+    if method != "open":
+        return True
+    receiver = callee.rsplit(".", 1)[0] if "." in callee else ""
+    if receiver:
+        return receiver.split(".")[-1] in FS_RECEIVERS
+    return any(record.module in FS_MODULES and "open" in record.names for record in file.imports)
+
 
 def _released_names(file: TsFile) -> set[str]:
     """Every release call made anywhere in the file, by method name."""
@@ -78,6 +95,8 @@ def _check_pairs(file: TsFile, report: Reporter) -> None:
     for paren, callee in iter_calls(file):
         method = callee.rsplit(".", 1)[-1]
         if method not in PAIRS:
+            continue
+        if not _is_resource_call(file, callee, method):
             continue
         release, cost, severity = PAIRS[method]
         aliases = RELEASE_ALIASES.get(release, {release})

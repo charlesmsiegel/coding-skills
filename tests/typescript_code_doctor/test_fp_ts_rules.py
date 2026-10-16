@@ -647,3 +647,59 @@ def test_a_dialog_whose_answer_gates_an_action_is_not_a_leftover(tmp_path):
     found = records("find_debug_leftovers.py", tmp_path, {"tags.ts": DIALOGS}, "browser_dialog")
     by_line = {r["line"]: r["kind"] for r in found}
     assert by_line == {5: "finding", 6: "candidate"}
+
+
+# --------------------------------------------------------------------------- #
+# message chains end in data; `open` is a file only on fs; the DOM and a syntax
+# tree are not the caller's data
+# --------------------------------------------------------------------------- #
+
+CHAINS = """\
+export function show(detail: Detail, frame: { current: Frame }, order: Order): string[] {
+  const tags = detail.meta.tags.map((t) => t.trim());
+  frame.current.fields.set("a", 1);
+  const city = order.customer.address.city.format();
+  return [...tags, city];
+}
+"""
+
+
+def test_a_chain_ending_in_a_builtin_method_is_data_access(tmp_path):
+    found = records("find_encapsulation_issues.py", tmp_path, {"show.ts": CHAINS}, "message_chain")
+    assert lines_of(found) == [4], "a domain method four objects deep is still a chain"
+
+
+OPENS = """\
+import { open as openFile } from "node:fs/promises";
+import * as fs from "node:fs";
+export function viewer(dialog: Dialog, id: string): void {
+  dialog.open(id);
+  open(id);
+  fs.open("/tmp/x", "r", () => undefined);
+}
+function open(id: string): void { void id; }
+"""
+
+
+def test_open_is_a_resource_only_on_the_file_system(tmp_path):
+    found = records("find_resource_leaks.py", tmp_path, {"viewer.ts": OPENS}, "unreleased_resource")
+    assert lines_of(found) == [6]
+
+
+MUTATIONS = """\
+export function guard(event: BeforeUnloadEvent, input: HTMLInputElement): void {
+  event.returnValue = "";
+  input.value = "";
+}
+export function walk(node: any, next: unknown[]): void {
+  node.children = next;
+}
+export function apply(options: { retries: number }): void {
+  options.retries = 3;
+}
+"""
+
+
+def test_dom_objects_and_syntax_trees_are_not_caller_owned_data(tmp_path):
+    found = records("find_mutation_hazards.py", tmp_path, {"guard.ts": MUTATIONS}, "mutates_argument_property")
+    assert {r["line"]: r["kind"] for r in found} == {6: "candidate", 9: "finding"}

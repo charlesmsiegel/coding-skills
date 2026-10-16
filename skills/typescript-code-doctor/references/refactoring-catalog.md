@@ -115,7 +115,8 @@ other's internals. Either move the behaviour, or make the member part of the API
 
 **Message chains.** `message_chain`. `a.b.c.d()` couples the caller to every type
 on the path. Ask the first object for what you want. (Walking a plain data shape
-you own is not this smell.)
+you own is not this smell: the detector does not count a trailing built-in method
+such as `.map()` or `.trim()`, or a ref's `.current`, towards the depth.)
 
 **Middle man.** `middle_man`, `pass_through_module`. A class or module that only
 forwards. Delete it, or give it a reason: translation, an invariant, a narrowed

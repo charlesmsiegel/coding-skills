@@ -9,6 +9,8 @@ it: a default parameter value is evaluated on every call, so
 default — it is the object the caller already owns and still holds a reference to.
 """
 
+import re
+
 from common import Reporter, run_file_detector
 from tsparse import TsFile, argument_spans, body_indices, iter_calls
 
@@ -44,11 +46,24 @@ def _check_parameter_reassignment(file: TsFile, report: Reporter) -> None:
                        "lie about what the function is working with halfway down the body.", "medium")
 
 
+# Parameter types that are the platform's objects, not the caller's data:
+# `event.returnValue = ""` in a `beforeunload` handler and `input.value = ""` on
+# a file input are how the DOM is driven, and the contract requires them.
+_PLATFORM_TYPE = re.compile(
+    r"^(?:\w+Event|Event|HTML\w*Element|SVG\w*Element|Element|Document|Window|"
+    r"EventTarget|ShadowRoot|DocumentFragment|CSSStyleDeclaration)$")
+# Names and types of a syntax tree a transformer walks. A unified/remark/rehype
+# plugin edits the tree in place by contract, which the syntax cannot confirm.
+_TREE_NAMES = frozenset({"node", "tree", "ast", "root", "parent"})
+_TREE_TYPE = re.compile(r"\b(?:\w*Node|Root|Parent|Ast|Tree)\b")
+
+
 def _check_property_writes_on_parameters(file: TsFile, report: Reporter) -> None:
     for func in file.functions:
         if not func.has_body:
             continue
-        parameters = {p.name for p in func.params if not p.is_destructured}
+        types = {p.name: p.type_text.strip() for p in func.params if not p.is_destructured}
+        parameters = {name for name, text in types.items() if not _PLATFORM_TYPE.match(text)}
         for index in body_indices(func):
             token = file.tokens[index]
             if token.kind != "name" or token.value not in parameters or index + 3 >= len(file):
@@ -57,6 +72,18 @@ def _check_property_writes_on_parameters(file: TsFile, report: Reporter) -> None
                 continue
             operator = file.tokens[index + 3]
             if not (operator.kind == "op" and operator.value in ASSIGN_OPS):
+                continue
+            if token.value in _TREE_NAMES or _TREE_TYPE.search(types[token.value]):
+                report.candidate(token.line, "mutates_argument_property",
+                                 f"`{token.value}.{file.tokens[index + 2].value} = …` writes through "
+                                 "an argument",
+                                 ("it is a syntax-tree transformer (a unified/remark/rehype plugin, a "
+                                  "Babel visitor) that edits the tree in place by contract",
+                                  "the parameter is a builder or accumulator the caller hands over "
+                                  "to be filled in",
+                                  "the object is a DOM node or platform object whose type is not "
+                                  "annotated"),
+                                 "medium")
                 continue
             report.add(token.line, "mutates_argument_property",
                        f"`{token.value}.{file.tokens[index + 2].value} = …` writes through an argument",
