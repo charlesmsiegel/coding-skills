@@ -382,7 +382,10 @@ docstrings (`D`), missing annotations (`ANN`), and security (`S`/bandit). Depend
 advisories and line coverage are not a linter's job at all — those come from pip-audit
 and coverage through `run_external_tools.py`. If the repo
 already runs those Ruff rules, disable the matching detector via `--ignore` (or drop
-its whole category with `analyze_all.py --skip`) to avoid double-reporting — or
+its whole category with `analyze_all.py --skip`) to avoid double-reporting. Where
+they overlap, a suppression with its reason written down — `# noqa: A002 -- the
+HTTP parameter is named id` — is read as a reviewed decision: `find_naming_issues.py`
+reports that shadow as a candidate, not a finding; a bare `# noqa` changes nothing. Or,
 better, run the real tools with
 `run_external_tools.py` (above) and lean on the detectors only for what the tools
 don't cover. The unique value here is the **bug-finding and design detectors**
