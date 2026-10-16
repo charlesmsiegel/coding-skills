@@ -76,7 +76,7 @@ def test_a_queryset_at_class_scope_is_reported(tmp_path):
         "shop/forms.py": "from django import forms\n"
                          "from .models import Customer\n\n\n"
                          "class OrderForm(forms.Form):\n"
-                         "    customer = forms.ModelChoiceField(queryset=Customer.objects.all())\n",
+                         "    customer_choices = list(Customer.objects.all())\n",
     })
     assert "queryset_at_class_scope" in smells(run_detector("find_form_issues.py", project))
 

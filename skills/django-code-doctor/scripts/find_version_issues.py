@@ -103,6 +103,88 @@ def _match_setting(change, tree, is_settings_module):
                     yield node.lineno
 
 
+def _imported_identity(tree):
+    """Resolve imported names and attributes, refusing shadowed bindings.
+
+    No application code is imported or executed. A local assignment, parameter,
+    or definition makes an imported spelling ambiguous in that lexical scope.
+    """
+    scopes = {}
+    parents = {tree: None}
+    bindings = {tree: {}}
+
+    def bind(scope, name, identity=None):
+        bindings[scope].setdefault(name, set()).add(identity)
+
+    def visit(node, scope):
+        scopes[node] = scope
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda)):
+            definition_scope = scope
+            if hasattr(node, "name"):
+                bind(scope, node.name)
+            enclosing = scope
+            # Class attributes are not lexical bindings inside a method.
+            while isinstance(enclosing, ast.ClassDef):
+                enclosing = parents[enclosing]
+            parents[node] = enclosing
+            bindings[node] = {}
+            scope = node
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+                # Defaults, annotations, and decorators execute where the
+                # function is defined, before its parameter bindings exist.
+                args = node.args
+                scopes[args] = scope
+                parameters = [*args.posonlyargs, *args.args, *args.kwonlyargs]
+                parameters += [arg for arg in (args.vararg, args.kwarg) if arg]
+                for arg in parameters:
+                    scopes[arg] = scope
+                    bind(scope, arg.arg)
+                    if arg.annotation:
+                        visit(arg.annotation, definition_scope)
+                for default in [*args.defaults, *args.kw_defaults]:
+                    if default is not None:
+                        visit(default, definition_scope)
+                for parameter in getattr(node, "type_params", []):
+                    visit(parameter, definition_scope)
+                for decorator in getattr(node, "decorator_list", []):
+                    visit(decorator, definition_scope)
+                if getattr(node, "returns", None):
+                    visit(node.returns, definition_scope)
+                for statement in node.body if isinstance(node.body, list) else [node.body]:
+                    visit(statement, scope)
+                return
+        if isinstance(node, ast.arg):
+            bind(scope, node.arg)
+        elif isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store):
+            bind(scope, node.id)
+        elif isinstance(node, ast.ImportFrom) and not node.level and node.module:
+            for alias in node.names:
+                bind(scope, alias.asname or alias.name, node.module + "." + alias.name)
+        elif isinstance(node, ast.Import):
+            for alias in node.names:
+                bind(scope, alias.asname or alias.name.split(".")[0],
+                     alias.name if alias.asname else alias.name.split(".")[0])
+        for child in ast.iter_child_nodes(node):
+            visit(child, scope)
+
+    visit(tree, tree)
+
+    def resolve(node):
+        if isinstance(node, ast.Attribute):
+            base = resolve(node.value)
+            return base + "." + node.attr if base else None
+        if isinstance(node, ast.Name):
+            scope = scopes[node]
+            while scope is not None:
+                identities = bindings[scope].get(node.id)
+                if identities is not None:
+                    return next(iter(identities)) if len(identities) == 1 else None
+                scope = parents[scope]
+        return None
+
+    return resolve
+
+
 def _match_import(change, tree):
     module = change.match.get("module")
     names = set(V.all_names(change))
@@ -117,23 +199,27 @@ def _match_import(change, tree):
             for alias in node.names:
                 if module and alias.name == module + "." + next(iter(names)):
                     yield node.lineno
-    # `timezone.utc` after `from django.utils import timezone` — the import line
-    # is innocent, the use site is the finding.
+    # Match the imported receiver, including aliases and fully qualified uses.
+    # A stdlib timezone.utc or an application object's .utc is unrelated.
     if module:
-        tail = module.rsplit(".", 1)[-1]
+        identity = _imported_identity(tree)
+        expected = {module + "." + name for name in names}
         for node in ast.walk(tree):
-            if (isinstance(node, ast.Attribute) and node.attr in names
-                    and isinstance(node.value, ast.Name) and node.value.id == tail):
+            if isinstance(node, ast.Attribute) and identity(node) in expected:
                 yield node.lineno
 
 
 def _match_call(change, tree):
     names = set(V.all_names(change))
     wants_no_args = change.match.get("no_args", False)
+    identity = _imported_identity(tree) if change.name == "url" else None
     for node in ast.walk(tree):
         if not isinstance(node, ast.Call):
             continue
-        if call_name(node) not in names:
+        if identity is not None:
+            if identity(node.func) != "django.conf.urls.url":
+                continue
+        elif call_name(node) not in names:
             continue
         if wants_no_args and (node.args or node.keywords):
             continue
