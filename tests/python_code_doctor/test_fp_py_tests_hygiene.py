@@ -51,7 +51,7 @@ def lines_of(findings: list[dict], smell: str) -> list[int]:
 
 
 def test_a_reasoned_noqa_is_read_on_the_line_or_the_comment_line_below(load_module):
-    noqa = load_module(SCRIPTS_DIR, "noqa")
+    common = load_module(SCRIPTS_DIR, "common")
     lines = [
         "x = 1  # noqa: A001 -- the protocol names it",   # 1: reasoned
         "y = 2  # noqa: A001",                            # 2: bare
@@ -62,13 +62,13 @@ def test_a_reasoned_noqa_is_read_on_the_line_or_the_comment_line_below(load_modu
         "v = 5",                                          # 7
         "u = 6  # noqa: A001 - fixed by the HTTP API",    # 8: code line below 7
     ]
-    assert noqa.reasoned_noqa(lines, 1, ["A001"])
-    assert not noqa.reasoned_noqa(lines, 1, ["A002"]), "the code must be the one asked about"
-    assert not noqa.reasoned_noqa(lines, 2, ["A001"]), "a bare noqa records no decision"
-    assert not noqa.reasoned_noqa(lines, 3, ["A001"]), "a separator alone is not a reason"
-    assert noqa.reasoned_noqa(lines, 4, ["A002"])
-    assert noqa.reasoned_noqa(lines, 5, ["A002"])
-    assert not noqa.reasoned_noqa(lines, 7, ["A001"]), "a code line below is another statement"
+    assert common.reasoned_noqa(lines, 1, "A001")
+    assert not common.reasoned_noqa(lines, 1, "A002"), "the code must be the one asked about"
+    assert not common.reasoned_noqa(lines, 2, "A001"), "a bare noqa records no decision"
+    assert not common.reasoned_noqa(lines, 3, "A001"), "a separator alone is not a reason"
+    assert common.reasoned_noqa(lines, 4, "A002")
+    assert common.reasoned_noqa(lines, 5, "A002")
+    assert not common.reasoned_noqa(lines, 7, "A001"), "a code line below is another statement"
 
 
 # --------------------------------------------------------------------------- #

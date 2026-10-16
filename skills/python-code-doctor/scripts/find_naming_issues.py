@@ -29,8 +29,7 @@ import argparse
 from pathlib import Path
 from dataclasses import dataclass, asdict
 from collections import defaultdict
-from common import sort_findings, cached_parse, SEVERITY_ICONS, configure_output, find_python_files, warn_detector_error, warn_unparseable
-from noqa import reasoned_noqa
+from common import sort_findings, cached_parse, SEVERITY_ICONS, configure_output, find_python_files, warn_detector_error, warn_unparseable, reasoned_noqa
 
 
 @dataclass
@@ -237,7 +236,7 @@ class NamingDetector(ast.NodeVisitor):
     def _shadow(self, name, line, code=_VARIABLE):
         if name in _BUILTINS and (line, name, "shadows_builtin") not in self._reported:
             self._reported.add((line, name, "shadows_builtin"))
-            if reasoned_noqa(self.lines, line, (code,)):
+            if reasoned_noqa(self.lines, line, code):
                 self._add(line, "shadows_builtin",
                     f"'{name}' shadows the Python builtin of the same name; a reasoned "
                     f"`# noqa: {code}` marks it as reviewed",
