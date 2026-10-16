@@ -193,6 +193,12 @@ def walk_paths(root: Path, *, skip_gitignored: bool = False) -> Iterator[Path]:
     this skill inspect host data and report a credential found there as
     committed to this repository. Git stores only the link target string, so
     there is nothing of the target's content to review in any case.
+
+    **A nested git checkout is another repository.** A directory below
+    ``root`` holding its own `.git` — a file for a worktree or a submodule, a
+    directory for a nested clone — is pruned: a credential in a sibling
+    worktree is not committed to *this* repo, and reporting it here (once per
+    copy of the tree) would say it was. ``root`` itself is never pruned.
     """
     if root.is_symlink():
         raise ScanPathError(
@@ -214,7 +220,8 @@ def walk_paths(root: Path, *, skip_gitignored: bool = False) -> Iterator[Path]:
     for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
         dirnames[:] = sorted(d for d in dirnames
                              if d not in EXCLUDE_DIRS
-                             and not Path(dirpath, d).is_symlink())
+                             and not Path(dirpath, d).is_symlink()
+                             and not os.path.lexists(Path(dirpath, d, ".git")))
         if ignored:
             dirnames[:] = [d for d in dirnames if Path(dirpath, d).resolve() not in ignored]
         for name in sorted(filenames):
