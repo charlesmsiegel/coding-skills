@@ -148,6 +148,7 @@ class TsFile:
         self.tokens = tokenizer.tokens
         self.comments = tokenizer.comments
         self.jsx_text = tokenizer.jsx_text
+        self.substitutions = tokenizer.substitutions
         self.match = match_brackets(self.tokens)
 
         self.imports: list[Import] = []
@@ -195,6 +196,21 @@ class TsFile:
         """
         low, high = self.tokens[open_index].end, self.tokens[close_index].start
         return [c for c in self.comments if low <= c.start < high]
+
+    def names(self, start: int = 0, stop: int | None = None):
+        """Every identifier the code in [start, stop) names, template substitutions included.
+
+        The code inside a template's `${...}` is not in the flat token list (the
+        literal is one token), so a question of the form "is this name read
+        anywhere" asks here rather than of `tokens`.
+        """
+        stop = len(self.tokens) if stop is None else min(stop, len(self.tokens))
+        for index in range(start, stop):
+            token = self.tokens[index]
+            if token.kind == "name":
+                yield token
+            elif token.kind == "template":
+                yield from (t for t in self.substitutions.get(index, ()) if t.kind == "name")
 
     def closer(self, index: int) -> int:
         """The matching bracket for the token at ``index``, or -1."""
