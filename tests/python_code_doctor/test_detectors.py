@@ -4779,3 +4779,320 @@ def test_a_cli_commands_parameters_are_its_flags(tmp_path, script, finding_type,
     (tmp_path / "cli.py").write_text(_CLI_COMMANDS)
     lines = sorted(f["line"] for f in run_detector(script, tmp_path) if f.get(key) == finding_type)
     assert lines == _lines_marked(_CLI_COMMANDS)
+
+
+# --------------------------------------------------------------------------- #
+# Coupling metrics, re-graded against the refactored project: what a method is,
+# what counts as the object's own state, and what delegation actually looks like.
+# --------------------------------------------------------------------------- #
+
+
+def _coupling(tmp_path, source: str, issue_type: str) -> list[dict]:
+    (tmp_path / "sample.py").write_text(source)
+    return [r for r in run_detector("find_coupling_issues.py", tmp_path) if r["issue_type"] == issue_type]
+
+
+def test_a_function_nested_in_a_method_belongs_to_that_method(tmp_path):
+    """A closure is not a method of the class; what it reads, its method reads."""
+    source = (
+        "class Service:\n"
+        "    def __init__(self):\n"
+        "        self.jobs = []\n"
+        "\n"
+        "    def execute(self, job):\n"
+        "        def on_step(progress):\n"
+        "            return progress.step + progress.total + progress.eta + progress.done\n"
+        "        self.jobs.append(job)\n"
+        "        return on_step\n"
+        "\n"
+        "    def clear(self):\n"
+        "        self.jobs.clear()\n"
+    )
+    (tmp_path / "sample.py").write_text(source)
+    records = run_detector("find_coupling_issues.py", tmp_path)
+
+    assert not any(r["name"].endswith("on_step") for r in records), records
+    envy = [(r["name"], r["line"]) for r in records if r["issue_type"] == "feature_envy"]
+    assert envy == [("Service.execute", 5)], "the closure's accesses still count, as its method's"
+
+
+_COHESIVE = (
+    "from dataclasses import dataclass, field\n"
+    "\n"
+    "class Resolver:\n"
+    "    def __init__(self, settings):\n"
+    "        self._settings = settings\n"
+    "\n"
+    "    def lora_path(self, name):\n"
+    "        return self._settings().loras_dir + name\n"
+    "\n"
+    "    def lora_specs(self, job):\n"
+    "        return [self.lora_path(n) for n in job.names]\n"
+    "\n"
+    "    def sweep_control(self, name):\n"
+    "        return self._settings().loras_dir + name\n"
+    "\n"
+    "    def selected_styles(self, job):\n"
+    "        return self._settings().styles\n"
+    "\n"
+    "    def prompt_state(self, job):\n"
+    "        return job.prompt\n"
+    "\n"
+    "    def assembled(self, job):\n"
+    "        return self.prompt_state(job), self.selected_styles(job)\n"
+    "\n"
+    "    def doubled(self, x):\n"
+    "        return x * 2\n"
+    "\n"
+    "    @property\n"
+    "    def root(self):\n"
+    "        return self._settings().root\n"
+    "\n"
+    "    def describe(self):\n"
+    "        return self.root\n"
+    "\n"
+    "@dataclass\n"
+    "class Job:\n"
+    "    request: object\n"
+    "    status: str = 'queued'\n"
+    "    notes: list = field(default_factory=list)\n"
+    "\n"
+    "    def note(self, text):\n"
+    "        self.notes.append(text)\n"
+    "\n"
+    "    def finish(self):\n"
+    "        self.status = 'done'\n"
+    "        self.note('finished')\n"
+    "\n"
+    "    def summary(self):\n"
+    "        return (self.request, self.status)\n"
+)
+
+
+def test_lcom4_sees_a_class_held_together_by_shared_state_and_sibling_calls(tmp_path):
+    """Every method reads `self._settings` or calls a sibling that does; a method that
+    uses no state at all is a static-method candidate, not evidence the class splits."""
+    assert _coupling(tmp_path, _COHESIVE, "low_cohesion") == []
+
+
+def test_lcom4_reports_disjoint_method_groups_and_names_them(tmp_path):
+    two = (
+        "class Mixed:\n"
+        "    def __init__(self):\n"
+        "        self.path = ''\n"
+        "        self.rows = []\n"
+        "        self.socket = None\n"
+        "\n"
+        "    def save(self):\n"
+        "        write(self.path, self.rows)\n"
+        "\n"
+        "    def load(self):\n"
+        "        self.rows = read(self.path)\n"
+        "\n"
+        "    def connect(self):\n"
+        "        self.socket = open_socket()\n"
+        "\n"
+        "    def send(self, data):\n"
+        "        self.socket.send(data)\n"
+    )
+    [record] = _coupling(tmp_path, two, "low_cohesion")
+    assert record["line"] == 1 and record["severity"] == "medium"
+    assert "2 groups" in record["description"]
+    assert "{save, load} and {connect, send}" in record["description"]
+
+    three = two + (
+        "\n"
+        "    def tick(self):\n"
+        "        self.clock += 1\n"
+    )
+    [record] = _coupling(tmp_path, three, "low_cohesion")
+    assert record["severity"] == "high"
+    assert "{save, load}, {connect, send} and {tick}" in record["description"]
+
+
+def test_a_local_taken_from_self_is_the_objects_own_data(tmp_path):
+    source = (
+        "class Board:\n"
+        "    def __init__(self):\n"
+        "        self._jobs = {}\n"
+        "        self.ctx = None\n"
+        "        self.job = None\n"
+        "\n"
+        "    def _settings(self):\n"
+        "        return self.ctx.settings\n"
+        "\n"
+        "    def resolve(self):\n"
+        "        settings = self._settings()\n"
+        "        return settings.a + settings.b + settings.c + settings.d\n"
+        "\n"
+        "    def persist(self):\n"
+        "        for job in self._jobs.values():\n"
+        "            write(job.id, job.status, job.request, job.started)\n"
+        "\n"
+        "    def evict(self):\n"
+        "        return [job.id for job in self._jobs.values() if job.done and job.old and job.stale]\n"
+        "\n"
+        "    def run(self):\n"
+        "        ctx, job = self.ctx, self.job\n"
+        "        return ctx.a + ctx.b + ctx.c + job.x + job.y + job.z\n"
+        "\n"
+        "    def request_of(self):\n"
+        "        request = self.job.request\n"
+        "        return request.a + request.b + request.c\n"
+        "\n"
+        "    def envious(self, order):  # fires\n"
+        "        return order.street + order.city + order.zip + order.country + order.state + self.ctx\n"
+    )
+    envy = [(r["line"], r["description"].split("'")[3]) for r in _coupling(tmp_path, source, "feature_envy")]
+    assert envy == [(line, "order") for line in _lines_marked(source)]
+
+
+def test_middle_man_is_a_class_whose_public_methods_only_forward(tmp_path):
+    """Reading your arguments is not delegation; a method that is nothing but
+    `return self.inner.x(...)` is."""
+    source = (
+        "class Writer:\n"
+        "    def __init__(self, root):\n"
+        "        self.root = root\n"
+        "\n"
+        "    def path(self, job):\n"
+        "        return job.dir + job.name + job.ext + job.stamp + self.root\n"
+        "\n"
+        "    def chunk(self, job, request):\n"
+        "        return [request.a, request.b, request.c, job.x, job.y]\n"
+        "\n"
+        "    def size(self, request):\n"
+        "        return request.w * request.h * request.d * request.e\n"
+        "\n"
+        "class HalfProxy:\n"
+        "    def __init__(self, inner):\n"
+        "        self._inner = inner\n"
+        "\n"
+        "    def get(self, key):\n"
+        "        return self._inner.get(key)\n"
+        "\n"
+        "    def put(self, key, value):\n"
+        "        self._inner.put(key, value)\n"
+        "\n"
+        "    def run(self):\n"
+        "        return self._run()\n"
+        "\n"
+        "    def _run(self):\n"
+        "        return self._inner\n"
+        "\n"
+        "    def total(self):\n"
+        "        return sum(self._inner.values()) + 1\n"
+        "\n"
+        "class Proxy:  # fires\n"
+        "    def __init__(self, inner):\n"
+        "        self._inner = inner\n"
+        "\n"
+        "    def get(self, key):\n"
+        "        return self._inner.get(key)\n"
+        "\n"
+        "    def put(self, key, value):\n"
+        "        self._inner.put(key, value)\n"
+        "\n"
+        "    def delete(self, key):\n"
+        "        \"\"\"Forward.\"\"\"\n"
+        "        return self._inner.delete(key)\n"
+        "\n"
+        "    def keys(self):\n"
+        "        return self._inner.keys()\n"
+    )
+    found = _coupling(tmp_path, source, "middle_man")
+    assert [r["line"] for r in found] == _lines_marked(source)
+    assert "self._inner" in found[0]["description"] and "4 of 4" in found[0]["description"]
+
+
+def test_a_lambda_parameter_is_not_the_loop_variable_it_shares_a_name_with(tmp_path):
+    """`job` here is three variables in three scopes. Two iterate self's jobs (one
+    through `sorted(...)`); the lambda's reads are two, under the threshold."""
+    source = (
+        "class Board:\n"
+        "    def __init__(self):\n"
+        "        self._jobs = {}\n"
+        "\n"
+        "    def evict(self):\n"
+        "        finished = sorted(\n"
+        "            (job for job in self._jobs.values() if job.done),\n"
+        "            key=lambda job: job.finished_at or job.queued_at,\n"
+        "        )\n"
+        "        for job in finished[:3]:\n"
+        "            del self._jobs[job.id]\n"
+        "\n"
+        "    def rank(self, jobs):  # fires\n"
+        "        return sorted(jobs, key=lambda job: job.a + job.b + job.c + job.d)\n"
+    )
+    envy = [r["line"] for r in _coupling(tmp_path, source, "feature_envy")]
+    assert envy == _lines_marked(source)
+
+
+def test_a_records_declared_fields_are_one_piece_of_state(tmp_path):
+    """A dataclass or pydantic model is one value: its generated init, repr, eq and
+    validation use every field together, so views over different fields do not split
+    it. State the record does not declare still can."""
+    source = (
+        "from dataclasses import dataclass\n"
+        "from pydantic import BaseModel\n"
+        "\n"
+        "@dataclass(frozen=True)\n"
+        "class Style:\n"
+        "    name: str\n"
+        "    prompt: str = ''\n"
+        "    source: str = 'saved'\n"
+        "\n"
+        "    @property\n"
+        "    def editable(self):\n"
+        "        return self.source == 'saved'\n"
+        "\n"
+        "    @property\n"
+        "    def wraps(self):\n"
+        "        return '{}' in self.prompt\n"
+        "\n"
+        "class Settings(BaseModel):\n"
+        "    dtype: str = 'bf16'\n"
+        "    host: str = ''\n"
+        "\n"
+        "    def torch_dtype(self):\n"
+        "        return self.dtype\n"
+        "\n"
+        "    def url(self):\n"
+        "        return self.host\n"
+        "\n"
+        "@dataclass\n"
+        "class Cached:  # fires\n"
+        "    path: str\n"
+        "\n"
+        "    def load(self):\n"
+        "        return read(self.path)\n"
+        "\n"
+        "    def remember(self, value):\n"
+        "        self._memo = value\n"
+        "\n"
+        "    def recall(self):\n"
+        "        return self._memo\n"
+    )
+    found = _coupling(tmp_path, source, "low_cohesion")
+    assert [r["line"] for r in found] == _lines_marked(source)
+    assert "{load} and {remember, recall}" in found[0]["description"]
+
+
+def test_a_test_double_is_shaped_by_the_interface_it_fakes(tmp_path):
+    """A recording fake answers each method of the real object from its own list."""
+    tests = tmp_path / "tests"
+    tests.mkdir()
+    (tests / "test_service.py").write_text(
+        "class RecordingPipeline:\n"
+        "    def __init__(self):\n"
+        "        self.calls = []\n"
+        "        self.prepared = []\n"
+        "\n"
+        "    def __call__(self, prompt):\n"
+        "        self.calls.append(prompt)\n"
+        "\n"
+        "    def prepare_conditioning(self, prompt):\n"
+        "        self.prepared.append(prompt)\n"
+    )
+    assert [r for r in run_detector("find_coupling_issues.py", tmp_path)
+            if r["issue_type"] == "low_cohesion"] == []

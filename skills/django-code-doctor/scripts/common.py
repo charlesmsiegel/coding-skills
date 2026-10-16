@@ -93,6 +93,21 @@ def configure_output() -> None:
                 reconfigure(errors="replace")
 
 
+def is_test_file(filepath: Path) -> bool:
+    """A test module or test infrastructure: test_*.py, *_test.py, conftest.py,
+    or anything under a tests/ (or test/) directory.
+
+    Detectors that judge design use it to stand down where a test's shape is set
+    by what it tests: a literal there is an expected value, a fake mirrors the
+    interface it stands in for, and each test function is a case, not a
+    responsibility.
+    """
+    name = filepath.name
+    if name.startswith("test_") or name.endswith("_test.py") or name == "conftest.py":
+        return True
+    return "tests" in filepath.parts or "test" in filepath.parts
+
+
 def in_nested_repository(root: Path, path: Path, cache: dict | None = None) -> bool:
     """True when the file ``path`` lies in another repository nested below ``root``.
 

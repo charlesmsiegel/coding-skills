@@ -108,7 +108,7 @@ python "$SKILL/scripts/analyze_all.py" . --format json > report.json
 # Complexity & structure
 python "$SKILL/scripts/analyze_complexity.py" .         # Cyclomatic/cognitive complexity, nesting, size
 python "$SKILL/scripts/find_duplicates.py" .            # AST-normalized duplicate blocks
-python "$SKILL/scripts/find_coupling_issues.py" .       # Feature envy, low cohesion (LCOM), message chains, middle man
+python "$SKILL/scripts/find_coupling_issues.py" .       # Feature envy, low cohesion (LCOM4), message chains, middle man
 
 # Smells, dead code, over-engineering
 python "$SKILL/scripts/find_code_smells.py" .           # Mutable defaults, bare excepts, magic numbers, god classes
