@@ -206,6 +206,32 @@ export function silent(): void {}
 
 
 # --------------------------------------------------------------------------- #
+# A JSX attribute name is neither a write nor a read
+# --------------------------------------------------------------------------- #
+
+def test_passing_a_parameter_as_a_jsx_attribute_is_not_reassigning_it(tmp_path):
+    root = project(tmp_path, {"src/a.tsx": """\
+export function Show(err: string, onDone: () => void) {
+  return <Note err={err} onDone={onDone} />;
+}
+export function Retry(err: string) {
+  err = err.trim();
+  return <Note err={err} />;
+}
+"""})
+    found = records("find_mutation_hazards.py", root, "parameter_reassigned")
+    assert [r["line"] for r in found] == [5]
+
+
+def test_a_jsx_attribute_sink_is_still_seen(tmp_path):
+    """Attribute names stay `name` tokens, so a sink named by one still fires."""
+    root = project(tmp_path, {"src/a.tsx": """\
+export const Raw = (props: { html: string }) => <div dangerouslySetInnerHTML={{ __html: props.html }} />;
+"""})
+    assert records("find_security_issues.py", root, "html_injection_sink")
+
+
+# --------------------------------------------------------------------------- #
 # Shared test scaffolding is test code
 # --------------------------------------------------------------------------- #
 

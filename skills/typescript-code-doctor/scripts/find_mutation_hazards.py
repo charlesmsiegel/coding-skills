@@ -36,6 +36,8 @@ def _check_parameter_reassignment(file: TsFile, report: Reporter) -> None:
                 continue
             if index and file.tokens[index - 1].is_op(".", "?."):
                 continue  # `x.param = …` is a property write on something else
+            if file.is_jsx_attribute(index):
+                continue  # `<Note err={err} />` passes the parameter on; it writes nothing
             report.add(token.line, "parameter_reassigned",
                        f"`{func.qualname}` reassigns its parameter `{token.value}`",
                        "Assign to a new local instead. A reassigned parameter makes the signature "

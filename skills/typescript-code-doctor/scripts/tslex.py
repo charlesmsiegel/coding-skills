@@ -102,8 +102,10 @@ class Tokenizer:
         # Side channels for what the flat token list cannot say on its own,
         # each keyed by an index into `tokens`:
         # - the code inside a template literal's `${...}`, keyed by the
-        #   template token (see _template).
+        #   template token (see _template);
+        # - the JSX attribute names, which are neither variables nor writes.
         self.substitutions: dict[int, list[Token]] = {}
+        self.jsx_attributes: set[int] = set()
 
     # -- low level ---------------------------------------------------------- #
 
@@ -325,7 +327,15 @@ class Tokenizer:
             else:
                 match = _IDENT.match(self.text, self.i)
                 if match:
-                    self._jsx_tag_name()
+                    # An attribute name. It stays a `name` token — a detector
+                    # looking for `dangerouslySetInnerHTML=` must still see it —
+                    # but it is recorded, because `err={err}` is neither a
+                    # write to `err` nor a read of it.
+                    index = len(self.tokens)
+                    if self._jsx_name():
+                        self.jsx_attributes.add(index)
+                    else:
+                        self._advance(self.i + 1)
                 else:
                     self._advance(self.i + 1)  # stray character; do not stall
         self._jsx_children()
