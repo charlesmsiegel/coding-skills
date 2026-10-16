@@ -398,3 +398,99 @@ def test_type_is_comparison_is_the_exact_check_not_a_smell(tmp_path):
     found = of_type(run_detector("find_code_smells.py", tmp_path), "type_comparison")
     # Two `==`/`!=` comparisons, one finding each, even when both sides call type().
     assert [r["line"] for r in found] == [8, 10]
+
+
+# --------------------------------------------------------------------------- #
+# find_parameter_objects: data_clump
+# --------------------------------------------------------------------------- #
+
+
+def test_overlapping_parameter_groups_are_one_clump(tmp_path):
+    write(tmp_path, {"sample.py": """\
+        def a(w, x, y, z):
+            return w
+
+        def b(w, x, y, z):
+            return w
+
+        def c(w, x, y, z):
+            return w
+
+        def d(x, y, z):
+            return x
+        """})
+    found = run_detector("find_parameter_objects.py", tmp_path)
+    assert len(found) == 1, [r["description"] for r in found]
+    assert found[0]["line"] == 1
+    assert found[0]["related_lines"] == [4, 7]
+
+
+def test_disjoint_groups_on_one_function_are_two_clumps(tmp_path):
+    # Two parameter objects that happen to meet in one signature are two
+    # objects: charging is per parameter, not per function.
+    write(tmp_path, {"sample.py": """\
+        def both(host, port, timeout, width, height, depth):
+            return host
+
+        def connect(host, port, timeout):
+            return host
+
+        def reconnect(host, port, timeout):
+            return host
+
+        def box(width, height, depth):
+            return width
+
+        def crate(width, height, depth):
+            return width
+        """})
+    found = run_detector("find_parameter_objects.py", tmp_path)
+    assert sorted(r["description"].split(" appear")[0] for r in found) == [
+        "Parameters ['depth', 'height', 'width']", "Parameters ['host', 'port', 'timeout']"]
+
+
+def test_fixture_requests_and_route_parameters_are_not_clumps(tmp_path):
+    write(tmp_path, {
+        "tests/test_things.py": """\
+            import pytest
+
+            @pytest.fixture
+            def store(monkeypatch, tmp_path, client):
+                return client
+
+            def test_one(monkeypatch, tmp_path, client):
+                assert client
+
+            def test_two(monkeypatch, tmp_path, client):
+                assert client
+
+            def test_three(monkeypatch, tmp_path, client):
+                assert client
+            """,
+        "routes.py": """\
+            @router.get("/c/{cid}/s/{sid}")
+            def read(cid, sid, body):
+                return cid
+
+            @router.put("/c/{cid}/s/{sid}")
+            def write(cid, sid, body):
+                return cid
+
+            @app.route("/c/<cid>/s/<sid>")
+            def legacy(cid, sid, body):
+                return cid
+            """,
+        "budget.py": """\
+            def expand(posts, radius, max_posts, max_bytes):
+                return posts
+
+            def window(posts, radius, max_posts, max_bytes):
+                return posts
+
+            def trim(posts, radius, max_posts, max_bytes):
+                return posts
+            """,
+    })
+    found = run_detector("find_parameter_objects.py", tmp_path)
+    assert [(Path(r["file"]).name, r["description"].split(" appear")[0]) for r in found] == [
+        ("budget.py", "Parameters ['max_bytes', 'max_posts', 'posts', 'radius']")]
