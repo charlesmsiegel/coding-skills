@@ -101,9 +101,16 @@ A green suite over hollow tests is worse than no suite: it gives false confidenc
 Before you lean on existing tests, audit them. `find_test_smells.py` catches the
 mechanical cases; confirm them by reading.
 
-- **Asserts nothing** (`test_without_assertion`). A test that calls code and never
-  asserts only proves *it didn't raise*. Either add real assertions or delete it —
-  a test that can't fail is noise that makes the bar look met.
+- **Asserts nothing** (`test_without_assertion`). A test that runs nothing that can
+  fail (`pass`, an assignment) is reported high: add real assertions or delete it —
+  a test that can't fail is noise that makes the bar look met. A test that calls code
+  and never asserts only proves *it didn't raise*, and is reported low: sometimes
+  that is the whole contract ("an empty store must not raise"), but even then a
+  postcondition — nothing written, state unchanged — lets it catch more than a
+  crash; otherwise assert the result. An assertion one step away
+  counts — in a helper the test calls (`_assert_same`, `check_reply`, a same-module
+  function that asserts), in a nested function it runs or installs as a tripwire, in
+  an `except` clause, or spelled `pytest.fail(...)` / `raise AssertionError(...)`.
 - **Tests the mocks, not the code** (`overmocking`). When a test mocks every
   collaborator, it asserts that the code calls the mocks the way the test said —
   i.e. it pins the implementation, not the behavior, and survives even when the
@@ -111,7 +118,14 @@ mechanical cases; confirm them by reading.
   reserve mocks for true boundaries (network, clock, filesystem, randomness).
 - **Hides logic** (`logic_in_test`). `if`/`for`/`while` in a test means the test
   has branches that may not run, and a bug in the test masquerades as a pass.
-  Make tests linear and obvious; use parametrization for multiple cases.
+  Make tests linear and obvious; use parametrization for multiple cases. Two shapes
+  have no branch that can be skipped and are not reported: a `for` over a fixed,
+  non-empty table written in the source (`for mode in ("soft", "hard"):`,
+  `range(3)`, a module constant bound once) with no `break`/`continue`/`return` in
+  it — parametrize still reports each case separately, which is worth having but is
+  style — and a guard that ends the test loudly, `if not shutil.which("git"):
+  pytest.skip(...)` or `if got != want: pytest.fail(diff)`. A loop over a computed
+  collection is reported: it passes vacuously when the collection is empty.
 - **Skipped without a reason** (`skipped_without_reason`). A silent `@skip` is dead
   coverage pretending to be alive. Give it a reason and a ticket, or delete it.
 - **Asserts on incidental detail.** A test that pins log strings, dict ordering, or
