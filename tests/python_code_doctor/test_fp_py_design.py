@@ -945,3 +945,37 @@ def test_a_documented_import_order_is_a_lead(tmp_path):
     found = of_type(run_detector("find_local_imports.py", tmp_path), "local_import")
     assert sorted((r["line"], r["kind"]) for r in found) == [
         (12, "candidate"), (13, "candidate"), (14, "finding")]
+
+
+# --------------------------------------------------------------------------- #
+# find_boolean_params
+# --------------------------------------------------------------------------- #
+
+
+def test_keyword_only_flags_are_a_lead_and_positional_ones_a_finding(tmp_path):
+    write(tmp_path, {"sample.py": """\
+        def plan(query, *, force=False, final_check=False):
+            return query
+
+        def render(data, plain=True, compact=False):
+            return data
+        """})
+    found = of_type(run_detector("find_boolean_params.py", tmp_path), "multiple_boolean_flags")
+    by_line = {r["line"]: r for r in found}
+    assert_candidate_shape(by_line[1])
+    assert by_line[4]["kind"] == "finding"
+
+
+def test_a_route_handlers_flags_are_bound_by_name(tmp_path):
+    write(tmp_path, {"routes.py": """\
+        @router.get("/scenes/{sid}")
+        def read_scene(sid: str, raw: bool = False, full: bool = False):
+            return sid
+
+        def helper(sid, raw=False):
+            return sid
+        """})
+    found = run_detector("find_boolean_params.py", tmp_path)
+    assert [(r["smell_type"], r["line"]) for r in of_type(found, "boolean_positional_param")] == [
+        ("boolean_positional_param", 5)]
+    assert all(r["kind"] == "candidate" for r in of_type(found, "multiple_boolean_flags"))
