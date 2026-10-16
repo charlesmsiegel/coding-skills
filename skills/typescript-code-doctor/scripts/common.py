@@ -123,10 +123,24 @@ def find_ts_files(path: Path) -> Iterator[Path]:
             yield candidate
 
 
+def _is_git_checkout(directory: Path) -> bool:
+    """Recognize Git metadata, ignoring empty sandbox mount placeholders."""
+    marker = directory / ".git"
+    if marker.is_dir():
+        return (marker / "HEAD").is_file()
+    if marker.is_file():
+        # Linked worktrees and submodules store a gitdir pointer instead.
+        text = marker.read_text(encoding="utf-8", errors="replace").strip()
+        if text.startswith("gitdir:"):
+            target = text[len("gitdir:"):].strip()
+            return bool(target) and (directory / target / "HEAD").is_file()
+    return False
+
+
 @functools.lru_cache(maxsize=None)
 def _root_of_dir(directory: Path) -> Path | None:
     """The OUTERMOST ancestor of (or equal to) ``directory`` holding a root marker,
-    bounded by the first `.git` directory met on the way up.
+    bounded by the first valid Git metadata directory or gitdir pointer.
 
     Outermost, not nearest: a fixture project committed under `tests/` carries
     its own `package.json`, and stopping at the nearest marker made *that* the
@@ -136,7 +150,7 @@ def _root_of_dir(directory: Path) -> Path | None:
     the first hit and remembers the last one. A checkout whose only marker is at
     its own top still resolves there, because nothing above it carries one.
 
-    But "keep going" cannot mean "keep going forever": a `.git` directory is the
+    But "keep going" cannot mean "keep going forever": valid Git metadata is the
     checkout boundary, so a marker above it belongs to something else — a `.git`
     in the home directory, a CI workspace repo, a monorepo umbrella — and must
     not become the root. That directory is itself still a candidate (`.git` is
@@ -158,7 +172,7 @@ def _root_of_dir(directory: Path) -> Path | None:
     outermost = None
     for candidate in (directory, *directory.parents):
         try:
-            is_checkout_root = (candidate / ".git").exists()
+            is_checkout_root = _is_git_checkout(candidate)
             has_marker = (
                 is_checkout_root
                 or any((candidate / marker).exists() for marker in ROOT_MARKERS if marker != ".git")

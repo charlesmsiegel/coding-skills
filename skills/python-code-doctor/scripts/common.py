@@ -247,6 +247,13 @@ def in_nested_repository(root: Path, path: Path, cache: dict | None = None) -> b
         if nested:
             return True
     return False
+# Installed skill payloads belong to the tooling, not to the host project.
+# Match the pair, not the agent directory: hooks and other configuration there
+# are still project inputs. Paths are relative to the scan root so an explicit
+# scan of a skill continues to work.
+def is_installed_skill(parts) -> bool:
+    return any(parent in {".codex", ".claude", ".kiro", ".agents"} and child == "skills"
+               for parent, child in zip(parts, parts[1:]))
 
 
 def find_python_files(path: Path) -> Iterator[Path]:
@@ -269,7 +276,8 @@ def _python_files(path: Path) -> Iterator[Path]:
         nested: dict = {}
         for p in path.rglob("*.py"):
             if (EXCLUDE_DIRS.isdisjoint(p.relative_to(path).parts)
-                    and not in_nested_repository(path, p, nested)):
+                    and not in_nested_repository(path, p, nested)
+                    and not is_installed_skill(p.relative_to(path).parts)):
                 yield p
 
 

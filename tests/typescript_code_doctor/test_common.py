@@ -257,10 +257,12 @@ def test_git_boundary_stops_a_marker_above_the_checkout_from_winning(common, tmp
     common._root_of_dir.cache_clear()
     outer = tmp_path / "outer"
     (outer / ".git").mkdir(parents=True)
+    (outer / ".git" / "HEAD").write_text("ref: refs/heads/main\n")
     repo = outer / "tests" / "repo"
     (repo / "src").mkdir(parents=True)
     (repo / "package.json").write_text('{"name": "repo"}')
     (repo / ".git").mkdir()
+    (repo / ".git" / "HEAD").write_text("ref: refs/heads/main\n")
     source = repo / "src" / "app.ts"
     source.write_text("export const a = 1;\n")
 
@@ -277,6 +279,7 @@ def test_git_at_the_root_still_scopes_a_nested_fixture_to_the_checkout(common, t
     (repo / "src").mkdir(parents=True)
     (repo / "package.json").write_text('{"name": "repo"}')
     (repo / ".git").mkdir()
+    (repo / ".git" / "HEAD").write_text("ref: refs/heads/main\n")
     fixture = repo / "tests" / "fixtures" / "app"
     (fixture / "src").mkdir(parents=True)
     (fixture / "package.json").write_text('{"name": "fixture"}')
@@ -285,3 +288,54 @@ def test_git_at_the_root_still_scopes_a_nested_fixture_to_the_checkout(common, t
 
     assert common.project_root_of(nested) == repo
     assert common.is_test_file(nested)
+
+
+def test_empty_ancestor_git_placeholder_does_not_override_manifest(common, tmp_path):
+    outer = tmp_path / 'sandbox'
+    (outer / '.git').mkdir(parents=True)
+    repo = outer / 'tests' / 'repo'
+    (repo / 'src').mkdir(parents=True)
+    (repo / 'package.json').write_text('{}')
+    source = repo / 'src' / 'app.ts'
+    source.write_text('export {};\n')
+
+    assert common.project_root_of(source) == repo
+    assert not common.is_test_file(source)
+
+
+def test_git_worktree_pointer_preserves_checkout_boundary(common, tmp_path):
+    outer = tmp_path / 'outer'
+    outer.mkdir()
+    (outer / 'package.json').write_text('{}')
+    metadata = outer / 'metadata' / 'worktrees' / 'repo'
+    metadata.mkdir(parents=True)
+    (metadata / 'HEAD').write_text('ref: refs/heads/main\n')
+    repo = outer / 'tests' / 'repo'
+    (repo / 'src').mkdir(parents=True)
+    (repo / '.git').write_text('gitdir: ../../metadata/worktrees/repo\n')
+    source = repo / 'src' / 'app.ts'
+    source.write_text('export {};\n')
+
+    assert common.project_root_of(source) == repo
+    assert not common.is_test_file(source)
+
+
+def test_inaccessible_git_pointer_keeps_nearer_manifest(common, tmp_path, monkeypatch):
+    outer = tmp_path / 'sandbox'
+    outer.mkdir()
+    pointer = outer / '.git'
+    pointer.write_text('gitdir: /inaccessible\n')
+    repo = outer / 'repo'
+    repo.mkdir()
+    (repo / 'package.json').write_text('{}')
+    source = repo / 'app.ts'
+    source.write_text('export {};\n')
+    real_read_text = Path.read_text
+
+    def read_text(path, *args, **kwargs):
+        if path == pointer:
+            raise PermissionError('locked git metadata')
+        return real_read_text(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, 'read_text', read_text)
+    assert common.project_root_of(source) == repo

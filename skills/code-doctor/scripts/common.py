@@ -218,6 +218,15 @@ def gitignored_paths(root: Path) -> set[Path]:
     return {(root / rel.strip()).resolve() for rel in listing.splitlines() if rel.strip()}
 
 
+# Installed skill payloads belong to the tooling, not to the host project.
+# Match the pair, not the agent directory: hooks and other configuration there
+# are still project inputs. Paths are relative to the scan root so an explicit
+# scan of a skill continues to work.
+def is_installed_skill(parts) -> bool:
+    return any(parent in {".codex", ".claude", ".kiro", ".agents"} and child == "skills"
+               for parent, child in zip(parts, parts[1:]))
+
+
 def walk_paths(root: Path, *, skip_gitignored: bool = False) -> Iterator[Path]:
     """Yield every non-excluded file path under ``root``, binaries included.
 
@@ -284,6 +293,8 @@ def walk_files(root: Path, *, source_only: bool) -> Iterator[Path]:
     # candidates rather than committed leaks; it cannot do that if the walk
     # hides them.
     for path in walk_paths(root, skip_gitignored=source_only):
+        if source_only and is_installed_skill(path.relative_to(root).parts):
+            continue
         if source_only and not is_source(path.relative_to(root).parts
                                          if root.is_dir() else (path.name,), path):
             continue

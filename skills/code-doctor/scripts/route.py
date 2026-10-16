@@ -33,6 +33,7 @@ from common import (
     configure_output,
     fail_on_bad_path,
     read_text,
+    is_installed_skill,
     walk_files,
 )
 
@@ -160,6 +161,8 @@ def _gather(root: Path) -> dict[str, list[Path]]:
         "package_json": [], "tsconfig": [], "manage_py": [], "python_source": [],
     }
     for path in walk_files(root, source_only=False):
+        if is_installed_skill(path.relative_to(root).parts):
+            continue
         name = path.name
         if name == "pyproject.toml":
             found["pyproject"].append(path)
@@ -220,7 +223,7 @@ def _settings_with_installed_apps(manage_files: list[Path]) -> list[Path]:
     for manage in manage_files:
         for candidate in sorted(manage.parent.rglob("*.py")):
             relative = candidate.relative_to(manage.parent)
-            if any(part in EXCLUDE_DIRS for part in relative.parts):
+            if any(part in EXCLUDE_DIRS for part in relative.parts) or is_installed_skill(relative.parts):
                 continue
             if "INSTALLED_APPS" in _safe_read(candidate):
                 hits.append(candidate)
