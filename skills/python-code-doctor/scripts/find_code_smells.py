@@ -11,7 +11,7 @@ import argparse
 from pathlib import Path
 from dataclasses import dataclass, asdict
 from collections import defaultdict
-from common import signature_is_a_contract, sort_findings, cached_parse, SEVERITY_ICONS, configure_output, find_python_files, warn_detector_error, warn_unparseable
+from common import is_test_file, signature_is_a_contract, sort_findings, cached_parse, SEVERITY_ICONS, configure_output, find_python_files, warn_detector_error, warn_unparseable
 
 
 @dataclass
@@ -32,15 +32,6 @@ DATA_CLASS_MARKERS = frozenset({
     "Enum", "IntEnum", "StrEnum", "Flag", "IntFlag",
     "BaseModel",  # pydantic
 })
-
-
-def _is_test_file(filepath: Path) -> bool:
-    """A test module or test infrastructure: test_*.py, *_test.py, conftest.py,
-    or anything under a tests/ (or test/) directory — find_test_smells' rule."""
-    name = filepath.name
-    if name.startswith("test_") or name.endswith("_test.py") or name == "conftest.py":
-        return True
-    return "tests" in filepath.parts or "test" in filepath.parts
 
 
 def _unwrap_negative(node: ast.AST) -> ast.AST:
@@ -265,7 +256,7 @@ def analyze_file(filepath: Path, ignore: set[str]) -> list[CodeSmell]:
     try:
         source, tree = cached_parse(filepath)
         lines = source.splitlines()
-        detector = CodeSmellDetector(str(filepath), lines, ignore, _is_test_file(filepath))
+        detector = CodeSmellDetector(str(filepath), lines, ignore, is_test_file(filepath))
         detector.visit(tree)
         return detector.issues
     except (SyntaxError, ValueError) as exc:
