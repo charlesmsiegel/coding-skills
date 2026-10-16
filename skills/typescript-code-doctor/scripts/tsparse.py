@@ -21,7 +21,7 @@ from tsnodes import (
 __all__ = [
     "TsSyntaxError", "Token", "TsFile", "Func", "Param", "Class", "Prop",
     "TypeDecl", "TypeMember", "Import", "Export", "RESERVED",
-    "parse_file", "parse_source", "callee_of", "iter_calls", "argument_spans",
+    "parse_file", "parse_source", "callee_of", "iter_calls", "enclosing_call", "argument_spans",
     "callback_target", "body_indices", "names_in", "statement_start", "statement_end", "line_indent",
     "is_definite_assignment",
 ]
@@ -88,6 +88,50 @@ def iter_calls(file: TsFile, start: int = 0, stop: int | None = None):
                            or file.tokens[index - 1].is_name("function")):
             continue
         yield index, callee
+
+
+def enclosing_call(file: TsFile, index: int) -> tuple[int, str]:
+    """(paren, callee) of the call whose argument list directly holds ``index``.
+
+    "Directly" means no `{` or `[` lies between them: a function passed to
+    `describe("…", fn)` is an argument of `describe`, but one stored in an
+    object literal that is then passed is not, because what the call receives
+    is the object. Returns ``(-1, "")`` when the innermost enclosing bracket is
+    not a call's `(`, and ``(paren, "")`` for a parenthesised expression or an
+    anonymous callee.
+
+    A curried call is named by its head, which is how a reader names it:
+    `describe.each(rows)("t", fn)` and `` describe.each`…`("t", fn) `` both
+    report `describe.each`.
+    """
+    cursor = index - 1
+    while cursor >= 0:
+        token = file.tokens[cursor]
+        if token.kind == "op" and token.value in CLOSERS:
+            opener = file.closer(cursor)
+            cursor = (opener if opener >= 0 else cursor) - 1
+            continue
+        if token.kind == "op" and token.value in OPENERS:
+            if token.value != "(":
+                return -1, ""
+            return cursor, _call_head(file, cursor)
+        cursor -= 1
+    return -1, ""
+
+
+def _call_head(file: TsFile, paren: int) -> str:
+    """The callee of the call at ``paren``, looking through one curried head."""
+    previous = file.tokens[paren - 1] if paren else None
+    if previous is not None and previous.is_op(")"):
+        opener = file.closer(paren - 1)
+        return callee_of(file, opener) if opener > 0 else ""
+    if previous is not None and previous.kind == "template":
+        return callee_of(file, paren - 1)  # `tag`…`(` — the template stands in for `(…)`
+    callee = callee_of(file, paren)
+    member = paren >= 2 and file.tokens[paren - 2].is_op(".", "?.")
+    if not member and (callee in CONTROL_KEYWORDS or (paren >= 2 and file.tokens[paren - 2].is_name("function"))):
+        return ""  # `if (…)` is not a call, and neither is `function f(…)`
+    return callee
 
 
 def argument_spans(file: TsFile, paren: int) -> list[tuple[int, int]]:

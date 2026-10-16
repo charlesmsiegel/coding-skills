@@ -6,9 +6,13 @@ language with a type checker.
 
 ## Bloaters
 
-**Long function.** `long_function`, `high_cognitive_complexity`. The seams are
-usually already marked by blank lines and comment headers — those are the function
-names. Extract until each level of the function is at one level of abstraction.
+**Long function.** `long_function`, `high_cyclomatic_complexity`,
+`high_cognitive_complexity`. The seams are usually already marked by blank lines
+and comment headers — those are the function names. Extract until each level of
+the function is at one level of abstraction. A function over both complexity
+thresholds is one finding, filed under the cyclomatic name with both numbers; a
+`describe` callback is not measured for length (each test in it is), and an outer
+function is charged only for the lines outside the long functions nested in it.
 
 **Long parameter list.** `long_parameter_list`. Three or more arguments and the
 call site stops being readable. Bundle into an options object with a named type:
