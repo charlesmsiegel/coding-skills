@@ -8,7 +8,7 @@ that are purely cosmetic are marked as such.
 ```ts
 if (x && x.y && x.y.z) …         →  if (x?.y?.z) …
 const n = opts.count || 10;       →  const n = opts.count ?? 10;      // `||` eats 0
-const s = opts.name || "";        →  const s = opts.name ?? "";       // `||` eats ""
+const s = opts.name || "";        →  const s = opts.name ?? "";       // cosmetic if `name` is a string
 if (x !== null && x !== undefined) → if (x != null)                   // the one legitimate `==`
 obj && obj.fn && obj.fn()         →  obj?.fn?.()
 arr && arr[0]                     →  arr?.[0]
@@ -17,6 +17,16 @@ x = x || {};                      →  x ??= {};
 
 `||` treating `0`, `""` and `false` as absent is a real bug class, not a style
 point. `??` is the one you almost always meant.
+
+Two limits on both swaps. A default that is its operand's own falsy value —
+`label || ""` on a string, `count || 0` on a number — gives the same answer
+either way; the bug is a *different* type, `days || ""` turning a 0 into an empty
+string, which only the type tells you (so `falsy_default_with_or` is a candidate),
+and `parseInt(s, 10) || 0` is a NaN guard where `||` is the right operator. And
+`?.` is not a drop-in after every guard: `budget && budget.level !== "off"` is
+falsy for a null budget, but `budget?.level !== "off"` is `true`, and
+`camp && camp.open.length > 0` becomes a possibly-undefined comparison that
+`strictNullChecks` rejects. `manual_optional_chaining` skips both shapes.
 
 ## Declarations
 
