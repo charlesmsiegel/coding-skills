@@ -206,6 +206,7 @@ at a time and the evidence is elsewhere:
 | `assert_for_validation` on `assert x is not None` / `assert isinstance(...)` | that shape usually narrows a type for the checker and records an invariant the caller guarantees |
 | `local_import` of a slow-to-import package (torch, transformers, ...) or inside a CLI command | deferral to keep startup and `--help` fast is the usual reason, and only the author knows |
 | `swallowed_exception` / `catches_baseexception` under a reasoned `# noqa: BLE001 -- why` | the repo's own lint gate adjudicated the line; the reason is what to check, and a bare noqa stays a finding |
+| `global_rebind` under a reasoned `# noqa: PLW0603 -- why` | an at-fork or install-once hook has no caller to return a value to |
 | `raise_without_from` on an `HTTPException` | the framework renders it as a response and never prints the chain |
 | `assert_for_validation` outside a public function's argument check | an invariant or type narrowing holds under `-O` too; only the call sites show whether input reaches it |
 
@@ -394,4 +395,5 @@ that rule **with a stated reason** — `# noqa: BLE001 -- the caller reads None 
 unreadable`, on the flagged line or a comment line directly below it — is read as
 the repo's own adjudication: the record becomes a candidate, and the reason is
 what to check. A bare `# noqa: BLE001` says nothing and stays a finding. The
-detectors that read it: `swallowed_exception` and `catches_baseexception` (BLE001).
+detectors that read it: `swallowed_exception` and `catches_baseexception` (BLE001),
+and `global_rebind` (PLW0603, on the `global` statement).
