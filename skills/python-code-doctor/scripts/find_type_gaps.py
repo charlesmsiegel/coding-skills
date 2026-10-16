@@ -13,6 +13,9 @@ Finds:
   - missing_param_annotation  : public function/method has un-annotated parameters
                                 but does annotate its return
   - any_overuse               : annotation uses `Any` or `typing.Any`, defeating static checks
+                                (on any public-named def, closures and private
+                                classes included: a written `Any` is a choice
+                                wherever it sits)
   - broad_type_ignore         : bare `# type: ignore` without an error code in brackets
 
 "Public" means a surface other code calls. Not reported for missing annotations:
@@ -98,33 +101,37 @@ def _is_route_handler(node) -> bool:
     return False
 
 
-def _api_functions(tree):
-    """Yield (function, is_method) for every def that is part of an API surface.
+def _api_function_ids(tree) -> set[int]:
+    """id() of every def that is part of an API surface, where annotating starts.
 
     Excluded: anything nested in a function (a closure, or a method of a class
     defined inside one), whose only callers are in that function; and methods
     of a `_Private` class, at any depth, which callers outside the module
-    cannot name.
+    cannot name. Only the missing-annotation checks use this: an `Any` someone
+    wrote defeats the checker wherever it sits.
     """
-    def walk(body, in_class: bool, private: bool):
+    found: set[int] = set()
+
+    def walk(body, private: bool):
         for node in body:
             if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 if not private:
-                    yield node, in_class
+                    found.add(id(node))
                 # Its body is a closure scope: nothing below is API surface.
             elif isinstance(node, ast.ClassDef):
-                yield from walk(node.body, True, private or node.name.startswith("_"))
+                walk(node.body, private or node.name.startswith("_"))
             else:
                 # if TYPE_CHECKING / try-except-ImportError / with blocks at
                 # module or class level still define module- or class-level names.
                 for field in ("body", "orelse", "finalbody", "handlers"):
                     for child in getattr(node, field, None) or ():
                         if isinstance(child, ast.ExceptHandler):
-                            yield from walk(child.body, in_class, private)
+                            walk(child.body, private)
                         elif isinstance(child, ast.stmt):
-                            yield from walk([child], in_class, private)
+                            walk([child], private)
 
-    yield from walk(tree.body, False, False)
+    walk(tree.body, False)
+    return found
 
 
 def _is_any_annotation(annotation) -> bool:
@@ -154,8 +161,25 @@ def detect(tree, filename, lines, ignore):
                 "Narrow to '# type: ignore[specific-error-code]' (run mypy/pyright to get the code), or fix the underlying type error.",
                 "medium")
 
-    for node, is_method in _api_functions(tree):
+    # Build a set of function AST node ids that are direct children of a ClassDef
+    method_ids: set = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ClassDef):
+            for item in node.body:
+                if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    method_ids.add(id(item))
+    surface = _api_function_ids(tree)
+
+    # Walk all function definitions
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+
         fname = node.name
+        is_method = id(node) in method_ids
+        # Missing annotations are judged on the API surface only; a route
+        # handler is exempt from both kinds.
+        judge_missing = id(node) in surface and not _is_route_handler(node)
 
         # Skip all dunder methods
         if fname.startswith("__") and fname.endswith("__"):
@@ -179,9 +203,8 @@ def detect(tree, filename, lines, ignore):
             if first_name in ("self", "cls"):
                 exclude_first = True
 
-        # Missing annotations are judged below, with the parameters, so a bare
-        # signature is charged once. A route handler is exempt from both.
-        missing_return = node.returns is None and not _is_route_handler(node)
+        # Judged below, with the parameters, so a bare signature is charged once.
+        missing_return = node.returns is None and judge_missing
 
         # --- any_overuse in return annotation ---
         if _is_any_annotation(node.returns):
@@ -212,7 +235,7 @@ def detect(tree, filename, lines, ignore):
                     f"Replace 'Any' with a specific type for '{param.arg}' in '{fname}'. Consider using a TypeVar, Union, or Protocol if the type is polymorphic.",
                     "medium")
 
-        if _is_route_handler(node):
+        if not judge_missing:
             unannotated = []
 
         kind = "method" if is_method else "function"
