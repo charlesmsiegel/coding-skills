@@ -158,6 +158,8 @@ def _check_type_imports(tsfile, path: Path, add) -> None:
         if record.is_type_only or record.kind != "import" or not record.names:
             continue
         for name in record.names:
+            if name in record.type_names:
+                continue  # `import { a, type B }` already marks B as a type
             uses = [i for i, token in enumerate(tsfile.tokens)
                     if token.kind == "name" and token.value == name and token.line != record.line]
             if not uses:
