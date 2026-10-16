@@ -9,7 +9,9 @@ the slot where a real one would go and report the code as covered.
 """
 
 from common import SUITE_DEFINERS, Reporter, is_test_file, run_file_detector
-from tsparse import TsFile, argument_spans, body_indices, iter_calls
+from tsparse import (
+    TsFile, argument_spans, body_indices, iter_calls, statement_end, statement_start,
+)
 
 TEST_DEFINERS = frozenset({"it", "test", "specify", "bench"})
 ASSERTION_NAMES = frozenset({"expect", "assert", "should", "chai", "toThrow", "verify", "assertThat"})
@@ -75,7 +77,85 @@ def _matcher_chain(file: TsFile, index: int) -> str:
     return ".".join(words)
 
 
+class _Evidence:
+    """What a function's body asserts."""
+
+    __slots__ = ("asserts", "matchers", "queries")
+
+    def __init__(self) -> None:
+        self.asserts = False
+        self.matchers: set[str] = set()
+        # A `getBy*`/`findBy*` query throws when nothing matches, so a test
+        # that makes one has asserted presence whatever matcher follows it.
+        self.queries = False
+
+    def absorb(self, other: "_Evidence") -> bool:
+        """Add ``other``'s assertions to these. True when anything was new."""
+        before = (self.asserts, self.queries, len(self.matchers))
+        self.asserts = self.asserts or other.asserts
+        self.queries = self.queries or other.queries
+        self.matchers |= other.matchers
+        return before != (self.asserts, self.queries, len(self.matchers))
+
+
+def _own_evidence(file: TsFile, func) -> _Evidence:
+    """The assertions written in ``func``'s own body (nested callbacks included)."""
+    evidence = _Evidence()
+    asserts = [i for i in body_indices(func) if file.tokens[i].kind == "name"
+               and (file.tokens[i].value in ASSERTION_NAMES
+                    or file.tokens[i].value.startswith(QUERY_PREFIXES))]
+    evidence.asserts = bool(asserts)
+    evidence.queries = any(file.tokens[i].value.startswith(QUERY_PREFIXES) for i in asserts)
+    for index in asserts:
+        chain = _matcher_chain(file, index)
+        if chain:
+            evidence.matchers.add(chain)
+    return evidence
+
+
+def _helpers_called(file: TsFile, func, helpers: dict[str, list]) -> list:
+    body = body_indices(func)
+    if not body:
+        return []
+    return [helper for _, callee in iter_calls(file, body.start, body.stop)
+            for helper in helpers.get(callee, ()) if helper is not func]
+
+
+class _Assertions:
+    """Per-function assertion evidence, counting the same-file helpers each one calls.
+
+    `streamAndCompare(input)`, a helper looping over `expect(...).toBe(...)`,
+    makes every test that calls it an asserting test; reading only the test's
+    own body reported each of them as making no assertion. A helper's evidence
+    is closed over the helpers it calls in turn, to a fixpoint, so a chain of
+    them (and a recursive one) counts like a single body.
+    """
+
+    def __init__(self, file: TsFile):
+        self.file = file
+        self.helpers: dict[str, list] = {}
+        for func in file.functions:
+            if func.has_body and func.owner is None and func.name != "<anonymous>":
+                self.helpers.setdefault(func.name, []).append(func)
+        named = [func for group in self.helpers.values() for func in group]
+        self.closed = {id(func): _own_evidence(file, func) for func in named}
+        callees = {id(func): _helpers_called(file, func, self.helpers) for func in named}
+        changed = True
+        while changed:
+            changed = False
+            for func in named:
+                for helper in callees[id(func)]:
+                    changed |= self.closed[id(func)].absorb(self.closed[id(helper)])
+
+    def of(self, func) -> _Evidence:
+        evidence = _own_evidence(self.file, func)
+        for helper in _helpers_called(self.file, func, self.helpers):
+            evidence.absorb(self.closed[id(helper)])
+        return evidence
+
+
 def _check_assertionless(file: TsFile, report: Reporter) -> None:
+    assertions = _Assertions(file)
     for paren, callee, title, callback in _test_calls(file):
         if callback is None:
             continue
@@ -85,18 +165,16 @@ def _check_assertionless(file: TsFile, report: Reporter) -> None:
                        f"`{callee}('{title}')` has an empty body",
                        "Finish it or delete it. An empty test is a green tick for nothing.", "high")
             continue
-        asserts = [i for i in body if file.tokens[i].kind == "name"
-                   and (file.tokens[i].value in ASSERTION_NAMES
-                        or file.tokens[i].value.startswith(QUERY_PREFIXES))]
-        if not asserts:
+        evidence = assertions.of(callback)
+        if not evidence.asserts:
             report.add(file.tokens[paren].line, "test_without_assertion",
                        f"`{callee}('{title}')` makes no assertion",
                        "It passes as long as nothing throws, which is a much weaker claim than the "
                        "name promises. Assert the value the code is supposed to produce.", "high")
             continue
-        matchers = {_matcher_chain(file, index) for index in asserts} - {""}
+        matchers = evidence.matchers
         weak = matchers & WEAK_MATCHERS
-        if matchers and matchers <= WEAK_MATCHERS:
+        if matchers and matchers <= WEAK_MATCHERS and not evidence.queries:
             report.add(file.tokens[paren].line, "weak_assertion_only",
                        f"`{callee}('{title}')` only asserts {', '.join(sorted(weak))}",
                        "These pass for almost any value. Assert the expected value with `toEqual` "
@@ -147,15 +225,97 @@ def _check_async_mistakes(file: TsFile, report: Reporter) -> None:
                    "and the test passes unconditionally. Write "
                    f"`await expect(...).{token.value}.toThrow(...)`.", "high")
 
+    async_helpers = {func.name for func in file.functions
+                     if func.is_async and func.owner is None and func.name != "<anonymous>"}
     for paren, callee, title, callback in _test_calls(file):
         if callback is None or not callback.is_async:
             continue
-        if not any(file.tokens[i].is_name("await") for i in body_indices(callback)):
+        body = body_indices(callback)
+        if any(file.tokens[i].is_name("await") for i in body):
+            continue
+        pending = _unawaited_promise(file, body, async_helpers)
+        if pending:
             report.add(file.tokens[paren].line, "async_test_never_awaits",
-                       f"`{callee}('{title}')` is async but never awaits anything",
-                       "Either drop `async`, or await the thing under test. An async test that "
-                       "forgets to await finishes before the assertion it was meant to make.",
-                       "medium")
+                       f"`{callee}('{title}')` is async but never awaits `{pending}`",
+                       f"Await it. `{pending}` produces a promise, and the test's own promise "
+                       "resolves without waiting for it — whatever it checks or rejects with lands "
+                       "after the test has already passed.", "medium")
+            continue
+        # Nothing visible here produces a promise, so the body runs to the end
+        # before the test's promise settles and every assertion in it counts:
+        # the `async` is redundant rather than a race. An imported call that
+        # returns a promise is the case syntax cannot see, so the advice names it.
+        report.add(file.tokens[paren].line, "async_test_never_awaits",
+                   f"`{callee}('{title}')` is async but never awaits anything",
+                   "Drop `async` if nothing in the body returns a promise. If a call does (an "
+                   "imported async function, a user-event action), await it — an unawaited "
+                   "promise settles after the test has already passed.", "low")
+
+
+# Calls whose promise carries an assertion or the work under test: Testing
+# Library's polling helpers and async queries, and the Promise methods that
+# chain one. (`act` is not here: its synchronous form is the common one.)
+_PROMISE_CALLS = frozenset({"waitFor", "waitForElementToBeRemoved"})
+_PROMISE_METHODS = frozenset({"then", "catch", "finally"})
+_ASYNC_QUERY_PREFIXES = ("findBy", "findAllBy")
+
+
+def _unawaited_promise(file: TsFile, body: range, async_helpers: set[str]) -> str:
+    """The first visibly promise-producing call in an `await`-free body, or "".
+
+    A call in a `return` statement is not unawaited: an async function adopts
+    the promise it returns, so the test waits for it.
+    """
+    if not body:
+        return ""
+    for paren, callee in iter_calls(file, body.start, body.stop):
+        last = callee.rsplit(".", 1)[-1]
+        if not (callee in async_helpers or last in _PROMISE_CALLS or last in _PROMISE_METHODS
+                or last.startswith(_ASYNC_QUERY_PREFIXES)):
+            continue
+        if file.tokens[statement_start(file, paren)].is_name("return"):
+            continue
+        return f"….{last}(…)" if last in _PROMISE_METHODS else f"{callee}(…)"
+    return ""
+
+
+def _is_throw_guard(file: TsFile, keyword: int) -> bool:
+    """`if (…) throw …` with no `else`: a narrowing guard, not a second path.
+
+    The branch that is not taken is the test continuing; the branch that is
+    taken fails the test. Neither is a path that passes without asserting.
+    """
+    if not file.tokens[keyword].is_name("if") or keyword + 1 >= len(file):
+        return False
+    cursor = file.skip_group(keyword + 1)  # past the condition
+    if cursor >= len(file):
+        return False
+    braced = file.tokens[cursor].is_op("{")
+    if braced:
+        cursor += 1
+    if not file.tokens[cursor].is_name("throw"):
+        return False
+    end = statement_end(file, cursor)
+    if braced:
+        if end >= len(file) or not file.tokens[end].is_op("}"):
+            return False  # the block does more than throw
+        end += 1
+    return end >= len(file) or not file.tokens[end].is_name("else")
+
+
+def _in_finally(file: TsFile, index: int, callback) -> bool:
+    """True when ``index`` sits in a `finally` block of ``callback``'s own body.
+
+    A `finally` runs after the assertions above it have already passed or
+    failed, so a conditional restore there cannot hide one.
+    """
+    for probe in body_indices(callback):
+        if probe >= index:
+            return False
+        if file.tokens[probe].is_name("finally") and probe + 1 < len(file) \
+                and file.tokens[probe + 1].is_op("{") and probe + 1 < index < file.closer(probe + 1):
+            return True
+    return False
 
 
 def _check_logic_in_tests(file: TsFile, report: Reporter) -> None:
@@ -164,7 +324,9 @@ def _check_logic_in_tests(file: TsFile, report: Reporter) -> None:
             continue
         branches = [i for i in body_indices(callback)
                     if file.tokens[i].is_name("if", "switch")
-                    and file.enclosing_function(i) is callback]
+                    and file.enclosing_function(i) is callback
+                    and not _is_throw_guard(file, i)
+                    and not _in_finally(file, i, callback)]
         if branches:
             report.add(file.tokens[branches[0]].line, "logic_in_test",
                        f"`{callee}('{title}')` branches on a condition",

@@ -236,3 +236,80 @@ def test_type_switch_needs_three_different_literals(tmp_path):
     found = records("find_design_smells.py", tmp_path, {"route.ts": TYPE_TESTS}, "type_switch")
     assert lines_of(found) == [8], "only node.kind is tested against three values"
     assert "`node.kind`" in found[0]["description"]
+
+
+# --------------------------------------------------------------------------- #
+# find_test_smells: helpers assert, exact matchers are exact, guards are not
+# branches, and an async test with nothing to await is not a race
+# --------------------------------------------------------------------------- #
+
+TEST_SUITE = """\
+import { it, expect } from "vitest";
+function streamAndCompare(input: string): void {
+  for (const c of input) expect(c).toBe(c);
+}
+function deeper(input: string): void { streamAndCompare(input); }
+function onlyRenders(): void { mount("<div />"); }
+it("helper asserts", () => { streamAndCompare("ab"); });
+it("helper chain asserts", () => { deeper("ab"); });
+it("helper only renders", () => { onlyRenders(); });
+it("null is exact", () => { expect(parse("x")).toBeNull(); });
+it("undefined is exact", () => { expect(parse("x")).toBeUndefined(); });
+it("getBy throws", () => { expect(screen.getByText("x")).toBeTruthy(); });
+it("truthy header", () => { expect(init.headers["X"]).toBeTruthy(); });
+it("async sync body", async () => { expect(compute()).toBe(3); });
+it("async then", async () => { load().then((r) => expect(r).toBe(1)); });
+it("async waitFor", async () => { waitFor(() => expect(x).toBe(1)); });
+it("async awaited", async () => { await waitFor(() => expect(x).toBe(1)); });
+it("guard", () => {
+  const n = find();
+  if (n.kind !== "y") throw new Error("fixture");
+  expect(n.v).toBe(1);
+});
+it("guard block", () => {
+  const n = find();
+  if (!n) { throw new Error("fixture"); }
+  expect(n.v).toBe(1);
+});
+it("real logic", () => {
+  const n = find();
+  if (n) expect(n.v).toBe(1);
+});
+it("guard with else", () => {
+  if (!n) { throw new Error("fixture"); } else { expect(n.v).toBe(1); }
+});
+it("finally restore", () => {
+  try { expect(f()).toBe(1); } finally { if (saved) restore(saved); }
+});
+"""
+
+
+def _test_smells(tmp_path: Path) -> dict[str, list[dict]]:
+    root = write(tmp_path / "proj", {"suite.test.ts": TEST_SUITE})
+    by_type: dict[str, list[dict]] = {}
+    for record in run_detector("find_test_smells.py", root):
+        by_type.setdefault(record["smell_type"], []).append(record)
+    return by_type
+
+
+def test_an_assertion_in_a_same_file_helper_counts(tmp_path):
+    found = _test_smells(tmp_path).get("test_without_assertion", [])
+    assert lines_of(found) == [9], "only the test whose helper merely renders asserts nothing"
+
+
+def test_exact_matchers_and_throwing_queries_are_not_weak(tmp_path):
+    found = _test_smells(tmp_path).get("weak_assertion_only", [])
+    assert lines_of(found) == [13], "toBeNull/toBeUndefined are exact; getBy* throws when absent"
+
+
+def test_an_async_test_is_charged_as_a_race_only_when_a_promise_is_left_behind(tmp_path):
+    found = {r["line"]: r for r in _test_smells(tmp_path).get("async_test_never_awaits", [])}
+    assert sorted(found) == [14, 15, 16]
+    assert found[14]["severity"] == "low", "a synchronous body: the async is redundant, not a race"
+    assert found[15]["severity"] == "medium" and ".then(" in found[15]["description"]
+    assert found[16]["severity"] == "medium" and "waitFor" in found[16]["description"]
+
+
+def test_a_throw_guard_and_a_finally_restore_are_not_logic_in_a_test(tmp_path):
+    found = _test_smells(tmp_path).get("logic_in_test", [])
+    assert lines_of(found) == [30, 33], "a guard with an else, and an if around an expect, still branch"
