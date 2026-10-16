@@ -223,6 +223,22 @@ def test_closures_and_methods_of_private_or_local_classes_are_not_api_surface(tm
     assert [line for line, _ in gaps(run_detector("find_type_gaps.py", tmp_path))] == [15, 17]
 
 
+def test_an_any_someone_wrote_is_reported_off_the_api_surface_too(tmp_path):
+    write(tmp_path, {"m.py": (
+        "from typing import Any\n"
+        "class _Loader:\n"
+        "    def get(self) -> Any:\n"          # 3
+        "        return self.v\n"
+        "def outer(x: int) -> int:\n"
+        "    def inner(y: Any) -> int:\n"      # 6
+        "        return y\n"
+        "    return inner(x)\n"
+    )})
+    found = run_detector("find_type_gaps.py", tmp_path)
+    assert lines_of(found, "any_overuse") == [3, 6]
+    assert gaps(found) == []
+
+
 def test_route_handlers_are_exempt_and_the_same_function_undecorated_is_not(tmp_path):
     write(tmp_path, {"m.py": (
         "from fastapi import APIRouter\n"
