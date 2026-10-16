@@ -9,10 +9,24 @@ Finds:
   - no_tests_in_repo  : project has source files but zero test files (HIGH)
   - untested_module   : a source module defining functions/classes that no
                         test file imports (MEDIUM)
+
+A test reaches a module in more ways than naming it in an import statement, and
+each of these counts:
+  - an attribute chain off an imported package — `from app import store` and
+    then `store.attempts.forget(...)` reaches `app/store/attempts.py`;
+  - `importlib.import_module("pkg.mod")`, `runpy.run_module("pkg.mod")`, and
+    loading the file by path with `importlib.util.spec_from_file_location`,
+    `runpy.run_path` or `SourceFileLoader` (a script outside any package);
+  - for a module of web route handlers (`@router.get("/items/{id}")`), a string
+    in a test that requests one of its paths.
+A route module none of that reaches is a candidate, not a finding: tests can
+drive it over HTTP through the application with URLs built at run time, which
+no reading of the test source can rule out.
 """
 
 import ast
 import json
+import re
 import argparse
 import contextlib
 from pathlib import Path
@@ -31,6 +45,10 @@ class CodeSmell:
     suggestion: str
     severity: str
     code_snippet: str = ""
+    # "candidate" for a route module no test names: it carries no fix and names,
+    # in also_caused_by, how tests can reach it without naming it.
+    kind: str = "finding"
+    also_caused_by: tuple[str, ...] = ()
 
 
 # ---------------------------------------------------------------------------
@@ -140,7 +158,7 @@ def _module_names_for_file(p: Path, root: Path) -> Tuple[str, str]:
 # Import name extraction
 # ---------------------------------------------------------------------------
 
-def _collect_imported_names(tree: ast.AST) -> tuple[Set[str], Set[str]]:
+def _collect_imported_names(tree: ast.AST, nodes: Optional[list] = None) -> tuple[Set[str], Set[str]]:
     """
     Collect module/name references from import statements.
 
@@ -154,6 +172,9 @@ def _collect_imported_names(tree: ast.AST) -> tuple[Set[str], Set[str]]:
     The separation lets the caller apply different matching rules: dotted
     imports require a suffix match against a module's full dotted path, while
     bare imports fall back to the generous stem-based match.
+
+    ``nodes`` is ``list(ast.walk(tree))`` when the caller already has it: a
+    large suite is walked once, not once per question asked of it.
     """
     dotted_names: Set[str] = set()
     bare_names: Set[str] = set()
@@ -164,7 +185,7 @@ def _collect_imported_names(tree: ast.AST) -> tuple[Set[str], Set[str]]:
         else:
             bare_names.add(name)
 
-    for node in ast.walk(tree):
+    for node in (nodes if nodes is not None else ast.walk(tree)):
         if isinstance(node, ast.Import):
             for alias in node.names:
                 dotted = alias.name
@@ -195,6 +216,216 @@ def _collect_imported_names(tree: ast.AST) -> tuple[Set[str], Set[str]]:
                 bare_names.add(module.split(".")[-1])
 
     return dotted_names, bare_names
+
+
+def _import_bindings(nodes: list) -> dict[str, str]:
+    """Local name -> the absolute dotted path it is bound to by an import statement.
+
+    `import a.b` binds `a` to `a`; `import a.b as c` binds `c` to `a.b`;
+    `from a import b` binds `b` to `a.b` (a submodule or a name in `a`, which
+    the matcher treats alike). Relative imports have no absolute path here.
+    """
+    bound: dict[str, str] = {}
+    for node in nodes:
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                if alias.asname:
+                    bound[alias.asname] = alias.name
+                else:
+                    top = alias.name.split(".")[0]
+                    bound[top] = top
+        elif isinstance(node, ast.ImportFrom) and node.module and not node.level:
+            for alias in node.names:
+                if alias.name != "*":
+                    bound[alias.asname or alias.name] = node.module + "." + alias.name
+    return bound
+
+
+def _attribute_chain(node: ast.Attribute) -> tuple[str, list[str]] | None:
+    """`a.b.c` -> ("a", ["b", "c"]); None when the chain is not rooted at a name."""
+    attrs: list[str] = []
+    while isinstance(node, ast.Attribute):
+        attrs.append(node.attr)
+        node = node.value
+    if not isinstance(node, ast.Name):
+        return None
+    return node.id, attrs[::-1]
+
+
+def _collect_attribute_reaches(nodes: list) -> Set[str]:
+    """Dotted paths a test reaches through attributes of a name it imported.
+
+    `from app import store` then `store.attempts.forget` gives
+    `app.store.attempts` and `app.store.attempts.forget` — the module is the
+    longest prefix that exists, which the matcher finds by suffix.
+    """
+    bound = _import_bindings(nodes)
+    reached: Set[str] = set()
+    for node in nodes:
+        if not isinstance(node, ast.Attribute):
+            continue
+        chain = _attribute_chain(node)
+        if chain is None or chain[0] not in bound:
+            continue
+        base, attrs = bound[chain[0]], chain[1]
+        for depth in range(1, len(attrs) + 1):
+            reached.add(base + "." + ".".join(attrs[:depth]))
+    return reached
+
+
+def _call_name(func: ast.expr) -> str:
+    if isinstance(func, ast.Name):
+        return func.id
+    if isinstance(func, ast.Attribute):
+        return func.attr
+    return ""
+
+
+# Calls that import a module named by a dotted string, and calls that load a
+# file by its path. The path is the last positional argument they take a path in.
+_IMPORT_BY_NAME = frozenset({"import_module", "run_module", "__import__"})
+_LOAD_BY_PATH = frozenset({"spec_from_file_location", "run_path", "SourceFileLoader"})
+
+
+def _path_segments(node: ast.expr, assigned: dict) -> tuple[str, ...]:
+    """The literal tail of a path expression, as segments.
+
+    `ROOT / "android" / "entry.py"` -> ("android", "entry.py");
+    `os.path.join(HERE, "tools/run.py")` -> ("tools", "run.py"); a name bound
+    once in the module to such an expression is followed. What precedes the
+    literal tail (a computed root) is dropped: only the tail can be matched.
+    """
+    if isinstance(node, ast.Name) and node.id in assigned:
+        return _path_segments(assigned[node.id], {})
+    if isinstance(node, ast.Call) and _call_name(node.func) in ("str", "Path", "PurePath") and len(node.args) == 1:
+        return _path_segments(node.args[0], assigned)
+    parts: list[ast.expr] = []
+    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Div):
+        while isinstance(node, ast.BinOp) and isinstance(node.op, ast.Div):
+            parts.append(node.right)
+            node = node.left
+        parts.append(node)
+        parts.reverse()
+    elif isinstance(node, ast.Call) and _call_name(node.func) == "join":
+        parts = list(node.args)
+    else:
+        parts = [node]
+    tail: list[str] = []
+    for part in reversed(parts):
+        if not (isinstance(part, ast.Constant) and isinstance(part.value, str)):
+            break
+        tail[:0] = [seg for seg in re.split(r"[\\/]", part.value) if seg and seg != "."]
+    return tuple(tail)
+
+
+def _collect_dynamic_imports(tree: ast.AST, nodes: list) -> tuple[Set[str], List[Tuple[str, ...]]]:
+    """(dotted names imported by string, path tails of files loaded by path)."""
+    assigned = {}
+    for node in getattr(tree, "body", []):
+        if isinstance(node, ast.Assign) and len(node.targets) == 1 and isinstance(node.targets[0], ast.Name):
+            assigned[node.targets[0].id] = node.value
+    dotted: Set[str] = set()
+    paths: List[Tuple[str, ...]] = []
+    for node in nodes:
+        if not isinstance(node, ast.Call) or not node.args:
+            continue
+        name = _call_name(node.func)
+        if name in _IMPORT_BY_NAME:
+            first = node.args[0]
+            if isinstance(first, ast.Constant) and isinstance(first.value, str):
+                dotted.add(first.value)
+        elif name in _LOAD_BY_PATH:
+            # spec_from_file_location(name, path), SourceFileLoader(name, path),
+            # run_path(path): the path is the last positional argument.
+            tail = _path_segments(node.args[-1], assigned)
+            if tail and tail[-1].endswith(".py"):
+                paths.append(tail)
+    return dotted, paths
+
+
+# ---------------------------------------------------------------------------
+# Web routes
+# ---------------------------------------------------------------------------
+
+# The verbs a router or app object registers a handler under: FastAPI and
+# Starlette (get/post/.../api_route/websocket), Flask and friends (route).
+_ROUTE_VERBS = frozenset({"get", "post", "put", "patch", "delete", "head", "options",
+                          "api_route", "route", "websocket"})
+
+
+def _route_templates(tree: ast.AST) -> List[str]:
+    """The path templates of every route handler the module registers.
+
+    Empty for a module with no route-decorated functions — the signal that it
+    is a route module at all.
+    """
+    templates: List[str] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        for dec in node.decorator_list:
+            if not (isinstance(dec, ast.Call) and isinstance(dec.func, ast.Attribute)
+                    and dec.func.attr in _ROUTE_VERBS):
+                continue
+            path = dec.args[0] if dec.args else next(
+                (kw.value for kw in dec.keywords if kw.arg in ("path", "rule")), None)
+            if isinstance(path, ast.Constant) and isinstance(path.value, str):
+                templates.append(path.value)
+            else:
+                templates.append("")   # a route, path unknown: still a route module
+    return templates
+
+
+def _template_pattern(template: str):
+    """A regex for the requests a template serves, or None when it names nothing.
+
+    `{id}` / `<id>` match one segment, `{p:path}` / `<path:p>` any tail. A
+    template must keep at least one literal segment: `/{id}` alone would match
+    every request in the suite and prove nothing. It is matched against the
+    end of a request path, since a router prefix the module does not spell
+    sits in front of it.
+    """
+    pieces = re.split(r"(\{[^}]*\}|<[^>]*>)", template)
+    if not any(re.search(r"[A-Za-z0-9]", piece) for piece in pieces[0::2]):
+        return None
+    out = []
+    for index, piece in enumerate(pieces):
+        if index % 2 == 0:
+            out.append(re.escape(piece))
+        elif piece.endswith(":path}") or piece.startswith("<path:"):
+            out.append(r".+")
+        else:
+            out.append(r"[^/?#]+")
+    return re.compile("".join(out).rstrip("/") + r"/?(?:[?#]|$)")
+
+
+# Stands in for an f-string's {expression} when a test builds a URL.
+_HOLE = "_x_"
+
+
+def _string_value(node: ast.expr) -> str | None:
+    """A string literal, an f-string or a `+` of them, with each hole filled."""
+    if isinstance(node, ast.Constant) and isinstance(node.value, str):
+        return node.value
+    if isinstance(node, ast.JoinedStr):
+        return "".join(v.value if isinstance(v, ast.Constant) else _HOLE for v in node.values)
+    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
+        left, right = _string_value(node.left), _string_value(node.right)
+        if left is None and right is None:
+            return None
+        return (left if left is not None else _HOLE) + (right if right is not None else _HOLE)
+    return None
+
+
+def _collect_request_strings(nodes: list) -> Set[str]:
+    """Every string in a test that could be a request path: it contains a `/`."""
+    found: Set[str] = set()
+    for node in nodes:
+        if isinstance(node, (ast.Constant, ast.JoinedStr, ast.BinOp)):
+            value = _string_value(node)
+            if value and "/" in value:
+                found.add(value.split("://", 1)[-1])
+    return found
 
 
 def _has_definitions(tree: ast.AST) -> bool:
@@ -245,14 +476,24 @@ def analyze(root: Path, ignore: Set[str]) -> List[CodeSmell]:
     # Collect all names referenced by test files, split into dotted vs bare.
     test_dotted: Set[str] = set()   # dotted imports (at least one dot component)
     test_bare: Set[str] = set()     # bare single-name imports
+    test_attrs: Set[str] = set()    # attribute chains off imported names
+    test_paths: List[Tuple[str, ...]] = []   # files loaded by path
+    test_strings: Set[str] = set()  # literals that could be request paths
     for tp in test_files:
         # Unreadable/unparseable test files are skipped by design.
         with contextlib.suppress(Exception):
             source = tp.read_text(encoding="utf-8", errors="replace")
             tree = ast.parse(source, filename=str(tp))
-            d, b = _collect_imported_names(tree)
+            nodes = list(ast.walk(tree))
+            d, b = _collect_imported_names(tree, nodes)
             test_dotted.update(d)
             test_bare.update(b)
+            test_attrs.update(_collect_attribute_reaches(nodes))
+            by_name, by_path = _collect_dynamic_imports(tree, nodes)
+            test_dotted.update(n for n in by_name if "." in n)
+            test_bare.update(n for n in by_name if "." not in n)
+            test_paths.extend(by_path)
+            test_strings.update(_collect_request_strings(nodes))
 
     def _is_tested(dotted: str, stem: str) -> bool:
         """Return True if any test import covers this module.
@@ -284,6 +525,27 @@ def analyze(root: Path, ignore: Set[str]) -> List[CodeSmell]:
         if stem in test_bare:
             return True
 
+        # Rule 4: an attribute chain off an imported package. Suffix only: the
+        # reverse rule above would let `os.path` bless a top-level `path.py`.
+        # Looked up by the module's own suffixes — a large suite reaches tens of
+        # thousands of chains, and scanning them per module is quadratic.
+        parts = dotted.split(".")
+        if any(".".join(parts[i:]) in test_attrs for i in range(len(parts) - 1)):
+            return True
+
+        return False
+
+    def _is_loaded_by_path(sp: Path) -> bool:
+        """Rule 5: a test loads this file by path (its literal tail ends the path)."""
+        parts = sp.relative_to(root).parts if sp.is_relative_to(root) else sp.parts
+        return any(len(tail) <= len(parts) and parts[-len(tail):] == tail for tail in test_paths)
+
+    def _route_requested(templates: List[str]) -> bool:
+        """Rule 6: a test string requests one of this route module's paths."""
+        for template in templates:
+            pattern = _template_pattern(template)
+            if pattern is not None and any(pattern.search(text) for text in test_strings):
+                return True
         return False
 
     # Check each source file
@@ -303,10 +565,33 @@ def analyze(root: Path, ignore: Set[str]) -> List[CodeSmell]:
                 continue
 
             dotted, stem = _module_names_for_file(sp, root)
-            if _is_tested(dotted, stem):
+            if _is_tested(dotted, stem) or _is_loaded_by_path(sp):
                 continue
 
             lines = source.splitlines()
+            templates = _route_templates(tree)
+            if templates:
+                if _route_requested(templates):
+                    continue
+                issues.append(CodeSmell(
+                    file=str(sp),
+                    line=1,
+                    smell_type="untested_module",
+                    description=(f"Module '{dotted}' registers web routes, and no test imports it "
+                                 "or names one of its paths"),
+                    suggestion="",
+                    severity="medium",
+                    code_snippet=_get_line(lines, 1),
+                    kind="candidate",
+                    also_caused_by=(
+                        "tests drive its handlers over HTTP through the application (a test "
+                        "client over the app factory, which imports this module), with request "
+                        "paths built at run time rather than written out",
+                        "its router is mounted under a prefix and the tests request the full "
+                        "path through a helper that assembles it",
+                    ),
+                ))
+                continue
             issues.append(CodeSmell(
                 file=str(sp),
                 line=1,
@@ -318,6 +603,17 @@ def analyze(root: Path, ignore: Set[str]) -> List[CodeSmell]:
             ))
 
     return issues
+
+
+def to_record(issue: "CodeSmell") -> dict:
+    """The JSON shape this detector emits, shared with the runner.
+
+    `kind` is always present, so a consumer never has to read an absent key as
+    a classification; the reasons tuple serialises as a list.
+    """
+    record = asdict(issue)
+    record["also_caused_by"] = list(record["also_caused_by"])
+    return record
 
 
 def analyze_tree(path: Path, ignore: set) -> list:
@@ -350,7 +646,7 @@ def main():
     sort_findings(all_issues)
 
     if args.format == "json":
-        print(json.dumps([asdict(i) for i in all_issues], indent=2))
+        print(json.dumps([to_record(i) for i in all_issues], indent=2))
     else:
         if not all_issues:
             print("✅ No test-coverage issues found!")
@@ -358,17 +654,25 @@ def main():
         by_type = defaultdict(int)
         for i in all_issues:
             by_type[i.smell_type] += 1
-        print(f"Found {len(all_issues)} test-coverage issue(s):\n\nSummary:")
+        leads = sum(1 for i in all_issues if i.kind == "candidate")
+        print(f"Found {len(all_issues) - leads} test-coverage issue(s), {leads} candidate(s):\n\nSummary:")
         for s, c in sorted(by_type.items(), key=lambda x: -x[1]):
             print(f"  {s}: {c}")
         print()
         icons = SEVERITY_ICONS
         for i in all_issues:
-            print(f"{icons[i.severity]} [{i.severity.upper()}] {i.file}:{i.line}")
+            marker = ("? [CANDIDATE]" if i.kind == "candidate"
+                      else f"{icons[i.severity]} [{i.severity.upper()}]")
+            print(f"{marker} {i.file}:{i.line}")
             print(f"   {i.smell_type}: {i.description}")
             if i.code_snippet:
                 print(f"   Code: {i.code_snippet}")
-            print(f"   → {i.suggestion}\n")
+            # A candidate has no fix to print; what it has is the readings to rule out.
+            if i.suggestion:
+                print(f"   → {i.suggestion}")
+            for reason in i.also_caused_by:
+                print(f"   ? also caused by: {reason}")
+            print()
 
 
 if __name__ == "__main__":
