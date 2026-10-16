@@ -146,6 +146,16 @@ This is the single change that most often removes a whole class of runtime bug.
 When you see an interface where several fields are optional and only certain
 combinations are legal, this is the finding.
 
+The `default` is not the only way to get that check. A switch that is the last
+statement of a function whose declared return type excludes `undefined`, with
+every case returning, is already checked under `strictNullChecks` (or
+`noImplicitReturns`): a missing case makes the end of the function reachable,
+which is TS2366. Adding `default: throw new Error(…)` *there* removes the check
+rather than adding one — so `switch_without_default` stays quiet on that shape
+when the governing tsconfig enables either flag, and is otherwise a candidate:
+whether a missing `default` is a defect depends on the discriminant's type,
+which syntax cannot see.
+
 ## Enums
 
 `enum` is one of the few TypeScript features that emits runtime code, which puts

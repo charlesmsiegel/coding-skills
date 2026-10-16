@@ -2,14 +2,30 @@
 """
 Detect the everyday smells: magic numbers, `==`, `var`, nested ternaries,
 switches with no default, god classes, and returns that disagree with themselves.
+
+Each check reports only what its own shape proves. A ternary inside a callback
+or a JSX expression container in another ternary's branch is its own expression,
+not a nested one. A `useEffect` callback that returns a cleanup on some paths
+is following React's contract. And a switch with no `default` is a lead rather
+than a defect — its discriminant's type decides — except where the compiler
+already proves it exhaustive, where it is not reported at all.
 """
 
 from common import Reporter, is_test_file, run_file_detector
-from tsparse import TsFile, argument_spans, body_indices, callee_of, callback_target, iter_calls
+from find_tsconfig_issues import compiler_options, strict_null_checks
+from tsparse import (
+    RESERVED, TsFile, argument_spans, body_indices, callee_of, callback_target, iter_calls,
+)
 
-# Values so conventional a name would add nothing.
+# Values so conventional a name would add nothing — including the unit
+# conversions built from them (seconds in an hour or a day, a mega in decimal
+# or binary), which read as what they are wherever they appear.
 MAGIC_NUMBER_ALLOWED = {0, 1, 2, -1, 10, 100, 1000, 24, 60, 365, 12, 7,
-                        16, 24, 32, 64, 128, 180, 255, 256, 360, 512, 1024}
+                        16, 24, 32, 64, 128, 180, 255, 256, 360, 512, 1024,
+                        3600, 86_400, 1_000_000, 1_048_576}
+# Comparisons in which an HTTP status code is self-describing: `res.status ===
+# 404` already says what 404 is, and `HTTP_NOT_FOUND` would only restate it.
+_COMPARISONS = frozenset({"===", "!==", "==", "!=", "<", ">", "<=", ">="})
 
 GOD_CLASS_METHODS, GOD_CLASS_MEMBERS = 15, 10
 
@@ -36,10 +52,34 @@ def _check_magic_numbers(file: TsFile, report: Reporter) -> None:
             continue
         if following is not None and following.is_op(",", "]", "}", ")"):
             continue
+        if value.is_integer() and 100 <= value <= 599 and _compared_with_status(file, index):
+            continue
         report.add(token.line, "magic_number",
                    f"Magic number {token.value} in an expression",
                    "Name it: `const RETRY_LIMIT = 3`. A named constant is greppable and says why "
                    "the value is what it is.", "low")
+
+
+def _status_like(name: str) -> bool:
+    lowered = name.lower()
+    return "status" in lowered or lowered.endswith("code")
+
+
+def _compared_with_status(file: TsFile, index: int) -> bool:
+    """True for `x.status === 404` / `404 === statusCode` / `res.status >= 500`."""
+    previous = file.tokens[index - 1] if index else None
+    if previous is not None and previous.kind == "op" and previous.value in _COMPARISONS:
+        operand = file.tokens[index - 2] if index >= 2 else None
+        return operand is not None and operand.kind == "name" and _status_like(operand.value)
+    following = file.tokens[index + 1] if index + 1 < len(file) else None
+    if following is not None and following.kind == "op" and following.value in _COMPARISONS:
+        cursor = index + 2
+        while cursor + 2 < len(file) and file.tokens[cursor + 1].is_op(".", "?.") \
+                and file.tokens[cursor + 2].kind == "name":
+            cursor += 2
+        operand = file.tokens[cursor] if cursor < len(file) else None
+        return operand is not None and operand.kind == "name" and _status_like(operand.value)
+    return False
 
 
 def _check_loose_equality(file: TsFile, report: Reporter) -> None:
@@ -67,16 +107,89 @@ def _check_var(file: TsFile, report: Reporter) -> None:
                        "blocks, which is a bug waiting for a loop.", "medium")
 
 
+def _is_ternary(file: TsFile, index: int) -> bool:
+    """A `?` that branches, as opposed to an optional parameter or property."""
+    return (file.tokens[index].is_op("?") and index + 1 < len(file)
+            and not file.tokens[index + 1].is_op(":", ")", ","))
+
+
+def _is_jsx_container(file: TsFile, brace: int) -> bool:
+    """A `{` that opens a JSX expression container rather than an object literal.
+
+    Inside an expression an object literal follows an operator, a `(` or `,`,
+    or a keyword. A container follows what only JSX puts there: the end of a
+    tag (`>`, `/>`), another container (`}`), an attribute's `=` after a tag or
+    attribute name (`<A p={…}`), or a bare name (`<A {...rest}`).
+    """
+    if not file.is_tsx or brace == 0:
+        return False
+    previous = file.tokens[brace - 1]
+    if previous.is_op(">", "/>", "}"):
+        return True
+    if previous.kind == "name":
+        return previous.value not in RESERVED
+    if previous.is_op("=") and brace >= 3:
+        attribute, before = file.tokens[brace - 2], file.tokens[brace - 3]
+        return attribute.kind == "name" and (before.kind in ("name", "str") or before.is_op("}"))
+    return False
+
+
+def _separate_expression(file: TsFile, outer: int, inner: int) -> bool:
+    """True when the ternary at ``inner`` belongs to a different expression than
+    the branch of the one at ``outer`` it sits in.
+
+    A callback's body — a block or a concise `=>` body — and a JSX expression
+    container are their own expressions: `x ? items.map(i => i.a ? 1 : 2) : []`
+    and `editing ? <>{saving ? "Saving…" : "Save"}</> : null` each read left to
+    right at every level. The branch itself, a parenthesised group in it, a
+    call argument, or an object or array literal are not, so `a ? (b ? 1 : 2) : 3`
+    is still nested.
+    """
+    # The brackets enclosing ``inner``, outermost first, up to the branch.
+    openers: list[int] = []
+    cursor = inner - 1
+    while cursor > outer:
+        token = file.tokens[cursor]
+        if token.kind == "op" and token.value in ")]}":
+            cursor = file.closer(cursor) - 1
+            continue
+        if token.kind == "op" and token.value in "([{":
+            openers.append(cursor)
+        cursor -= 1
+    openers.reverse()
+    bodies = {func.body_open for func in file.functions if func.has_body}
+    for opener in openers:
+        if file.tokens[opener].is_op("{") and (opener in bodies or _is_jsx_container(file, opener)):
+            return True
+    # A concise arrow body: an `=>` on the path's own bracket level, with no
+    # `,` after it on that level (which would end the arrow and start a sibling).
+    for start, stop in zip([outer] + openers, openers + [inner]):
+        arrow = False
+        cursor = start + 1
+        while cursor < stop:
+            token = file.tokens[cursor]
+            if token.kind == "op" and token.value in "([{" and file.closer(cursor) < stop:
+                cursor = file.closer(cursor) + 1
+                continue
+            if token.is_op("=>"):
+                arrow = True
+            elif token.is_op(","):
+                arrow = False
+            cursor += 1
+        if arrow:
+            return True
+    return False
+
+
 def _check_nested_ternary(file: TsFile, report: Reporter) -> None:
     for index, token in enumerate(file.tokens):
-        if not token.is_op("?") or index + 1 >= len(file) or file.tokens[index + 1].is_op(":", ")", ","):
+        if not _is_ternary(file, index):
             continue
         colon = file.find_op(":", index + 1, len(file))
         if colon < 0:
             continue
         nested = any(
-            file.tokens[probe].is_op("?") and probe + 1 < len(file)
-            and not file.tokens[probe + 1].is_op(":", ")", ",")
+            _is_ternary(file, probe) and not _separate_expression(file, index, probe)
             for probe in range(index + 1, colon)
         )
         if nested:
@@ -84,6 +197,86 @@ def _check_nested_ternary(file: TsFile, report: Reporter) -> None:
                        "Nested ternary — the branches no longer read left to right",
                        "Extract to a small function with early returns, or a lookup table keyed by "
                        "the discriminant.", "medium")
+
+
+# Words in a declared return type that let a function fall off its end
+# without a compile error, so the compiler stops checking that it cannot.
+_RETURN_TYPES_ALLOWING_FALLTHROUGH = frozenset({"undefined", "void", "any", "unknown"})
+
+
+def _declared_return_type(file: TsFile, func) -> str:
+    if func.return_type:
+        return func.return_type
+    # Arrows: `(x: K): string => { … }` — the annotation sits between `)` and `=>`.
+    close, body = func.params_close, func.body_open
+    if func.kind == "arrow" and close >= 0 and body > close + 2 \
+            and file.tokens[close + 1].is_op(":") and file.tokens[body - 1].is_op("=>"):
+        return file.slice(close + 2, body - 1)
+    return ""
+
+
+def _clause_exits(file: TsFile, start: int, end: int) -> bool:
+    """True when a `case` body is empty (falls through) or ends in `return`/`throw`."""
+    while start < end and file.tokens[start].is_op("{") and file.closer(start) == end - 1:
+        start, end = start + 1, end - 1  # `case "a": { … }`
+    last, cursor = start, start
+    while cursor < end:
+        token = file.tokens[cursor]
+        if token.is_op("{", "(", "["):
+            previous = file.tokens[cursor - 1]
+            block = token.is_op("{") and (previous.is_op(")", ";", ":", "{", "}")
+                                          or previous.is_name("else", "try", "finally", "do"))
+            cursor = file.skip_group(cursor)
+            # A block closes a statement unless the statement continues past it.
+            if block and cursor < end and not file.tokens[cursor].is_name(
+                    "else", "catch", "finally", "while"):
+                last = cursor
+            continue
+        cursor += 1
+        if token.is_op(";") and cursor < end:
+            last = cursor
+    return start >= end or file.tokens[last].is_name("return", "throw")
+
+
+def _compiler_checks_exhaustiveness(file: TsFile, switch: int, body_open: int, close: int) -> bool:
+    """Whether a missing case here would already be a compile error.
+
+    It is when the switch is the last statement of a function that declares a
+    return type excluding `undefined`, every clause returns or throws, and the
+    project compiles with `strictNullChecks` (TS2366) or `noImplicitReturns`
+    (TS7030): falling off the end is then an error, and control flow analysis
+    only lets the end go unreached when the cases cover the discriminant's
+    whole union. A `default: throw` there would *remove* that check.
+    """
+    func = file.enclosing_function(switch)
+    if func is None or close + 1 != func.body_close:
+        return False
+    declared = _declared_return_type(file, func)
+    words = set("".join(ch if ch.isalnum() or ch == "_" else " " for ch in declared).split())
+    if not declared or words & _RETURN_TYPES_ALLOWING_FALLTHROUGH:
+        return False
+    labels = [i for i in range(body_open + 1, close)
+              if file.tokens[i].is_name("case") and _directly_in(file, i, body_open)]
+    for label, following in zip(labels, labels[1:] + [close]):
+        colon = file.find_op(":", label + 1, following)
+        if colon < 0 or not _clause_exits(file, colon + 1, following):
+            return False
+    options = compiler_options(file.path)
+    return options is not None and (strict_null_checks(options) or options.get("noImplicitReturns") is True)
+
+
+def _directly_in(file: TsFile, index: int, brace: int) -> bool:
+    """True when ``index`` is at the top level of the block opened at ``brace``."""
+    cursor = brace + 1
+    while cursor < index:
+        if file.tokens[cursor].is_op("{", "(", "["):
+            end = file.skip_group(cursor)
+            if end > index:
+                return False
+            cursor = end
+            continue
+        cursor += 1
+    return True
 
 
 def _check_switches(file: TsFile, report: Reporter) -> None:
@@ -98,12 +291,24 @@ def _check_switches(file: TsFile, report: Reporter) -> None:
         close = file.closer(cursor)
         if close < 0:
             continue
-        if not any(file.tokens[probe].is_name("default") for probe in range(cursor, close)):
-            report.add(token.line, "switch_without_default",
-                       "`switch` with no `default` branch",
-                       "Add a `default` that throws on the unexpected value. On a union type, an "
-                       "exhaustive switch with `default: assertNever(x)` makes the compiler tell you "
-                       "when a new member is added.", "medium")
+        if any(file.tokens[probe].is_name("default") for probe in range(cursor, close)):
+            continue
+        if _compiler_checks_exhaustiveness(file, index, cursor, close):
+            continue
+        # Whether a missing `default` is a defect depends on the discriminant's
+        # type, which syntax cannot see: over a union every member of which has
+        # a case it is complete, over an open `string` it silently ignores the
+        # rest. A lead, then, not a finding.
+        report.candidate(token.line, "switch_without_default",
+                         "`switch` with no `default` branch",
+                         ("the cases cover every member of a union or enum, so there is no "
+                          "other value to handle",
+                          "the switch acts on a few special values of an open set and doing "
+                          "nothing for the rest is the intended behaviour",
+                          "a missing case is already a compile error here (a tail switch in a "
+                          "function whose return type excludes `undefined`) under a tsconfig "
+                          "this scanner could not resolve"),
+                         "medium")
 
 
 # Mock-call assertions spelled as a function rather than an `expect` matcher
@@ -233,11 +438,12 @@ def _check_returns(file: TsFile, report: Reporter) -> None:
             # A line break straight after `return` is an automatic semicolon
             # (a restricted production): `if (!x) return` then `const y = …` on
             # the next line returns undefined, not `const`.
-            if following is None or following.is_op(";", "}") or following.line > file.tokens[index].line:
+            if following is None or following.is_op(";", "}") or following.is_name("void") \
+                    or following.line > file.tokens[index].line:
                 bare.append(file.tokens[index].line)
             else:
                 with_value.append(file.tokens[index].line)
-        if with_value and bare:
+        if with_value and bare and not _is_effect_callback(file, func):
             report.add(file.tokens[returns[0]].line, "inconsistent_returns",
                        f"`{func.qualname}` returns a value on some paths and nothing on others",
                        "Return the same shape everywhere. Callers otherwise have to guard against "
