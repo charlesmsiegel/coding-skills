@@ -109,6 +109,25 @@ def scan(repo: Path, excluded: set[str]) -> dict[str, list[Path]]:
     return found
 
 
+_SETUP_IMPORT = re.compile(r"^\s*(?:from|import)\s+(?:setuptools|distutils)\b", re.MULTILINE)
+
+
+def is_manifest(path: Path) -> bool:
+    """Whether a manifest-named file is one.
+
+    Only `setup.py` needs asking: the name is also an ordinary module name
+    (`app/setup.py` implementing a `setup` command), and such a module
+    proposed a package named after whatever `name = ...` its body assigned. A
+    packaging script imports setuptools or distutils to call their `setup()`.
+    """
+    if path.name != "setup.py":
+        return True
+    try:
+        return bool(_SETUP_IMPORT.search(path.read_text(encoding="utf-8", errors="replace")))
+    except OSError:
+        return False
+
+
 def manifest_name(path: Path) -> str:
     try:
         text = path.read_text(encoding="utf-8", errors="replace")
@@ -231,10 +250,18 @@ def cargo_members(repo: Path, manifest: Path) -> list[Path]:
     return found
 
 
-def top_level_python_packages(found: dict[str, list[Path]]) -> list[Path]:
+# A directory of these names holds a test suite. An `__init__.py` makes it
+# importable — pytest's rootdir handling often needs one — but the tests are
+# the doctors' evidence about the packages they exercise, not a unit of the
+# product with a design of its own to grade.
+TEST_DIR_NAMES = frozenset({"test", "tests", "testing"})
+
+
+def top_level_python_packages(found: dict[str, list[Path]], repo: Path) -> list[Path]:
     """Directories with __init__.py whose parent has none — importable roots."""
     return [init.parent for init in found["__init__.py"]
-            if not (init.parent.parent / "__init__.py").is_file()]
+            if not (init.parent.parent / "__init__.py").is_file()
+            and not TEST_DIR_NAMES & set(init.parent.relative_to(repo).parts)]
 
 
 # A second language below this share of the package's *lines* is incidental — a
@@ -314,6 +341,8 @@ def discover(repo: Path, excluded: set[str], min_files: int) -> dict:
     # --- manifests
     for manifest_name_, family in MANIFESTS.items():
         for manifest in found[manifest_name_]:
+            if not is_manifest(manifest):
+                continue
             directory = manifest.parent
             name = manifest_name(manifest) or directory.name
             if directory.resolve() == repo:
@@ -346,13 +375,13 @@ def discover(repo: Path, excluded: set[str], min_files: int) -> dict:
                 f"{family}-manifest")
 
     # --- importable Python roots the manifests did not already name
-    for package in top_level_python_packages(found):
+    for package in top_level_python_packages(found, repo):
         add([package], package.name,
             f"importable package ({package.relative_to(repo).as_posix()})", "python-package")
 
     # --- last resort: top-level source directories
     for child in sorted(repo.iterdir()):
-        if not child.is_dir() or is_skipped(child, repo, excluded):
+        if not child.is_dir() or is_skipped(child, repo, excluded) or child.name in TEST_DIR_NAMES:
             continue
         add([child], child.name, f"top-level source directory ({child.name})", "directory")
 
