@@ -22,7 +22,7 @@ __all__ = [
     "TsSyntaxError", "Token", "TsFile", "Func", "Param", "Class", "Prop",
     "TypeDecl", "TypeMember", "Import", "Export", "RESERVED",
     "parse_file", "parse_source", "callee_of", "iter_calls", "argument_spans",
-    "body_indices", "names_in", "statement_start", "statement_end", "line_indent",
+    "callback_target", "body_indices", "names_in", "statement_start", "statement_end", "line_indent",
 ]
 
 
@@ -115,6 +115,45 @@ def argument_spans(file: TsFile, paren: int) -> list[tuple[int, int]]:
     if close > start:
         spans.append((start, close))
     return spans
+
+
+def callback_target(file: TsFile, func: Func) -> tuple[str, int]:
+    """(callee, argument position) of the call ``func`` is passed to directly.
+
+    `useEffect(() => {…}, deps)` yields ("useEffect", 0). A curried call is
+    named by its head, so `describe.each(rows)('t', fn)` yields
+    ("describe.each", 1). A function that is assigned, returned, or sits inside
+    some larger expression is not a direct argument and yields ("", -1).
+    """
+    start = func.start
+    if start <= 0 or not file.tokens[start - 1].is_op("(", ","):
+        return "", -1
+    after = func.body_close + 1 if func.has_body else -1
+    if 0 < after < len(file.tokens) and not file.tokens[after].is_op(",", ")"):
+        return "", -1  # `run(() => {…} && x)`: the function is an operand, not the argument
+    position = 0
+    cursor = start - 1
+    while cursor >= 0:
+        token = file.tokens[cursor]
+        if token.kind == "op" and token.value in CLOSERS:
+            cursor = file.closer(cursor) - 1
+            continue
+        if token.is_op(","):
+            position += 1
+        elif token.is_op("("):
+            break
+        elif (token.kind == "op" and token.value in OPENERS) or token.is_op(";"):
+            return "", -1  # an array or object literal, or a block — not an argument list
+        cursor -= 1
+    if cursor < 0:
+        return "", -1
+    callee = callee_of(file, cursor)
+    if callee in CONTROL_KEYWORDS:
+        return "", -1  # `return (fn)`, `await (fn)`: parentheses, not a call
+    if not callee and cursor > 0 and file.tokens[cursor - 1].is_op(")"):
+        opener = file.closer(cursor - 1)
+        callee = callee_of(file, opener) if opener > 0 else ""
+    return (callee, position) if callee else ("", -1)
 
 
 def body_indices(func: Func) -> range:

@@ -32,12 +32,14 @@ method touches (that is what LCOM measures); the groups are the classes.
 
 ## Object-orientation abusers
 
-**Type switch.** `type_switch`. An `if/else if` ladder on `typeof x` or
-`x.kind === "…"` is the single most TypeScript-specific smell in the catalog,
-because the language has a purpose-built answer: a discriminated union plus an
-exhaustive `switch` with `default: assertNever(x)`. That fix does not just tidy
-the code — it makes the compiler point at every site that needs updating when a
-new case appears. See `references/type-system.md`.
+**Type switch.** `type_switch`. An `if/else if` ladder on `x.kind === "…"` is
+the single most TypeScript-specific smell in the catalog, because the language
+has a purpose-built answer: a discriminated union plus an exhaustive `switch`
+with `default: assertNever(x)`. That fix does not just tidy the code — it makes
+the compiler point at every site that needs updating when a new case appears.
+See `references/type-system.md`. Two lookalikes are not reported: `typeof x ===
+"string"` is how a union of primitives is narrowed (`typeof` is already the
+discriminant), and `event.key === "Enter"` compares a string the platform owns.
 
 **Refused bequest.** `refused_bequest`. A subclass overriding a method only to
 throw is saying it is not really a subtype. Use composition: hold an instance,

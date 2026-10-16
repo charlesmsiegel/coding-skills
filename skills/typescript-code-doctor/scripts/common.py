@@ -49,6 +49,10 @@ DECLARATION_SUFFIXES = (".d.ts", ".d.mts", ".d.cts")
 TEST_DIR_NAMES = frozenset({"__tests__", "__test__", "test", "tests", "spec", "e2e", "cypress"})
 TEST_NAME_MARKERS = (".test.", ".spec.", "-test.", "_test.")
 
+# Calls whose callback groups tests into a suite (`describe('x', () => …)`).
+# Their `.each` / `.only` / `.skip` spellings share the head word.
+SUITE_DEFINERS = frozenset({"describe", "suite", "context"})
+
 # Files that mark the top of a project. The project root is the OUTERMOST
 # marker found *inside the checkout*, bounded by the first `.git` — a `.git`
 # directory is the checkout boundary, so markers above it belong to something
@@ -85,6 +89,12 @@ def walk_tree(path: Path, *, keep: frozenset[str] | set[str] = frozenset()) -> I
     a directory that is otherwise in `EXCLUDE_DIRS` but should still be
     descended into here — e.g. a caller looking for coverage reports nested
     under a package's own `coverage/` directory in a monorepo.
+
+    A directory below ``path`` that holds its own `.git` — a file for a git
+    worktree or a submodule, a directory for a nested clone — is a different
+    repository and is pruned too. Scanning it would report another checkout's
+    code (often a second copy of this one, on another branch) as this repo's.
+    ``path`` itself is never pruned, so pointing the scan at a worktree works.
     """
     if path.is_file():
         yield path
@@ -92,10 +102,18 @@ def walk_tree(path: Path, *, keep: frozenset[str] | set[str] = frozenset()) -> I
     if not path.is_dir():
         return
     for directory, subdirectories, names in os.walk(path):
-        subdirectories[:] = sorted(d for d in subdirectories if d not in EXCLUDE_DIRS or d in keep)
         base = Path(directory)
+        subdirectories[:] = sorted(
+            d for d in subdirectories
+            if (d not in EXCLUDE_DIRS or d in keep) and not is_nested_checkout(base / d)
+        )
         for name in sorted(names):
             yield base / name
+
+
+def is_nested_checkout(directory: Path) -> bool:
+    """True when ``directory`` is the top of its own git checkout (a `.git` file or directory)."""
+    return os.path.lexists(directory / ".git")
 
 
 def find_ts_files(path: Path) -> Iterator[Path]:

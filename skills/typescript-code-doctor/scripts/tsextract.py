@@ -53,9 +53,15 @@ def read_type_after_colon(file: TsFile, colon: int, stop: int) -> tuple[str, int
 
     The span is recorded on the file so `in_type_position` can later tell a
     function type from a function.
+
+    `<` and `>` are not in the bracket map (outside a type they compare), so the
+    generic depth is counted here: the `,` in `Record<string, number>` separates
+    type arguments, not parameters, and ending the type there loses the body
+    `{` that follows the `>`.
     """
     cursor = colon + 1
     start = cursor
+    angle = 0
     while cursor < stop:
         token = file.tokens[cursor]
         if token.kind == "op":
@@ -68,13 +74,22 @@ def read_type_after_colon(file: TsFile, colon: int, stop: int) -> tuple[str, int
             if token.value in OPENERS:
                 cursor = file.skip_group(cursor)
                 continue
-            if token.value in (",", ";", ")", "]", "}", "="):
-                break
+            if token.value == "<":
+                angle += 1
+            elif token.value in (">", ">>", ">>>"):
+                angle = max(0, angle - len(token.value))
+            elif token.value == "," and angle:
+                pass  # between type arguments
+            elif token.value in (",", ";", ")", "]", "}", "=", ">=", ">>="):
+                break  # `>=` is a closing `>` fused with the initializer's `=`
         if token.kind == "name" and token.value in ("const", "let", "var", "function", "class", "return"):
             break
         # A newline followed by something that cannot continue a type ends it.
+        # In a type a `>` only ever closes a generic, so unlike the comparison
+        # it is in CONTINUATIONS for, nothing has to follow it.
         previous = file.tokens[cursor - 1]
-        if cursor > start and token.line > previous.line and previous.value not in CONTINUATIONS \
+        if cursor > start and not angle and token.line > previous.line \
+                and (previous.value not in CONTINUATIONS or previous.is_op(">")) \
                 and token.value not in CONTINUATIONS and token.kind == "name":
             break
         cursor += 1
@@ -87,22 +102,44 @@ def _parse_params(file: TsFile, open_index: int, close_index: int) -> list[Param
     params: list[Param] = []
     cursor = open_index + 1
     while cursor < close_index:
-        chunk_end = cursor
-        depth_guard = 0
-        while chunk_end < close_index:
-            token = file.tokens[chunk_end]
-            if token.kind == "op" and token.value in OPENERS:
-                chunk_end = file.skip_group(chunk_end)
-                depth_guard += 1
-                continue
-            if token.kind == "op" and token.value == ",":
-                break
-            chunk_end += 1
+        chunk_end = _param_end(file, cursor, close_index)
         param = _parse_one_param(file, cursor, chunk_end)
         if param is not None:
             params.append(param)
         cursor = chunk_end + 1
     return params
+
+
+def _param_end(file: TsFile, start: int, stop: int) -> int:
+    """Index of the `,` that ends the parameter starting at ``start`` (or ``stop``).
+
+    A comma inside a bracket group belongs to the group, and so does one inside
+    the `<…>` of a generic in the parameter's *type* — `m: Map<string, number>`
+    is one parameter. `<` and `>` are not bracket-matched, so they are counted,
+    but only between the annotation's `:` and the default's `=`: in a default
+    value (`n = a < b`) they compare, and counting them would swallow the comma.
+    """
+    cursor = start
+    state = "name"  # → "type" at the annotation's `:`, → "default" at the `=`
+    angle = 0
+    while cursor < stop:
+        token = file.tokens[cursor]
+        if token.kind == "op":
+            if token.value in OPENERS:
+                cursor = file.skip_group(cursor)
+                continue
+            if token.value == "," and not angle:
+                return cursor
+            if token.value in ("=", ">=", ">>="):  # `>=` is a closing `>` fused with the `=`
+                state, angle = "default", 0
+            elif state == "name" and token.value == ":":
+                state = "type"
+            elif state == "type" and token.value == "<":
+                angle += 1
+            elif state == "type" and token.value in (">", ">>", ">>>"):
+                angle = max(0, angle - len(token.value))
+        cursor += 1
+    return stop
 
 
 def _parse_one_param(file: TsFile, start: int, stop: int) -> Param | None:
@@ -519,21 +556,38 @@ def _accessibility(modifiers: set[str], name: str) -> str | None:
 
 
 def skip_to_statement_end(file: TsFile, index: int, stop: int) -> int:
-    """Advance past the end of a statement: a `;`, or an ASI-style line break."""
+    """Advance past the end of a statement: a `;`, or an ASI-style line break.
+
+    Two things end a statement without being part of it. A closing bracket that
+    was not opened inside the statement belongs to the enclosing block, so the
+    statement stops *at* it: `return {…}` as a body's last line ends at the
+    body's `}`, not past it. And a bracket group is still followed by a line
+    break the ASI rule must see — `g(a)` then `log(a)` on the next line is two
+    statements, which stepping over the group in one jump used to hide.
+    """
     cursor = index
     while cursor < stop:
         token = file.tokens[cursor]
         if token.kind == "op" and token.value in OPENERS:
+            closer = file.closer(cursor)
             cursor = file.skip_group(cursor)
+            if 0 <= closer and cursor < stop and _breaks_statement(file.tokens[closer], file.tokens[cursor]):
+                return cursor
             continue
+        if token.kind == "op" and token.value in CLOSERS:
+            return cursor  # closes the enclosing block, not this statement
         if token.is_op(";"):
             return cursor + 1
         nxt = file.tokens[cursor + 1] if cursor + 1 < stop else None
-        if nxt is not None and nxt.line > token.line \
-                and token.value not in CONTINUATIONS and nxt.value not in CONTINUATIONS:
+        if nxt is not None and _breaks_statement(token, nxt):
             return cursor + 1
         cursor += 1
     return stop
+
+
+def _breaks_statement(token, nxt) -> bool:
+    """True when a line break between two tokens is an automatic-semicolon point."""
+    return nxt.line > token.line and token.value not in CONTINUATIONS and nxt.value not in CONTINUATIONS
 
 
 def extract_object_methods(file: TsFile) -> None:

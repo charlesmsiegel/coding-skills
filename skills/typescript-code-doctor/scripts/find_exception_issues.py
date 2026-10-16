@@ -7,11 +7,18 @@ The failure mode these share is that the program keeps going and reports
 success. A crash is a bug report; a swallowed error is a wrong answer.
 """
 
+import re
+
 from common import Reporter, run_file_detector
 from tsparse import TsFile, argument_spans, iter_calls
 
 # Calls that count as "handled" inside a catch: the error goes somewhere.
 REPORTING_CALLS = frozenset({"error", "warn", "captureException", "report", "logError", "fatal"})
+# Comment delimiters, so what is left is the comment's prose.
+COMMENT_MARKS = re.compile(r"^/[/*]+|\*+/$")
+# Comments that mark a handler as not written yet, rather than explain why there is none.
+UNFINISHED = re.compile(r"(?:todo|fixme|xxx|hack)\b|(?:handle|process)\s+(?:the\s+)?(?:error|exception)s?\W*$",
+                        re.IGNORECASE)
 
 
 def _catch_clauses(file: TsFile):
@@ -29,20 +36,31 @@ def _catch_clauses(file: TsFile):
             yield index, binding, cursor, file.closer(cursor)
 
 
+def _explains_itself(file: TsFile, body_open: int, body_close: int) -> bool:
+    """True when an otherwise empty block holds a comment saying why it is empty.
+
+    `catch { /* no presets is a normal state */ }` is exactly what the
+    empty-catch fix asks for. A bare `// TODO` or `/* handle error */` marks the
+    handler as missing rather than explaining its absence, so it does not count.
+    """
+    for comment in file.comments_between(body_open, body_close):
+        text = COMMENT_MARKS.sub("", comment.value).strip(" \t\r\n*")
+        if text and not UNFINISHED.match(text):
+            return True
+    return False
+
+
 def _check_catch_bodies(file: TsFile, report: Reporter) -> None:
     for index, binding, body_open, body_close in _catch_clauses(file):
         line = file.tokens[index].line
         body = list(range(body_open + 1, body_close))
         if not body:
-            has_comment = any(body_open < c.start < body_close for c in file.comments)
+            if _explains_itself(file, body_open, body_close):
+                continue  # the comment is the decision, written down: nothing was swallowed silently
             report.add(line, "empty_catch",
                        "`catch` block is empty — the error is discarded and the program continues",
                        "Handle it or let it propagate. If ignoring is genuinely right, say why in a "
-                       "comment and name the binding so a reader knows it was a decision."
-                       if not has_comment else
-                       "An explained no-op is better than a silent one, but consider whether the "
-                       "narrower `try` would remove the need to ignore anything.",
-                       "high" if not has_comment else "low")
+                       "comment so a reader knows it was a decision.", "high")
             continue
 
         rethrows = any(file.tokens[i].is_name("throw") for i in body)
