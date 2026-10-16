@@ -5,7 +5,7 @@ switches with no default, god classes, and returns that disagree with themselves
 """
 
 from common import Reporter, is_test_file, run_file_detector
-from tsparse import TsFile, argument_spans, body_indices, callback_target, iter_calls
+from tsparse import TsFile, argument_spans, body_indices, callee_of, callback_target, iter_calls
 
 # Values so conventional a name would add nothing.
 MAGIC_NUMBER_ALLOWED = {0, 1, 2, -1, 10, 100, 1000, 24, 60, 365, 12, 7,
@@ -106,7 +106,54 @@ def _check_switches(file: TsFile, report: Reporter) -> None:
                        "when a new member is added.", "medium")
 
 
+# Mock-call assertions spelled as a function rather than an `expect` matcher
+# (Sinon's `assert.calledWith(spy, …)`). Their arguments restate a call that was
+# made elsewhere; they are not a call anybody has to read.
+_CALL_ASSERTIONS = frozenset({
+    "calledWith", "calledWithExactly", "calledOnceWith", "calledOnceWithExactly",
+    "alwaysCalledWith", "alwaysCalledWithExactly", "neverCalledWith", "notCalledWith",
+})
+
+
+def _is_assertion_call(file: TsFile, paren: int, callee: str) -> bool:
+    """`expect(spy).toHaveBeenCalledWith(…, true, false)` and its relatives.
+
+    A matcher's arguments are the expected values of an assertion: the boolean
+    literals in them describe the call under test, which is charged where it
+    is made, and the matcher has no parameters to name.
+    """
+    if callee.rsplit(".", 1)[-1] in _CALL_ASSERTIONS:
+        return True
+    head = paren - 1 - 2 * callee.count(".")  # first token of the dotted callee
+    if head < 2 or not file.tokens[head - 1].is_op(".") or not file.tokens[head - 2].is_op(")"):
+        return False
+    opener = file.closer(head - 2)
+    return opener > 0 and callee_of(file, opener).split(".")[0] == "expect"
+
+
+def _flagged_signatures(file: TsFile) -> set[str]:
+    """Functions declared here whose `boolean` parameter boolean_flag_parameter reports.
+
+    That detector skips test files and a one-argument setter, so this does
+    too: a name it does not charge is one whose call sites still carry the
+    blindness alone.
+    """
+    if is_test_file(file.path):
+        return set()
+    return {
+        func.name for func in file.functions
+        if any(p.type_text.strip() == "boolean" for p in func.params)
+        and not (len(func.params) == 1 and func.name.startswith(("set", "toggle", "is", "has")))
+    }
+
+
 def _check_call_shapes(file: TsFile, report: Reporter) -> None:
+    # Boolean blindness is a property of a signature, so it is charged once per
+    # callee per file, at its first call site, with the rest as related lines —
+    # and not at all when this file declares the signature and
+    # boolean_flag_parameter already charges it there.
+    blind: dict[str, list[tuple[int, int]]] = {}
+    flagged = _flagged_signatures(file)
     for paren, callee in iter_calls(file):
         close = file.closer(paren)
         if close < 0:
@@ -115,11 +162,8 @@ def _check_call_shapes(file: TsFile, report: Reporter) -> None:
         spans = argument_spans(file, paren)
         booleans = [s for s in spans
                     if s[1] == s[0] + 1 and file.tokens[s[0]].is_name("true", "false")]
-        if len(booleans) >= 2:
-            report.add(file.tokens[paren].line, "boolean_blindness",
-                       f"`{callee}(…)` is called with {len(booleans)} boolean literals",
-                       "Nobody can read `f(true, false)`. Take an options object, or split the "
-                       "function so each name says what it does.", "low")
+        if len(booleans) >= 2 and method not in flagged and not _is_assertion_call(file, paren, callee):
+            blind.setdefault(callee, []).append((file.tokens[paren].line, len(booleans)))
         if method == "parseInt" and len(spans) == 1:
             report.add(file.tokens[paren].line, "parseint_without_radix",
                        "`parseInt` without a radix",
@@ -129,6 +173,16 @@ def _check_call_shapes(file: TsFile, report: Reporter) -> None:
             report.add(file.tokens[paren].line, "array_constructor",
                        "`new Array(n)` creates holes, and `new Array(x)` changes meaning with arity",
                        "Use a literal `[]`, `Array.from({ length: n }, …)`, or `Array.of(x)`.", "low")
+    for callee, sites in blind.items():
+        most = max(count for _, count in sites)
+        description = (
+            f"`{callee}(…)` is called with {most} boolean literals" if len(sites) == 1
+            else f"`{callee}(…)` is called with up to {most} boolean literals at {len(sites)} call sites"
+        )
+        report.add(sites[0][0], "boolean_blindness", description,
+                   "Nobody can read `f(true, false)`. Take an options object, or split the "
+                   "function so each name says what it does.", "low",
+                   related=[line for line, _ in sites[1:6]])
 
 
 def _check_class_shape(file: TsFile, report: Reporter) -> None:
