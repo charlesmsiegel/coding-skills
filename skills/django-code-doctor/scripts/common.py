@@ -386,6 +386,49 @@ def first_party_modules(root: Path) -> frozenset:
     return frozenset(names)
 
 
+def looks_like_test(path) -> bool:
+    """Shared test predicate, scoped to the project rather than checkout ancestors."""
+    return is_test_file(Path(path))
+
+
+# A noqa comment's code list followed by a separator and some text: the suppression
+# says why. The separators are the ones people actually type after a noqa list;
+# the reason must start with something other than another separator character,
+# so a trailing `--` with nothing after it is still a bare suppression.
+_REASONED_NOQA = re.compile(
+    r"#\s*noqa:\s*(?P<codes>[A-Z]+\d+(?:\s*,\s*[A-Z]+\d+)*)\s*(?:--|—|-|:)\s*[^\s\-—:]",
+    re.IGNORECASE,
+)
+
+
+def reasoned_noqa(lines: list[str], lineno: int, code: str) -> bool:
+    """True when ``lineno`` carries ``# noqa: <code>`` *with a stated reason*.
+
+    A repo that gates on Ruff has already adjudicated the line a detector is about
+    to flag, and the reason it wrote down is the benign explanation a candidate
+    names — so a detector that mirrors a Ruff rule reads a reasoned suppression
+    of that rule as "a lead to confirm", not as a defect. A bare ``# noqa: CODE``
+    states no reason and proves nothing; it stays a finding.
+
+    The suppression may sit on the flagged line itself or on a comment-only line
+    directly below it (the first line of a block body, where a long reason lands
+    once the header line is full). ``lines`` is the file's text split into lines,
+    ``lineno`` is 1-based.
+    """
+    wanted = code.upper()
+    for index in (lineno, lineno + 1):
+        if not 0 < index <= len(lines):
+            continue
+        text = lines[index - 1]
+        if index != lineno and not text.lstrip().startswith("#"):
+            continue
+        for match in _REASONED_NOQA.finditer(text):
+            codes = {c.strip().upper() for c in match.group("codes").split(",")}
+            if wanted in codes:
+                return True
+    return False
+
+
 class _ParseCache:
     """The last file read, held only until a different one is asked for.
 
