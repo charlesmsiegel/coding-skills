@@ -186,3 +186,78 @@ def test_a_private_module_has_no_public_surface_but_init_does(tmp_path):
         ("impl.py", "public_function_no_docstring"), ("impl.py", "public_class_no_docstring"),
         ("__init__.py", "public_function_no_docstring"), ("__init__.py", "public_class_no_docstring"),
     }
+
+
+# --------------------------------------------------------------------------- #
+# missing_return_annotation / missing_param_annotation
+# --------------------------------------------------------------------------- #
+
+GAPS = ("missing_return_annotation", "missing_param_annotation")
+
+
+def gaps(findings: list[dict]) -> list[tuple[int, str]]:
+    return sorted((f["line"], f["smell_type"]) for f in findings if f["smell_type"] in GAPS)
+
+
+def test_closures_and_methods_of_private_or_local_classes_are_not_api_surface(tmp_path):
+    write(tmp_path, {"m.py": (
+        "def outer(x: int) -> int:\n"            # 1
+        "    def helper(y):\n"                  # 2  closure
+        "        return y + 1\n"
+        "    class Local:\n"
+        "        def run(self, z):\n"           # 5  method of a class inside a function
+        "            return z\n"
+        "    return helper(x)\n"
+        "class _Private:\n"
+        "    def run(self, z):\n"               # 9  method of a private class
+        "        return z\n"
+        "    class Inner:\n"
+        "        def go(self, q):\n"            # 12 nested in a private class
+        "            return q\n"
+        "class Public:\n"
+        "    def run(self, z):\n"               # 15 public method: still reported
+        "        return z\n"
+        "def plain(a):\n"                       # 17 module function: still reported
+        "    return a\n"
+    )})
+    assert [line for line, _ in gaps(run_detector("find_type_gaps.py", tmp_path))] == [15, 17]
+
+
+def test_route_handlers_are_exempt_and_the_same_function_undecorated_is_not(tmp_path):
+    write(tmp_path, {"m.py": (
+        "from fastapi import APIRouter\n"
+        "from flask import Flask\n"
+        "router = APIRouter()\n"
+        "app = Flask(__name__)\n"
+        "@router.get('/things/{tid}')\n"
+        "def get_thing(tid: str):\n"           # 6
+        "    return {'id': tid}\n"
+        "@router.post('/things', response_model=dict)\n"
+        "async def make_thing(body):\n"        # 9
+        "    return body\n"
+        "@app.route('/index')\n"
+        "def index():\n"                       # 12
+        "    return 'hi'\n"
+        "def get_other(tid: str):\n"           # 14 not registered: still reported
+        "    return {'id': tid}\n"
+    )})
+    assert gaps(run_detector("find_type_gaps.py", tmp_path)) == [(14, "missing_return_annotation")]
+
+
+def test_a_bare_signature_is_one_finding_that_names_both_gaps(tmp_path):
+    write(tmp_path, {"m.py": (
+        "def both(a, b):\n    return a\n"
+        "def params_only(a) -> int:\n    return a\n"
+        "def return_only(a: int):\n    return a\n"
+    )})
+    found = run_detector("find_type_gaps.py", tmp_path)
+    assert gaps(found) == [(1, "missing_return_annotation"), (3, "missing_param_annotation"),
+                           (5, "missing_return_annotation")]
+    both = next(f for f in found if f["line"] == 1)
+    assert "a, b" in both["description"] and "a, b" in both["suggestion"]
+
+
+def test_ignoring_the_return_gap_still_reports_the_parameters(tmp_path):
+    write(tmp_path, {"m.py": "def both(a, b):\n    return a\n"})
+    found = run_detector("find_type_gaps.py", tmp_path, "--ignore", "missing_return_annotation")
+    assert gaps(found) == [(1, "missing_param_annotation")]

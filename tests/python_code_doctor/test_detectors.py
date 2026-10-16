@@ -170,6 +170,8 @@ CASES = [
                 "    return a\n"
                 "def g(b: Any) -> Any:\n"
                 "    return b\n"
+                "def h(c) -> int:\n"
+                "    return c\n"
                 "x = 1  # type: ignore\n"
             )
         },

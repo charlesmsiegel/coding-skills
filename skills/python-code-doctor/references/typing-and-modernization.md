@@ -25,8 +25,13 @@ the checker out of spite. Adopt it as a ratchet.
    mostly by ignoring, not fixing, at first. That establishes the baseline.
 2. **Annotate boundaries first.** Public functions, public methods, module-level
    APIs — the surfaces other code calls. That's exactly what `find_type_gaps.py`
-   flags as `missing_return_annotation` / `missing_param_annotation`. Internal
-   one-line helpers can wait; their callers will infer fine.
+   flags as `missing_return_annotation` / `missing_param_annotation` (a signature
+   missing both is one finding naming both). Internal one-line helpers can wait;
+   their callers will infer fine — which is why closures and methods of `_Private`
+   classes are not flagged. Neither are web route handlers: the framework calls
+   them, and in FastAPI a return annotation *becomes* the response model, so adding
+   one changes validation and the published schema. Decide that on purpose, not as
+   part of a typing pass.
 3. **Tighten file by file.** Use per-module overrides to enable
    `disallow_untyped_defs` on modules you've fully typed, leaving the rest lax.
    Each cleaned module ratchets one notch; the baseline can only shrink.
