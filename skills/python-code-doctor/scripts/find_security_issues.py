@@ -27,10 +27,13 @@ Finds:
 import ast
 import json
 import argparse
+import re
+import string
 from pathlib import Path
 from dataclasses import dataclass, asdict
 from collections import defaultdict
-from common import sort_findings, cached_parse, SEVERITY_ICONS, configure_output, find_python_files, warn_detector_error, warn_unparseable
+from common import (sort_findings, cached_parse, SEVERITY_ICONS, configure_output, find_python_files,
+                    looks_like_test, warn_detector_error, warn_unparseable)
 
 
 @dataclass
@@ -155,6 +158,9 @@ def _leading_sql_literal(node) -> str | None:
     if isinstance(node, ast.BinOp):
         if isinstance(node.left, ast.Constant) and isinstance(node.left.value, str):
             return node.left.value
+        if isinstance(node.left, ast.BinOp):
+            # 'CREATE TABLE "' + name + '" (...)' nests to the left.
+            return _leading_sql_literal(node.left)
         return None
     if isinstance(node, ast.Call):
         func = node.func
@@ -165,17 +171,121 @@ def _leading_sql_literal(node) -> str | None:
     return None
 
 
-def _is_pragma_sql(node) -> bool:
-    """True when the executed SQL text begins with the PRAGMA keyword.
+# Statements that take no bound parameters where the interpolation goes: a
+# table, view, trigger or column name in DDL, a PRAGMA's argument, a DEFAULT.
+_UNBINDABLE_KEYWORDS = frozenset({"create", "drop", "alter", "pragma"})
+_LEADING_WORD = re.compile(r"\s*([A-Za-z]+)")
 
-    SQLite PRAGMA statements accept no bound parameters — an identifier such as
-    a table name cannot be passed as a ``?`` placeholder — so interpolation is
-    the only way to write a dynamic-table PRAGMA. Flagging that as injection is
-    a false positive when the interpolated value is not attacker-controlled, so
-    the caller downgrades it to an unscored lead rather than a scored finding.
+
+def _unbindable_keyword(node) -> str | None:
+    """The leading DDL/PRAGMA keyword of the executed SQL text, upper-cased.
+
+    SQLite (like most engines) accepts no bound parameter for an identifier —
+    `DROP TABLE ?` is not a statement it will run — so interpolation is the only
+    way to write DDL against a dynamic name. Flagging that as injection is a
+    false positive when the name is not attacker-controlled, so the caller
+    downgrades it to an unscored lead rather than a scored finding.
     """
     prefix = _leading_sql_literal(node)
-    return prefix is not None and prefix.lstrip().lower().startswith("pragma")
+    match = _LEADING_WORD.match(prefix or "")
+    if match and match.group(1).lower() in _UNBINDABLE_KEYWORDS:
+        return match.group(1).upper()
+    return None
+
+
+def _is_quoting_call(node) -> bool:
+    """`_quote_table(name)`, `quote_ident(x)`: a value made an identifier on purpose."""
+    if not isinstance(node, ast.Call):
+        return False
+    func = node.func
+    name = func.id if isinstance(func, ast.Name) else (func.attr if isinstance(func, ast.Attribute) else "")
+    return "quote" in name.lower()
+
+
+def _sql_parts(node):
+    """The SQL as an ordered list of ("text", str) and ("value", expr) parts.
+
+    None for a shape whose positions cannot be read (a template that is not a
+    literal, a %-format whose specifiers do not line up with its values).
+    """
+    if isinstance(node, ast.JoinedStr):
+        parts = []
+        for piece in node.values:
+            if isinstance(piece, ast.Constant) and isinstance(piece.value, str):
+                parts.append(("text", piece.value))
+            elif isinstance(piece, ast.FormattedValue):
+                parts.append(("value", piece.value))
+            else:
+                return None
+        return parts
+    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
+        left, right = _sql_parts(node.left), _sql_parts(node.right)
+        if left is None or right is None:
+            return None
+        return left + right
+    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Mod):
+        if not (isinstance(node.left, ast.Constant) and isinstance(node.left.value, str)):
+            return None
+        values = node.right.elts if isinstance(node.right, ast.Tuple) else [node.right]
+        texts = re.split(r"%[-#0 +]*\d*(?:\.\d+)?[sdirfgx]", node.left.value.replace("%%", "\0"))
+        if len(texts) != len(values) + 1:
+            return None
+        parts = [("text", texts[0])]
+        for value, text in zip(values, texts[1:]):
+            parts += [("value", value), ("text", text)]
+        return parts
+    if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr == "format":
+        template = node.func.value
+        if not (isinstance(template, ast.Constant) and isinstance(template.value, str)):
+            return None
+        try:
+            fields = list(string.Formatter().parse(template.value))
+        except ValueError:
+            return None
+        # Which argument fills which field is not tracked; every field stands
+        # for "some argument", and every argument must be an identifier.
+        arguments = list(node.args) + [kw.value for kw in node.keywords]
+        if not arguments:
+            return None
+        parts = []
+        for text, field, _spec, _conversion in fields:
+            parts.append(("text", text))
+            if field is not None:
+                parts.append(("value", arguments[0] if len(arguments) == 1 else ast.Tuple(elts=arguments)))
+        return parts
+    if isinstance(node, ast.Constant) and isinstance(node.value, str):
+        return [("text", node.value)]
+    return [("value", node)]
+
+
+def _interpolates_only_identifiers(node) -> bool:
+    """True when every interpolated value is an identifier, not data.
+
+    An identifier position is one a bound parameter cannot fill, so
+    interpolation there is the only spelling: a value passed through a quoting
+    function, or one written inside a double-quoted SQL identifier
+    (`UPDATE t SET "{column}"=?`). A value inside a single-quoted string
+    literal is data, and the classic injection — it never qualifies.
+    """
+    parts = _sql_parts(node)
+    if not parts or not any(kind == "value" for kind, _ in parts):
+        return False
+    state = None                      # None, or the quote character we are inside
+    for kind, piece in parts:
+        if kind == "text":
+            for char in piece:
+                if state is None and char in "'\"":
+                    state = char
+                elif char == state:
+                    state = None      # a doubled quote closes and reopens: net no change
+            continue
+        values = piece.elts if isinstance(piece, ast.Tuple) else [piece]
+        if state == '"':
+            continue
+        if state is None and all(_is_quoting_call(v) for v in values):
+            continue
+        return False
+    return True
 
 
 # --------------------------------------------------------------------------- #
@@ -567,6 +677,8 @@ def detect(tree, filename, lines, ignore):
         issues.append(CodeSmell(filename, line, st, desc, sug, sev, _get_line(lines, line),
                                 kind, tuple(also_caused_by)))
 
+    in_test = looks_like_test(filename)
+
     for node in ast.walk(tree):
 
         # ------------------------------------------------------------------ #
@@ -590,31 +702,38 @@ def detect(tree, filename, lines, ignore):
                   and node.args
                   and _is_dynamic_string(node.args[0])):
                 if proof.proves(node.args[0]):
-                    # Every interpolated piece is spelled out in this file —
-                    # `",".join("?" * len(ids))`, a clause chosen between two
-                    # literals. No value from outside reaches the statement.
-                    pass
-                elif _is_pragma_sql(node.args[0]):
-                    # PRAGMA takes no bound parameters, so a dynamic-table PRAGMA
-                    # must be interpolated. Keep it as an unscored lead rather
-                    # than a scored SQL-injection finding.
+                    continue
+                keyword = _unbindable_keyword(node.args[0])
+                identifiers = not keyword and quoted_constant_sql(node.args[0])
+                reasons = []
+                if keyword:
+                    # DDL and PRAGMA take no bound parameters, so a dynamic
+                    # name there must be interpolated.
+                    reasons += [
+                        f"{keyword} accepts no bound parameters, so a dynamic identifier can "
+                        "only be interpolated — this is the only spelling",
+                        "the interpolated value is validated against a known set of table "
+                        "names before it reaches the statement",
+                    ]
+                elif identifiers:
+                    reasons.append(
+                        "every interpolated value is an identifier — passed through a quoting "
+                        "function or written inside a double-quoted name — a position no bound "
+                        "parameter can fill; confirm the quoting doubles an embedded `\"`")
+                if in_test:
+                    reasons.append(
+                        "the SQL is built by a test from values the test itself wrote; no "
+                        "untrusted input reaches it")
+                if reasons:
+                    # Kept as an unscored lead rather than a scored
+                    # SQL-injection finding: what would make it one (an
+                    # attacker reaching the value) is not visible here.
+                    what = (f"interpolates a value into a {keyword} statement" if keyword
+                            else "interpolates only quoted identifiers into SQL" if identifiers
+                            else "passes a dynamically built SQL string in a test file")
                     add(node.lineno, "sql_injection",
-                        f"Call to .{func.attr}() interpolates a value into a PRAGMA statement",
-                        "", "high", kind="candidate",
-                        also_caused_by=(
-                            "PRAGMA accepts no bound parameters, so a dynamic identifier can "
-                            "only be interpolated — this is the only spelling",
-                            "the interpolated value is validated against a known set of table "
-                            "names before it reaches the statement",
-                        ))
-                elif quoted_constant_sql(node.args[0]):
-                    add(node.lineno, "sql_injection",
-                        f"Call to .{func.attr}() interpolates quoted constant SQL identifiers",
-                        "", "high", kind="candidate",
-                        also_caused_by=(
-                            "SQL identifiers cannot be passed as bound query parameters",
-                            "constant table and column names are quoted using the database backend",
-                        ))
+                        f"Call to .{func.attr}() {what}",
+                        "", "high", kind="candidate", also_caused_by=reasons)
                 else:
                     add(node.lineno, "sql_injection",
                         f"Call to .{func.attr}() passes a dynamically built SQL string",

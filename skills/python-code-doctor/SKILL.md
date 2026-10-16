@@ -205,6 +205,7 @@ at a time and the evidence is elsewhere:
 | `sql_injection` on a `PRAGMA` statement | PRAGMA accepts no bound parameters, so a dynamic identifier has no parameterized spelling |
 | `assert_for_validation` on `assert x is not None` / `assert isinstance(...)` | that shape usually narrows a type for the checker and records an invariant the caller guarantees |
 | `local_import` of a slow-to-import package (torch, transformers, ...) or inside a CLI command | deferral to keep startup and `--help` fast is the usual reason, and only the author knows |
+| `sql_injection` on DDL or a `PRAGMA`, on quoted identifiers only, or in a test | a bound parameter cannot fill an identifier position, so interpolation is the only spelling, and a test builds its SQL from its own values; whether a name is attacker-controlled shows only at the call sites |
 | `swallowed_exception` / `catches_baseexception` under a reasoned `# noqa: BLE001 -- why` | the repo's own lint gate adjudicated the line; the reason is what to check, and a bare noqa stays a finding |
 | `global_rebind` under a reasoned `# noqa: PLW0603 -- why` | an at-fork or install-once hook has no caller to return a value to |
 | `mutable_class_attribute` that nothing in the module mutates | a read-only table shared on purpose looks the same; only another module's code can show a mutation |

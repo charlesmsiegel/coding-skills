@@ -656,3 +656,50 @@ def test_kwargs_whose_signature_someone_else_chose_are_not_flagged(tmp_path, sou
 def test_kwargs_that_only_swallow_typos_are_still_flagged(tmp_path, source):
     found = records("find_ai_scaffolding.py", tmp_path, source, "unused_kwargs")
     assert len(findings(found)) == 1
+
+
+# ---- sql_injection ----------------------------------------------------------- #
+
+
+@pytest.mark.parametrize("statement", [
+    # DDL takes no bound parameter for a name
+    "conn.execute(f'DROP TABLE {_quote_table(n)}')",
+    "conn.execute(f'CREATE TABLE {n} (body TEXT)')",
+    "conn.execute('CREATE TABLE \"' + n + '\" (body TEXT)')",
+    "conn.execute(f'ALTER TABLE t ADD COLUMN {n} TEXT')",
+    # identifiers only: a quoting function, or a double-quoted name
+    "conn.execute(f'DELETE FROM {_quote_table(n)}')",
+    "conn.execute(f'UPDATE t SET \"{col}\"=?', (v,))",
+    "conn.execute('SELECT * FROM \"{}\"'.format(n))",
+    "conn.execute('SELECT * FROM %s' % quote_ident(n))",
+])
+def test_sql_a_bound_parameter_cannot_replace_is_a_candidate(tmp_path, statement):
+    found = records("find_security_issues.py", tmp_path,
+                    f"def f(conn, n, col, v):\n    {statement}\n", "sql_injection")
+    assert len(found) == 1
+    assert_candidate_shape(found[0])
+
+
+@pytest.mark.parametrize("statement", [
+    "cur.execute(f\"SELECT * FROM users WHERE name = '{name}'\")",
+    # a value inside a string literal is data, double quotes in it or not
+    "cur.execute(f\"SELECT * FROM t WHERE note = 'say \\\"{name}\\\"'\")",
+    # one identifier does not excuse a data value beside it
+    "cur.execute(f\"SELECT * FROM \\\"{t}\\\" WHERE a = '{name}'\")",
+    "cur.execute('SELECT * FROM users WHERE id = ' + name)",
+])
+def test_sql_that_interpolates_data_is_still_a_finding(tmp_path, statement):
+    found = records("find_security_issues.py", tmp_path,
+                    f"def f(cur, name, t):\n    {statement}\n", "sql_injection")
+    assert len(findings(found)) == 1
+    assert found[0]["severity"] == "high"
+
+
+def test_sql_built_in_a_test_file_is_a_candidate(tmp_path):
+    found = records("find_security_issues.py", tmp_path,
+                    "def test_count(conn, table):\n"
+                    "    assert conn.execute('SELECT count(*) FROM ' + table).fetchone()\n",
+                    "sql_injection", name="tests/test_purge.py")
+    assert len(found) == 1
+    assert_candidate_shape(found[0])
+    assert "test" in found[0]["description"]
