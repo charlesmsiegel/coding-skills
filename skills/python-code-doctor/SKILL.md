@@ -213,6 +213,12 @@ at a time and the evidence is elsewhere:
 | `mutable_class_attribute` that nothing in the module mutates | a read-only table shared on purpose looks the same; only another module's code can show a mutation |
 | `raise_without_from` on an `HTTPException` | the framework renders it as a response and never prints the chain |
 | `assert_for_validation` outside a public function's argument check | an invariant or type narrowing holds under `-O` too; only the call sites show whether input reaches it |
+| `feature_envy`, `try_finally_close` | whether the receiver is a strategy's context, or a context manager, is decided where its class is defined |
+
+Others are candidates because the file states a reason the detector cannot
+weigh — a reasoned `# noqa: E402`, a docstring documenting an import order, two
+copies of a block (below the rule of three), keyword-only flags, one short
+type switch. Each record's `also_caused_by` names the readings to rule out.
 
 Confirm one before acting on it — deleting a "dead" public function on a
 single-file verdict deletes live code. `format_findings.py` files candidates as
