@@ -872,3 +872,76 @@ def test_a_list_that_already_holds_items_is_extended_not_replaced(tmp_path):
     found = of_type(run_detector("find_loop_simplifications.py", tmp_path), "loop_to_comprehension")
     assert [(r["line"], ".extend(" in r["suggestion"]) for r in found] == [
         (3, True), (7, True), (9, True)]
+
+
+# --------------------------------------------------------------------------- #
+# find_local_imports
+# --------------------------------------------------------------------------- #
+
+
+def test_an_import_after_a_path_bootstrap_is_at_the_top(tmp_path):
+    write(tmp_path, {
+        "script.py": """\
+            import os
+            import sys
+            from pathlib import Path
+
+            REPO = Path(__file__).resolve().parents[1]
+            if str(REPO) not in sys.path:
+                sys.path.insert(0, str(REPO))
+            os.environ["APP_HOME"] = "/tmp/app"
+
+            import app
+            """,
+        "late.py": """\
+            import os
+
+            def helper():
+                return os.sep
+
+            import json
+            """,
+    })
+    found = of_type(run_detector("find_local_imports.py", tmp_path), "import_not_at_top")
+    assert [(Path(r["file"]).name, r["line"], r["kind"]) for r in found] == [("late.py", 6, "finding")]
+
+
+def test_a_reasoned_e402_suppression_is_a_lead(tmp_path):
+    write(tmp_path, {"sample.py": """\
+        import os
+
+        def helper():
+            return os.sep
+
+        import dataclasses  # noqa: E402 - deliberate late import, after the fixtures
+        import json  # noqa: E402
+        """})
+    found = of_type(run_detector("find_local_imports.py", tmp_path), "import_not_at_top")
+    # A bare suppression says nothing about why.
+    assert sorted((r["line"], r["kind"]) for r in found) == [(6, "candidate"), (7, "finding")]
+    lead = next(r for r in found if r["kind"] == "candidate")
+    assert_candidate_shape(lead)
+    assert "deliberate late import" in lead["also_caused_by"][0]
+
+
+def test_a_documented_import_order_is_a_lead(tmp_path):
+    write(tmp_path, {"entry.py": '''\
+        """Process entrypoint.
+
+        Ordering matters: the socket is bound before anything of uvicorn or
+        webapp is imported. The reply is json, and nothing about the order
+        in which the helpers below are defined or imported matters to it.
+        """
+        import socket
+
+
+        def start():
+            sock = socket.socket()
+            import uvicorn
+            from webapp.main import app
+            import json
+            return sock, uvicorn, app, json
+        '''})
+    found = of_type(run_detector("find_local_imports.py", tmp_path), "local_import")
+    assert sorted((r["line"], r["kind"]) for r in found) == [
+        (12, "candidate"), (13, "candidate"), (14, "finding")]

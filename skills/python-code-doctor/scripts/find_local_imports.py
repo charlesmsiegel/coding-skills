@@ -23,12 +23,26 @@ the author knows):
   - an import inside a CLI command (`@app.command()`, `@app.callback()`,
     `@click.command`, `@click.group`), which keeps `--help` and the other
     subcommands from paying for one subcommand's dependencies
+  - a module-level import after a path bootstrap — statements that modify
+    `sys.path` or `os.environ` (and the `X = Path(__file__)...` they are
+    computed from). The import cannot move above the code that makes it
+    importable; pycodestyle's E402 exempts the same statements.
+
+Reported as candidates, because the file itself says why:
+  - a module-level import after other code carrying `# noqa: E402` *with a
+    stated reason* (`# noqa: E402 - deliberate late import`): the repo gates on
+    the rule and adjudicated this line. A bare `# noqa: E402` states nothing.
+  - a function-level import of a module the module docstring names in a
+    sentence about importing ("before anything of uvicorn is imported"): a
+    documented deliberate import order, such as a process entry point that must
+    answer before it loads its heavy dependencies.
 """
 
 import ast
 import functools
 import json
 import warnings
+import re
 import argparse
 from pathlib import Path
 from dataclasses import dataclass, asdict
@@ -236,6 +250,60 @@ def _imported_packages(node) -> list:
     if node.level:
         return [""]
     return [(node.module or "").split(".")[0]]
+# A noqa comment whose code list is followed by a separator and a reason. A
+# bare suppression states no reason and proves nothing.
+_REASONED_NOQA = re.compile(
+    r"#\s*noqa:\s*(?P<codes>[A-Z]+\d+(?:\s*,\s*[A-Z]+\d+)*)\s*(?:--|—|-|:)\s*(?P<reason>[^\s\-—:].*)",
+    re.IGNORECASE,
+)
+# What a path bootstrap touches before the imports it makes possible.
+_BOOTSTRAP_MARKERS = ("sys.path", "os.environ", "os.putenv", "site.addsitedir", "importorskip")
+_IMPORT_WORD = re.compile(r"\bimport(?:s|ed|ing)?\b", re.IGNORECASE)
+
+
+def _reasoned_noqa(lines: list[str], node: ast.stmt, code: str) -> str | None:
+    """The reason a `# noqa: <code> - reason` on the statement's lines gives, if any."""
+    for number in range(node.lineno, (node.end_lineno or node.lineno) + 1):
+        if not 0 < number <= len(lines):
+            continue
+        match = _REASONED_NOQA.search(lines[number - 1])
+        if match and code in {c.strip().upper() for c in match.group("codes").split(",")}:
+            return match.group("reason").strip()
+    return None
+
+
+def _is_bootstrap(stmt) -> bool:
+    """A statement that makes later imports importable: it edits sys.path or
+    the environment, computes the path it puts there from `__file__`, or is an
+    `if` holding nothing else."""
+    if isinstance(stmt, ast.If):
+        return all(_is_bootstrap(s) for s in stmt.body + stmt.orelse)
+    if not isinstance(stmt, (ast.Expr, ast.Assign, ast.AnnAssign, ast.AugAssign)):
+        return False
+    source = ast.unparse(stmt)
+    if any(marker in source for marker in _BOOTSTRAP_MARKERS):
+        return True
+    return isinstance(stmt, (ast.Assign, ast.AnnAssign)) and stmt.value is not None \
+        and "__file__" in ast.unparse(stmt.value)
+
+
+# How far apart, in words, a module's name and an "import" may sit and still be
+# one statement about importing it ("before anything of uvicorn or grimoire is
+# imported"), rather than a sentence that mentions both in passing.
+_DEFERRAL_WINDOW = 6
+
+
+def _docstring_deferral(tree, top: str) -> str | None:
+    """The sentence of the module docstring that says something about
+    importing ``top``, if there is one."""
+    doc = ast.get_docstring(tree) or ""
+    for sentence in re.split(r"(?<=[.!?])\s+", doc):
+        words = [w.rstrip(".") for w in re.findall(r"[A-Za-z_][\w.]*", sentence)]
+        named = [i for i, w in enumerate(words) if w.split(".")[0] == top]
+        importing = [i for i, w in enumerate(words) if _IMPORT_WORD.fullmatch(w)]
+        if any(abs(i - j) <= _DEFERRAL_WINDOW for i in named for j in importing):
+            return " ".join(sentence.split())
+    return None
 
 
 def _get_line(lines, lineno):
@@ -308,7 +376,9 @@ def _only_imports(stmt) -> bool:
 def detect(tree, filename, lines, ignore):
     issues = []
 
-    def add(line, st, desc, sug, sev, kind="finding", also_caused_by=()):
+    def add(line, st, desc, sug, sev, kind="finding", also_caused_by=(), reasons=()):
+        if reasons:
+            kind, also_caused_by, sug = "candidate", tuple(reasons), ""
         if st in ignore:
             return
         issues.append(CodeSmell(filename, line, st, desc, sug, sev, _get_line(lines, line),
@@ -330,8 +400,10 @@ def detect(tree, filename, lines, ignore):
                     if not heavy:  # first-party: is it slow because of what *it* loads?
                         chain = _deferred_chain(child, Path(filename))
                         heavy = chain is not None
-                    if heavy or in_command:
-                        reasons = (_HEAVY_REASONS if heavy else ()) + (_CLI_REASONS if in_command else ())
+                    documented = next(filter(None, (_docstring_deferral(tree, top)
+                                       for top in _imported_packages(child))), None)
+                    if heavy or in_command or documented:
+                        reasons = ((f"The module docstring explains deliberate deferral: {documented}",) if documented else ()) + (_HEAVY_REASONS if heavy else ()) + (_CLI_REASONS if in_command else ())
                         where = "a CLI command" if in_command else "a function"
                         loads = f", which loads {chain} at import time" if chain else ""
                         add(child.lineno, "local_import",
@@ -360,15 +432,17 @@ def detect(tree, filename, lines, ignore):
     for i, stmt in enumerate(tree.body):
         if isinstance(stmt, (ast.Import, ast.ImportFrom)):
             if seen_code and id(stmt) not in guarded:
+                reason = _reasoned_noqa(lines, stmt, "E402")
                 add(stmt.lineno, "import_not_at_top",
                     "Module-level import placed after other code instead of at the top of the file",
                     "Move all imports to the top of the module (after the docstring and __future__ imports).",
-                    "low")
+                    "low",
+                    reasons=[f"the line suppresses E402 with a stated reason: {reason}"] if reason else ())
             continue
         # statements allowed above imports without counting as "real code"
         if i == 0 and isinstance(stmt, ast.Expr) and isinstance(stmt.value, ast.Constant) and isinstance(stmt.value.value, str):
             continue  # module docstring
-        if _is_dunder_assign(stmt) or _only_imports(stmt):
+        if _is_dunder_assign(stmt) or _only_imports(stmt) or _is_bootstrap(stmt):
             continue
         seen_code = True
 
