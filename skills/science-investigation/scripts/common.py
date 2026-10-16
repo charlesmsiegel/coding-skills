@@ -84,6 +84,15 @@ def wanted(path: Path, suffixes) -> bool:
     return CONFIG_SUFFIXES <= suffixes and is_config(path)
 
 
+# Installed skill payloads belong to the tooling, not to the host project.
+# Match the pair, not the agent directory: hooks and other configuration there
+# are still project inputs. Paths are relative to the scan root so an explicit
+# scan of a skill continues to work.
+def is_installed_skill(parts) -> bool:
+    return any(parent in {".codex", ".claude", ".kiro", ".agents"} and child == "skills"
+               for parent, child in zip(parts, parts[1:]))
+
+
 def iter_files(root: Path, suffixes) -> list:
     """Every file under `root` with one of `suffixes`, sorted, vendored trees skipped."""
     root = Path(root)
@@ -93,7 +102,8 @@ def iter_files(root: Path, suffixes) -> list:
     for path in root.rglob("*"):
         if not path.is_file() or not wanted(path, suffixes):
             continue
-        if EXCLUDE_DIRS.isdisjoint(path.relative_to(root).parts):
+        if (EXCLUDE_DIRS.isdisjoint(path.relative_to(root).parts)
+                and not is_installed_skill(path.relative_to(root).parts)):
             found.append(path)
     return sorted(found)
 
