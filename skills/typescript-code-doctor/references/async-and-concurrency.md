@@ -130,6 +130,15 @@ makes the failure not matter), **translate** it (add context, re-throw with
 `cause`), or **let it through** (do not catch). "Log and continue" is not one of
 them unless the operation is genuinely optional — and then say so in a comment.
 
+That is also how the detectors read it. `.catch(() => null)` whose result the
+caller keeps and branches on (`const live = await find().catch(() => null); if
+(!live) …`) *handles* the failure, as does `.then(onOk, onErr)`; neither is
+reported. A statement-level `.catch(() => {})` with a comment beside it, or on a
+promise someone else holds (`await settling.catch(() => {})`), is reported as a
+candidate to confirm rather than a swallowed rejection. A `catch` block that
+records the failure — sets a flag or sentinel the code reads afterwards, or
+puts the error in front of the user — is handling it too.
+
 ## Reviewing async code
 
 1. Every promise-returning call: awaited, returned, or `.catch`ed?

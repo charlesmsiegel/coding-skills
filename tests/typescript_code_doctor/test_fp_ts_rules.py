@@ -429,3 +429,58 @@ export function classify(err: { status: number }, bytes: number, step: number): 
 def test_status_codes_and_unit_constants_are_not_magic(tmp_path):
     found = records("find_code_smells.py", tmp_path, {"classify.ts": MAGIC}, "magic_number")
     assert lines_of(found) == [5, 6], "`step === 4` and `* 37` still need names"
+
+
+# --------------------------------------------------------------------------- #
+# find_async_issues: a rejection turned into a value is handled; an explained or
+# shared one is a lead; a two-argument then handles; a test stub may be async
+# --------------------------------------------------------------------------- #
+
+REJECTIONS = """\
+export async function recover(api: Api, settling: Promise<void>): Promise<string> {
+  const live = await api.find().catch(() => null);
+  if (!live) throw new Error("gone");
+  chain.current = task.catch(() => undefined);
+  void p.catch(() => {}).then(() => next());
+  queue(api.load().catch(() => null), 1);
+  const later = () => api.find().catch(() => null);
+  // A budget is optional: a failed read leaves the bar undrawn.
+  api.budget().then(setBudget).catch(() => {});
+  await settling.catch(() => {});
+  api.cast().then(setCast).catch(() => {});
+  await reload().catch(() => {});
+  return String(live) + String(later);
+}
+"""
+
+
+def test_a_rejection_turned_into_a_value_is_not_swallowed(tmp_path):
+    found = records("find_async_issues.py", tmp_path, {"recover.ts": REJECTIONS}, "swallowed_rejection")
+    findings = [r["line"] for r in found if r["kind"] == "finding"]
+    candidates = [r["line"] for r in found if r["kind"] == "candidate"]
+    assert findings == [11, 12], "a discarded `.catch(() => {})` on a promise made here is still swallowed"
+    assert candidates == [9, 10], "a commented optional read and a shared promise are leads"
+
+
+def test_a_two_argument_then_handles_the_rejection(tmp_path):
+    source = """\
+export async function save(): Promise<void> { await fetch("/x"); }
+export function run(onOk: () => void, onErr: (e: unknown) => void): void {
+  const pending = save();
+  pending.then(onOk, onErr);
+  pending.then(onOk);
+}
+"""
+    found = records("find_async_issues.py", tmp_path, {"run.ts": source}, "floating_promise")
+    assert lines_of(found) == [5]
+
+
+def test_an_empty_async_stub_in_a_test_is_not_async_without_await(tmp_path):
+    source = """\
+import { it, expect } from "vitest";
+const props = { onSaved: async () => {} };
+async function slowly(): Promise<number> { return 1; }
+it("renders", async () => { await render(props); expect(await slowly()).toBe(1); });
+"""
+    found = records("find_async_issues.py", tmp_path, {"panel.test.ts": source}, "async_without_await")
+    assert lines_of(found) == [3], "a named async helper with a body and no await is still reported"
