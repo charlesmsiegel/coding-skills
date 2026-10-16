@@ -152,7 +152,7 @@ python "$SKILL/scripts/find_dead_code.py" .            # unused imports/exports,
 python "$SKILL/scripts/find_duplicates.py" .           # duplicated blocks, identical type shapes, repeated literals (not CSS class lists)
 
 # Safety net (build this BEFORE refactoring — see references/safety-net-and-testing.md)
-python "$SKILL/scripts/find_untested_modules.py" .     # source modules no test imports; "no tests in repo" alarm
+python "$SKILL/scripts/find_untested_modules.py" .     # source modules no test reaches; "no tests in repo" alarm
 python "$SKILL/scripts/find_test_smells.py" .          # assertion-less tests, .only/.skip, unawaited rejects, over-mocking
 
 # Simplification & hygiene
@@ -243,7 +243,7 @@ Four of these answer questions the detectors structurally **cannot**:
   a range is unpinned; only an advisory database can say the version you have is
   vulnerable.
 - **coverage** — what actually executed. `find_untested_modules.py` answers "does
-  a test import this"; coverage answers "does this code ever run".
+  a test reach this through its imports"; coverage answers "does this code ever run".
 
 **When a tool is missing, ask before installing.** The script never installs
 anything and never runs `npx` in download mode; it lists each absent tool with an

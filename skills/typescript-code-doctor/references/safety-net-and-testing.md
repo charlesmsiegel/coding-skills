@@ -94,9 +94,11 @@ Coverage is a **map of the untested**, not a score. Two questions it answers wel
 It answers "is this code correct" not at all: a suite of assertion-less tests hits
 100%.
 
-`find_untested_modules.py` answers a cheaper question — does *any* test import
-this module — which is enough to find the gaps before you start. Coverage
-(`run_external_tools.py --run-coverage`) answers the finer one.
+`find_untested_modules.py` answers a cheaper question — does *any* test reach
+this module, directly or through the modules it imports — which is enough to find
+the gaps before you start. Coverage (`run_external_tools.py --run-coverage`)
+answers the finer one: a page-level test reaches every component its page
+imports, but may never render the branch you are about to change.
 
 ## The order of operations
 
