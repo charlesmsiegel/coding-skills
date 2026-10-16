@@ -320,3 +320,40 @@ def test_loose_root_files_beside_real_packages_are_reported(run_script, repo):
     assert not any(p["roots"] == ["."] for p in proposal["packages"]), (
         "and it must not become a whole-repo package overlapping the real one"
     )
+
+
+def test_a_module_named_setup_py_does_not_make_a_package(run_script, repo):
+    """`app/setup.py` is a command module, not a packaging script; reading a
+    `name = "backend"` out of its body named a phantom package after it."""
+    repo.write("pyproject.toml", '[project]\nname = "tool"\n')
+    for module in ("__init__", "cli", "setup", "doctor"):
+        repo.write(f"src/tool/app/{module}.py", 'name = "backend"\nx = 1\n')
+    repo.write("src/tool/__init__.py", "")
+    repo.commit("init")
+    proposal = propose(run_script, repo)
+    assert "backend" not in names(proposal)
+    assert all("setup.py" not in package["evidence"] for package in proposal["packages"])
+
+
+def test_a_real_setup_script_still_names_a_package(run_script, repo):
+    repo.write("lib/setup.py", "from setuptools import setup\nsetup(name='legacy-lib')\n"
+               "name = 'legacy-lib'\n")
+    for module in ("a", "b", "c"):
+        repo.write(f"lib/legacy/{module}.py", "x = 1\n")
+    repo.commit("init")
+    assert "legacy-lib" in names(propose(run_script, repo))
+
+
+def test_a_test_package_is_not_proposed_as_an_importable_unit(run_script, repo):
+    """`tests/tui/__init__.py` makes the directory importable; it does not make
+    it a unit of the product. The tests are the doctor's evidence about the
+    packages they exercise."""
+    repo.write("pyproject.toml", '[project]\nname = "tool"\n')
+    for module in ("__init__", "a", "b", "c"):
+        repo.write(f"src/tool/{module}.py", "x = 1\n")
+    for module in ("__init__", "test_a", "test_b", "conftest"):
+        repo.write(f"tests/tui/{module}.py", "def test_x():\n    assert True\n")
+    repo.commit("init")
+    proposal = propose(run_script, repo)
+    assert all(package["roots"] != ["tests/tui"] for package in proposal["packages"])
+    assert all(package["roots"] != ["tests"] for package in proposal["packages"])
