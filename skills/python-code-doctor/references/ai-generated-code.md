@@ -63,7 +63,11 @@ can't raise, `hasattr`/`getattr(..., default)` guarding attributes that always e
 `**kwargs` catch-alls that are never read (`find_ai_scaffolding.py` flags the last).
 Each check reads as caution; together they bury the actual logic and silence the
 typos a real signature would have caught. Strip guards that defend against the
-impossible.
+impossible. The `**kwargs` check skips the signatures somebody else chose: a
+function handed over by reference (a callback, a `monkeypatch.setattr`
+replacement), a method on a class with a base (an override), a `*args, **kwargs`
+adapter that uses neither, and the explicit `**_ignored` — dropping the catch-all
+from any of those breaks the caller rather than catching its typo.
 
 ### Superfluous abstraction for a simple ask
 Asked for a function, AI delivers a class with a factory and a config dataclass;

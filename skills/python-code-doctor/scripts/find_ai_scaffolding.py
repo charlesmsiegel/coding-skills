@@ -11,8 +11,13 @@ Finds:
   - stub_not_implemented : function whose only effective body is raise NotImplementedError
   - empty_stub           : function whose body is only pass or ...
   - todo_implement       : comment with TODO/FIXME + implementation keyword
-  - placeholder_value    : string literal whose value is clearly a placeholder
-  - unused_kwargs        : **kwargs that is never referenced inside the body
+  - placeholder_value    : string literal whose value is clearly a placeholder —
+                           a whole-word token (CHANGEME, REPLACE_ME, your-api-key),
+                           or a reserved example.com host / lorem ipsum outside
+                           tests (in a test they are the right fixture values)
+  - unused_kwargs        : **kwargs that is never referenced inside the body, on a
+                           function whose signature is its own to choose (not a
+                           callback, an override, an adapter, or `**_ignored`)
 """
 
 import ast
@@ -22,7 +27,8 @@ import argparse
 from pathlib import Path
 from dataclasses import dataclass, asdict
 from collections import defaultdict
-from common import sort_findings, cached_parse, SEVERITY_ICONS, configure_output, find_python_files, warn_detector_error, warn_unparseable
+from common import (sort_findings, cached_parse, SEVERITY_ICONS, configure_output, find_python_files,
+                    looks_like_test, warn_detector_error, warn_unparseable)
 
 
 @dataclass
@@ -166,51 +172,41 @@ def _is_only_pass_or_ellipsis(func_node):
 # placeholder_value patterns
 # ---------------------------------------------------------------------------
 
-_PLACEHOLDER_EXACT = {
-    "lorem ipsum",
-    "your-api-key",
-    "your_api_key",
-    "api_key_here",
-    "api-key-here",
-    "replace_me",
-    "replaceme",
-    "changeme",
-    "change_me",
-}
-
-_PLACEHOLDER_CONTAINS = [
-    "example.com",
-]
-
-_PLACEHOLDER_STARTSWITH = [
-    "lorem ipsum",
-    "<your",
-]
-
-# The replace-me words count only as whole tokens: "a very long replacement"
-# contains `replaceme` and is prose. Underscore and hyphen separate tokens here
-# (`API_KEY_CHANGEME` is a placeholder), letters and digits do not.
-_PLACEHOLDER_REGEX = re.compile(
-    r"(your[_\-]api[_\-]key|api[_\-]key[_\-]here|insert_.+_here|<your"
-    r"|(?<![a-z0-9])(?:replace_me|replaceme|changeme|change_me)(?![a-z0-9]))",
+# Placeholder tokens, matched as whole words. Unanchored, `replaceme` matched
+# inside "replacement" and `replace_me` inside "replace_messages", so every
+# find-and-replace rule's `rule["replacement"]` read as a placeholder. A letter
+# or digit on either side means the token is part of a longer word; `_` and
+# `-` do not, so REPLACE_ME_WITH_KEY still matches.
+_PLACEHOLDER_TOKEN = re.compile(
+    r"(?<![A-Za-z0-9])"
+    r"(?:your[_\-]api[_\-]key|api[_\-]key[_\-]here|insert[_\-][\w\-]+?[_\-]here|replace[_\-]?me|change[_\-]?me)"
+    r"(?![A-Za-z0-9])"
+    r"|<your",
     re.IGNORECASE,
 )
 
+# RFC 2606 reserves these second-level domains for documentation, so in
+# shipping code a URL on one is a value nobody replaced. Matched as a host:
+# `myexample.com` is somebody's real domain.
+_EXAMPLE_HOST = re.compile(r"(?<![A-Za-z0-9-])example\.(?:com|org|net)(?![A-Za-z0-9-])", re.IGNORECASE)
 
-def _is_placeholder_string(value: str) -> bool:
-    """Return True if the string value looks like a placeholder."""
-    v = value.strip().lower()
-    if v in _PLACEHOLDER_EXACT:
+_LOREM = "lorem ipsum"
+
+
+def _is_placeholder_string(value: str, in_test: bool = False) -> bool:
+    """Return True if the string value looks like a placeholder.
+
+    In a test file a reserved example host and lorem-ipsum filler are not
+    placeholders: a fake endpoint on example.com is the correct fixture value
+    (RFC 2606 reserves it for exactly that, as RFC 6761 reserves `.test` and
+    `.invalid`), and filler text is the input under test. "Replace it with a
+    real value" is the wrong remedy for either.
+    """
+    if _PLACEHOLDER_TOKEN.search(value):
         return True
-    for pat in _PLACEHOLDER_CONTAINS:
-        if pat in v:
-            return True
-    for pat in _PLACEHOLDER_STARTSWITH:
-        if v.startswith(pat):
-            return True
-    if _PLACEHOLDER_REGEX.search(value):
-        return True
-    return False
+    if in_test:
+        return False
+    return value.strip().lower().startswith(_LOREM) or bool(_EXAMPLE_HOST.search(value))
 
 
 # ---------------------------------------------------------------------------
@@ -288,6 +284,47 @@ def _build_override_map(tree):
                 if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef)) and item.name in from_bases:
                     overrides.add(id(item))
     return overrides
+def _names_passed_by_reference(tree) -> set:
+    """Names loaded anywhere other than as the callee of a call.
+
+    A function named this way is handed to someone — `monkeypatch.setattr(m,
+    "f", boom)`, a callback, a registry — and the callee that will invoke it
+    dictates its signature. Its `**kwargs` absorbs arguments production code
+    passes, written against the real signature; dropping it makes that call
+    raise, and there is no typo of the author's for it to hide.
+    """
+    callees = {id(node.func) for node in ast.walk(tree) if isinstance(node, ast.Call)}
+    return {node.id for node in ast.walk(tree)
+            if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load) and id(node) not in callees}
+
+
+def _methods_of_derived_classes(tree) -> set:
+    """ids of methods defined directly in a class that inherits from something.
+
+    Such a method may override a base's or implement a protocol, whose
+    signature it has to accept whether or not it uses every argument.
+    """
+    result = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ClassDef) and any(
+                not (isinstance(base, ast.Name) and base.id == "object") for base in node.bases):
+            result.update(id(item) for item in node.body
+                          if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef)))
+    return result
+
+
+def _kwargs_owned_by_the_signature(func_node, by_reference, derived_methods, used) -> bool:
+    """True when `**kwargs` is there because someone else chose the signature."""
+    kwarg = func_node.args.kwarg.arg
+    if kwarg.startswith("_"):
+        return True                           # `**_ignored`: the declared-unused convention
+    if func_node.name in by_reference:
+        return True                           # a callback or a monkeypatched replacement
+    if id(func_node) in derived_methods:
+        return True                           # an override or a protocol implementation
+    vararg = func_node.args.vararg
+    # `*args, **kwargs` both unused: an adapter that absorbs any call shape.
+    return vararg is not None and vararg.arg not in used
 
 
 # ---------------------------------------------------------------------------
@@ -304,6 +341,9 @@ def detect(tree, filename, lines, ignore):
 
     class_map = _build_class_map(tree)
     overrides = _build_override_map(tree)
+    by_reference = _names_passed_by_reference(tree)
+    derived_methods = _methods_of_derived_classes(tree)
+    in_test = looks_like_test(filename)
 
     # -----------------------------------------------------------------------
     # stub_not_implemented, empty_stub, unused_kwargs
@@ -358,7 +398,8 @@ def detect(tree, filename, lines, ignore):
         ):
             kwarg_name = node.args.kwarg.arg
             used = _names_used_in_body(node)
-            if kwarg_name not in used:
+            if kwarg_name not in used and not _kwargs_owned_by_the_signature(
+                    node, by_reference, derived_methods, used):
                 add(
                     node.lineno,
                     "unused_kwargs",
@@ -386,22 +427,19 @@ def detect(tree, filename, lines, ignore):
 
     # -----------------------------------------------------------------------
     # placeholder_value  (AST scan for string Constants)
-    # Skip docstring constants — the first Expr(Constant(str)) in the body of
-    # a Module, ClassDef, FunctionDef, or AsyncFunctionDef.
+    # Skip a string that is a whole statement: a docstring, a PEP 257
+    # attribute docstring after an assignment, or a string used as a block
+    # comment. It has no runtime effect, so it is prose about the code, never
+    # a value that ships.
     # -----------------------------------------------------------------------
     _docstring_ids: set[int] = set()
     for node in ast.walk(tree):
-        if isinstance(node, (ast.Module, ast.ClassDef,
-                             ast.FunctionDef, ast.AsyncFunctionDef)):
-            body = node.body
-            if body:
-                first = body[0]
-                if (
-                    isinstance(first, ast.Expr)
-                    and isinstance(first.value, ast.Constant)
-                    and isinstance(first.value.value, str)
-                ):
-                    _docstring_ids.add(id(first.value))
+        if (
+            isinstance(node, ast.Expr)
+            and isinstance(node.value, ast.Constant)
+            and isinstance(node.value.value, str)
+        ):
+            _docstring_ids.add(id(node.value))
 
     for node in ast.walk(tree):
         if not isinstance(node, ast.Constant):
@@ -410,7 +448,7 @@ def detect(tree, filename, lines, ignore):
             continue
         if id(node) in _docstring_ids:
             continue
-        if _is_placeholder_string(node.value):
+        if _is_placeholder_string(node.value, in_test):
             add(
                 node.lineno,
                 "placeholder_value",
