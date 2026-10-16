@@ -64,6 +64,32 @@ def parse(ts, source: str, name: str = "sample.ts"):
 
 
 # --------------------------------------------------------------------------- #
+# Comments are located by character offset
+# --------------------------------------------------------------------------- #
+
+def test_an_explained_empty_catch_is_low_and_a_silent_one_high(tmp_path):
+    root = project(tmp_path, {"src/a.ts": """\
+export function f(g: () => void): void {
+  try { g(); } catch { /* best effort: the cache is rebuilt on the next read */ }
+  try { g(); } catch {}
+}
+"""})
+    found = records("find_exception_issues.py", root, "empty_catch")
+    assert sorted((r["line"], r["severity"]) for r in found) == [(2, "low"), (3, "high")]
+
+
+def test_an_explained_empty_function_is_not_reported(tmp_path):
+    root = project(tmp_path, {"src/a.ts": """\
+export function quiet(): void {
+  // deliberately a no-op: the platform has nothing to release
+}
+export function silent(): void {}
+"""})
+    found = records("find_code_smells.py", root, "empty_function_body")
+    assert [r["description"] for r in found] == ["`silent` has an empty body"]
+
+
+# --------------------------------------------------------------------------- #
 # Shared test scaffolding is test code
 # --------------------------------------------------------------------------- #
 
