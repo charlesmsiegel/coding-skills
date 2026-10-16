@@ -104,7 +104,9 @@ classes — via Replace Type Code with Subclasses first if needed. If branches j
 call one method with different arguments, Replace Parameter with Explicit Methods.
 If one branch handles None, consider Introduce Null Object (sparingly — see
 `overengineering-and-abstraction.md`).
-**Detector:** `find_design_smells.py` (`type_switch`).
+**Detector:** `find_design_smells.py` (`type_switch`: a finding when the ladder
+has six or more branches or its subject is switched in more than one ladder; one
+short ladder is a candidate, for the reason below).
 **Ignore when:** one simple switch in one place is often the clearest form —
 factory functions legitimately switch on what to build. The smell is complexity
 and repetition, not the keyword.
@@ -280,7 +282,9 @@ spend too much time together; mutual dependence.
 Delegate to make the relationship official; mutual dependence → Change
 Bidirectional Association to Unidirectional. Subclass-parent intimacy: either
 accept it explicitly (Replace Delegation with Inheritance) or break it.
-**Detector:** `find_design_smells.py` (`inappropriate_intimacy`).
+**Detector:** `find_design_smells.py` (`inappropriate_intimacy`; a private name
+a class in the same module defines is not reported, and a relatively-imported
+sibling module's private name is a candidate).
 **Python note:** touching `_private` names within the *same module* is
 conventional and fine; the smell is cross-module reaching.
 

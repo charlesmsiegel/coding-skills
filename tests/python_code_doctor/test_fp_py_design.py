@@ -703,3 +703,74 @@ def test_low_cohesion_counts_only_methods_that_use_state(tmp_path):
     assert "7 stateful methods" in by_file["grab.py"]["description"]
     # A subclass's methods may be the base's interface: a lead, not a verdict.
     assert_candidate_shape(by_file["sub.py"])
+
+
+# --------------------------------------------------------------------------- #
+# find_design_smells
+# --------------------------------------------------------------------------- #
+
+
+def _ladder(subject: str, branches: int, indent: str = "    ") -> str:
+    return "".join(f"{indent}{'if' if n == 0 else 'elif'} {subject} == '{chr(97 + n)}':\n"
+                   f"{indent}    return {n}\n" for n in range(branches))
+
+
+def test_one_short_switch_is_a_lead_and_a_repeated_or_long_one_a_finding(tmp_path):
+    write(tmp_path, {
+        "single.py": "def build(kind):\n" + _ladder("kind", 4) + "    return None\n",
+        "long.py": "def apply(op):\n" + _ladder("op", 7) + "    return None\n",
+        "repeated.py": ("def first(operation):\n" + _ladder("operation", 4) + "    return None\n\n"
+                        "def second(operation):\n" + _ladder("operation", 4) + "    return None\n"),
+    })
+    found = of_type(run_detector("find_design_smells.py", tmp_path), "type_switch")
+    by_file: dict[str, list[str]] = {}
+    for record in found:
+        by_file.setdefault(Path(record["file"]).name, []).append(record["kind"])
+    assert by_file == {"single.py": ["candidate"], "long.py": ["finding"],
+                       "repeated.py": ["finding", "finding"]}
+    assert_candidate_shape(next(r for r in found if r["kind"] == "candidate"))
+
+
+def test_a_private_this_module_defines_is_same_module_access(tmp_path):
+    write(tmp_path, {"loop.py": """\
+        class _Loop:
+            def __init__(self):
+                self._trace = []
+
+            def _usable(self):
+                return True
+
+
+        class RunView:
+            def take(self, loop, request):
+                if request._usable():
+                    return loop._trace
+                return request._foreign
+        """})
+    found = of_type(run_detector("find_design_smells.py", tmp_path), "inappropriate_intimacy")
+    assert [r["description"].split("'")[1] for r in found] == ["request._foreign"]
+
+
+def test_a_sibling_modules_private_is_a_lead_and_a_stdlib_one_is_not(tmp_path):
+    write(tmp_path, {"pkg/__init__.py": "", "pkg/sync.py": """\
+        import os
+        import sys
+        from . import overlay
+
+        def strict(view):
+            frame = sys._getframe(0)
+            if frame is None:
+                os._exit(1)
+            return overlay._strict_ledger(view)
+
+        def local(view):
+            from .. import characters
+            return characters._card_path(view)
+        """})
+    found = of_type(run_detector("find_design_smells.py", tmp_path), "inappropriate_intimacy")
+    # Whether `_` means module- or package-internal is the package's
+    # convention, which one file cannot see: a lead, not a defect.
+    assert sorted(r["description"].split("'")[1] for r in found) == [
+        "characters._card_path", "overlay._strict_ledger"]
+    for record in found:
+        assert_candidate_shape(record)
