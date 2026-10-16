@@ -27,8 +27,8 @@ What each measure counts, and why:
   - cognitive complexity (Sonar-style): +1 plus the current nesting level for
     if, loop, except, ternary, lambda and list/set/dict comprehension; +1 flat
     for each `elif` and `else`; boolean operands as for cyclomatic. Only
-    if/elif/else, loop, except, ternary and comprehension bodies nest — `try`
-    and `with` are not decisions and add no level.
+    if/elif/else, loop, except and ternary bodies nest — `try` and `with` are
+    not decisions and add no level.
   - nesting depth: if, loop, with and try blocks. An `elif` is a sibling branch
     of its `if`, not a block inside it, so a ladder is as deep as its deepest
     branch, not as long as the ladder.
