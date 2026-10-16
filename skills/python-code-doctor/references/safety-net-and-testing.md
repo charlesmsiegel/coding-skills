@@ -9,6 +9,11 @@ isn't, and refusing to trust tests that don't actually test anything.
 The deterministic helpers `find_untested_modules.py` (which source modules no test
 references) and `find_test_smells.py` (tests that assert nothing, over-mock, or
 hide logic) point at the gaps. This file is the judgment that goes with them.
+"References" is read generously: an import, an attribute chain off an imported
+package (`store.attempts.forget(...)`), `importlib`/`runpy` by name or by path, or —
+for a module of web routes — a test string requesting one of its paths. A route
+module none of those reach is only a candidate, since a test client can drive it
+through the app with URLs no reading of the source can see; confirm with coverage.
 
 ## The order of operations is not negotiable
 

@@ -584,3 +584,98 @@ def test_determinism_and_not_none_checks_can_fail_so_are_not_trivial(tmp_path):
     ))
     assert flagged == {"test_true", "test_same_name", "test_literal", "test_equal_names",
                        "test_true_constant"}
+
+
+# --------------------------------------------------------------------------- #
+# find_untested_modules: untested_module
+# --------------------------------------------------------------------------- #
+
+FUNC = "def run():\n    return 1\n"
+
+
+def untested(root: Path) -> dict[str, str]:
+    """Module path (relative, `/`-separated) -> kind, for every untested_module record."""
+    return {Path(f["file"]).resolve().relative_to(root.resolve()).as_posix(): f["kind"]
+            for f in of_type(run_detector("find_untested_modules.py", root), "untested_module")}
+
+
+def test_an_attribute_chain_off_an_imported_package_reaches_the_module(tmp_path):
+    write(tmp_path, {
+        "app/__init__.py": "",
+        "app/store/__init__.py": "",
+        "app/store/attempts.py": FUNC,
+        "app/store/journal.py": FUNC,
+        "app/store/other.py": FUNC,
+        "tests/test_a.py": "from app import store\n\ndef test_a():\n    assert store.attempts.run()\n",
+        "tests/test_b.py": "import app.store as st\n\ndef test_b():\n    assert st.journal.run()\n",
+    })
+    assert untested(tmp_path) == {"app/store/other.py": "finding"}
+
+
+def test_a_stdlib_attribute_chain_does_not_bless_a_same_named_module(tmp_path):
+    write(tmp_path, {
+        "path.py": FUNC,
+        "tests/test_a.py": "import os\n\ndef test_a():\n    assert os.path.join('a', 'b')\n",
+    })
+    assert untested(tmp_path) == {"path.py": "finding"}
+
+
+def test_importlib_and_load_by_path_reach_the_module(tmp_path):
+    write(tmp_path, {
+        "pkg/__init__.py": "",
+        "pkg/dyn.py": FUNC,
+        "android/python/entry.py": FUNC,
+        "tools/gen.py": FUNC,
+        "tools/never.py": FUNC,
+        "tests/test_dyn.py": (
+            "import importlib, importlib.util, pathlib, runpy\n"
+            "ROOT = pathlib.Path(__file__).resolve().parents[1]\n"
+            "ENTRY = ROOT / 'android' / 'python' / 'entry.py'\n"
+            "spec = importlib.util.spec_from_file_location('entry', ENTRY)\n"
+            "def test_dyn():\n"
+            "    assert importlib.import_module('pkg.dyn').run()\n"
+            "def test_script():\n"
+            "    assert runpy.run_path('tools/gen.py')\n"
+        ),
+    })
+    assert untested(tmp_path) == {"tools/never.py": "finding"}
+
+
+def test_a_route_module_is_reached_by_a_request_and_is_otherwise_a_candidate(tmp_path):
+    write(tmp_path, {
+        "app/__init__.py": "",
+        "app/routes/__init__.py": "",
+        "app/routes/shell.py": (
+            "from fastapi import APIRouter\nrouter = APIRouter()\n"
+            "@router.get('/campaigns/{cid}/shell')\ndef get_shell(cid: str):\n    return {}\n"
+        ),
+        "app/routes/regex.py": (
+            "from flask import Blueprint\nbp = Blueprint('r', __name__)\n"
+            "@bp.route('/regex/<int:rid>')\ndef rule(rid):\n    return ''\n"
+        ),
+        "app/routes/hidden.py": (
+            "from fastapi import APIRouter\nrouter = APIRouter()\n"
+            "@router.get('/{wid}')\ndef only_params(wid: str):\n    return {}\n"
+            "@router.post('/hidden/{x}')\ndef hidden(x: str):\n    return {}\n"
+        ),
+        "app/logic.py": FUNC,
+        "tests/test_http.py": (
+            "def test_shell(client, cid):\n"
+            "    assert client.get(f'/api/campaigns/{cid}/shell?full=1').status_code == 200\n"
+            "def test_regex(client):\n"
+            "    assert client.get('/api/regex/' + str(7)).status_code == 200\n"
+        ),
+    })
+    found = untested(tmp_path)
+    assert found == {"app/routes/hidden.py": "candidate", "app/logic.py": "finding"}
+
+
+def test_an_untested_route_candidate_has_reasons_and_no_fix(tmp_path):
+    write(tmp_path, {
+        "routes.py": "@router.get('/things/{tid}')\ndef get_thing(tid):\n    return {}\n",
+        "tests/test_x.py": "def test_x():\n    assert True\n",
+    })
+    [record] = of_type(run_detector("find_untested_modules.py", tmp_path), "untested_module")
+    assert record["kind"] == "candidate" and record["suggestion"] == "" and record["also_caused_by"]
+    text = run_detector_text("find_untested_modules.py", tmp_path)
+    assert "[CANDIDATE]" in text and not [line for line in text.splitlines() if line.strip() == "→"]
