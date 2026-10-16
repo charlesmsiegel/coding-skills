@@ -33,7 +33,7 @@ import argparse
 import subprocess
 from pathlib import Path
 from collections import defaultdict, Counter
-from common import SEVERITY_ICONS, configure_output
+from common import SEVERITY_ICONS, configure_output, drop_aliased
 
 # Per-file detectors only. Each is meaningful on a single file and reports a line
 # within that file. Whole-repo detectors are excluded on purpose (see module docstring).
@@ -340,6 +340,7 @@ def collect(base, all_lines, scripts=None):
         if key not in seen:
             seen.add(key)
             unique.append(f)
+    unique = drop_aliased(unique)  # one defect two detectors name differently is listed once
     rank = {"high": 0, "medium": 1, "low": 2}
     unique.sort(key=lambda f: (rank.get(f.get("severity", "medium"), 1), str(f.get("file")), f.get("line", 0)))
     return files, unique

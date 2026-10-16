@@ -5195,3 +5195,68 @@ def test_cli_flags_and_a_fakes_signature_are_not_boolean_flag_smells(tmp_path):
         ("test_text_encoder.py", _lines_marked(fake)[0], "boolean_positional_param"),
         ("test_text_encoder.py", _lines_marked(fake)[0], "multiple_boolean_flags"),
     ]
+
+
+_SIGNATURES = (
+    "def seven(a, b, c, d, e, f, g):\n"
+    "    return a\n"
+    "\n"
+    "def eight(a, b, c, d, e, f, g, *rest):\n"
+    "    return a\n"
+    "\n"
+    "def ten(a, b, c, d, e, f, g, h, i, j):\n"
+    "    return a\n"
+)
+
+
+def test_the_two_parameter_count_detectors_agree_on_severity(tmp_path):
+    """Same count, same grade: what one calls a medium, so does the other."""
+    (tmp_path / "sigs.py").write_text(_SIGNATURES)
+    complexity = {r["line"]: r["severity"] for r in run_detector("analyze_complexity.py", tmp_path)
+                  if r["issue_type"] == "parameter_count"}
+    smells = {r["line"]: r["severity"] for r in run_detector("find_code_smells.py", tmp_path)
+              if r["smell_type"] == "long_parameter_list"}
+    assert complexity == {1: "low", 4: "medium", 7: "high"}
+    assert smells == complexity
+
+
+def test_one_too_long_signature_is_one_finding_in_the_report(tmp_path):
+    (tmp_path / "sigs.py").write_text(_SIGNATURES)
+
+    def records(*extra):
+        report = json.loads(subprocess.run(
+            [sys.executable, str(SCRIPTS_DIR / "analyze_all.py"), str(tmp_path),
+             "--format", "json", "--skip-duplicates", *extra],
+            capture_output=True, text=True, timeout=300, check=True).stdout)
+        return sorted((r["line"], r.get("issue_type") or r.get("smell_type"), r["severity"])
+                      for category in ("complexity", "code_smells")
+                      if category in report["categories"]
+                      for r in report["categories"][category]["issues"]
+                      if (r.get("issue_type") or r.get("smell_type")) in ("parameter_count", "long_parameter_list"))
+
+    assert records() == [(1, "parameter_count", "low"), (4, "parameter_count", "medium"),
+                         (7, "parameter_count", "high")]
+    assert records("--skip", "complexity") == [
+        (1, "long_parameter_list", "low"), (4, "long_parameter_list", "medium"),
+        (7, "long_parameter_list", "high")], "with no parameter_count, the alias is the report"
+
+
+def test_the_diff_lens_lists_one_too_long_signature_once(tmp_path):
+    _git(tmp_path, "init", "-q")
+    target = tmp_path / "mod.py"
+    target.write_text("BASE = 1\n")
+    _git(tmp_path, "add", "-A")
+    _git(tmp_path, "commit", "-qm", "base")
+    target.write_text("BASE = 1\n" + _SIGNATURES)
+    _git(tmp_path, "add", "-A")
+
+    result = subprocess.run(
+        [sys.executable, str(SCRIPTS_DIR / "analyze_diff.py"), "HEAD", "--format", "json"],
+        cwd=tmp_path, capture_output=True, text=True, timeout=300,
+    )
+    assert result.returncode == 0, result.stderr[:500]
+    signature = sorted((r["line"], r.get("issue_type") or r.get("smell_type"))
+                       for r in json.loads(result.stdout)
+                       if (r.get("issue_type") or r.get("smell_type"))
+                       in ("parameter_count", "long_parameter_list"))
+    assert signature == [(2, "parameter_count"), (5, "parameter_count"), (8, "parameter_count")]

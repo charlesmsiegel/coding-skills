@@ -10,7 +10,7 @@ import json
 import argparse
 from pathlib import Path
 from dataclasses import dataclass, asdict
-from common import signature_is_a_contract, sort_findings, cached_parse, SEVERITY_ICONS, configure_output, find_python_files, warn_detector_error
+from common import count_parameters, parameter_severity, signature_is_a_contract, sort_findings, cached_parse, SEVERITY_ICONS, configure_output, find_python_files, warn_detector_error
 
 
 @dataclass
@@ -169,17 +169,13 @@ class ComplexityVisitor(ast.NodeVisitor):
             ))
         
         # Parameter count
-        params = len(node.args.args) + len(node.args.kwonlyargs)
-        if node.args.vararg:
-            params += 1
-        if node.args.kwarg:
-            params += 1
+        params = count_parameters(node)
         if params > self.config.max_params and not signature_is_a_contract(node):
             self.issues.append(ComplexityIssue(
                 file=self.filename, line=node.lineno, name=name,
                 issue_type="parameter_count", value=params,
                 threshold=self.config.max_params,
-                severity=self._severity(params, self.config.max_params),
+                severity=parameter_severity(params, self.config.max_params),
                 suggestion="Use a config object or dataclass"
             ))
 

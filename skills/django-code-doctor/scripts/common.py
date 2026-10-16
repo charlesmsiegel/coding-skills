@@ -78,6 +78,62 @@ def signature_is_a_contract(func) -> bool:
     return registers_config(func) or is_cli_command(func)
 
 
+# The signature size a function may reach before analyze_complexity reports it.
+PARAMETER_LIMIT = 5
+
+
+def count_parameters(func) -> int:
+    """Every parameter a caller can bind, as written: positional-only,
+    positional (`self` and `cls` included), keyword-only, `*args`, `**kwargs`."""
+    args = func.args
+    return (len(args.posonlyargs) + len(args.args) + len(args.kwonlyargs)
+            + (args.vararg is not None) + (args.kwarg is not None))
+
+
+def parameter_severity(count: int, limit: int = PARAMETER_LIMIT) -> str:
+    """How bad a signature of ``count`` parameters is: low past the limit,
+    medium from half again over it, high from double.
+
+    analyze_complexity's parameter_count and find_code_smells'
+    long_parameter_list both grade with this, so one signature cannot be a
+    medium in one report and a low in the other.
+    """
+    ratio = count / limit
+    return "high" if ratio >= 2.0 else ("medium" if ratio >= 1.5 else "low")
+
+
+# One defect that two detectors report under different names: alias -> canonical.
+# A too-long signature is analyze_complexity's parameter_count and
+# find_code_smells' long_parameter_list; a report shows it once.
+FINDING_ALIASES = {"long_parameter_list": "parameter_count"}
+_SEVERITY_RANK = {"low": 0, "medium": 1, "high": 2}
+
+
+def _record_type(record: dict):
+    return next((record[key] for key in ("smell_type", "issue_type", "pattern_type", "type")
+                 if record.get(key)), None)
+
+
+def drop_aliased(records: list) -> list:
+    """``records`` without each alias whose canonical twin is at the same file and line.
+
+    The twin keeps the higher of the two severities, so dropping a duplicate
+    never lowers what the report says about the code. An alias with no twin —
+    its detector ran and the canonical one did not — is kept.
+    """
+    canonical = {(r.get("file"), r.get("line"), _record_type(r)): r
+                 for r in records if isinstance(r, dict)}
+    kept = []
+    for record in records:
+        target = FINDING_ALIASES.get(_record_type(record)) if isinstance(record, dict) else None
+        twin = canonical.get((record.get("file"), record.get("line"), target)) if target else None
+        if twin is None:
+            kept.append(record)
+        elif _SEVERITY_RANK.get(record.get("severity"), 0) > _SEVERITY_RANK.get(twin.get("severity"), 0):
+            twin["severity"] = record["severity"]
+    return kept
+
+
 def configure_output() -> None:
     """Keep emoji output from crashing narrow console encodings.
 

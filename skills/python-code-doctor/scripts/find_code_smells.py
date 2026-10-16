@@ -11,7 +11,7 @@ import argparse
 from pathlib import Path
 from dataclasses import dataclass, asdict
 from collections import defaultdict
-from common import is_test_file, signature_is_a_contract, sort_findings, cached_parse, SEVERITY_ICONS, configure_output, find_python_files, warn_detector_error, warn_unparseable
+from common import count_parameters, is_test_file, parameter_severity, signature_is_a_contract, sort_findings, cached_parse, SEVERITY_ICONS, configure_output, find_python_files, warn_detector_error, warn_unparseable
 
 
 @dataclass
@@ -138,12 +138,13 @@ class CodeSmellDetector(ast.NodeVisitor):
                         f"Mutable default from {default.func.id}() in {node.name}",
                         "Use None and create inside function", "high")
 
-        # Long parameter list
-        total_params = len(node.args.args) + len(node.args.kwonlyargs)
+        # Long parameter list — counted and graded as analyze_complexity's
+        # parameter_count is, which analyze_all keeps in its place when both fire.
+        total_params = count_parameters(node)
         if total_params > 6 and not signature_is_a_contract(node):
             self._add(node.lineno, "long_parameter_list",
                 f"{node.name} has {total_params} parameters",
-                "Group into dataclass or config object", "medium")
+                "Group into dataclass or config object", parameter_severity(total_params))
 
     def visit_ExceptHandler(self, node: ast.ExceptHandler):
         if node.type is None:
