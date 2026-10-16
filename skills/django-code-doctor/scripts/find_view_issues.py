@@ -1,14 +1,9 @@
 #!/usr/bin/env python3
-"""View and URL problems, including the object-level authorization gap.
+"""View and URL problems and authorization review leads.
 
-`missing_ownership_filter` is the finding worth the whole file. Fetching a record
-by a primary key taken from the URL, with no filter tying it to the requesting
-user, is the most common real vulnerability in application code — the endpoint
-checks that you are logged in, and then hands you somebody else's row.
-
-The standing caveat: this reads function bodies and class bodies. Authorization
-enforced through a base class, a custom mixin, or a permission backend is
-invisible here. A clean report means "nothing obvious", not "checked".
+Missing local ownership syntax cannot establish a vulnerability: callers,
+middleware, policy services, and inherited view hooks may enforce access. The
+ownership checks here therefore emit candidates, with their uncertainty intact.
 """
 
 import ast
@@ -16,7 +11,7 @@ import sys
 
 from django_context import (VIEWSET_BASES, call_name, decorator_name, source_of,
                             string_value)
-from django_report import finding, run
+from django_report import candidate, finding, run
 
 FAT_VIEW_LINES = 60
 CBV_HOOK_LIMIT = 5
@@ -52,7 +47,7 @@ def _mentions_request_user(text):
 
 
 def _takes_a_url_argument(func):
-    """A view whose signature carries a lookup key from the URL."""
+    """An id-like parameter is a lookup lead; routing is not established."""
     names = {a.arg for a in func.args.args} | {a.arg for a in func.args.kwonlyargs}
     return bool(names & URL_KEY_ARGS)
 
@@ -168,13 +163,14 @@ def collect(ctx):
                         if isinstance(sub, ast.Call) and call_name(sub) in FETCH_CALLS
                     ]
                     if fetches and not _mentions_request_user(body_text):
-                        findings.append(finding(
+                        findings.append(candidate(
                             path, fetches[0].lineno, "missing_ownership_filter",
-                            "`" + node.name + "` looks up a record by a key from the URL and never "
-                            "mentions request.user — any authenticated user can read another "
-                            "user's row by changing the id",
-                            "Filter by the owner in the same query: "
-                            "get_object_or_404(Model, pk=pk, owner=request.user).",
+                            "`" + node.name + "` accepts an id-like argument and fetches a record "
+                            "without a local request.user reference; verify whether this lookup "
+                            "requires object-level authorization",
+                            ["This function may be an internal helper whose caller already authorized access.",
+                             "The record may be public reference data rather than user-owned data.",
+                             "Middleware, a custom policy service, or a permission backend may enforce access."],
                             "high"))
 
                 if "csrf_exempt" in decorators:
@@ -273,7 +269,7 @@ def collect(ctx):
                 "that it is a template method pattern you are fighting.",
                 "medium"))
 
-        # A view that never scopes its queryset to the caller.
+        # No local scoping syntax: review inherited and centralized authorization.
         #
         # DRF viewsets are deliberately left to find_drf_issues: it reports the
         # same gap as unscoped_viewset_queryset, knows about permission classes
@@ -285,23 +281,26 @@ def collect(ctx):
         has_queryset_attr = "queryset" in info.assignments
         get_queryset = info.methods.get("get_queryset")
 
+        authorization_alternatives = [
+            "The queryset may expose intentionally public reference data.",
+            "A base view or custom mixin may scope results or enforce object permissions.",
+            "Central middleware, a policy service, or a permission backend may enforce access.",
+        ]
         if has_queryset_attr and get_queryset is None:
-            findings.append(finding(
+            findings.append(candidate(
                 info.file, info.line, "unscoped_get_queryset",
-                "`" + name + "` sets a class-level queryset and never overrides get_queryset, so "
-                "every authenticated caller sees every row",
-                "Override get_queryset and filter by the caller: "
-                "return super().get_queryset().filter(owner=self.request.user). "
-                "Confirm by reading — a permission class or a base view may already scope it.",
+                "`" + name + "` sets a class-level queryset without a local get_queryset override; "
+                "verify whether these records require caller-specific access restrictions",
+                authorization_alternatives,
                 "high"))
         elif get_queryset is not None:
             body = source_of(ctx, info.file, get_queryset)
             if not _mentions_request_user(body) and "filter" not in body:
-                findings.append(finding(
+                findings.append(candidate(
                     info.file, get_queryset.lineno, "unscoped_get_queryset",
-                    "`" + name + ".get_queryset()` neither filters nor mentions request.user",
-                    "This is the right place to scope a queryset to its owner; its absence is "
-                    "usually the bug. Confirm by reading before acting.",
+                    "`" + name + ".get_queryset()` has no local filter or request.user reference; "
+                    "authorization may be delegated outside this method",
+                    authorization_alternatives,
                     "medium"))
 
         # A CBV that mutates and mixes in no auth.

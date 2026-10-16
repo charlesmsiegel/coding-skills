@@ -76,6 +76,16 @@ python-code-doctor is installed. `analyze_django.py` builds the project graph an
 parses each file **once**, sharing both with all fifteen detectors — which is most
 of the runtime on a large project.
 
+### Evidence limits
+
+Lazy ModelChoiceField querysets are standard Django configuration, not import-time
+snapshots. Inherited model display methods and ordering count as implementations.
+Reads during validation hooks and guarded reads are not evidence that validation
+was skipped. A `get_or_create()` call alone cannot prove a race: database uniqueness
+may make it safe, so unresolved cases are candidates. Likewise, `commit=False`
+without a visible `save_m2m()` is a candidate when the form's many-to-many fields
+and caller lifecycle cannot be established.
+
 ### The three findings to read first
 
 - **`missing_ownership_filter`** / **`unscoped_viewset_queryset`** — a view or a

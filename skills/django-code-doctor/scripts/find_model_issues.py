@@ -14,9 +14,10 @@ check it says what you expected before applying any of these.
 import ast
 import sys
 
-from django_context import (MODEL_BASES, RELATION_FIELDS, TEXT_FIELDS, field_calls,
+from django_context import (ClassInfo, MODEL_BASES, RELATION_FIELDS, TEXT_FIELDS,
+                            _class_assignments, _meta_assignments, base_name, field_calls,
                             is_true, keyword, string_value)
-from django_report import finding, run
+from django_report import candidate, finding, run
 
 FAT_MODEL_METHODS = 20
 TOO_MANY_FIELDS = 25
@@ -65,13 +66,161 @@ def _concrete_model_parents(ctx, info):
     return parents
 
 
+def _dotted(node):
+    if isinstance(node, ast.Name):
+        return node.id
+    if isinstance(node, ast.Attribute):
+        prefix = _dotted(node.value)
+        return prefix + "." + node.attr if prefix else None
+    return None
+
+
+def _base_import(ctx, info, expression):
+    """Resolve a base expression through imports visible before this class."""
+    dotted = _dotted(expression)
+    if not dotted:
+        return False
+    first, separator, rest = dotted.partition(".")
+    tree = ctx.parsed(info.file)
+    canonical = None
+    for statement in tree.body if tree else ():
+        if statement.lineno >= info.line:
+            break
+        if isinstance(statement, ast.Import):
+            for alias in statement.names:
+                if (alias.asname or alias.name.split(".")[0]) == first:
+                    canonical = alias.name if alias.asname else alias.name.split(".")[0]
+        elif isinstance(statement, ast.ImportFrom):
+            for alias in statement.names:
+                if (alias.asname or alias.name) == first:
+                    canonical = ("." * statement.level + (statement.module + "." if statement.module else "")
+                                 + alias.name)
+        elif isinstance(statement, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
+            if statement.name == first:
+                canonical = None
+        elif isinstance(statement, (ast.Assign, ast.AnnAssign)):
+            targets = statement.targets if isinstance(statement, ast.Assign) else [statement.target]
+            if any(isinstance(target, ast.Name) and target.id == first for target in targets):
+                canonical = None
+    canonical = canonical + (separator + rest if separator else "") if canonical else None
+    return canonical
+
+
+def _parent_class(ctx, info, expression, canonical):
+    """Resolve exact top-level definitions; unrelated duplicate names are harmless.
+
+    Re-exports, dynamic bases and star imports remain unresolved rather than
+    selecting an arbitrary project class with the same final name.
+    """
+    if canonical:
+        module, _, name = canonical.rpartition(".")
+        if canonical.startswith("."):
+            level = len(canonical) - len(canonical.lstrip("."))
+            relative_module, _, name = canonical[level:].rpartition(".")
+            directory = info.file.parent
+            for _ in range(level - 1):
+                directory = directory.parent
+            target = directory.joinpath(*relative_module.split(".")) if relative_module else directory
+        elif module:
+            target = ctx.root.joinpath(*module.split("."))
+        else:
+            return None
+        paths = (target.with_suffix(".py"), target / "__init__.py")
+    elif isinstance(expression, ast.Name):
+        name, paths = expression.id, (info.file,)
+    else:
+        return None
+    for path in paths:
+        tree = ctx.parsed(path)
+        if tree is None:
+            continue
+        nodes = [node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == name]
+        if len(nodes) != 1:
+            continue
+        node = nodes[0]
+        return ClassInfo(
+            name=name, file=path, line=node.lineno,
+            bases=[base_name(base) for base in node.bases],
+            methods={child.name: child for child in node.body
+                     if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef))},
+            node=node, meta=_meta_assignments(node), fields={},
+            assignments=_class_assignments(node), decorators=list(node.decorator_list),
+        )
+    return None
+
+
+def _model_fact(ctx, info, fact, seen=None):
+    """Return present/absent/unknown, never treating unresolved ancestry as absence.
+
+    This is an absence check, not a replacement for Python's full MRO: any known
+    implementation is enough to avoid asserting that one is missing, while
+    duplicate names, cycles and imported bases prevent a definitive absence.
+    """
+    seen = set() if seen is None else seen
+    identity = (info.file, info.line)
+    if identity in seen:
+        return "unknown"
+    seen = seen | {identity}
+    meta = next((item for item in info.node.body
+                 if isinstance(item, ast.ClassDef) and item.name == "Meta"), None)
+    if fact == "__str__":
+        if fact in info.methods:
+            return "present"
+        if fact in info.assignments or info.decorators:
+            return "unknown"
+    else:
+        for key in ("ordering", "order_with_respect_to"):
+            if key not in info.meta:
+                continue
+            try:
+                value = ast.literal_eval(info.meta[key])
+            except (ValueError, TypeError):
+                return "unknown"
+            if value:
+                return "present"
+        # Explicitly empty ordering disables inherited ordering.
+        if "ordering" in info.meta:
+            return "absent"
+        if meta is not None and meta.bases:
+            return "unknown"
+    states = []
+    for expression in info.node.bases:
+        canonical = _base_import(ctx, info, expression)
+        if canonical in {"django.db.models.Model", "django.db.models.base.Model"}:
+            states.append("absent")
+            continue
+        parent = _parent_class(ctx, info, expression, canonical)
+        if parent is None:
+            states.append("unknown")
+            continue
+        # An explicitly declared Meta does not inherit abstract-parent options
+        # unless its own bases say so (handled conservatively above).
+        if fact == "ordering" and meta is not None and is_true(parent.meta.get("abstract")):
+            continue
+        states.append(_model_fact(ctx, parent, fact, seen))
+    if "present" in states:
+        return "present"
+    if "unknown" in states:
+        return "unknown"
+    return "absent"
+
+
 def collect(ctx):
     findings = []
 
     for name, info in sorted(ctx.models.items(), key=lambda kv: (str(kv[1].file), kv[1].line)):
         path, abstract = info.file, ctx.is_abstract(name)
 
-        if "__str__" not in info.methods and not abstract:
+        str_status = _model_fact(ctx, info, "__str__")
+        if not abstract and str_status == "unknown":
+            findings.append(candidate(
+                path, info.line, "missing_str_method",
+                "model `" + name + "` has no local __str__; its complete inherited behavior "
+                "could not be resolved",
+                ["An imported or ambiguous ancestor may supply __str__.",
+                 "A class decorator or assigned method may provide its display representation."],
+                "medium"))
+        elif not abstract and str_status == "absent":
             findings.append(finding(
                 path, info.line, "missing_str_method",
                 "model `" + name + "` has no __str__, so it renders as "
@@ -97,7 +246,15 @@ def collect(ctx):
                 "into a service function; keep what genuinely belongs to the record.",
                 "low"))
 
-        if not abstract and not info.meta.get("ordering") and not info.meta.get("order_with_respect_to"):
+        ordering_status = _model_fact(ctx, info, "ordering")
+        if not abstract and ordering_status == "unknown":
+            findings.append(candidate(
+                path, info.line, "no_default_ordering",
+                "model `" + name + "` has no statically resolved default ordering",
+                ["Ordering may be supplied by an imported base or inherited Meta options.",
+                 "Queries may specify their own order_by() or not require stable ordering."],
+                "low"))
+        elif not abstract and ordering_status == "absent":
             findings.append(finding(
                 path, info.line, "no_default_ordering",
                 "model `" + name + "` has no Meta.ordering, so queries come back in whatever "

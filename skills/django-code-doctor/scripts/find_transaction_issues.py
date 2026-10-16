@@ -23,7 +23,7 @@ import ast
 import sys
 
 from django_context import call_name
-from django_report import finding, run
+from django_report import candidate, finding, run
 
 # Calls that go over the network. Inside a transaction, their latency is the
 # transaction's duration.
@@ -180,16 +180,22 @@ def collect(ctx):
                     "Model.objects.select_for_update().get(pk=pk).",
                     "high"))
 
-        # get_or_create races two concurrent requests unless the columns are unique.
+        # Syntax alone cannot establish a race: this detector does not resolve
+        # model constraints, migrations, or write serialization. In particular,
+        # absence of a visible Meta constraint is not evidence of its absence
+        # from the database (unique fields and external DDL also protect it).
         for node in ast.walk(tree):
             if isinstance(node, ast.Call) and call_name(node) == "get_or_create":
-                findings.append(finding(
+                findings.append(candidate(
                     path, node.lineno, "get_or_create_race",
-                    "get_or_create() is two statements under the hood, so two concurrent requests "
-                    "can both miss the SELECT and both attempt the INSERT",
-                    "It is safe when a unique constraint covers the lookup columns — Django then "
-                    "catches the IntegrityError and re-fetches. Confirm the constraint exists; "
-                    "without one this creates duplicates under load.",
+                    "get_or_create() performs a lookup before attempting an insert; "
+                    "this call alone does not establish whether concurrent calls can "
+                    "create duplicate rows",
+                    ["A database unique field, unique_together, or UniqueConstraint "
+                     "covers the lookup, so Django can recover from an IntegrityError.",
+                     "The caller serializes creation or runs without concurrent writers.",
+                     "The receiver may be a custom manager or another API whose "
+                     "get_or_create implementation has its own concurrency guarantees."],
                     "low"))
 
         # A loop of saves inside one atomic block holds every lock to the end.
