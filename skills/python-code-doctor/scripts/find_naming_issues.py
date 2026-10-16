@@ -6,7 +6,10 @@ Finds:
   - shadows_builtin          : a name that shadows a Python builtin (list, dict,
                                id, type, ...), which hides the builtin and confuses readers
   - non_snake_case_function  : a function/method not named in snake_case
-  - non_pascal_case_class    : a class not named in PascalCase
+  - non_pascal_case_class    : a class not named in PascalCase. A class nested
+                               directly in another class body is exempt: it is an
+                               attribute namespace (`vae.config.latents_mean`),
+                               named for the API it imitates
 
 (Overlaps Ruff's pep8-naming (N) and flake8-builtins (A) rule sets; included so
 the suite is self-contained for repos that don't run those.)
@@ -65,6 +68,7 @@ class NamingDetector(ast.NodeVisitor):
         self.ignore = ignore
         self.issues = []
         self._reported = set()   # (line, name, type) to avoid duplicate shadow reports
+        self._namespace_classes = set()  # id() of classes defined directly in a class body
 
     def _add(self, line, st, desc, sug, sev):
         if st in self.ignore:
@@ -100,7 +104,9 @@ class NamingDetector(ast.NodeVisitor):
                 self._shadow(a.arg, node.lineno)
 
     def visit_ClassDef(self, node):
-        if not _PASCAL.match(node.name):
+        self._namespace_classes.update(id(item) for item in node.body
+                                       if isinstance(item, ast.ClassDef))
+        if id(node) not in self._namespace_classes and not _PASCAL.match(node.name):
             self._add(node.lineno, "non_pascal_case_class",
                 f"Class '{node.name}' is not PascalCase",
                 "Rename to PascalCase (PEP 8), e.g. 'HttpClient' not 'http_client'.",

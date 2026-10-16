@@ -21,7 +21,8 @@ import re
 from pathlib import Path
 from dataclasses import dataclass, asdict
 from collections import defaultdict
-from common import sort_findings, SEVERITY_ICONS, configure_output, find_python_files, warn_detector_error, warn_unparseable
+from common import (sort_findings, SEVERITY_ICONS, configure_output, find_python_files,
+                    in_nested_repository, warn_detector_error, warn_unparseable)
 
 # tomllib is stdlib on 3.11+. On older interpreters we simply skip pyproject.toml
 # parsing rather than depend on a third-party backport (this skill is stdlib-only).
@@ -104,6 +105,8 @@ def _collect_requirements_files(root: Path):
     for req_file in sorted(root.rglob("requirements*.txt")):
         if ".venv" in req_file.parts or "node_modules" in req_file.parts:
             continue
+        if in_nested_repository(root, req_file):
+            continue  # another repository's manifest, not this project's
         entries = []
         try:
             text = req_file.read_text(encoding="utf-8", errors="replace")
@@ -234,6 +237,11 @@ def _compute_local_packages(root: Path) -> frozenset:
       directory's name is a local top-level package.
     - Stems of all .py files sitting directly inside any "src" directory under
       root.
+    - The stem of every <name>.py and the name of every <name>/__init__.py
+      anywhere in the tree (outside venvs, node_modules and the rest of
+      common.EXCLUDE_DIRS). A script that puts `tests/models` on sys.path and
+      imports `sampler_case` is importing a file of this repository; nothing
+      can install it, so no manifest should declare it.
     """
     names: set[str] = set()
 
@@ -257,7 +265,7 @@ def _compute_local_packages(root: Path) -> frozenset:
     _skip = {".venv", "node_modules", "__pycache__"}
     for init_file in root.rglob("__init__.py"):
         # Skip ignored directories anywhere in the path
-        if any(part in _skip for part in init_file.parts):
+        if any(part in _skip for part in init_file.parts) or in_nested_repository(root, init_file):
             continue
         pkg_dir = init_file.parent
         # Walk up while the parent also has __init__.py (i.e. is still a pkg)
@@ -273,8 +281,13 @@ def _compute_local_packages(root: Path) -> frozenset:
         if any(part in _skip for part in src_candidate.parts):
             continue
         for p in src_candidate.iterdir():
-            if p.is_file() and p.suffix == ".py" and p.stem != "__init__":
+            if (p.is_file() and p.suffix == ".py" and p.stem != "__init__"
+                    and not in_nested_repository(root, p)):
                 names.add(p.stem)
+
+    # Any module or package that exists as a file in the repository is first-party.
+    for p in find_python_files(root):
+        names.add(p.parent.name if p.name == "__init__.py" else p.stem)
 
     return frozenset(names)
 
@@ -334,7 +347,7 @@ def analyze(root: Path, ignore: set) -> list[CodeSmell]:
     has_manifest = (
         bool(req_files)
         or bool(pyproject_deps)
-        or bool(list(root.rglob("requirements*.txt")))
+        or any(not in_nested_repository(root, p) for p in root.rglob("requirements*.txt"))
         or _pyproject_parses()
     )
 

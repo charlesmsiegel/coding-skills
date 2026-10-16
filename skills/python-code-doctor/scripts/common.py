@@ -9,6 +9,7 @@ per script; this module is the single copy.
 
 import ast
 import contextlib
+import os
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -42,13 +43,39 @@ def configure_output() -> None:
                 reconfigure(errors="replace")
 
 
+def in_nested_repository(root: Path, path: Path, cache: dict | None = None) -> bool:
+    """True when the file ``path`` lies in another repository nested below ``root``.
+
+    A directory below the scanned root that holds a ``.git`` entry is a
+    different repository: a file there for a git worktree or a submodule, a
+    directory for a nested clone. A worktree checked out under the project is a
+    second copy of its code, and scoring it as the project's counts every
+    finding twice. ``root``'s own ``.git`` is not consulted — scanning a
+    worktree is scanning a repository. ``cache`` (directory -> verdict) lets a
+    caller walking many files stat each directory once.
+    """
+    cache = {} if cache is None else cache
+    current = root
+    for part in path.relative_to(root).parts[:-1]:
+        current = current / part
+        nested = cache.get(current)
+        if nested is None:
+            nested = cache[current] = os.path.lexists(current / ".git")
+        if nested:
+            return True
+    return False
+
+
 def find_python_files(path: Path) -> Iterator[Path]:
-    """Yield the .py files under ``path``, skipping vendored/generated dirs."""
+    """Yield the .py files under ``path``, skipping vendored/generated dirs and
+    any repository nested below it (see in_nested_repository)."""
     if path.is_file() and path.suffix == ".py":
         yield path
     elif path.is_dir():
+        nested: dict = {}
         for p in path.rglob("*.py"):
-            if EXCLUDE_DIRS.isdisjoint(p.relative_to(path).parts):
+            if (EXCLUDE_DIRS.isdisjoint(p.relative_to(path).parts)
+                    and not in_nested_repository(path, p, nested)):
                 yield p
 
 

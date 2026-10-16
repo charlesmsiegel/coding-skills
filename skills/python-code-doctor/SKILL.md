@@ -176,6 +176,8 @@ at a time and the evidence is elsewhere:
 | `unused_function` / `unused_class` on a public name | any other module may import it |
 | `unused_parameter` on a method or a nested callback | the base class or the caller that receives it dictates the signature |
 | `sql_injection` on a `PRAGMA` statement | PRAGMA accepts no bound parameters, so a dynamic identifier has no parameterized spelling |
+| `assert_for_validation` on `assert x is not None` / `assert isinstance(...)` | that shape usually narrows a type for the checker and records an invariant the caller guarantees |
+| `local_import` of a slow-to-import package (torch, transformers, ...) or inside a CLI command | deferral to keep startup and `--help` fast is the usual reason, and only the author knows |
 
 Confirm one before acting on it — deleting a "dead" public function on a
 single-file verdict deletes live code. `format_findings.py` files candidates as

@@ -15,6 +15,14 @@ Finds:
 Deliberately NOT flagged (the legitimate deferred-import patterns):
   - imports guarded by `if TYPE_CHECKING:` (type-only imports)
   - imports inside a `try: ... except ImportError/ModuleNotFoundError:` (optional dep)
+
+Reported as candidates, not findings (deferral is the usual reason, but only
+the author knows):
+  - a deferred import of a known slow-to-import package (torch, transformers,
+    ...), where import latency is the likely point
+  - an import inside a CLI command (`@app.command()`, `@app.callback()`,
+    `@click.command`, `@click.group`), which keeps `--help` and the other
+    subcommands from paying for one subcommand's dependencies
 """
 
 import ast
@@ -35,6 +43,63 @@ class CodeSmell:
     suggestion: str
     severity: str
     code_snippet: str = ""
+    # A scored defect by default; "candidate" for a lead the downstream merge
+    # must not score. A candidate carries no fix and names, in also_caused_by,
+    # the ways a healthy codebase produces the same observation.
+    kind: str = "finding"
+    also_caused_by: tuple[str, ...] = ()
+
+
+# Top-level packages whose import alone takes on the order of a second: they
+# load compiled extensions (CUDA/BLAS kernels, a C++ runtime) or eagerly import
+# large submodule trees. Deferring one is a measured startup choice far more
+# often than a cycle workaround. Kept short on purpose — numpy, PIL and the like
+# import in tens of milliseconds and get no benefit of the doubt.
+_HEAVY_MODULES = frozenset({
+    "torch", "torchvision", "torchaudio", "tensorflow", "jax", "transformers",
+    "diffusers", "accelerate", "ultralytics", "xformers", "triton", "onnxruntime",
+    "numba", "cv2", "scipy", "sklearn", "pandas", "matplotlib", "spacy", "nltk",
+})
+
+_HEAVY_REASONS = (
+    "deliberate deferral of a slow-to-import module to keep startup fast: a CLI's "
+    "--help, or a code path that never needs it, should not pay seconds to import it",
+    "an optional heavy dependency: only the code path that uses it imports it, so the "
+    "rest of the program runs without it installed",
+)
+
+_CLI_REASONS = (
+    "deferring a subcommand's dependencies keeps --help and the other subcommands fast: "
+    "only the command that runs pays for what it imports",
+    "the subcommand's dependency is an optional extra the other commands must work without",
+)
+
+# Decorators that make a function a CLI command: typer/click `@app.command()`,
+# `@app.callback()`, and click's module-level `@click.command` / `@click.group`.
+_CLI_ATTRS = frozenset({"command", "callback"})
+_CLICK_ATTRS = frozenset({"command", "group"})
+
+
+def _is_cli_command(func) -> bool:
+    for dec in func.decorator_list:
+        target = dec.func if isinstance(dec, ast.Call) else dec
+        if not isinstance(target, ast.Attribute):
+            continue
+        if target.attr in _CLI_ATTRS:
+            return True
+        if (target.attr in _CLICK_ATTRS and isinstance(target.value, ast.Name)
+                and target.value.id == "click"):
+            return True
+    return False
+
+
+def _imported_packages(node) -> list:
+    """Top-level package each name of an import statement loads ('' if relative)."""
+    if isinstance(node, ast.Import):
+        return [alias.name.split(".")[0] for alias in node.names]
+    if node.level:
+        return [""]
+    return [(node.module or "").split(".")[0]]
 
 
 def _get_line(lines, lineno):
@@ -107,32 +172,45 @@ def _only_imports(stmt) -> bool:
 def detect(tree, filename, lines, ignore):
     issues = []
 
-    def add(line, st, desc, sug, sev):
+    def add(line, st, desc, sug, sev, kind="finding", also_caused_by=()):
         if st in ignore:
             return
-        issues.append(CodeSmell(filename, line, st, desc, sug, sev, _get_line(lines, line)))
+        issues.append(CodeSmell(filename, line, st, desc, sug, sev, _get_line(lines, line),
+                                kind, tuple(also_caused_by)))
 
     guarded = _collect_guarded(tree)
 
     # Case 1: imports inside functions/methods (deferred imports).
-    def walk(node, in_function):
+    def walk(node, in_function, in_command):
         for child in ast.iter_child_nodes(node):
             if isinstance(child, (ast.Import, ast.ImportFrom)):
                 if in_function and id(child) not in guarded:
                     what = ("import " + ", ".join(a.name for a in child.names)
                             if isinstance(child, ast.Import)
                             else "from " + ("." * getattr(child, "level", 0)) + (child.module or "") + " import ...")
-                    add(child.lineno, "local_import",
-                        f"Import inside a function ('{what}') — a deferred import, usually a circular-import workaround or laziness",
-                        "Move it to the top of the module. If it's breaking a real import cycle, fix the cycle; "
-                        "if it's a genuinely optional/heavy dependency, guard it with try/except ImportError or TYPE_CHECKING and add a comment.",
-                        "medium")
-            if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
-                walk(child, True)
+                    heavy = all(pkg in _HEAVY_MODULES for pkg in _imported_packages(child))
+                    if heavy or in_command:
+                        reasons = (_HEAVY_REASONS if heavy else ()) + (_CLI_REASONS if in_command else ())
+                        where = "a CLI command" if in_command else "a function"
+                        add(child.lineno, "local_import",
+                            f"Import deferred into {where} ('{what}') — usually to keep startup "
+                            "fast; confirm it is not a circular-import workaround",
+                            "", "low", kind="candidate", also_caused_by=reasons)
+                    else:
+                        add(child.lineno, "local_import",
+                            f"Import inside a function ('{what}') — a deferred import, usually a circular-import workaround or laziness",
+                            "Move it to the top of the module. If it is breaking a real import cycle, fix the cycle "
+                            "instead (extract what both modules need into a module they can both import). Only a "
+                            "dependency the program must run without belongs in try/except ImportError, at module top.",
+                            "medium")
+            if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                walk(child, True, in_command or _is_cli_command(child))
+            elif isinstance(child, ast.Lambda):
+                walk(child, True, in_command)
             else:
-                walk(child, in_function)
+                walk(child, in_function, in_command)
 
-    walk(tree, False)
+    walk(tree, False, False)
 
     # Case 2: module-level import placed after real code (E402).
     seen_code = False
@@ -166,6 +244,17 @@ def analyze_file(filepath: Path, ignore: set) -> list:
         return []
 
 
+def to_record(issue: "CodeSmell") -> dict:
+    """The JSON shape this detector emits, shared with the runner.
+
+    `kind` is always present, so a consumer never reads an absent key as a
+    classification; the reasons tuple serialises as a list.
+    """
+    record = asdict(issue)
+    record["also_caused_by"] = list(record["also_caused_by"])
+    return record
+
+
 def main():
     configure_output()
     parser = argparse.ArgumentParser(description="Detect imports not at the top of the module")
@@ -181,7 +270,7 @@ def main():
     sort_findings(all_issues)
 
     if args.format == "json":
-        print(json.dumps([asdict(i) for i in all_issues], indent=2))
+        print(json.dumps([to_record(i) for i in all_issues], indent=2))
     else:
         if not all_issues:
             print("✅ No non-top-level imports found!")
@@ -189,17 +278,27 @@ def main():
         by_type = defaultdict(int)
         for i in all_issues:
             by_type[i.smell_type] += 1
-        print(f"Found {len(all_issues)} import-placement issue(s):\n\nSummary:")
+        # A candidate is a lead, not a defect, so it is counted apart.
+        leads = sum(1 for i in all_issues if i.kind == "candidate")
+        print(f"Found {len(all_issues) - leads} import-placement finding(s), "
+              f"{leads} candidate(s):\n\nSummary:")
         for s, c in sorted(by_type.items(), key=lambda x: -x[1]):
             print(f"  {s}: {c}")
         print()
         icons = SEVERITY_ICONS
         for i in all_issues:
-            print(f"{icons[i.severity]} [{i.severity.upper()}] {i.file}:{i.line}")
+            # A severity icon on a lead reads as a verdict the evidence does not support.
+            marker = ("? [CANDIDATE]" if i.kind == "candidate"
+                      else f"{icons[i.severity]} [{i.severity.upper()}]")
+            print(f"{marker} {i.file}:{i.line}")
             print(f"   {i.smell_type}: {i.description}")
             if i.code_snippet:
                 print(f"   Code: {i.code_snippet}")
-            print(f"   → {i.suggestion}\n")
+            if i.suggestion:
+                print(f"   → {i.suggestion}")
+            for reason in i.also_caused_by:
+                print(f"   ? also caused by: {reason}")
+            print()
 
 
 if __name__ == "__main__":

@@ -17,6 +17,7 @@ import io
 import json
 import re
 import tokenize
+import warnings
 import argparse
 from pathlib import Path
 from dataclasses import dataclass, asdict
@@ -72,8 +73,15 @@ _STRUCTURAL = (
 
 
 def _looks_like_code(text: str) -> bool:
+    # The text is a comment, usually prose, so CPython's complaints about it
+    # ("500ing" is a numeric literal glued to `in`; "\d" an invalid escape) are
+    # about nothing in the user's code. Left unfiltered they reach stderr as
+    # `<unknown>:1: SyntaxWarning` and land in the middle of a report.
     try:
-        tree = ast.parse(text)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", SyntaxWarning)
+            warnings.simplefilter("ignore", DeprecationWarning)
+            tree = ast.parse(text)
     except (SyntaxError, ValueError):
         return False
     if not tree.body:

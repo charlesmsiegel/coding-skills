@@ -74,3 +74,34 @@ def test_validate_record_does_not_mutate_its_argument(common):
     record = {"file": "a.py", "line": 1, "smell_type": "x", "description": "d", "suggestion": "fix"}
     out = common.validate_record(record)
     assert "kind" not in record and out["kind"] == "finding"
+
+
+def _tree_with_nested_repositories(root: Path) -> None:
+    """The analysed repository, plus three repositories that only live below it."""
+    (root / ".git").mkdir(parents=True)  # the analysed root's own repository
+    (root / "app.py").write_text("x = 1\n")
+    worktree = root / ".worktrees" / "ui"  # a git worktree: `.git` is a file
+    worktree.mkdir(parents=True)
+    (worktree / ".git").write_text("gitdir: /elsewhere/.git/worktrees/ui\n")
+    (worktree / "app.py").write_text("x = 1\n")
+    submodule = root / "sub"  # a submodule: `.git` is a file too
+    (submodule / "pkg").mkdir(parents=True)
+    (submodule / ".git").write_text("gitdir: ../.git/modules/sub\n")
+    (submodule / "pkg" / "mod.py").write_text("x = 1\n")
+    clone = root / "vendor" / "clone"  # a nested clone: `.git` is a directory
+    (clone / ".git").mkdir(parents=True)
+    (clone / "lib.py").write_text("x = 1\n")
+    (root / "vendor" / "own.py").write_text("x = 1\n")
+
+
+def test_a_directory_holding_a_git_entry_is_another_repository(common, tmp_path):
+    _tree_with_nested_repositories(tmp_path)
+    found = sorted(p.relative_to(tmp_path).as_posix() for p in common.find_python_files(tmp_path))
+    assert found == ["app.py", "vendor/own.py"]
+
+
+def test_the_scanned_root_may_itself_be_inside_a_worktree(common, tmp_path):
+    """Only directories *below* the root count: scanning a worktree is scanning a repository."""
+    _tree_with_nested_repositories(tmp_path)
+    worktree = tmp_path / ".worktrees" / "ui"
+    assert [p.name for p in common.find_python_files(worktree)] == ["app.py"]

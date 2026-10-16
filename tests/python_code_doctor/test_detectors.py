@@ -4058,3 +4058,682 @@ def test_the_diff_lens_marks_a_candidate_as_a_lead_not_a_ranked_defect(tmp_path)
     assert not arrow_only_lines(output), \
         "a candidate rendered a fix arrow with nothing after it"
     assert "candidate(s)" in output, "the count line still calls every record a finding"
+
+
+# --------------------------------------------------------------------------- #
+# False positives triaged against a real project (a diffusion-model web app):
+# each case below is a shape a detector scored as a defect and must not, paired
+# with the true positive the narrowed rule must keep reporting.
+# --------------------------------------------------------------------------- #
+
+
+def _lines_marked(text: str, marker: str = "# fires") -> list[int]:
+    """The 1-based lines of a fixture whose source ends with ``marker``."""
+    return [n for n, line in enumerate(text.splitlines(), 1) if line.rstrip().endswith(marker)]
+
+
+def test_a_literal_in_a_test_file_is_fixture_data_not_a_magic_number(tmp_path):
+    """In a test a number is an input or an expected value; naming it buys nothing."""
+    tests = tmp_path / "tests"
+    tests.mkdir()
+    (tests / "test_area.py").write_text("def test_area():\n    assert area(7, 9) == 63\n")
+    (tests / "helpers.py").write_text("def make():\n    return resize(17, 33)\n")
+    (tmp_path / "conftest.py").write_text("def value():\n    return scale(37)\n")
+    (tmp_path / "widget_test.py").write_text("def check():\n    return scale(41)\n")
+    (tmp_path / "app.py").write_text("def area(width):\n    return width * 7\n")
+
+    magic = [(Path(f["file"]).name, f["line"])
+             for f in run_detector("find_code_smells.py", tmp_path)
+             if f["smell_type"] == "magic_number"]
+
+    assert magic == [("app.py", 2)], "production code still has its magic number reported"
+
+
+def test_explicit_return_none_is_the_consistent_form_pep8_asks_for(tmp_path):
+    """PEP 8: when any return has a value, a no-value return says `return None`."""
+    (tmp_path / "sample.py").write_text(
+        "def crop_box(box):\n"
+        "    if box is None:\n"
+        "        return None\n"
+        "    return (box[0], box[1])\n"
+        "\n"
+        "def install(module):\n"
+        "    def hook(v):\n"
+        "        if v is None:\n"
+        "            return None\n"
+        "        return v.reshape(2)\n"
+        "    return hook\n"
+    )
+    assert "inconsistent_returns" not in smell_types(run_detector("find_return_issues.py", tmp_path))
+
+
+def test_a_bare_return_beside_a_value_is_still_inconsistent(tmp_path):
+    (tmp_path / "sample.py").write_text(
+        "def lookup(d, k):\n"
+        "    if k not in d:\n"
+        "        return None\n"
+        "    if not d[k]:\n"
+        "        return\n"
+        "    return d[k]\n"
+    )
+    found = [f for f in run_detector("find_return_issues.py", tmp_path)
+             if f["smell_type"] == "inconsistent_returns"]
+
+    assert [f["line"] for f in found] == [1]
+    assert "return None" in found[0]["suggestion"], "the fix is the explicit spelling"
+
+
+# The statements below are all safe: every interpolated name is assembled from
+# string literals in the function that executes it (or is a module constant
+# bound once). Shapes copied from a real tag-autocomplete module.
+_LITERAL_DERIVED_SQL = r'''
+TABLE = "events"
+
+
+def counts(connection):
+    return {
+        name: connection.execute(f"SELECT COUNT(*) FROM {name}").fetchone()[0]
+        for name in ("tags", "neighbours", "aliases")
+    }
+
+
+def by_names(connection, wanted, category):
+    placeholders = ",".join("?" * len(wanted))
+    clause, params = ("AND category = ?", [category]) if category is not None else ("", [])
+    return connection.execute(
+        f"SELECT * FROM tags WHERE name IN ({placeholders}) {clause}", [*wanted, *params])
+
+
+def search(connection, words, category):
+    word_clause = "".join(" AND name LIKE ? ESCAPE '\\'" for _ in words)
+    loose_clause = f" OR (1=1{word_clause})" if words else ""
+    direct_clause = "AND category = ?" if category is not None else ""
+    return connection.execute(
+        f"SELECT * FROM tags WHERE (name LIKE ?{loose_clause}) {direct_clause}", [])
+
+
+def batched(connection, seeds, candidates):
+    seed_slots = ",".join("?" * len(seeds))
+    for start in range(0, len(candidates), 10):
+        chunk = candidates[start:start + 10]
+        candidate_slots = ",".join("?" * len(chunk))
+        connection.execute(
+            f"SELECT 1 FROM n WHERE tag IN ({seed_slots}) AND other IN ({candidate_slots})",
+            [*seeds, *chunk])
+
+
+def from_module_constant(connection):
+    return connection.execute("SELECT * FROM " + TABLE)
+
+
+def formatted(connection, ascending):
+    order = "ASC" if ascending else "DESC"
+    return connection.execute("SELECT * FROM t ORDER BY id {}".format(order))
+
+
+def in_a_loop(connection):
+    for table in ["a", "b"]:
+        connection.execute(f"DELETE FROM {table}")
+
+
+def accumulated(connection, flag):
+    sql = "SELECT * FROM t"
+    if flag:
+        sql += " WHERE a = ?"
+    return connection.execute(f"{sql} LIMIT 5")
+
+
+def outer(connection):
+    clause = "AND a = ?"
+
+    def inner():
+        return connection.execute(f"SELECT * FROM t WHERE 1=1 {clause}")
+    return inner
+'''
+
+# Each `# fires` line must still be reported: one binding of an interpolated
+# name is not literal-derived, or the name resolves somewhere this check cannot
+# prove (a parameter, a call, a global another function rebinds).
+_UNPROVEN_SQL = r'''
+TABLE = "events"
+TABLE = input()
+
+
+def param(connection, user_input):
+    return connection.execute(f"SELECT * FROM t WHERE name = '{user_input}'")  # fires
+
+
+def one_bad_binding(connection, user_input, flag):
+    clause = "AND a = ?"
+    if flag:
+        clause = user_input
+    return connection.execute(f"SELECT * FROM t WHERE 1=1 {clause}")  # fires
+
+
+def iterating_input(connection, tables):
+    for table in tables:
+        connection.execute(f"DELETE FROM {table}")  # fires
+
+
+def joined_input(connection, columns):
+    cols = ",".join(c for c in columns)
+    return connection.execute(f"SELECT {cols} FROM t")  # fires
+
+
+def rebound_module_name(connection):
+    return connection.execute("SELECT * FROM " + TABLE)  # fires
+
+
+def unpacked_from_a_call(connection):
+    clause, params = build()
+    return connection.execute(f"SELECT * FROM t {clause}", params)  # fires
+
+
+def repeated_input(connection, user_input):
+    return connection.execute(f"SELECT * FROM t {user_input * 2}")  # fires
+
+
+def declared_global(connection):
+    global CLAUSE
+    CLAUSE = "x"
+    return connection.execute(f"SELECT {CLAUSE}")  # fires
+
+
+def comprehension_variable_does_not_leak(connection):
+    names = [name for name in ("a", "b")]
+    return connection.execute(f"SELECT * FROM {name}", names)  # fires
+
+
+def formatted_input(connection, order):
+    return connection.execute("SELECT * FROM t ORDER BY {}".format(order))  # fires
+
+
+def concatenated_input(connection, where):
+    return connection.execute("SELECT * FROM t WHERE " + where)  # fires
+'''
+
+
+def test_sql_built_only_from_string_literals_is_not_injection(tmp_path):
+    (tmp_path / "tags.py").write_text(_LITERAL_DERIVED_SQL)
+    found = [(f["line"], f["kind"]) for f in run_detector("find_security_issues.py", tmp_path)
+             if f["smell_type"] == "sql_injection"]
+    assert found == []
+
+
+def test_sql_interpolating_anything_unproven_is_still_injection(tmp_path):
+    (tmp_path / "queries.py").write_text(_UNPROVEN_SQL)
+    found = sorted((f["line"], f["kind"]) for f in run_detector("find_security_issues.py", tmp_path)
+                   if f["smell_type"] == "sql_injection")
+    assert found == [(line, "finding") for line in _lines_marked(_UNPROVEN_SQL)]
+
+
+def test_a_pragma_over_a_literal_table_name_is_not_even_a_lead(tmp_path):
+    (tmp_path / "db.py").write_text(
+        "def describe(conn):\n"
+        "    for table in ('tags', 'aliases'):\n"
+        '        conn.execute(f"PRAGMA table_info({table})")\n'
+    )
+    assert "sql_injection" not in smell_types(run_detector("find_security_issues.py", tmp_path))
+
+
+def _cycles(tmp_path) -> list[str]:
+    return sorted(f["description"] for f in run_detector("find_import_cycles.py", tmp_path)
+                  if f["smell_type"] == "circular_import")
+
+
+def test_a_type_checking_import_never_runs_so_it_closes_no_cycle(tmp_path):
+    pkg = tmp_path / "pkg"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_text("")
+    (pkg / "grid.py").write_text(
+        "from typing import TYPE_CHECKING\n"
+        "\n"
+        "if TYPE_CHECKING:\n"
+        "    from pkg.service import Request\n"
+        "\n"
+        "def expand(request: 'Request'):\n"
+        "    return request\n"
+    )
+    (pkg / "service.py").write_text("from pkg import grid\n")
+    (pkg / "a.py").write_text("import typing\n\nif typing.TYPE_CHECKING:\n    from pkg import b\n")
+    (pkg / "b.py").write_text("from pkg import a\n")
+
+    assert _cycles(tmp_path) == []
+
+
+def test_a_runtime_import_still_closes_a_cycle_even_when_deferred(tmp_path):
+    """A lazy import inside a function is a cycle worked around, not removed —
+    and the `else` of a TYPE_CHECKING guard is exactly the branch that runs."""
+    pkg = tmp_path / "pkg"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_text("")
+    (pkg / "upscale.py").write_text("from pkg.vae import decode\n")
+    (pkg / "vae.py").write_text("def decode():\n    from pkg.upscale import upscale\n    return upscale\n")
+    (pkg / "c.py").write_text(
+        "from typing import TYPE_CHECKING\n"
+        "\n"
+        "if TYPE_CHECKING:\n"
+        "    pass\n"
+        "else:\n"
+        "    from pkg import d\n"
+    )
+    (pkg / "d.py").write_text("from pkg import c\n")
+
+    assert _cycles(tmp_path) == [
+        "Import cycle detected: pkg.c → pkg.d → pkg.c",
+        "Import cycle detected: pkg.upscale → pkg.vae → pkg.upscale",
+    ]
+
+
+def test_a_module_is_not_an_object_a_method_can_envy(tmp_path):
+    """`torch.cat` is a call into a library; there is no class to move the method to."""
+    (tmp_path / "sample.py").write_text(
+        "import torch\n"
+        "import numpy as np\n"
+        "from torch.nn import functional as F\n"
+        "\n"
+        "class Rope:\n"
+        "    def __init__(self):\n"
+        "        self.dim = 4\n"
+        "\n"
+        "    def forward(self, x):\n"
+        "        a = torch.arange(3)\n"
+        "        b = torch.cat([a, a])\n"
+        "        c = np.zeros(3) + np.ones(3) + np.eye(3)\n"
+        "        return F.pad(b, 1) + F.relu(c) + F.gelu(c) + torch.ones(1)\n"
+    )
+    assert "feature_envy" not in issue_types(run_detector("find_coupling_issues.py", tmp_path))
+
+
+def test_feature_envy_is_reported_at_the_envious_method_and_names_it(tmp_path):
+    (tmp_path / "sample.py").write_text(
+        "import json\n"
+        "\n"
+        "class Invoice:\n"
+        "    def __init__(self):\n"
+        "        self.total = 0\n"
+        "\n"
+        "    def label(self):\n"
+        "        return str(self.total)\n"
+        "\n"
+        "    def ship(self, order):\n"
+        "        return order.street + order.city + order.zip_code + order.country\n"
+        "\n"
+        "    def encode(self, json):\n"
+        "        return json.dumps(1) + json.dumps(2) + json.dumps(3)\n"
+    )
+    envy = [f for f in run_detector("find_coupling_issues.py", tmp_path)
+            if f["issue_type"] == "feature_envy"]
+
+    assert [f["line"] for f in envy] == [10, 13], \
+        "reported at each def, and a parameter shadowing an imported module is an object"
+    assert "ship" in envy[0]["description"]
+    assert "encode" in envy[1]["description"]
+
+
+def test_a_type_narrowing_assert_is_a_candidate_not_a_validation_finding(tmp_path):
+    """`assert x is not None` narrows an Optional for the checker and documents an
+    invariant of the caller; `-O` stripping it changes no validation."""
+    (tmp_path / "service.py").write_text(
+        "def run(job):\n"
+        "    spec = job.spec\n"
+        "    assert spec is not None  # _execute only routes here when it is set\n"
+        "    assert isinstance(spec, dict)\n"
+        "    assert len(spec) > 0\n"
+        "    assert spec is not None and spec.ready\n"
+        "    return spec\n"
+    )
+    records = {r["line"]: r for r in run_detector("find_exception_issues.py", tmp_path)
+               if r["smell_type"] == "assert_for_validation"}
+
+    assert {line: r["kind"] for line, r in records.items()} == {
+        3: "candidate", 4: "candidate", 5: "finding", 6: "finding"}
+    assert records[3]["also_caused_by"] and not records[3]["suggestion"]
+    assert records[5]["suggestion"] and not records[5].get("also_caused_by")
+
+    output = run_detector_text("find_exception_issues.py", tmp_path)
+    assert "[CANDIDATE]" in output and "? also caused by:" in output
+    assert not arrow_only_lines(output), "a candidate rendered a fix arrow with nothing after it"
+
+
+@pytest.mark.parametrize("text", [
+    "a very long replacement ", "exchange_meter", "changemenot", "the replace_mentions",
+])
+def test_a_placeholder_word_inside_another_word_is_not_a_placeholder(tmp_path, text):
+    (tmp_path / "sample.py").write_text(f"LABEL = {text!r} * 20\n")
+    assert "placeholder_value" not in smell_types(run_detector("find_ai_scaffolding.py", tmp_path))
+
+
+@pytest.mark.parametrize("text", [
+    "REPLACE_ME", "token: changeme", "<change_me>", "api_key_replaceme", "replace_me-later",
+])
+def test_a_placeholder_token_is_still_a_placeholder(tmp_path, text):
+    (tmp_path / "sample.py").write_text(f"LABEL = {text!r}\n")
+    assert "placeholder_value" in smell_types(run_detector("find_ai_scaffolding.py", tmp_path))
+
+
+_KWARGS = r'''
+import remote
+
+
+def boom(*_args, **_kwargs):
+    raise RuntimeError("x")
+
+
+def model(x, sigma, **_kwargs):
+    return x * sigma
+
+
+class Base:
+    def call(self, method, **kwargs):
+        return send(method, **kwargs)
+
+
+class Fake(Base):
+    def call(self, method, **kwargs):
+        return method
+
+
+class Grandchild(Fake):
+    def call(self, method, **kwargs):
+        return 1
+
+
+class Unrelated:
+    def call(self, method, **kwargs):  # fires
+        return method
+
+
+class Child(Base):
+    def other(self, **kwargs):  # fires
+        return 1
+
+
+class Remote(remote.Base):
+    def call(self, **kwargs):  # fires
+        return 1
+
+
+def plain(a, **kwargs):  # fires
+    return a
+'''
+
+
+def test_unused_kwargs_spares_deliberate_and_inherited_catch_alls(tmp_path):
+    """`**_kwargs` says "unused on purpose"; an override must keep its base's
+    signature. A base this file cannot see proves nothing, so that one stays."""
+    (tmp_path / "sample.py").write_text(_KWARGS)
+    lines = sorted(f["line"] for f in run_detector("find_ai_scaffolding.py", tmp_path)
+                   if f["smell_type"] == "unused_kwargs")
+    assert lines == _lines_marked(_KWARGS)
+
+
+def test_a_class_nested_in_a_class_body_is_named_for_the_api_it_fakes(tmp_path):
+    """`vae.config.latents_mean`: the lowercase class is an attribute namespace."""
+    source = (
+        "class FakeVae:\n"
+        "    class config:\n"
+        "        latents_mean = 0\n"
+        "\n"
+        "def test_shifted():\n"
+        "    class Shifted(FakeVae):\n"
+        "        class config:\n"
+        "            latents_mean = 1\n"
+        "    return Shifted\n"
+        "\n"
+        "class http_client:  # fires\n"
+        "    pass\n"
+        "\n"
+        "def factory():\n"
+        "    class local_thing:  # fires\n"
+        "        pass\n"
+        "    return local_thing\n"
+    )
+    (tmp_path / "sample.py").write_text(source)
+    lines = sorted(f["line"] for f in run_detector("find_naming_issues.py", tmp_path)
+                   if f["smell_type"] == "non_pascal_case_class")
+    assert lines == _lines_marked(source)
+
+
+def test_a_skip_guard_is_not_logic_in_a_test(tmp_path):
+    source = (
+        "import pytest\n"
+        "\n"
+        "def test_fixtures_match(tmp_path):\n"
+        "    if not tmp_path.exists():\n"
+        "        pytest.skip('no interpreter')\n"
+        "    if broken():\n"
+        "        pytest.xfail('known')\n"
+        "        return\n"
+        "    torch = pytest.importorskip('torch')\n"
+        "    assert compute(torch) == 3\n"
+        "\n"
+        "def test_branches():\n"
+        "    if flag():  # fires\n"
+        "        pytest.skip('x')\n"
+        "    else:\n"
+        "        value = 2\n"
+        "    assert value == 2\n"
+        "\n"
+        "def test_guard_then_more():\n"
+        "    if flag():  # fires\n"
+        "        pytest.skip('x')\n"
+        "        cleanup()\n"
+        "    assert compute() == 1\n"
+    )
+    (tmp_path / "test_sample.py").write_text(source)
+    lines = sorted(f["line"] for f in run_detector("find_test_smells.py", tmp_path)
+                   if f["smell_type"] == "logic_in_test")
+    assert lines == _lines_marked(source)
+
+
+def test_a_deferred_heavy_import_is_a_candidate_not_a_defect(tmp_path):
+    """`import torch` inside main() keeps `--help` from paying for torch."""
+    source = (
+        "def main():\n"
+        "    import torch  # lead\n"
+        "    from transformers import AutoModel  # lead\n"
+        "    import torch.nn.functional as F  # lead\n"
+        "    import json  # fires\n"
+        "    import os, torch  # fires\n"
+        "    from .models import vae  # fires\n"
+        "    return torch, AutoModel, F, json, os, vae\n"
+    )
+    (tmp_path / "cli.py").write_text(source)
+    records = {r["line"]: r for r in run_detector("find_local_imports.py", tmp_path)
+               if r["smell_type"] == "local_import"}
+
+    assert sorted(line for line, r in records.items() if r["kind"] == "candidate") == \
+        _lines_marked(source, "# lead")
+    assert sorted(line for line, r in records.items() if r["kind"] == "finding") == \
+        _lines_marked(source)
+    lead = records[2]
+    assert lead["also_caused_by"] and not lead["suggestion"]
+    assert "heavy" not in records[5]["suggestion"], \
+        "a required dependency must not be told to hide behind try/except ImportError"
+
+    output = run_detector_text("find_local_imports.py", tmp_path)
+    assert "[CANDIDATE]" in output and "? also caused by:" in output
+    assert not arrow_only_lines(output), "a candidate rendered a fix arrow with nothing after it"
+
+
+def test_new_candidates_satisfy_the_schema_in_the_aggregate_report(tmp_path):
+    (tmp_path / "service.py").write_text(
+        "def run(spec):\n"
+        "    import torch\n"
+        "    assert spec is not None\n"
+        "    return torch.zeros(spec)\n"
+    )
+    report = json.loads(subprocess.run(
+        [sys.executable, str(SCRIPTS_DIR / "analyze_all.py"), str(tmp_path),
+         "--format", "json", "--skip-duplicates"],
+        capture_output=True, text=True, timeout=300, check=True).stdout)
+
+    assert "records_rejected" not in report["meta"], report["meta"].get("records_rejected")
+    kinds = {(r.get("smell_type"), r["kind"])
+             for category in ("exception_issues", "local_imports")
+             for r in report["categories"][category]["issues"]}
+    assert kinds == {("assert_for_validation", "candidate"), ("local_import", "candidate")}
+
+
+def test_a_module_that_lives_in_the_repository_is_first_party(tmp_path):
+    """A script that puts a test helper's directory on sys.path imports it by bare
+    name. The file is right there in the tree; no manifest should declare it."""
+    (tmp_path / "pyproject.toml").write_text(
+        '[project]\nname = "x"\nversion = "0"\ndependencies = []\n')
+    (tmp_path / "tests" / "models").mkdir(parents=True)
+    (tmp_path / "tests" / "models" / "sampler_case.py").write_text("CASES = []\n")
+    (tmp_path / "tools" / "vendored" / "helperpkg").mkdir(parents=True)
+    (tmp_path / "tools" / "vendored" / "helperpkg" / "__init__.py").write_text("")
+    site = tmp_path / ".venv" / "lib" / "site-packages" / "requests"
+    site.mkdir(parents=True)
+    (site / "__init__.py").write_text("")
+    (tmp_path / "node_modules" / "x").mkdir(parents=True)
+    (tmp_path / "node_modules" / "x" / "leftpad.py").write_text("")
+    (tmp_path / "scripts").mkdir()
+    (tmp_path / "scripts" / "generate.py").write_text(
+        "import sys\n"
+        "sys.path.insert(0, 'tests/models')\n"
+        "import sampler_case\n"
+        "import helperpkg\n"
+        "import requests\n"
+        "import leftpad\n"
+    )
+    missing = sorted(f["description"].split("'")[1]
+                     for f in run_detector("find_dependency_issues.py", tmp_path)
+                     if f["smell_type"] == "missing_dependency")
+
+    assert missing == ["leftpad", "requests"], "a venv or node_modules copy is not first-party"
+
+
+def test_a_comment_that_only_looks_numeric_leaks_no_syntax_warning(tmp_path):
+    """`500ing` parses as a numeric literal glued to `in`: CPython warns about the
+    comment text it was handed, and the warning used to land in the report."""
+    (tmp_path / "sample.py").write_text(
+        "# makes an empty PUT name the file instead of 500ing.\n"
+        "x = 1\n"
+    )
+    result = subprocess.run(
+        [sys.executable, "-W", "always", str(SCRIPTS_DIR / "find_comment_smells.py"),
+         str(tmp_path), "--format", "json"],
+        capture_output=True, text=True, timeout=120,
+    )
+    assert result.returncode == 0, result.stderr[:500]
+    assert "invalid decimal literal" not in result.stderr, result.stderr[:500]
+    assert json.loads(result.stdout) == []
+
+
+def test_imports_deferred_into_a_cli_subcommand_are_candidates(tmp_path):
+    """A Typer/click command defers its own dependencies so `--help` and the other
+    subcommands do not pay for them. A plain helper doing the same stays a finding."""
+    source = (
+        "import click\n"
+        "import typer\n"
+        "\n"
+        "app = typer.Typer()\n"
+        "\n"
+        "@app.command()\n"
+        "def serve(port: int = 8000):\n"
+        "    import uvicorn  # lead\n"
+        "    from pkg.api import create_app  # lead\n"
+        "    uvicorn.run(create_app(), port=port)\n"
+        "\n"
+        "@app.callback()\n"
+        "def main():\n"
+        "    import logging  # lead\n"
+        "    return logging\n"
+        "\n"
+        "@click.command()\n"
+        "def verify():\n"
+        "    from pkg.pipeline import load  # lead\n"
+        "    return load()\n"
+        "\n"
+        "@click.group\n"
+        "def cli():\n"
+        "    import json  # lead\n"
+        "    return json\n"
+        "\n"
+        "@cli.command\n"
+        "def sub():\n"
+        "    def inner():\n"
+        "        import os  # lead\n"
+        "        return os\n"
+        "    return inner\n"
+        "\n"
+        "def helper():\n"
+        "    from pkg.api import create_app  # fires\n"
+        "    return create_app\n"
+        "\n"
+        "@router.get('/x')\n"
+        "def route():\n"
+        "    import json  # fires\n"
+        "    return json\n"
+    )
+    (tmp_path / "cli.py").write_text(source)
+    records = {r["line"]: r for r in run_detector("find_local_imports.py", tmp_path)
+               if r["smell_type"] == "local_import"}
+
+    assert sorted(line for line, r in records.items() if r["kind"] == "candidate") == \
+        _lines_marked(source, "# lead")
+    assert sorted(line for line, r in records.items() if r["kind"] == "finding") == \
+        _lines_marked(source)
+    assert any("--help" in reason for reason in records[8]["also_caused_by"])
+
+
+_REGISTERED_CONFIG = (
+    "from diffusers import configuration_utils\n"
+    "from diffusers.configuration_utils import ConfigMixin, register_to_config\n"
+    "\n"
+    "class Model(ConfigMixin):\n"
+    "    @register_to_config\n"
+    "    def __init__(self, a, b, c, d, e, f, g, h):\n"
+    "        self.a = a\n"
+    "\n"
+    "class Other(ConfigMixin):\n"
+    "    @configuration_utils.register_to_config\n"
+    "    def __init__(self, a, b, c, d, e, f, g, h):\n"
+    "        self.a = a\n"
+    "\n"
+    "    def forward(self, a, b, c, d, e, f, g, h):  # fires\n"
+    "        return a\n"
+    "\n"
+    "class Plain:\n"
+    "    def __init__(self, a, b, c, d, e, f, g, h):  # fires\n"
+    "        self.a = a\n"
+    "\n"
+    "@register_to_config\n"
+    "def build(a, b, c, d, e, f, g, h):  # fires\n"
+    "    return a\n"
+)
+
+
+@pytest.mark.parametrize("script,finding_type,key", [
+    ("analyze_complexity.py", "parameter_count", "issue_type"),
+    ("find_code_smells.py", "long_parameter_list", "smell_type"),
+])
+def test_a_register_to_config_init_keeps_its_flat_keyword_arguments(tmp_path, script,
+                                                                    finding_type, key):
+    """diffusers' ConfigMixin serialises the config from those flat keyword
+    arguments: grouping them into a dataclass breaks from_pretrained/save_pretrained."""
+    (tmp_path / "model.py").write_text(_REGISTERED_CONFIG)
+    lines = sorted(f["line"] for f in run_detector(script, tmp_path) if f.get(key) == finding_type)
+    assert lines == _lines_marked(_REGISTERED_CONFIG)
+
+
+def test_a_nested_repository_is_not_analysed_as_part_of_the_project(tmp_path):
+    """A git worktree checked out under the project (`.worktrees/ui/.git` is a file)
+    is another copy of a repository; its code, manifests and imports are not this one's."""
+    (tmp_path / "pyproject.toml").write_text(
+        '[project]\nname = "x"\nversion = "0"\ndependencies = []\n')
+    (tmp_path / "app.py").write_text("def area(width):\n    return width * 7\n")
+    worktree = tmp_path / ".worktrees" / "ui"
+    worktree.mkdir(parents=True)
+    (worktree / ".git").write_text("gitdir: /elsewhere/.git/worktrees/ui\n")
+    (worktree / "app.py").write_text("import requests\n\ndef area(width):\n    return width * 7\n")
+    (worktree / "requirements.txt").write_text("leftpadpy\n")
+
+    magic = [f["file"] for f in run_detector("find_code_smells.py", tmp_path)
+             if f["smell_type"] == "magic_number"]
+    assert [Path(f).relative_to(tmp_path).as_posix() for f in magic] == ["app.py"]
+    assert run_detector("find_dependency_issues.py", tmp_path) == [], \
+        "the worktree's import and its unpinned requirement are not this project's"
