@@ -155,3 +155,34 @@ def test_nested_os_path_calls_are_one_finding_per_line(tmp_path):
         "    return os.path.exists(p)\n"
     )})
     assert lines_of(run_detector("find_outdated_idioms.py", tmp_path), "os_path_join") == [2, 4]
+
+
+# --------------------------------------------------------------------------- #
+# public_*_no_docstring
+# --------------------------------------------------------------------------- #
+
+BODY = "    a = 1\n    b = a + 1\n    return b\n"
+
+
+def test_a_bare_exception_class_needs_no_docstring_but_other_classes_do(tmp_path):
+    write(tmp_path, {"m.py": (
+        '"""Module."""\n'
+        "class StoreError(Exception):\n    pass\n"
+        "class NotFound(StoreError):\n    ...\n"
+        "class Shape:\n    pass\n"
+        "class ParseError(ValueError):\n    def __init__(self, at):\n        self.at = at\n"
+    )})
+    classes = of_type(run_detector("find_missing_docstrings.py", tmp_path), "public_class_no_docstring")
+    assert sorted(f["description"].split("'")[1] for f in classes) == ["ParseError", "Shape"]
+
+
+def test_a_private_module_has_no_public_surface_but_init_does(tmp_path):
+    for name in ("_impl.py", "impl.py", "__init__.py"):
+        write(tmp_path, {name: '"""Module."""\n' f"def visible():\n{BODY}"
+                               "class Thing:\n    pass\n"})
+    found = run_detector("find_missing_docstrings.py", tmp_path)
+    reported = {(Path(f["file"]).name, f["smell_type"]) for f in found}
+    assert reported == {
+        ("impl.py", "public_function_no_docstring"), ("impl.py", "public_class_no_docstring"),
+        ("__init__.py", "public_function_no_docstring"), ("__init__.py", "public_class_no_docstring"),
+    }
