@@ -266,7 +266,9 @@ Things that change together should live together.
 **Fix:** Move Method to the data it envies; if only part of the method envies,
 Extract Method first and move that piece. Using several classes' data? Move it to
 the one with the most.
-**Detector:** `find_coupling_issues.py`.
+**Detector:** `find_coupling_issues.py` — a candidate (distinct attributes on
+each side; a module or a loop variable is never the envied object), because one
+file cannot rule out the case below.
 **Ignore when:** behavior is deliberately kept separate from data — Strategy,
 Visitor and friends do this on purpose to allow swapping behavior.
 

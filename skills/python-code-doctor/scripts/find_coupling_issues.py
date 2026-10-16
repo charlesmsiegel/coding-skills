@@ -36,6 +36,26 @@ class CouplingIssue:
     metric_value: float
     suggestion: str
     severity: str
+    kind: str = "finding"
+    also_caused_by: tuple[str, ...] = ()
+
+
+_INTERFACE_BASES = frozenset({"Protocol", "ABC"})
+_VALUE_DECORATORS = frozenset({"dataclass", "define", "frozen", "attrs"})
+# Bases that dictate no methods: inheriting from them adds no interface.
+_NEUTRAL_BASES = frozenset({"object", "Generic"})
+
+_ENVY_REASONS = (
+    "the receiver is a value object, a configuration or a strategy's context that "
+    "the method is meant to read — moving the method would make the data depend "
+    "on its reader",
+    "the method coordinates this class with the receiver, and either home would "
+    "read the other's attributes",
+)
+_INHERITED_COHESION_REASONS = (
+    "the base class or interface dictates the methods, so they share the "
+    "interface's purpose rather than the subclass's attributes",
+)
 
 
 # A declared record — a dataclass, attrs class, NamedTuple, TypedDict or pydantic
@@ -45,6 +65,17 @@ class CouplingIssue:
 _RECORD_DECORATORS = frozenset({"dataclass", "define", "frozen", "mutable", "attrs"})
 _RECORD_BASES = frozenset({"NamedTuple", "TypedDict", "BaseModel", "BaseSettings"})
 _FIELDS = "<declared fields>"
+
+
+def _name_of(node: ast.AST) -> str | None:
+    target = node.func if isinstance(node, ast.Call) else node
+    if isinstance(target, ast.Subscript):
+        target = target.value
+    if isinstance(target, ast.Attribute):
+        return target.attr
+    if isinstance(target, ast.Name):
+        return target.id
+    return None
 
 
 def _declared_fields(node: ast.ClassDef) -> set:
@@ -647,17 +678,22 @@ def _analyze_class(node: ast.ClassDef, filename: str, module_names: set,
     class_name = node.name
 
     # Low cohesion (LCOM4)
-    groups = [] if in_tests else _groups(methods, _declared_fields(node))
+    interface = any(_name_of(base) in _INTERFACE_BASES for base in node.bases) or any(
+        kw.arg == "metaclass" and _name_of(kw.value) == "ABCMeta" for kw in node.keywords)
+    groups = [] if in_tests or interface else _groups(methods, _declared_fields(node))
+    inherited = any(_name_of(base) not in _NEUTRAL_BASES for base in node.bases)
     if len(groups) >= 2:
         issues.append(CouplingIssue(
             file=filename, line=node.lineno,
             issue_type="low_cohesion", name=class_name,
-            description=(f"Class has low cohesion (LCOM4={len(groups)}): methods fall into "
+            description=(f"Class has low cohesion (LCOM4={len(groups)} over {sum(map(len, groups))} stateful methods): methods fall into "
                          f"{len(groups)} groups sharing no state: {_describe_groups(groups)}"),
             metric_value=len(groups),
-            suggestion="Each group is a responsibility of its own: split the class along these "
+            suggestion="" if inherited else "Each group is a responsibility of its own: split the class along these "
                        "groups, or move the group that does not belong to the class whose state it uses",
             severity="medium" if len(groups) == 2 else "high",
+            kind="candidate" if inherited else "finding",
+            also_caused_by=_INHERITED_COHESION_REASONS if inherited else (),
         ))
 
     # Feature Envy — reported at the envious method, which is what moves. Not in
@@ -678,8 +714,8 @@ def _analyze_class(node: ast.ClassDef, filename: str, module_names: set,
                 name=f"{class_name}.{method.name}",
                 description=f"Method '{method.name}' reads {count} of '{other_obj}'s attributes and {self_accesses} of its own",
                 metric_value=atfd,
-                suggestion=f"Consider moving method to {other_obj}'s class",
-                severity="medium",
+                suggestion="",
+                severity="medium", kind="candidate", also_caused_by=_ENVY_REASONS,
             ))
 
     # Message Chains
