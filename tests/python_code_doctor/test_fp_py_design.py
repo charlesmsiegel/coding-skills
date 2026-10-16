@@ -494,3 +494,34 @@ def test_fixture_requests_and_route_parameters_are_not_clumps(tmp_path):
     found = run_detector("find_parameter_objects.py", tmp_path)
     assert [(Path(r["file"]).name, r["description"].split(" appear")[0]) for r in found] == [
         ("budget.py", "Parameters ['max_bytes', 'max_posts', 'posts', 'radius']")]
+
+
+# --------------------------------------------------------------------------- #
+# find_duplicates: the rule of three
+# --------------------------------------------------------------------------- #
+
+DUPLICATED_BODY = (
+    "    total = 0\n"
+    "    for item in items:\n"
+    "        total += item.price * item.quantity\n"
+    "    discount = total * rate\n"
+    "    return total - discount\n"
+)
+
+
+def test_two_identical_blocks_are_a_candidate(tmp_path):
+    write(tmp_path, {"one.py": "def first(items, rate):\n" + DUPLICATED_BODY,
+                     "two.py": "def second(items, rate):\n" + DUPLICATED_BODY})
+    found = run_detector("find_duplicates.py", tmp_path)
+    assert len(found) == 1
+    assert_candidate_shape(found[0])
+    assert "rule of three" in " ".join(found[0]["also_caused_by"])
+
+
+def test_three_identical_blocks_are_a_finding(tmp_path):
+    write(tmp_path, {"one.py": "def first(items, rate):\n" + DUPLICATED_BODY,
+                     "two.py": "def second(items, rate):\n" + DUPLICATED_BODY,
+                     "three.py": "def third(items, rate):\n" + DUPLICATED_BODY})
+    found = run_detector("find_duplicates.py", tmp_path)
+    assert [(r["kind"], r["severity"], len(r["occurrences"])) for r in found] == [("finding", "high", 3)]
+    assert found[0]["suggestion"]

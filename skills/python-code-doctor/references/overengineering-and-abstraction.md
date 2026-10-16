@@ -73,7 +73,8 @@ maze of conditionals serving callers that no longer have anything in common.
 
 Guidance:
 - **Rule of three.** Two similar fragments: leave them. The third occurrence tells
-  you the shape of the real abstraction; extract then.
+  you the shape of the real abstraction; extract then. `find_duplicates.py` follows
+  it: two identical blocks are a candidate, three or more a finding.
 - **A little duplication is cheaper than the wrong abstraction.** Wrong abstractions
   are expensive to detect and expensive to unwind. Tolerable duplication is a local,
   honest cost.
