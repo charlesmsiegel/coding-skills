@@ -7,8 +7,8 @@ the whole class of "this compiled and did nothing" lives here. `forEach(async
 …)` is the canonical one — it type-checks, runs, and does not wait.
 """
 
-from common import Reporter, run_file_detector
-from tsparse import TsFile, body_indices, iter_calls, statement_start
+from common import Reporter, is_test_file, run_file_detector
+from tsparse import TsFile, argument_spans, body_indices, iter_calls, statement_end, statement_start
 
 # Array methods whose callback result is *used*: handing them an async callback
 # gives them a Promise, and a Promise is always truthy.
@@ -133,7 +133,8 @@ def _check_floating_promises(file: TsFile, report: Reporter) -> None:
         if following is not None and (following.is_op(".", "?.", ",", ")", "]", "=>", "+", ":", "=")
                                       or following.kind == "name"):
             continue  # the value is consumed by a chain, an argument, or an assignment
-        if method == "catch" or _chain_has(file, statement, close, "catch"):
+        if method == "catch" or _chain_has(file, statement, close, "catch") \
+                or _chain_has_two_argument_then(file, statement, close):
             continue
         report.add(head.line, "floating_promise",
                    f"`{callee}(…)` returns a promise that is never awaited or handled",
@@ -149,7 +150,58 @@ def _chain_has(file: TsFile, start: int, stop: int, method: str) -> bool:
     )
 
 
+def _chain_has_two_argument_then(file: TsFile, start: int, stop: int) -> bool:
+    """`p.then(onOk, onErr)` handles the rejection exactly as `.catch(onErr)` would."""
+    for index in range(start, min(stop + 1, len(file))):
+        if file.tokens[index].is_name("then") and file.tokens[index - 1].is_op(".", "?.") \
+                and index + 1 < len(file) and file.tokens[index + 1].is_op("("):
+            if len(argument_spans(file, index + 1)) >= 2:
+                return True
+    return False
+
+
+# Tokens that, at the head of a statement, put its value somewhere.
+_CONSUMING_HEADS = frozenset({"return", "const", "let", "var", "yield", "throw", "export", "case"})
+_ASSIGNMENTS = frozenset({"=", "+=", "-=", "||=", "&&=", "??="})
+
+
+def _result_discarded(file: TsFile, paren: int, close: int) -> tuple[bool, int, int]:
+    """(whether the `.catch(…)` result is thrown away, statement start, statement end).
+
+    `const live = await find().catch(() => null); if (!live) …` is not a
+    swallowed rejection: the handler turns failure into a value and the caller
+    branches on it. Neither is a catch whose result is chained on, passed as an
+    argument, assigned, or returned (including by a concise arrow). What is
+    left is the shape the finding describes: a statement — optionally `await`ed
+    or `void`ed — that ends at the `.catch(…)` and keeps nothing.
+    """
+    start = statement_start(file, paren)
+    end = statement_end(file, start)
+    if close + 1 != end and not (close + 1 < len(file) and file.tokens[close + 1].is_op(";")):
+        return False, start, end  # something follows: a chain, an argument list, an operator
+    if start and file.tokens[start - 1].is_op("=>"):
+        return False, start, end  # a concise arrow body returns it
+    if file.tokens[start].kind == "name" and file.tokens[start].value in _CONSUMING_HEADS:
+        return False, start, end
+    if any(file.tokens[i].kind == "op" and file.tokens[i].value in _ASSIGNMENTS
+           for i in range(start, paren)):
+        return False, start, end
+    return True, start, end
+
+
+def _explained(file: TsFile, start: int, end: int) -> bool:
+    """A comment inside the statement, after it on its last line, or directly above it."""
+    first, last = file.tokens[start], file.tokens[max(end - 1, start)]
+    for comment in file.comments:
+        if comment.start >= first.start and comment.line <= last.line:
+            return True
+        if comment.line + comment.value.count("\n") == first.line - 1:
+            return True
+    return False
+
+
 def _check_swallowed_rejections(file: TsFile, report: Reporter) -> None:
+    test = is_test_file(file.path)
     for paren, callee in iter_calls(file):
         if callee.rsplit(".", 1)[-1] != "catch":
             continue
@@ -161,11 +213,37 @@ def _check_swallowed_rejections(file: TsFile, report: Reporter) -> None:
         if close < 0:
             continue
         inner = file.slice(paren + 1, close).strip()
-        if inner in ("() => {}", "() => { }", "() => undefined", "() => null", "()=>{}"):
-            report.add(file.tokens[paren].line, "swallowed_rejection",
-                       "`.catch(() => {})` discards the error and reports success",
-                       "Log it with context and re-throw, or handle it concretely. An empty catch "
-                       "turns a failure into a silent wrong answer.", "high")
+        if inner not in ("() => {}", "() => { }", "() => undefined", "() => null", "()=>{}"):
+            continue
+        discarded, start, end = _result_discarded(file, paren, close)
+        if not discarded:
+            continue
+        line = file.tokens[paren].line
+        # The receiver is a promise named here, not one this statement created:
+        # `await settling.catch(() => {})` waits for a promise someone else holds,
+        # and whether its rejection is lost depends on that owner.
+        head = paren - 1 - 2 * callee.count(".")
+        shared = "." in callee and not (head and file.tokens[head - 1].is_op(".", "?.", ")"))
+        # In a test the call is often expected to reject, and what the test
+        # asserts is what happened before it did.
+        if shared or test or _explained(file, start, end):
+            report.candidate(line, "swallowed_rejection",
+                             f"`{callee}({inner})` drops the rejection here",
+                             ("the operation is optional and a comment beside it says so — a failed "
+                              "read leaves a state the code already renders",
+                              "it is a test that expects the call to reject and asserts what "
+                              "happened before it did",
+                              "the promise is shared, its owner observes the rejection, and this "
+                              "statement only waits for it to settle",
+                              "the failure is reported elsewhere (an error boundary, a status the "
+                              "request itself sets) before it reaches this handler"),
+                             "medium")
+            continue
+        report.add(line, "swallowed_rejection",
+                   "`.catch(() => {})` discards the error and reports success",
+                   "Log it with context and re-throw, or handle it concretely. An empty catch "
+                   "turns a failure into a silent wrong answer. If the operation is genuinely "
+                   "optional, say so in a comment.", "high")
 
 
 def _check_await_in_loop(file: TsFile, report: Reporter) -> None:
@@ -202,8 +280,13 @@ def _same_function(file: TsFile, index: int, loop_body: int) -> bool:
 
 
 def _check_async_without_await(file: TsFile, report: Reporter) -> None:
+    # In a test, `onSaved: async () => {}` is a stub that satisfies a
+    # `() => Promise<void>` prop or mock; the `async` is the type, not a mistake.
+    test = is_test_file(file.path)
     for func in file.functions:
         if not func.is_async or not func.has_body:
+            continue
+        if test and func.body_close == func.body_open + 1:
             continue
         body = body_indices(func)
         nested = [(f.body_open, f.body_close) for f in file.functions
