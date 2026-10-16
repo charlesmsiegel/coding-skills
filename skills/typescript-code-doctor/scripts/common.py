@@ -46,8 +46,19 @@ DECLARATION_SUFFIXES = (".d.ts", ".d.mts", ".d.cts")
 # Filename markers that make a file a test. Used by several detectors to
 # apply a different standard (a `console.log` in a test is not a leftover)
 # and by find_untested_modules to tell the two halves of a repo apart.
-TEST_DIR_NAMES = frozenset({"__tests__", "__test__", "test", "tests", "spec", "e2e", "cypress"})
+#
+# Test code is more than the test files themselves. The scaffolding the suites
+# share — a mocks directory, a harness kit, the runner's setup file — casts
+# mocks into place and stubs browser APIs exactly as a test does, and no
+# production module imports it. The directory names below cover the usual
+# homes for that scaffolding; TEST_SETUP_STEMS covers the setup files Jest,
+# Vitest and Create React App load before every suite (`setupFiles`).
+TEST_DIR_NAMES = frozenset({
+    "__tests__", "__test__", "test", "tests", "spec", "e2e", "cypress",
+    "__mocks__", "__fixtures__", "testkit", "test-utils", "testutils", "test-helpers",
+})
 TEST_NAME_MARKERS = (".test.", ".spec.", "-test.", "_test.")
+TEST_SETUP_STEMS = frozenset({"test-setup", "setuptests", "vitest.setup", "jest.setup"})
 
 # Calls whose callback groups tests into a suite (`describe('x', () => …)`).
 # Their `.each` / `.only` / `.skip` spellings share the head word.
@@ -194,7 +205,7 @@ def project_root_of(filepath: Path) -> Path | None:
 
 
 def is_test_file(filepath: Path) -> bool:
-    """True when the path names a test file by directory or by suffix.
+    """True when the path names a test file by directory, by suffix, or as a setup file.
 
     Directory markers are matched *below the project root only*. Every
     component of an absolute path is the wrong scope: a checkout that happens
@@ -206,6 +217,10 @@ def is_test_file(filepath: Path) -> bool:
     """
     name = filepath.name
     if any(marker in name for marker in TEST_NAME_MARKERS):
+        return True
+    # `vitest.setup.ts` → stem `vitest.setup`; the extension is whatever
+    # follows the last dot.
+    if name.rsplit(".", 1)[0].lower() in TEST_SETUP_STEMS:
         return True
     root = project_root_of(filepath)
     if root is not None:
