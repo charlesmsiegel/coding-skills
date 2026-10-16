@@ -16,6 +16,7 @@ Finds:
 """
 
 import ast
+import functools
 import json
 import argparse
 from pathlib import Path
@@ -111,22 +112,20 @@ _COPYING_MODEL_BASES = frozenset({
 # two; bounded because each hop parses a file.
 _MAX_RESOLUTION_DEPTH = 8
 
-_RESOLVERS: dict[Path, "ClassFamilyResolver | None"] = {}
-
-
 def _resolver_for(path: Path) -> "ClassFamilyResolver | None":
     """One resolver per first-party module, parsed at most once per process."""
-    path = path.resolve()
-    if path not in _RESOLVERS:
-        try:
-            _source, tree = cached_parse(path)
-        except (OSError, SyntaxError, ValueError):
-            _RESOLVERS[path] = None
-        else:
-            parents = {child: parent for parent in ast.walk(tree)
-                       for child in ast.iter_child_nodes(parent)}
-            _RESOLVERS[path] = ClassFamilyResolver(tree, parents, path)
-    return _RESOLVERS[path]
+    return _resolver_at(path.resolve())
+
+
+@functools.lru_cache(maxsize=None)
+def _resolver_at(path: Path) -> "ClassFamilyResolver | None":
+    try:
+        _source, tree = cached_parse(path)
+    except (OSError, SyntaxError, ValueError):
+        return None
+    parents = {child: parent for parent in ast.walk(tree)
+               for child in ast.iter_child_nodes(parent)}
+    return ClassFamilyResolver(tree, parents, path)
 
 
 def _module_file(directory: Path, parts: list[str]) -> Path | None:
