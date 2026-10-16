@@ -9,7 +9,7 @@ import json
 import argparse
 from pathlib import Path
 from datetime import datetime
-from common import SEVERITY_ICONS, SchemaError, configure_output, validate_record
+from common import SEVERITY_ICONS, SchemaError, configure_output, drop_aliased, validate_record
 from runner import default_jobs, run_detectors
 
 
@@ -57,6 +57,15 @@ ANALYZERS = [
 
 CATEGORIES = [category for category, _, _, _ in ANALYZERS]
 
+def merge_aliases(results: dict) -> None:
+    """Drop, in place, each record another category reports under its canonical
+    name (common.FINDING_ALIASES): one too-long signature is billed once."""
+    lists = [found for found in results.values() if isinstance(found, list)]
+    kept = {id(r) for r in drop_aliased([r for found in lists for r in found])}
+    for category, found in results.items():
+        if isinstance(found, list):
+            results[category] = [r for r in found if id(r) in kept]
+
 
 def generate_report(path: str, skip: set | None = None, jobs: int | None = None) -> dict:
     skip = skip or set()
@@ -72,6 +81,7 @@ def generate_report(path: str, skip: set | None = None, jobs: int | None = None)
     )
     # Report in the table's order, not the order the pool happened to finish in.
     results = {category: results[category] for category, _, _, _ in scheduled}
+    merge_aliases(results)
 
     report = {
         'meta': {
