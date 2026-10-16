@@ -703,3 +703,22 @@ export function apply(options: { retries: number }): void {
 def test_dom_objects_and_syntax_trees_are_not_caller_owned_data(tmp_path):
     found = records("find_mutation_hazards.py", tmp_path, {"guard.ts": MUTATIONS}, "mutates_argument_property")
     assert {r["line"]: r["kind"] for r in found} == {6: "candidate", 9: "finding"}
+
+
+# --------------------------------------------------------------------------- #
+# find_untested_modules: a test reaches the whole closure of its imports
+# --------------------------------------------------------------------------- #
+
+def test_a_module_reached_through_several_imports_is_tested(tmp_path):
+    files = {
+        "package.json": '{"name": "p", "version": "1.0.0"}',
+        "src/page.test.ts": 'import { page } from "./page";\ntest("p", () => { expect(page()).toBe(3); });\n',
+        "src/page.ts": 'import { panel } from "./panel";\nexport function page(): number { return panel(); }\n',
+        "src/panel.ts": 'import { hook } from "./hook";\nexport function panel(): number { return hook(); }\n',
+        "src/hook.ts": 'import { leaf } from "./leaf";\nexport function hook(): number { return leaf(); }\n',
+        "src/leaf.ts": "export function leaf(): number { return 3; }\n",
+        "src/orphan.ts": "export function orphan(): number { return 4; }\n",
+        "vite.config.ts": "export default { plugins: [] };\n",
+    }
+    found = records("find_untested_modules.py", tmp_path, files, "untested_module")
+    assert [Path(r["file"]).name for r in found] == ["orphan.ts"]
