@@ -5,12 +5,19 @@ string literals repeated across the codebase.
 
 Duplication is compared after normalising identifiers and literals away, so
 copy-paste that has since been renamed still matches — which is most of it.
+React hook names are the exception, and a window that is mostly hook state
+declarations is not compared at all: `const [a, setA] = useState(…)` five
+times over is how a component declares state, not a copied block. A repeated
+string is not counted where its repetition is not a missed constant — a CSS
+class name shared with a stylesheet, or a member of a literal union in a type,
+a comparison or a `case` label, where the compiler already checks the spelling.
 That also means a match is a *candidate*: two blocks with the same shape can
 encode genuinely different rules, and merging those is the wrong abstraction.
 The finding names both sites so a reader can decide.
 """
 
 import hashlib
+import re
 from collections import defaultdict
 from pathlib import Path
 
@@ -31,13 +38,23 @@ CLASS_ATTRIBUTES = frozenset({"className", "class"})
 CLASS_LIST_HELPERS = frozenset({"clsx", "cn", "cx", "classNames", "classnames", "twMerge", "twJoin", "cva", "tv"})
 
 
+# A React hook's name is its meaning — `useState` and `useRef` are different
+# operations, not two spellings of one — so it survives normalisation.
+_HOOK = re.compile(r"use[A-Z]\w*$")
+# A window this hook-declaration-heavy is a component declaring its state, the
+# language's idiom for it, and two components that each declare five pieces of
+# state have not copied each other.
+HOOK_DECLARATION_SHARE = 0.6
+
+
 def _normalise(tsfile, start: int, stop: int) -> str:
     """Token shape with names and literals erased, so renames still match."""
     parts = []
     for index in range(start, stop):
         token = tsfile.tokens[index]
         if token.kind == "name":
-            parts.append("#" if token.value not in _KEYWORDS else token.value)
+            keep = token.value in _KEYWORDS or _HOOK.match(token.value)
+            parts.append(token.value if keep else "#")
         elif token.kind in ("str", "num", "template", "regex"):
             parts.append("$")
         else:
@@ -68,6 +85,20 @@ def _block_windows(tsfile):
             yield start, start + WINDOW
 
 
+def _mostly_hook_declarations(tsfile, start: int, stop: int) -> bool:
+    """True when most lines of the window declare state with a hook call."""
+    lines: dict[int, list[int]] = defaultdict(list)
+    for index in range(start, stop):
+        lines[tsfile.tokens[index].line].append(index)
+    hooked = sum(
+        1 for indices in lines.values()
+        if any(tsfile.tokens[i].kind == "name" and _HOOK.match(tsfile.tokens[i].value)
+               and i + 1 < len(tsfile) and tsfile.tokens[i + 1].is_op("(", "<")
+               and i >= 1 and tsfile.tokens[i - 1].is_op("=") for i in indices)
+    )
+    return hooked >= HOOK_DECLARATION_SHARE * len(lines)
+
+
 def _check_blocks(project, add) -> None:
     seen: dict[str, list[tuple[Path, int]]] = defaultdict(list)
     for path, tsfile in project.analyzable.items():
@@ -79,6 +110,8 @@ def _check_blocks(project, add) -> None:
             shape = _normalise(tsfile, start, stop)
             if shape.count("#") < MIN_DISTINCT_NAMES:
                 continue  # boilerplate-shaped, e.g. a long chain of punctuation
+            if _mostly_hook_declarations(tsfile, start, stop):
+                continue
             digest = hashlib.blake2b(shape.encode("utf-8"), digest_size=12).hexdigest()
             seen[digest].append((path, tsfile.tokens[start].line))
 
@@ -185,15 +218,70 @@ def _class_list_strings(tsfile) -> set[int]:
     return marked
 
 
+# Attributes and helpers whose string arguments are CSS class names. Those are
+# a vocabulary shared with a stylesheet, not constants the code owns: the
+# stylesheet cannot import a TypeScript name, so "import the constant" is not
+# the fix, and a repeated `"field-hint"` is how a design system is used.
+_CLASS_KEYS = frozenset({"className", "class", "classList"})
+_CLASS_LIST_METHODS = frozenset({"add", "remove", "toggle", "contains", "replace"})
+# The property names a discriminated union is conventionally tagged with.
+_DISCRIMINANT_KEYS = ("kind", "type", "tag")
+
+
+def _exempt_literal_positions(tsfile) -> set[int]:
+    """Token indices of strings whose repetition is not a missed constant.
+
+    Two kinds. A class name (above). And a member of a literal union: a
+    string in a type, compared with `===`/`!==`, used as a `case` label,
+    narrowed with `as`/`satisfies`, or given as a `kind`/`type`/`tag` value.
+    Those slots are typically typed as a union of literals, where a typo is a
+    compile error (TS2367, TS2678, TS2322) — the very check the finding says
+    the compiler cannot make.
+    """
+    tokens = tsfile.tokens
+    exempt: set[int] = set()
+
+    def cover(start: int, stop: int) -> None:
+        exempt.update(i for i in range(max(start, 0), min(stop, len(tokens))) if tokens[i].kind == "str")
+
+    for start, end in tsfile.type_spans:
+        cover(start, end + 1)
+    for index, token in enumerate(tokens):
+        if token.kind == "name" and token.value in _CLASS_KEYS and index + 2 < len(tokens) \
+                and tokens[index + 1].is_op("=", ":"):
+            value = index + 2
+            if tokens[value].kind == "str":
+                cover(value, value + 1)
+        elif token.is_op("(") and index:
+            callee = tokens[index - 1]
+            member = index >= 3 and tokens[index - 2].is_op(".") and tokens[index - 3].is_name("classList")
+            if callee.kind == "name" and member and callee.value in _CLASS_LIST_METHODS:
+                cover(index, tsfile.skip_group(index))
+        elif token.kind == "str":
+            previous = tokens[index - 1] if index else None
+            following = tokens[index + 1] if index + 1 < len(tokens) else None
+            compared = (previous is not None and (previous.is_op("===", "!==", "==", "!=")
+                                                  or previous.is_name("case"))) \
+                or (following is not None and (following.is_op("===", "!==", "==", "!=")
+                                               or following.is_name("as", "satisfies")))
+            # `{ kind: "campaign", … }`: the value of a discriminant property,
+            # checked against the union wherever the object meets its type.
+            discriminant = previous is not None and previous.is_op(":") and index >= 2 \
+                and tokens[index - 2].is_name(*_DISCRIMINANT_KEYS)
+            if compared or discriminant:
+                exempt.add(index)
+    return exempt
+
+
 def _check_literals(project, add) -> None:
     occurrences: dict[str, list[tuple[Path, int]]] = defaultdict(list)
     for path, tsfile in project.analyzable.items():
         if is_test_file(path) or is_declaration_file(path):
             continue
         import_lines = {record.line for record in tsfile.imports}
-        class_lists = _class_list_strings(tsfile)
+        exempt = _exempt_literal_positions(tsfile) | _class_list_strings(tsfile)
         for index, token in enumerate(tsfile.tokens):
-            if token.kind != "str" or token.line in import_lines or index in class_lists:
+            if token.kind != "str" or token.line in import_lines or index in exempt:
                 continue
             literal = token.value.strip("'\"")
             if len(literal) < MIN_LITERAL_LENGTH or literal.startswith(("http", "./", "../")):
