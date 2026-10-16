@@ -538,3 +538,67 @@ def test_a_state_shaped_boolean_is_named_well_and_a_noun_is_a_lead(tmp_path):
     found = records("find_naming_issues.py", tmp_path, {"wire.ts": BOOLEANS}, "boolean_without_predicate_name")
     assert lines_of(found) == [9, 10]
     assert all(r["kind"] == "candidate" and r["also_caused_by"] for r in found)
+
+
+# --------------------------------------------------------------------------- #
+# find_duplicates: state declarations are not a copied block; class names and
+# union members are not missed constants
+# --------------------------------------------------------------------------- #
+
+def _component(name: str, states: list[str], tail: str) -> str:
+    lines = [f"export function {name}(): number {{"]
+    for state in states:
+        setter = "set" + state[:1].upper() + state[1:]
+        lines.append(f"  const [{state}, {setter}] = useState<string | null>(null);")
+    lines.append(f"  {tail}")
+    lines.append("}")
+    return "\n".join(lines) + "\n"
+
+
+COPIED = """\
+export function {name}(rows: Row[]): number {{
+  let total = 0;
+  for (const row of rows) {{
+    if (row.amount > row.limit) {{ total += row.amount - row.limit; continue; }}
+    const scaled = row.amount * row.rate + row.base;
+    total += Math.round(scaled / row.divisor) + row.bonus;
+    if (total > row.cap) {{ total = row.cap; break; }}
+  }}
+  return total;
+}}
+"""
+
+
+def test_runs_of_state_declarations_are_not_duplicate_blocks(tmp_path):
+    files = {
+        "a.tsx": _component("Ledger", ["alpha", "beta", "gamma", "delta", "epsilon", "zeta", "eta"],
+                            "return alpha ? 1 : 0;"),
+        "b.tsx": _component("Scenes", ["one", "two", "three", "four", "five", "six", "seven"],
+                            "return [one, two].length;"),
+        "c.ts": COPIED.format(name="charge"),
+        "d.ts": COPIED.format(name="bill"),
+    }
+    found = records("find_duplicates.py", tmp_path, files, "duplicate_block")
+    assert [Path(r["file"]).name for r in found] == ["c.ts"], "the copied loop is still a duplicate"
+
+
+LITERALS = """\
+type Scope = { kind: "campaign-scope" | "worldwide-scope" };
+export function view(scope: Scope, el: HTMLElement): string[] {
+  el.className = "field-hint";
+  el.classList.add("field-hint");
+  const a = cn("field-hint", scope.kind === "campaign-scope" && "on");
+  const tags = [{ kind: "campaign-scope" }, { kind: "campaign-scope" }];
+  switch (scope.kind) { case "campaign-scope": break; }
+  const label = "Generating the summary";
+  const again = "Generating the summary";
+  return [a, label, again, "Generating the summary", "Generating the summary",
+          "Generating the summary", String(tags), "field-hint" as string];
+}
+"""
+
+
+def test_class_names_and_union_members_are_not_repeated_literals(tmp_path):
+    files = {"view.tsx": LITERALS + 'export const C = () => <p className="field-hint" />;\n'}
+    found = records("find_duplicates.py", tmp_path, files, "repeated_string_literal")
+    assert [r["description"].split("`")[1] for r in found] == ["Generating the summary"]
