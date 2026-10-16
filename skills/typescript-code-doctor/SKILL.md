@@ -200,10 +200,17 @@ one file at a time and the evidence that settles it is elsewhere. A candidate
 carries `also_caused_by`, the benign readings a healthy codebase produces, and
 **no `suggestion`**: there is nothing to fix until the lead is confirmed.
 
-Ten heuristics are reported this way: `type_assertion`, `missing_return_type`,
-`all_optional_type`, `definite_assignment_assertion`, `await_in_loop`,
-`single_implementation_interface`, `barrel_file`, `data_clump`,
-`primitive_obsession` and `public_mutable_field`.
+Thirteen heuristics are always reported this way: `type_assertion`,
+`missing_return_type`, `all_optional_type`, `definite_assignment_assertion`,
+`await_in_loop`, `single_implementation_interface`, `barrel_file`, `data_clump`,
+`primitive_obsession`, `public_mutable_field`, `switch_without_default` (whether
+a missing `default` matters depends on the discriminant's type),
+`boolean_without_predicate_name` (a noun, or an adjective?) and
+`falsy_default_with_or` (the left operand's type decides). Three more are
+candidates in their ambiguous shape only: a bare `alert()` under
+`browser_dialog`; a `swallowed_rejection` that a comment explains, that waits on
+a promise someone else holds, or that sits in a test; and a
+`mutates_argument_property` that edits a syntax-tree parameter in place.
 Each is ordinary, correct TypeScript often enough that only a reader with the
 surrounding context can tell. Confirm one before acting on it — an `as` at a
 boundary where the value really was checked is the honest spelling, not a defect.
