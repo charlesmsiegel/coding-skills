@@ -828,3 +828,47 @@ def test_a_close_in_finally_is_a_lead_naming_its_with_form(tmp_path):
     assert_candidate_shape(found[0])
     assert "contextlib.closing()" in found[0]["description"]
     assert any("sqlite3" in reason for reason in found[0]["also_caused_by"])
+
+
+# --------------------------------------------------------------------------- #
+# find_loop_simplifications: loop_to_comprehension
+# --------------------------------------------------------------------------- #
+
+
+def test_a_loop_that_reads_the_list_it_builds_is_not_a_comprehension(tmp_path):
+    write(tmp_path, {"sample.py": """\
+        def dedupe(keys):
+            off = []
+            for key in keys:
+                if key and key not in off:
+                    off.append(key)
+            return off
+
+        def doubled(items):
+            out = []
+            for item in items:
+                out.append(item * 2)
+            return out
+        """})
+    found = of_type(run_detector("find_loop_simplifications.py", tmp_path), "loop_to_comprehension")
+    assert [r["line"] for r in found] == [10]
+    assert "out = [" in found[0]["suggestion"]
+
+
+def test_a_list_that_already_holds_items_is_extended_not_replaced(tmp_path):
+    write(tmp_path, {"sample.py": """\
+        def gather(groups, extra, seed):
+            out = [seed]
+            for item in extra:
+                out.append(item)
+            names = []
+            for group in groups:
+                for member in group:
+                    names.append(member.name)
+            for item in extra:
+                seed.append(item)
+            return out, names
+        """})
+    found = of_type(run_detector("find_loop_simplifications.py", tmp_path), "loop_to_comprehension")
+    assert [(r["line"], ".extend(" in r["suggestion"]) for r in found] == [
+        (3, True), (7, True), (9, True)]
