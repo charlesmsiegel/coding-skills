@@ -261,3 +261,326 @@ def test_ignoring_the_return_gap_still_reports_the_parameters(tmp_path):
     write(tmp_path, {"m.py": "def both(a, b):\n    return a\n"})
     found = run_detector("find_type_gaps.py", tmp_path, "--ignore", "missing_return_annotation")
     assert gaps(found) == [(1, "missing_param_annotation")]
+
+
+# --------------------------------------------------------------------------- #
+# find_test_smells: logic_in_test
+# --------------------------------------------------------------------------- #
+
+
+def logic_tests(tmp_path: Path, source: str) -> set[str]:
+    """The names of the tests logic_in_test reports in `source`."""
+    write(tmp_path, {"test_sample.py": source})
+    return {f["description"].split("'")[1]
+            for f in of_type(run_detector("find_test_smells.py", tmp_path), "logic_in_test")}
+
+
+def test_a_loop_over_a_literal_table_is_not_logic_but_a_computed_one_is(tmp_path):
+    flagged = logic_tests(tmp_path, (
+        "import itertools, pytest\n"
+        "CASES = (('a', 1), ('b', 2))\n"
+        "def test_tuple():\n"
+        "    for x in (1, 2, 3):\n"
+        "        assert x > 0\n"
+        "def test_range_arrange():\n"
+        "    xs = []\n"
+        "    for n in range(10):\n"
+        "        xs.append(n)\n"
+        "    assert len(xs) == 10\n"
+        "def test_module_table():\n"
+        "    for name, n in CASES:\n"
+        "        assert name and n\n"
+        "def test_local_dict_items():\n"
+        "    cases = {'a': 1, 'b': 2}\n"
+        "    for k, v in cases.items():\n"
+        "        assert k and v\n"
+        "def test_zip_enumerate_product():\n"
+        "    for i, (a, b) in enumerate(zip('ab', [1, 2])):\n"
+        "        for p in itertools.product((1, 2), repeat=2):\n"
+        "            assert a and b and p\n"
+        # Still logic: each of these can run an iteration short, or none at all.
+        "def test_computed(client):\n"
+        "    for item in client.get('/x').json():\n"
+        "        assert item['id']\n"
+        "def test_empty_range():\n"
+        "    for n in range(0):\n"
+        "        assert n\n"
+        "def test_break_skips():\n"
+        "    for x in (1, 2, 3):\n"
+        "        if x == 2:\n"
+        "            break\n"
+        "def test_continue_skips():\n"
+        "    for x in (1, 2, 3):\n"
+        "        continue\n"
+        "def test_rebound_name():\n"
+        "    cases = [1, 2]\n"
+        "    cases = load()\n"
+        "    for c in cases:\n"
+        "        assert c\n"
+        "def test_shrunk_name():\n"
+        "    cases = [1, 2]\n"
+        "    cases.clear()\n"
+        "    for c in cases:\n"
+        "        assert c\n"
+        "def test_starred_only():\n"
+        "    for c in [*load()]:\n"
+        "        assert c\n"
+        "def test_iterator_through_a_name():\n"
+        "    pairs = zip((1, 2), (3, 4))\n"
+        "    for a, b in pairs:\n"
+        "        assert a < b\n"
+        "def test_nested_if_in_table(k):\n"
+        "    for x in (1, 2):\n"
+        "        if k:\n"
+        "            assert x\n"
+    ))
+    assert flagged == {"test_computed", "test_empty_range", "test_break_skips", "test_continue_skips",
+                       "test_rebound_name", "test_shrunk_name", "test_starred_only",
+                       "test_iterator_through_a_name", "test_nested_if_in_table"}
+
+
+def test_a_skip_or_fail_guard_is_not_logic_but_a_branch_is(tmp_path):
+    flagged = logic_tests(tmp_path, (
+        "import shutil, pytest\n"
+        "def test_env_guard():\n"
+        "    if not shutil.which('git'):\n"
+        "        pytest.skip('no git')\n"
+        "    assert run()\n"
+        "def test_fail_guard(actual, expected):\n"
+        "    if actual != expected:\n"
+        "        msg = report(actual, expected)\n"
+        "        pytest.fail(msg)\n"
+        "def test_raise_guard(x):\n"
+        "    if x is None:\n"
+        "        raise AssertionError('missing')\n"
+        "def test_xfail_guard(platform):\n"
+        "    if platform == 'win':\n"
+        "        pytest.xfail('not on windows')\n"
+        "    assert run()\n"
+        # Still logic: a branch whose arms check different things.
+        "@pytest.mark.parametrize('k', ['a', 'b'])\n"
+        "def test_branch_on_param(k):\n"
+        "    if k == 'a':\n"
+        "        assert g() == 1\n"
+        "def test_guard_with_else(x):\n"
+        "    if x:\n"
+        "        pytest.skip('x')\n"
+        "    else:\n"
+        "        assert y()\n"
+        "def test_guard_that_loops(xs):\n"
+        "    if xs:\n"
+        "        for x in xs:\n"
+        "            check(x)\n"
+        "        pytest.fail('xs')\n"
+        "def test_early_return(x):\n"
+        "    if x:\n"
+        "        return\n"
+        "    assert y()\n"
+        "def test_polling():\n"
+        "    while not done():\n"
+        "        tick()\n"
+        "    assert done()\n"
+    ))
+    assert flagged == {"test_branch_on_param", "test_guard_with_else", "test_guard_that_loops",
+                       "test_early_return", "test_polling"}
+
+
+def test_logic_in_an_except_clause_or_an_async_for_is_logic(tmp_path):
+    flagged = logic_tests(tmp_path, (
+        "async def test_async_for(stream):\n"
+        "    async for chunk in stream:\n"
+        "        assert chunk\n"
+        "def test_branch_in_except():\n"
+        "    try:\n"
+        "        run()\n"
+        "    except ValueError as exc:\n"
+        "        if 'x' in str(exc):\n"
+        "            assert False\n"
+    ))
+    assert flagged == {"test_async_for", "test_branch_in_except"}
+
+
+# --------------------------------------------------------------------------- #
+# find_test_smells: test_without_assertion
+# --------------------------------------------------------------------------- #
+
+
+def assertion_free(tmp_path: Path, source: str) -> dict[str, str]:
+    """test name -> severity, for every test reported as asserting nothing."""
+    write(tmp_path, {"test_sample.py": source})
+    return {f["description"].split("'")[1]: f["severity"]
+            for f in of_type(run_detector("find_test_smells.py", tmp_path), "test_without_assertion")}
+
+
+def test_assertions_the_test_reaches_in_one_step_count(tmp_path):
+    reported = assertion_free(tmp_path, (
+        "import asyncio, pytest, unittest\n"
+        "def _assert_same(a, b):\n"
+        "    assert a == b\n"
+        "def bad_tree_case(tree, word):\n"
+        "    with pytest.raises(ValueError, match=word):\n"
+        "        parse(tree)\n"
+        "def _first_matching(lines, pattern):\n"
+        "    for line in lines:\n"
+        "        if pattern in line:\n"
+        "            return line\n"
+        "    raise AssertionError(pattern)\n"
+        "async def assert_async(x):\n"
+        "    assert x\n"
+        "def test_underscore_helper():\n"
+        "    _assert_same(1, 1)\n"
+        "def test_module_helper():\n"
+        "    bad_tree_case({}, 'object')\n"
+        "def test_helper_raising_assertion_error():\n"
+        "    _first_matching(['a'], 'a')\n"
+        "async def test_awaited_helper():\n"
+        "    await assert_async(1)\n"
+        "def test_assert_in_except():\n"
+        "    try:\n"
+        "        int('x')\n"
+        "    except ValueError as e:\n"
+        "        assert 'invalid' in str(e)\n"
+        "def test_pytest_fail_in_if():\n"
+        "    if run() != 2:\n"
+        "        pytest.fail('broke')\n"
+        "def test_raise_assertion_error_in_else():\n"
+        "    try:\n"
+        "        run()\n"
+        "    except ValueError:\n"
+        "        pass\n"
+        "    else:\n"
+        "        raise AssertionError('expected ValueError')\n"
+        "def test_nested_called():\n"
+        "    def check():\n"
+        "        assert run()\n"
+        "    check()\n"
+        "def test_nested_run_by_asyncio():\n"
+        "    async def main():\n"
+        "        assert await go()\n"
+        "    asyncio.run(main())\n"
+        "def test_lambda_tripwire(monkeypatch):\n"
+        "    monkeypatch.setattr(mod, 'write', lambda *a: pytest.fail('wrote'))\n"
+        "    mod.repoint()\n"
+        "def test_nested_def_tripwire(monkeypatch):\n"
+        "    def read(*a):\n"
+        "        raise AssertionError('read')\n"
+        "    monkeypatch.setattr(mod, 'read', read)\n"
+        "    mod.compose()\n"
+        "def test_nested_class_tripwire():\n"
+        "    class Manager:\n"
+        "        def register(self, *a):\n"
+        "            raise AssertionError('registered')\n"
+        "    plugin.register(Manager())\n"
+        "def test_fluent_expect(page):\n"
+        "    expect(page).to_have_title('x')\n"
+        "class TestReply(unittest.TestCase):\n"
+        "    def check_reply(self, r):\n"
+        "        self.assertEqual(r, 1)\n"
+        "    def test_self_helper(self):\n"
+        "        self.check_reply(run())\n"
+    ))
+    assert reported == {}
+
+
+def test_a_test_that_reaches_no_assertion_is_still_reported(tmp_path):
+    reported = assertion_free(tmp_path, (
+        "import pytest\n"
+        "def make_cart():\n"
+        "    return []\n"
+        "def checkout(cart):\n"
+        "    return cart\n"
+        "@pytest.fixture\n"
+        "def client():\n"
+        "    c = build()\n"
+        "    assert c\n"
+        "    return c\n"
+        "def test_helper_that_asserts_nothing():\n"
+        "    make_cart()\n"
+        "def test_checkout_is_not_a_check():\n"
+        "    checkout(make_cart())\n"
+        "def test_a_fixture_is_not_a_helper(client):\n"
+        "    client.get('/')\n"
+        "def test_a_validator_check_is_the_code_under_test():\n"
+        "    schemas.check({})\n"
+        "def test_nested_helper_never_used():\n"
+        "    def check():\n"
+        "        assert False\n"
+        "    run()\n"
+    ))
+    assert set(reported) == {"test_helper_that_asserts_nothing", "test_checkout_is_not_a_check",
+                             "test_a_fixture_is_not_a_helper",
+                             "test_a_validator_check_is_the_code_under_test",
+                             "test_nested_helper_never_used"}
+
+
+def test_a_test_that_runs_code_is_low_and_one_that_runs_nothing_is_high(tmp_path):
+    reported = assertion_free(tmp_path, (
+        "def test_placeholder():\n"
+        "    pass\n"
+        "def test_only_assigns():\n"
+        "    '''Docstring.'''\n"
+        "    x = 1\n"
+        "def test_must_not_raise():\n"
+        "    migrate()  # an empty store must not raise\n"
+        "def test_context_manager(lock):\n"
+        "    with lock:\n"
+        "        pass\n"
+    ))
+    assert reported == {"test_placeholder": "high", "test_only_assigns": "high",
+                        "test_must_not_raise": "low", "test_context_manager": "low"}
+
+
+def test_the_low_finding_says_what_the_test_does_prove(tmp_path):
+    write(tmp_path, {"test_sample.py": "def test_x():\n    run()\n"})
+    [finding] = of_type(run_detector("find_test_smells.py", tmp_path), "test_without_assertion")
+    assert "does not raise" in finding["description"] and finding["suggestion"]
+
+
+# --------------------------------------------------------------------------- #
+# find_test_smells: trivial_assertion
+# --------------------------------------------------------------------------- #
+
+
+def trivial(tmp_path: Path, source: str) -> set[str]:
+    write(tmp_path, {"test_sample.py": source})
+    return {f["description"].split("'")[1]
+            for f in of_type(run_detector("find_test_smells.py", tmp_path), "trivial_assertion")}
+
+
+def test_determinism_and_not_none_checks_can_fail_so_are_not_trivial(tmp_path):
+    flagged = trivial(tmp_path, (
+        "import unittest\n"
+        "def _check(x):\n"
+        "    assert x == 3\n"
+        "def test_determinism():\n"
+        "    assert build(cid) == build(cid)\n"
+        "def test_awaited_determinism():\n"
+        "    assert nominate(h) == nominate(h)\n"
+        "def test_optional_present():\n"
+        "    assert lookup('a') is not None\n"
+        "def test_optional_absent():\n"
+        "    assert lookup('z') is None\n"
+        "def test_true_beside_a_real_helper():\n"
+        "    assert True\n"
+        "    _check(run())\n"
+        "class TestT(unittest.TestCase):\n"
+        "    def test_is_not_none(self):\n"
+        "        self.assertIsNotNone(read())\n"
+        "    def test_equal_calls(self):\n"
+        "        self.assertEqual(make(), make())\n"
+        # Still trivial: these cannot fail.
+        "def test_true():\n"
+        "    assert True\n"
+        "def test_same_name(x):\n"
+        "    assert x == x\n"
+        "def test_literal(x):\n"
+        "    assert 1 == 1\n"
+        "class TestU(unittest.TestCase):\n"
+        "    def test_equal_names(self):\n"
+        "        y = 2\n"
+        "        self.assertEqual(y, y)\n"
+        "    def test_true_constant(self):\n"
+        "        self.assertTrue(True)\n"
+    ))
+    assert flagged == {"test_true", "test_same_name", "test_literal", "test_equal_names",
+                       "test_true_constant"}

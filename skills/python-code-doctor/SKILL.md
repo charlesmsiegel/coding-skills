@@ -362,7 +362,7 @@ Keep `SKILL.md` lean; pull in depth only when a review needs it.
 | Same function/class defined twice; `<<<<<<<` markers | Remove the duplicate / resolve the conflict (the later def silently wins) |
 | Coroutine called without `await` | `await` it (or wrap in `asyncio.create_task`/`gather`) |
 | `except Exception: pass` / `print(e)` then continue | Handle and re-raise, or catch a narrow type — don't swallow |
-| Test that asserts nothing or only `assert True`/`assertIsNotNone` | Assert the actual expected value/behavior |
+| Test that asserts nothing, only `assert True`, or only not-None on a value never None | Assert the actual expected value/behavior |
 
 ## When NOT to simplify
 

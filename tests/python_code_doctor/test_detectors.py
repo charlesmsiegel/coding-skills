@@ -493,12 +493,14 @@ def test_open_closed_in_finally_is_not_a_leak(tmp_path):
     assert "unmanaged_open" not in smell_types(run_detector("find_resource_leaks.py", tmp_path))
 
 
-def test_assert_in_nested_helper_does_not_count_as_test_assertion(tmp_path):
+def test_assert_in_an_unused_nested_helper_does_not_count_as_test_assertion(tmp_path):
+    # A nested helper the test calls does assert for it (test_fp_py_tests_hygiene);
+    # one it only defines never runs.
     (tmp_path / "test_sample.py").write_text(
         "def test_a():\n"
         "    def helper():\n"
         "        assert False\n"
-        "    helper()\n"
+        "    return None\n"
     )
     assert "test_without_assertion" in smell_types(run_detector("find_test_smells.py", tmp_path))
 

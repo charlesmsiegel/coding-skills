@@ -106,8 +106,10 @@ and stays a finding.
 ### Tests that can't fail
 Generated tests over-mock (asserting the code calls the mocks the test set up — i.e.
 pinning the implementation, not the behavior), assert nothing, or assert the vacuous
-(`assert True`, `assertIsNotNone(result)` as the sole check). `find_test_smells.py`
-catches assertion-less, over-mocked, and trivial-assertion tests. A green AI test
+(`assert True`, `assert x == x`, or `assertIsNotNone(result)` as the sole check on a
+call that never returns None). `find_test_smells.py` catches assertion-less,
+over-mocked, and trivial-assertion tests; the not-None case is yours to judge, since
+it fails whenever None comes back and is a real check on anything typed `Optional`. A green AI test
 suite is **not** evidence of correctness until you've confirmed the tests would fail
 on a wrong answer — change a return value and watch a test go red. If none do, the
 suite is theater.
