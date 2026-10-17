@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Dependencies tab: module dependency graph, cycles, fan-in/fan-out.
 
-Usage: python3 analyze_deps.py REPO_DIR --tabs-dir TABS_DIR [--depth N]
+Usage: python3 analyze_deps.py REPO_DIR --tabs-dir TABS_DIR [--depth N] [--root DIR ...]
 Emits: TABS_DIR/03-dependencies.html and a JSON summary on stdout.
 
 Two kinds of dependency, both drawn:
@@ -33,8 +33,9 @@ from pathlib import Path
 
 import imports
 import resources
-from common import (bar_cell, detect_lang, esc, json_block,
-                    loc_and_complexity, read_text, walk_source, write_fragment)
+from common import (ROOT_HELP, bar_cell, detect_lang, esc, in_roots,
+                    json_block, loc_and_complexity, read_text, scope_roots,
+                    walk_source, write_fragment)
 
 # Languages that carry no import syntax we extract; they are still eligible to
 # be *targets* of a load, which is how a template or prompt enters the graph.
@@ -192,6 +193,7 @@ def main() -> int:
                          "directories (0=auto: split the largest module until the "
                          "graph holds 12-30 nodes)")
     ap.add_argument("--max-nodes", type=int, default=55)
+    ap.add_argument("--root", action="append", default=[], help=ROOT_HELP)
     args = ap.parse_args()
     extra_exclude = {d.strip() for d in args.exclude.split(",") if d.strip()}
     repo = Path(args.repo).resolve()
@@ -200,27 +202,51 @@ def main() -> int:
         # "0 modules, 0 edges" graph.
         print(f"error: repo directory does not exist: {repo}", file=sys.stderr)
         return 2
+    try:
+        roots = scope_roots(repo, args.root)
+    except ValueError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
 
-    paths, locs, all_paths = {}, {}, {}
+    # --root limits what is drawn, not what is read: every manifest and every
+    # file an import could name stays visible to the resolver, so an import
+    # from the roots into a sibling package resolves (and is counted under
+    # outside_roots) instead of reading as an unresolved first-party gap.
+    paths, locs, all_paths, repo_code = {}, {}, {}, set()
     for rel, p in walk_source(repo, extra_exclude=extra_exclude):
         all_paths[rel] = p
         if detect_lang(rel) in NON_CODE_LANGS:
             continue
+        repo_code.add(rel)
+        if not in_roots(rel, roots):
+            continue
         paths[rel] = p
         locs[rel] = loc_and_complexity(read_text(p))[0]
     file_set = set(paths)
-    edges, stats = imports.extract(paths, all_paths, file_set)
+    edges, stats = imports.extract(paths, all_paths, repo_code)
+    outside = defaultdict(int)  # code file outside the roots -> edges reaching it
+
+    def inside(dst):
+        """Keep an edge whose target is drawn; tally one that leaves the roots."""
+        if dst in repo_code and dst not in file_set:
+            outside[dst] += 1
+            return False
+        return True
+    edges = {src: {d for d in dsts if inside(d)} for src, dsts in edges.items()}
 
     # ---- runtime resource references ----
     # A referenced asset joins the graph as a node (with its own LOC, so a large
     # prompts/ directory reads as the mass it is); an unreferenced one stays out.
+    # Loads are found repo-wide, so an asset outside the roots that code inside
+    # them loads still joins the graph; only loads made from the roots count.
     scan = resources.scan(repo, all_paths)
+    refs = [ref for ref in scan.refs if in_roots(ref.src, roots)]
     res_edges = defaultdict(set)
-    for ref in scan.refs:
-        if ref.src != ref.dst:
+    for ref in refs:
+        if ref.src != ref.dst and inside(ref.dst):
             res_edges[ref.src].add(ref.dst)
     loaders_of = defaultdict(list)  # asset -> ["file:line", ...]
-    for ref in sorted(scan.refs):
+    for ref in sorted(refs):
         loaders_of[ref.dst].append(f"{ref.src}:{ref.line}")
 
     asset_nodes = sorted({d for dsts in res_edges.values() for d in dsts} - file_set)
@@ -234,12 +260,12 @@ def main() -> int:
     # A prompt or template nothing loads is a finding — but only where we know
     # what a loaded asset in that directory looks like, so a docs tree full of
     # never-referenced Markdown is not paraded as dead code.
-    referenced = set(loaders_of)
+    referenced = {ref.dst for ref in scan.refs}  # loaded from anywhere is not an orphan
     asset_dirs = {rel.rsplit("/", 1)[0] if "/" in rel else "" for rel in asset_nodes}
     asset_exts = {rel.rsplit(".", 1)[-1] for rel in asset_nodes if "." in rel}
     orphans = sorted(
         rel for rel in all_paths
-        if rel not in referenced and rel not in file_set
+        if rel not in referenced and rel not in repo_code and in_roots(rel, roots)
         and not rel.startswith(".")  # .github & co are loaded by outside tooling
         and (rel.rsplit("/", 1)[0] if "/" in rel else "") in asset_dirs
         and "." in rel and rel.rsplit(".", 1)[-1] in asset_exts)
@@ -468,6 +494,12 @@ def main() -> int:
             for lang, s in skipped)
         resolution_html += f"""<div class="callout warn"><b>Many import statements sat inside string literals</b> and were skipped as text. That is right for a code generator or a docs page, and wrong everywhere else — check a few before trusting the graph's sparseness.<ul style="margin-top:8px">{rows}</ul></div>"""
 
+    if outside:
+        resolution_html += (
+            f"""<p class="dim">Scoped to {', '.join(f'<code>{esc(r)}/</code>' for r in roots)}: """
+            f"""{sum(outside.values())} import(s) and load(s) reach {len(outside)} file(s) outside """
+            """those roots. They resolved, and are not drawn.</p>""")
+
     top_assets = sorted(loaders_of.items(), key=lambda kv: (-len(kv[1]), kv[0]))[:25]
     resource_html = ""
     if scan.refs:
@@ -538,6 +570,7 @@ code that names them. {esc(resources.CAVEAT)}{esc(truncation)}</p>
     write_fragment(Path(args.tabs_dir), "03-dependencies.html", "Dependencies", body)
 
     summary = {
+        **({"roots": list(roots)} if roots else {}),
         "top_level_arms": arms,
         "structural_dirs_peeled": peeled,
         "modules": len(nodes),
@@ -554,6 +587,13 @@ code that names them. {esc(resources.CAVEAT)}{esc(truncation)}</p>
         # coupling — say so in the Overview instead of presenting sparseness as
         # architecture (and consider hand-building that part of the graph).
         "resolution": stats.summary(),
+        # Edges from the roots into code outside them: resolved, not drawn.
+        # Which other packages this one leans on, and how hard.
+        **({"outside_roots": {
+            "edges": sum(outside.values()), "files": len(outside),
+            "top": [{"path": f, "edges": n} for f, n in
+                    sorted(outside.items(), key=lambda kv: (-kv[1], kv[0]))[:10]],
+        }} if roots else {}),
         "module_cycles": sccs,
         "file_cycles": sorted(file_sccs, key=len, reverse=True)[:6],
         "top_fan_in_files": [{"path": f, "fan_in": n, "fan_out": fan_out.get(f, 0)} for f, n in hub_in[:10]],

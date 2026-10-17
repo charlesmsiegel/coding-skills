@@ -294,3 +294,17 @@ Pass `--exclude docs` to the `code-visualization` analyzers. Without it, a
 rebuild counts the previously-generated HTML as source: a small package's own
 `docs/codemap.html` can be 90% of its measured lines, and the inventory tab then
 describes the documentation rather than the code.
+
+Scope a package's atlas with `--root`, once per entry in its `roots`, and point
+the analyzers at the repo root rather than at a root:
+
+```bash
+python "$CV/scripts/analyze_deps.py" <repo> --tabs-dir $TABS --exclude docs \
+  --root src/billing --root tests/billing
+```
+
+Only files under the roots are reported, but the whole repo is still read for
+context, so a root-level manifest still governs resolution and an import into a
+sibling package resolves — it is listed under `outside_roots`, not drawn, and
+not counted as an unresolved gap. `--exclude` cannot do this job: it matches
+directory names, so excluding a top-level `scripts` also drops `tests/scripts`.

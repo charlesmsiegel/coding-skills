@@ -129,12 +129,19 @@ layer can prove.
 
 For each package in the map, with `ROOTS` its roots and `DOCS` its docs dir:
 
-**The atlas.** Run the full `code-visualization` workflow scoped to the package's
-roots, `--out <DOCS>/codemap.html`. **Pass `--exclude docs` to its analyzers** —
-otherwise a rebuild counts the previously-generated HTML as source, and a small
-package's inventory tab ends up describing its own documentation. Scale judgment
-tabs to size: a 400-line package may warrant the automated tabs only, and
-code-visualization's own proportion rule covers this.
+**The atlas.** Run the full `code-visualization` workflow from the repo root,
+scoped to the package's roots by passing each analyzer `--root <root>` once per
+root, `--out <DOCS>/codemap.html`. Point the analyzers at the repo, not at a root:
+they still read the rest of it for context (a root-level `go.mod` or
+`tsconfig.json`, the sibling package an import lands in), report only what is
+under the roots, and list the edges that leave them as `outside_roots`. Do not
+reach for `--exclude` to carve a package out — it matches directory names, so
+excluding a top-level `scripts` also drops `tests/scripts`. **Do pass
+`--exclude docs` to its analyzers** — otherwise a rebuild counts the
+previously-generated HTML as source, and a small package's inventory tab ends up
+describing its own documentation. Scale judgment tabs to size: a 400-line
+package may warrant the automated tabs only, and code-visualization's own
+proportion rule covers this.
 
 **The measurement audit.** Run `science-investigation`'s scripts **once from the
 repo root** — pointed at a package, `find_metrics.py` cannot see `evals/` and
