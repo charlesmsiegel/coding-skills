@@ -132,3 +132,21 @@ def test_rebinding_a_loop_receiver_preserves_foreign_data_candidate(tmp_path):
     found = records("find_coupling_issues.py", sample, "feature_envy")
     assert len(found) == 1 and found[0]["kind"] == "candidate"
     assert found[0]["metric_value"] == 4
+
+
+def test_unrelated_case_families_do_not_promote_short_switches(tmp_path):
+    sample = tmp_path / "app.py"
+    sample.write_text(
+        "def color_name(kind):\n"
+        "    if kind == 1: return 'red'\n"
+        "    elif kind == 2: return 'green'\n"
+        "    elif kind == 3: return 'blue'\n"
+        "    elif kind == 4: return 'white'\n\n"
+        "def shape_name(kind):\n"
+        "    if kind == 'c': return 'circle'\n"
+        "    elif kind == 's': return 'square'\n"
+        "    elif kind == 't': return 'triangle'\n"
+        "    elif kind == 'h': return 'hexagon'\n", encoding="utf-8")
+    found = records("find_design_smells.py", sample, "type_switch")
+    assert [(r["kind"], r["severity"]) for r in found] == [("candidate", "low")] * 2
+    assert all(r["also_caused_by"] and not r["suggestion"] for r in found)
