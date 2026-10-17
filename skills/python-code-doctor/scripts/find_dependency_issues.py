@@ -21,7 +21,8 @@ Deliberately NOT charged as missing:
     the module optional, unless an unguarded import of it elsewhere makes it
     required. It still counts as a use of a declared dependency (an extra). A
     bare `except:` or `except Exception:` also catches the error but does not
-    say the import was meant to be optional, so it does not count.
+    say the import was meant to be optional, so it does not count — and an
+    `except ImportError:` placed after one never runs, so it does not count either.
 
 Reported as a candidate, not a finding:
   - an undeclared module imported only under such a guard, where the guard
@@ -279,13 +280,28 @@ class _ImportSite:
 
 
 _IMPORT_ERRORS = frozenset({"ImportError", "ModuleNotFoundError"})
+_CATCH_ALLS = frozenset({"Exception", "BaseException"})
 
 
-def _catches_import_error(handler: ast.ExceptHandler) -> bool:
-    """An `except` that names ImportError or ModuleNotFoundError, alone or in a tuple."""
-    caught = handler.type.elts if isinstance(handler.type, ast.Tuple) else [handler.type]
-    return any((isinstance(t, ast.Name) and t.id in _IMPORT_ERRORS)
-               or (isinstance(t, ast.Attribute) and t.attr in _IMPORT_ERRORS) for t in caught)
+def _caught(handler: ast.ExceptHandler) -> set[str]:
+    """The exception class names an `except` lists, alone or in a tuple."""
+    listed = handler.type.elts if isinstance(handler.type, ast.Tuple) else [handler.type]
+    return {t.id if isinstance(t, ast.Name) else t.attr
+            for t in listed if isinstance(t, (ast.Name, ast.Attribute))}
+
+
+def _import_error_handlers(node) -> list:
+    """The handlers that name ImportError or ModuleNotFoundError and can run: only
+    the first matching handler does, so none after a bare `except:` or an `except
+    Exception:` / `except BaseException:` counts."""
+    found = []
+    for handler in node.handlers:
+        caught = _caught(handler)
+        if caught & _IMPORT_ERRORS:
+            found.append(handler)
+        if handler.type is None or caught & _CATCH_ALLS:
+            break
+    return found
 
 
 # A handler whose last statement is one of these does not carry on.
@@ -361,8 +377,7 @@ def _walk(tree: ast.AST):
         yield node, guards, scopes
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
             guards, scopes = (), (*scopes, node)
-        handlers = ([h for h in node.handlers if _catches_import_error(h)]
-                    if isinstance(node, (ast.Try, ast.TryStar)) else [])
+        handlers = _import_error_handlers(node) if isinstance(node, (ast.Try, ast.TryStar)) else []
         if handlers:
             inner = (*guards, _Guard.of(node, handlers))
             stack.extend((stmt, inner, scopes) for stmt in node.body)

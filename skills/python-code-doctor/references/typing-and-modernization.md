@@ -99,7 +99,8 @@ versions that float (so "works today" doesn't mean "works tomorrow").
   one imported in a `try` with other imports whose handler replaces only the
   others. One guarded site that carries on makes the module optional everywhere;
   one unguarded import of the same name anywhere makes it required again; a bare
-  `except:` or `except Exception:` does not count as a guard. A module imported only after its
+  `except:` or `except Exception:` does not count as a guard, and neither does an
+  `except ImportError:` written after one, which never runs. A module imported only after its
   own file puts a directory on `sys.path` that the source cannot place inside the
   repo — one that resolves outside the tree, or that reads a function parameter,
   `os.environ`/`os.getenv`, `sys.argv` or a name bound more than once — is reported
