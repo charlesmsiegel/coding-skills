@@ -127,6 +127,20 @@ def _mutation_receivers(tree, multi_relations):
     return receivers
 
 
+def _plain_assignment_targets(tree):
+    """Only the assigned attribute, not a descriptor traversed to reach it.
+
+    AugAssign deliberately stays visible: it reads the old value before writing.
+    """
+    targets = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Assign):
+            targets.update(node.targets)
+        elif isinstance(node, ast.AnnAssign):
+            targets.add(node.target)
+    return targets
+
+
 def _walk_loops(tree):
     for node in ast.walk(tree):
         if isinstance(node, (ast.For, ast.AsyncFor)):
@@ -170,7 +184,7 @@ def collect(ctx):
     multi_relations = _multi_relation_names(ctx)
 
     for path, tree in ctx.python_trees():
-        mutation_receivers = _mutation_receivers(tree, multi_relations)
+        non_reads = _mutation_receivers(tree, multi_relations) | _plain_assignment_targets(tree)
         for loop in _walk_loops(tree):
             loop_vars = _loop_var_names(loop.target)
             iterates_queryset = _is_queryset_expr(loop.iter)
@@ -214,7 +228,7 @@ def collect(ctx):
                         and isinstance(node.value, ast.Name)
                         and node.value.id in loop_vars
                         and node.attr in relations
-                        and node not in mutation_receivers):
+                        and node not in non_reads):
                     kind = relations[node.attr]
                     helper = ("select_related" if kind in FORWARD_RELATIONS
                               else "prefetch_related")
