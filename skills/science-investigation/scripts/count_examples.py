@@ -28,6 +28,11 @@ import json
 import argparse
 from pathlib import Path
 
+# `python -I` (the safe way to run on an untrusted checkout) leaves this script's
+# own directory off sys.path, so the sibling import below has to put it back.
+if str(Path(__file__).resolve().parent) not in sys.path:
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+
 from common import (
     EXCLUDE_DIRS, add_common_args, candidate, configure_output, emit, envelope, rel,
 )

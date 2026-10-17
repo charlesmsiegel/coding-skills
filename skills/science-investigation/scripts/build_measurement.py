@@ -25,6 +25,11 @@ import sys
 from datetime import date
 from pathlib import Path
 
+# `python -I` (the safe way to run on an untrusted checkout) leaves this script's
+# own directory off sys.path, so the sibling import below has to put it back.
+if str(Path(__file__).resolve().parent) not in sys.path:
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+
 import rubric
 
 ASSETS = Path(__file__).resolve().parent.parent / "assets"

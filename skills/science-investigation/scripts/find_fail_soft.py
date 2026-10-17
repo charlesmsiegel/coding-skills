@@ -29,6 +29,11 @@ import sys
 import argparse
 from pathlib import Path
 
+# `python -I` (the safe way to run on an untrusted checkout) leaves this script's
+# own directory off sys.path, so the sibling import below has to put it back.
+if str(Path(__file__).resolve().parent) not in sys.path:
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+
 from common import (
     CODE_SUFFIXES, CONFIG_SUFFIXES, add_common_args, bound_lines, candidate, configure_output,
     coverage_note, emit, envelope, iter_files, looks_generated, mask_strings, read_source, rel,
