@@ -11,6 +11,7 @@ discriminated union fails the build when a new case is added. (`typeof x` is
 not one: on a union of primitives it is the narrowing the compiler checks.)
 """
 
+import re
 from collections import defaultdict
 from itertools import combinations
 
@@ -26,6 +27,8 @@ CLUMP_SIZE = 3
 CLUMP_OCCURRENCES = 3
 PRIMITIVE_TYPES = frozenset({"string", "number", "boolean"})
 PRIMITIVE_RUN = 3
+# React's naming rule for a hook: `use` followed by a capital letter.
+HOOK_NAME = re.compile(r"^use[A-Z0-9]")
 
 
 def _check_type_switches(file: TsFile, report: Reporter) -> None:
@@ -102,6 +105,15 @@ def _check_boolean_parameters(file: TsFile, report: Reporter) -> None:
             continue
         if len(func.params) == 1 and func.name.startswith(("set", "toggle", "is", "has")):
             continue  # a setter's argument is the value, not a mode switch
+        if func.kind in ("function", "arrow") and HOOK_NAME.match(func.name):
+            # A React hook's parameters are the reactive inputs its effects
+            # depend on: `useDismiss(open)` re-subscribes when `open` changes.
+            # The boolean is state the hook follows, not a switch between two
+            # behaviours — and splitting the hook in two would push the branch
+            # into callers, where choosing between hooks breaks the rules of
+            # hooks. Class methods are never hooks, so a `useX` method is not
+            # excused.
+            continue
         for flag in flags:
             report.add(flag.line, "boolean_flag_parameter",
                        f"`{func.qualname}` takes the boolean flag `{flag.name}`",
