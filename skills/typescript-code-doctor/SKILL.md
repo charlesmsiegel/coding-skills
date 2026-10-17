@@ -149,7 +149,7 @@ python "$SKILL/scripts/find_code_smells.py" .          # ==, var, nested ternari
 python "$SKILL/scripts/find_module_issues.py" .        # import cycles, barrel files, god modules, deep relative paths
 python "$SKILL/scripts/find_dependency_issues.py" .    # package.json vs imports, stylesheets, HTML, tool configs: missing, unused, misplaced, unpinned
 python "$SKILL/scripts/find_dead_code.py" .            # unused imports/exports, unreachable code, dead private members
-python "$SKILL/scripts/find_duplicates.py" .           # duplicated blocks, identical type shapes, repeated literals
+python "$SKILL/scripts/find_duplicates.py" .           # duplicated blocks, identical type shapes, repeated literals (not CSS class lists)
 
 # Safety net (build this BEFORE refactoring — see references/safety-net-and-testing.md)
 python "$SKILL/scripts/find_untested_modules.py" .     # source modules no test imports; "no tests in repo" alarm

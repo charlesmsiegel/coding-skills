@@ -1886,3 +1886,70 @@ export class Builder {
 }
 """})
     assert _lines(run_detector("find_design_smells.py", root), "boolean_flag_parameter") == [1, 3, 6]
+
+
+# --------------------------------------------------------------------------- #
+# A class list repeated in markup is Tailwind's idiom, not a magic string
+# --------------------------------------------------------------------------- #
+
+def _repeated_literals(records: list[dict]) -> list[str]:
+    return sorted(r["description"].split("`")[1] for r in records
+                  if r["smell_type"] == "repeated_string_literal")
+
+
+def test_a_class_list_repeated_in_markup_is_not_a_repeated_literal(tmp_path):
+    """Tailwind styles by repeating utility classes, and its docs answer the
+    repetition with a component, not a string constant. A class list is the
+    value of a JSX `className`/`class` attribute — directly, in a ternary, or
+    in a template literal's substitution — or an argument of a class helper."""
+    component = """\
+import clsx from "clsx";
+import {{ twMerge }} from "tailwind-merge";
+import {{ cva }} from "class-variance-authority";
+import classNames from "classnames";
+import {{ cn }} from "./cn";
+
+export const button{n} = cva("inline-flex items-center", {{
+  variants: {{ intent: {{ primary: "bg-amber-500 text-void" }} }},
+}});
+
+export function Panel{n}({{ on }}: {{ on: boolean }}) {{
+  return (
+    <div className="flex items-center gap-2">
+      <span className={{on ? "readout text-faint" : "readout text-amber"}}>x</span>
+      <p className={{`readout mt-1 ${{on ? "text-cat-artist" : "text-faint-strong"}}`}}>y</p>
+      <i className={{clsx("btn btn-quiet", on && "btn-active-state")}} />
+      <b className={{cn("btn btn-primary", {{ "ring-2 ring-amber": on }})}} />
+      <u class="space-y-3 px-4" />
+      <em className={{classNames("text-sm leading-relaxed")}} />
+    </div>
+  );
+}}
+
+export const surface{n} = twMerge("rounded-md border", "bg-surface-raised");
+"""
+    root = write(tmp_path, {f"src/Panel{n}.tsx": component.format(n=n) for n in range(6)})
+    assert _repeated_literals(run_detector("find_duplicates.py", root)) == []
+
+
+def test_a_repeated_message_key_or_url_is_still_a_repeated_literal(tmp_path):
+    """A message, a storage key and an endpoint are still literals a rename can
+    miss — including a lookup key passed to some other function inside a
+    `className` attribute, which is an argument of that function, not a class
+    list."""
+    module = """\
+export async function load{n}(store: Map<string, string>): Promise<Response> {{
+  const token = store.get("session-token");
+  if (!token) throw new Error("You are not signed in");
+  return fetch("/api/v1/session", {{ headers: {{ authorization: token }} }});
+}}
+"""
+    component = """\
+import {{ theme }} from "./theme";
+
+export const Badge{n} = () => <b className={{theme.pick("primary-button")}}>!</b>;
+"""
+    files = {f"src/load{n}.ts": module.format(n=n) for n in range(5)}
+    files.update({f"src/Badge{n}.tsx": component.format(n=n) for n in range(5)})
+    assert _repeated_literals(run_detector("find_duplicates.py", write(tmp_path, files))) == [
+        "/api/v1/session", "You are not signed in", "primary-button", "session-token"]
