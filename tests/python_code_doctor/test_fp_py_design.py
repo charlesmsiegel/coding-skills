@@ -342,7 +342,7 @@ def test_keyword_only_options_are_named_at_every_call_site(tmp_path):
         def lined_up(a, b, c, d, e, f):
             return a
 
-        def everything(a, b, *, c, d, e, f, g, h, i, j):
+        def everything(a, b, *, c, d, e, f, g, h, i, j, k):
             return a
         """})
     found = run_detector("analyze_complexity.py", tmp_path)
