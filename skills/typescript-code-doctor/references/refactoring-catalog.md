@@ -55,7 +55,9 @@ does the rest — you rarely need a shared interface, only shared names.
 
 **Switch on a boolean flag parameter.** `boolean_flag_parameter`. `f(x, true)`
 tells a reader nothing. Split the function, or take `{ force: true }`, or a union
-of string literals.
+of string literals. A React hook (`useX`) is not reported: its parameters are the
+reactive inputs its effects depend on, so `useDismiss(open)` follows state rather
+than switching modes, and splitting a hook pushes the choice into callers.
 
 ## Change preventers
 

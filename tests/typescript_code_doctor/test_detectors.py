@@ -1850,3 +1850,39 @@ export interface Settings {
     assert _boolean_names(run_detector("find_naming_issues.py", root)) == [
         "Settings.data", "Settings.embed", "Settings.featureFlag", "Settings.flag", "Settings.mode",
         "Settings.status", "Settings.table", "Settings.toggle", "Settings.value"]
+
+
+# --------------------------------------------------------------------------- #
+# A React hook's boolean parameter is state, not a mode switch
+# --------------------------------------------------------------------------- #
+
+def test_a_react_hooks_boolean_parameter_is_not_a_flag(tmp_path):
+    """`useDismiss(open)` re-runs its effect when `open` changes: a hook's
+    parameters are the reactive inputs its effects depend on. Splitting it in
+    two, as the finding suggests, would move the branch into every caller and
+    break the rules of hooks the moment a caller chose between them."""
+    root = write(tmp_path, {"hooks.ts": """\
+import { useEffect } from "react";
+
+export function useDismiss(open: boolean, onClose: () => void): void {
+  useEffect(() => { if (open) onClose(); }, [open, onClose]);
+}
+
+export const useRelated = (tag: string, enabled: boolean): string[] => (enabled ? [tag] : []);
+"""})
+    assert _lines(run_detector("find_design_smells.py", root), "boolean_flag_parameter") == []
+
+
+def test_a_plain_functions_boolean_parameter_is_still_a_flag(tmp_path):
+    """Only a `use` + capital name is a hook: `user` is not one, and neither is
+    a class method, which the rules of hooks rule out."""
+    root = write(tmp_path, {"render.ts": """\
+export function render(x: string, compact: boolean): string { return compact ? x.trim() : x; }
+
+export function user(name: string, admin: boolean): string { return admin ? name : ""; }
+
+export class Builder {
+  useCache(key: string, enabled: boolean): this { void key; void enabled; return this; }
+}
+"""})
+    assert _lines(run_detector("find_design_smells.py", root), "boolean_flag_parameter") == [1, 3, 6]
