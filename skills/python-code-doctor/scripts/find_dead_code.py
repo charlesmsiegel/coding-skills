@@ -29,6 +29,7 @@ from dataclasses import dataclass, asdict
 from typing import Set
 from collections import defaultdict
 from contextlib import contextmanager
+from functools import lru_cache
 from common import cached_parse, configure_output, find_python_files, warn_detector_error, warn_unparseable
 
 
@@ -43,7 +44,6 @@ _DJANGO_REGISTRATION_MODULES = {"checks", "signals"}
 _ATTRIBUTE_VALUE = re.compile(r"(?<!\w)(?=([A-Za-z_]\w*)\.([A-Za-z_]\w*)\b(?!\s*\())")
 # `import x as y` / `from p import x as y`: the receiver a module goes by.
 _ALIAS = re.compile(r"\b([A-Za-z_]\w*)\s+as\s+([A-Za-z_]\w*)\b")
-_VALUE_INDEX: dict[Path, tuple[dict, dict]] = {}
 
 
 def _import_root(filepath: Path) -> Path:
@@ -65,24 +65,28 @@ def _handed_out_in_tree(filepath: Path, function: str) -> bool:
     it; a file whose text matches is then parsed to confirm the reference is
     code, not a mention in a docstring or comment.
     """
-    root = _import_root(filepath)
-    if root not in _VALUE_INDEX:
-        pairs: dict[tuple[str, str], set[Path]] = {}
-        aliases: dict[str, set[str]] = {}
-        for path in find_python_files(root):
-            try:
-                text = path.read_text(encoding="utf-8", errors="replace")
-            except OSError:
-                continue
-            for pair in _ATTRIBUTE_VALUE.findall(text):
-                pairs.setdefault(pair, set()).add(path)
-            for original, alias in _ALIAS.findall(text):
-                aliases.setdefault(original, set()).add(alias)
-        _VALUE_INDEX[root] = (pairs, aliases)
-    pairs, aliases = _VALUE_INDEX[root]
+    pairs, aliases = _value_index(_import_root(filepath))
     receivers = {filepath.stem, *aliases.get(filepath.stem, ())}
     paths = set().union(*(pairs.get((receiver, function), set()) for receiver in receivers))
     return any(_loads_attribute(path, receivers, function) for path in sorted(paths))
+
+
+@lru_cache(maxsize=None)
+def _value_index(root: Path) -> tuple[dict, dict]:
+    """Every `<receiver>.<name>` value reference under ``root``, by pair, and
+    every alias a module is imported under, by original name."""
+    pairs: dict[tuple[str, str], set[Path]] = {}
+    aliases: dict[str, set[str]] = {}
+    for path in find_python_files(root):
+        try:
+            text = path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        for pair in _ATTRIBUTE_VALUE.findall(text):
+            pairs.setdefault(pair, set()).add(path)
+        for original, alias in _ALIAS.findall(text):
+            aliases.setdefault(original, set()).add(alias)
+    return pairs, aliases
 
 
 def _loads_attribute(path: Path, receivers: set[str], attr: str) -> bool:
