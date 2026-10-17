@@ -116,6 +116,7 @@ SHARED_NAMES = (
     "find_test_smells", "find_type_gaps", "find_untested_modules",
     "format_findings", "imports", "jvmdecl", "lint_fragments", "llmops",
     "manifests", "resources", "rubric", "run_external_tools", "runner",
+    "signature_contracts",
     "verify_citations",
 )
 

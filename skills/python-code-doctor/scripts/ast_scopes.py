@@ -113,3 +113,45 @@ def decorator_names(node: ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef)
         elif isinstance(target, ast.Attribute):
             names.add(target.attr)
     return names
+
+
+def _is_self_attribute(node: ast.AST, attr: str) -> bool:
+    return isinstance(node, ast.Attribute) and node.attr == attr \
+        and isinstance(node.value, ast.Name) and node.value.id == "self"
+
+
+def _repeated(nodes: list[ast.AST]) -> set[int]:
+    """Ids of the nodes a loop among `nodes` can run more than once: each loop's
+    body, and a while loop's test."""
+    loops = [node for node in nodes if isinstance(node, (ast.For, ast.AsyncFor, ast.While))]
+    return {id(inner) for loop in loops
+            for inner in walk_same_scope(loop.body + ([loop.test] if isinstance(loop, ast.While) else []))}
+
+
+def _writes_self_attribute(stmt: ast.AST, attr: str) -> bool:
+    if isinstance(stmt, ast.Assign):
+        targets = stmt.targets
+    elif isinstance(stmt, (ast.AnnAssign, ast.AugAssign)):
+        targets = [stmt.target]
+    else:
+        return False
+    return any(_is_self_attribute(sub, attr) for target in targets for sub in ast.walk(target))
+
+
+def _reads_before_writing(body: list[ast.stmt], attr: str) -> bool:
+    """Whether a call to this method reads `self.<attr>` before writing it,
+    with the read outside any loop.
+
+    That read can only see what an earlier call (or __init__) left there:
+    `if self._key != key: ...; self._key = key` remembers what is cached, and
+    `self._total = add(self._total, x)` carries a running value. A write takes
+    effect when its statement ends, so the read in `self.x = f(self.x)` comes
+    first. A read inside a loop may see this call's own earlier write, so it
+    proves nothing.
+    """
+    nodes = list(walk_same_scope(body))
+    repeated = _repeated(nodes)
+    reads = [(node.lineno, node.col_offset) for node in nodes
+             if _is_self_attribute(node, attr) and isinstance(node.ctx, ast.Load) and id(node) not in repeated]
+    writes = [(stmt.end_lineno, stmt.end_col_offset) for stmt in nodes if _writes_self_attribute(stmt, attr)]
+    return bool(reads) and (not writes or min(reads) < min(writes))
