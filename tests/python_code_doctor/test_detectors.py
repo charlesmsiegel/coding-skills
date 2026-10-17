@@ -4903,6 +4903,34 @@ def test_a_deferred_heavy_import_is_a_candidate_not_a_defect(tmp_path):
     assert not arrow_only_lines(output), "a candidate rendered a fix arrow with nothing after it"
 
 
+@pytest.mark.parametrize("setup", [
+    "sys.path.insert(0, str(Path(__file__).resolve().parent))\n",
+    "if str(Path(__file__).resolve().parent) not in sys.path:\n"
+    "    sys.path.insert(0, str(Path(__file__).resolve().parent))\n",
+])
+def test_putting_a_scripts_own_directory_on_sys_path_is_not_code_above_imports(tmp_path, setup):
+    """Under `python -I` a script must put its own directory back on sys.path
+    before importing a sibling, and nowhere but above that import will do. Ruff's
+    E402 and pycodestyle's both allow it; this one reported it as a defect."""
+    (tmp_path / "tool.py").write_text(
+        "import sys\nfrom pathlib import Path\n\n" + setup + "\nfrom sibling import helper\n\nhelper()\n"
+    )
+    assert not [r for r in run_detector("find_local_imports.py", tmp_path)
+                if r["smell_type"] == "import_not_at_top"]
+
+
+@pytest.mark.parametrize("setup", [
+    "x = 1\n",
+    "if DEBUG:\n    print('debug')\n",
+    "if DEBUG:\n    sys.path.insert(0, 'x')\n    configure()\n",
+    "if DEBUG:\n    sys.path.insert(0, 'x')\nelse:\n    configure()\n",
+])
+def test_other_code_above_an_import_is_still_import_not_at_top(tmp_path, setup):
+    (tmp_path / "tool.py").write_text("import sys\n\n" + setup + "\nimport json\n\njson.dumps(sys.argv)\n")
+    rows = [r for r in run_detector("find_local_imports.py", tmp_path) if r["smell_type"] == "import_not_at_top"]
+    assert rows and rows[0]["kind"] == "finding"
+
+
 def test_new_candidates_satisfy_the_schema_in_the_aggregate_report(tmp_path):
     (tmp_path / "service.py").write_text(
         "def run(spec):\n"
