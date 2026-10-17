@@ -285,7 +285,12 @@ def _collect_imports(root: Path) -> dict[str, list[ImportSite]]:
         except Exception as exc:
             warn_detector_error(filepath, exc)
             continue
-        for top, site in import_sites(tree, filepath, root):
+        try:
+            sites = list(import_sites(tree, filepath, root))
+        except Exception as exc:  # one file the reader trips on must not sink the tree's report
+            warn_detector_error(filepath, exc)
+            continue
+        for top, site in sites:
             imports[top].append(site)
     return imports
 
