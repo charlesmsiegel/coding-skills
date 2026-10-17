@@ -13,9 +13,11 @@ Finds:
 
 Deliberately NOT charged as missing:
   - an optional import: one inside the body of a `try` whose `except` names
-    ImportError or ModuleNotFoundError and carries on — its last statement does
-    not raise or exit (raise, sys.exit, exit, quit, os._exit). The code runs
-    without the package, so it is optional by construction. When the try body
+    ImportError or ModuleNotFoundError and visibly degrades — its last
+    statement is `pass`, `continue`, a falsy `return`, a rebinding of the
+    guarded name (`x = None`, `x = fallback`, a fallback import of the same
+    name), or a warnings.warn / logging call. The code runs on without the
+    package, so it is optional by construction. When the try body
     imports more than one module, only an import the handler replaces with
     another import of the same name is optional. One such site anywhere makes
     the module optional, unless an unguarded import of it elsewhere makes it
@@ -26,10 +28,13 @@ Deliberately NOT charged as missing:
 
 Reported as a candidate, not a finding:
   - an undeclared module imported only under such a guard, where the guard
-    does not make it optional: the handler raises or exits (how a script says
-    a package is required, and also how an optional feature's entry point
-    reports a missing extra), or the try body imports other modules and the
-    handler replaces none of this one's names.
+    does not make it optional: no handler visibly degrades — it raises or exits
+    (how a script says a package is required, and also how an optional
+    feature's entry point reports a missing extra), or ends any other way the
+    detector cannot call a degrade (a helper that may exit, `return 1`,
+    argparse's error()) — or the try body imports other modules and the handler
+    replaces none of this one's names. An unrecognised handler costs a lead,
+    never silence.
   - an undeclared module every import of which follows, in its own file, a
     sys.path addition (sys.path.insert/append/extend, `sys.path += [...]`,
     site.addsitedir) whose directory the source cannot place inside the project:
