@@ -33,7 +33,7 @@ from pathlib import Path
 from dataclasses import dataclass, asdict
 from typing import Set, List, Tuple, Optional
 from collections import defaultdict
-from common import project_parts, sort_findings, SEVERITY_ICONS, configure_output, find_python_files, warn_detector_error, warn_unparseable, ROUTE_VERBS
+from common import cached_parse, project_parts, sort_findings, SEVERITY_ICONS, configure_output, find_python_files, warn_detector_error, warn_unparseable, ROUTE_VERBS
 
 
 @dataclass
@@ -429,6 +429,177 @@ def _collect_request_strings(nodes: list) -> Set[str]:
     return found
 
 
+# ---------------------------------------------------------------------------
+# Re-exports: `from pkg import build_server` tests pkg/server.py
+# ---------------------------------------------------------------------------
+
+def _top_level(body: list):
+    """A module's statements, including those under a top-level if/try/with."""
+    for stmt in body:
+        yield stmt
+        if isinstance(stmt, (ast.If, ast.Try, ast.With)):
+            for field in ("body", "orelse", "finalbody"):
+                yield from _top_level(getattr(stmt, field, []))
+            for handler in getattr(stmt, "handlers", []):
+                yield from _top_level(handler.body)
+
+
+def _literal_names(value) -> list | None:
+    """The strings of a list/tuple literal such as `__all__ = ["a", "b"]`; None if it is not one."""
+    if not isinstance(value, (ast.List, ast.Tuple)):
+        return None
+    names = [elt.value for elt in value.elts if isinstance(elt, ast.Constant)]
+    return names if all(isinstance(name, str) for name in names) and len(names) == len(value.elts) else None
+
+
+@dataclass
+class _Bindings:
+    """What a module's top level binds: its own definitions, the names it imports
+    from other modules (name -> (module, level, original name)), its star imports,
+    and its `__all__` when that is a literal."""
+    defined: set
+    imported: dict
+    stars: list
+    exported: list | None = None
+
+
+def _record_import(found: _Bindings, stmt: ast.ImportFrom) -> None:
+    for alias in stmt.names:
+        if alias.name == "*":
+            found.stars.append((stmt.module, stmt.level))
+        else:
+            found.imported[alias.asname or alias.name] = (stmt.module, stmt.level, alias.name)
+
+
+def _record_assignment(found: _Bindings, stmt: ast.Assign | ast.AnnAssign | ast.AugAssign) -> None:
+    targets = stmt.targets if isinstance(stmt, ast.Assign) else [stmt.target]
+    names = {node.id for target in targets for node in ast.walk(target)
+             if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store)}
+    found.defined |= names
+    if "__all__" not in names or stmt.value is None:
+        return
+    listed = _literal_names(stmt.value)
+    if listed is not None and isinstance(stmt, ast.AugAssign) and found.exported is not None:
+        listed = found.exported + listed
+    found.exported = listed
+
+
+def _bindings(tree: ast.Module) -> _Bindings:
+    found = _Bindings(set(), {}, [])
+    for stmt in _top_level(tree.body):
+        if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            found.defined.add(stmt.name)
+        elif isinstance(stmt, ast.ImportFrom):
+            _record_import(found, stmt)
+        elif isinstance(stmt, (ast.Assign, ast.AnnAssign, ast.AugAssign)):
+            _record_assignment(found, stmt)
+    return found
+
+
+class _ReExports:
+    """Follows a name imported from a project module to the module that defines it.
+
+    `pkg/__init__.py` doing `from .server import build_server` makes
+    `from pkg import build_server` hand a test the function server.py defines, so
+    that test exercises server.py. The same holds for a plain module that imports
+    a name and is imported from (`from pkg.facade import read_header`, where
+    facade got it from pkg.layout), and for star imports, which honour `__all__`.
+    Only the imported name is followed: a module that is merely imported by the
+    module a test imports is not tested by it.
+    """
+
+    def __init__(self, files: list, root: Path):
+        self._dotted: dict = {}                       # file -> its package-or-module dotted name
+        self._by_suffix: dict = defaultdict(list)    # dotted suffix -> files
+        for path in files:
+            dotted = _module_names_for_file(path, root)[0]
+            if path.name == "__init__.py":
+                dotted = dotted.rpartition(".")[0]
+            self._dotted[path] = dotted
+            suffix = dotted
+            while suffix:                             # src.pkg.server, pkg.server, server
+                self._by_suffix[suffix].append(path)
+                suffix = suffix.partition(".")[2]
+        self._parsed: dict = {}
+
+    def resolve(self, importer: Path, module: str | None, level: int) -> list:
+        """The project files `from <module> import ...` in `importer` can name."""
+        if not level:
+            return self._by_suffix.get(module, []) if module else []
+        package = self._dotted.get(importer, "").split(".")
+        if importer.name != "__init__.py":
+            package = package[:-1]
+        if level - 1 > len(package):
+            return []
+        base = package[:len(package) - (level - 1)]
+        target = ".".join(base + (module.split(".") if module else []))
+        return [path for path in self._by_suffix.get(target, []) if self._dotted[path] == target]
+
+    def _bindings_of(self, path: Path) -> _Bindings:
+        if path not in self._parsed:
+            try:
+                self._parsed[path] = _bindings(cached_parse(path)[1])
+            except (SyntaxError, ValueError, OSError):
+                self._parsed[path] = _Bindings(set(), {}, [])
+        return self._parsed[path]
+
+    def exports(self, path: Path, seen: frozenset = frozenset()) -> set:
+        """The names `from <path> import *` binds: `__all__`, else every public name."""
+        bound = self._bindings_of(path)
+        if bound.exported is not None:
+            return set(bound.exported)
+        names = {name for name in bound.defined | set(bound.imported) if not name.startswith("_")}
+        for module, level in bound.stars:
+            for target in self.resolve(path, module, level):
+                if target not in seen:
+                    names |= self.exports(target, seen | {path})
+        return names
+
+    def defining(self, importer: Path, node: ast.ImportFrom) -> set:
+        """The project files that define what `node`, an import in `importer`, binds."""
+        found: set = set()
+        names = [alias.name for alias in node.names]
+        for target in self.resolve(importer, node.module, node.level):
+            for name in self.exports(target) if names == ["*"] else names:
+                found |= self.definers(target, name)
+        return found
+
+    def definers(self, path: Path, name: str, seen: frozenset = frozenset()) -> set:
+        """The project files that define `name` as `path` exposes it."""
+        if (path, name) in seen:
+            return set()
+        seen = seen | {(path, name)}
+        bound = self._bindings_of(path)
+        if name in bound.defined:
+            return {path}
+        found: set = set()
+        if name in bound.imported:
+            module, level, original = bound.imported[name]
+            for target in self.resolve(path, module, level):
+                found |= self.definers(target, original, seen)
+            return found
+        for module, level in bound.stars:
+            for target in self.resolve(path, module, level):
+                if name in self.exports(target):
+                    found |= self.definers(target, name, seen)
+        return found
+
+
+def _tested_through_reexports(test_files: list, files: list, root: Path) -> set:
+    """Files that define a name some test imports, wherever the test imports it from."""
+    reexports = _ReExports(files, root)
+    tested: set = set()
+    for test in test_files:
+        try:
+            tree = cached_parse(test)[1]
+        except (SyntaxError, ValueError, OSError):
+            continue
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ImportFrom):
+                tested |= reexports.defining(test, node)
+    return tested
+
+
 def _has_definitions(tree: ast.AST) -> bool:
     """Return True if the module defines at least one function or class."""
     for node in tree.body:
@@ -549,6 +720,10 @@ def analyze(root: Path, ignore: Set[str]) -> List[CodeSmell]:
                 return True
         return False
 
+    # A test that imports a name re-exported through another module (a
+    # package's __init__, or any module that imports it) tests where it is defined.
+    reexported = _tested_through_reexports(test_files, py_files, root)
+
     # Check each source file
     if "untested_module" not in ignore:
         for sp in sorted(source_files, key=str):
@@ -566,7 +741,7 @@ def analyze(root: Path, ignore: Set[str]) -> List[CodeSmell]:
                 continue
 
             dotted, stem = _module_names_for_file(sp, root)
-            if _is_tested(dotted, stem) or _is_loaded_by_path(sp):
+            if _is_tested(dotted, stem) or _is_loaded_by_path(sp) or sp in reexported:
                 continue
 
             lines = source.splitlines()

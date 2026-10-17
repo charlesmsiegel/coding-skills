@@ -552,6 +552,47 @@ def test_dotted_test_import_does_not_bless_same_stem_module(tmp_path):
     assert not any(ends_with_path(f, "pkg1/util.py") for f in untested_files)
 
 
+def test_a_name_reexported_through_another_module_tests_the_module_defining_it(tmp_path):
+    """`from pkg import build_server` hands the test server.py's function when
+    pkg/__init__.py re-exports it, so server.py is tested. Relative, absolute and
+    aliased re-exports count, as do star imports (honouring `__all__`) and a plain
+    module that re-binds a name. A module the imported module merely uses, and a
+    name `__all__` leaves out of a star import, do not."""
+    files = {
+        "src/pkg/__init__.py": (
+            "from .server import build_server\n"
+            "from pkg.client import connect as open_connection\n"
+            "from .stars import *\n"
+            "from .internal import helper\n"
+            "__all__ = ['build_server', 'open_connection', 'shine']\n"
+        ),
+        "src/pkg/server.py": "def build_server():\n    return 1\n",
+        "src/pkg/client.py": "def connect():\n    return 2\n",
+        "src/pkg/stars.py": "__all__ = ['shine']\ndef shine():\n    return 3\ndef hidden():\n    return 4\n",
+        "src/pkg/internal.py": "def helper():\n    return 5\n",
+        "src/pkg/facade.py": (
+            "from pkg.layout import read_header\n"
+            "from pkg.engine import run\n"
+            "def wrap():\n    return run()\n"
+        ),
+        "src/pkg/layout.py": "def read_header():\n    return 6\n",
+        "src/pkg/engine.py": "def run():\n    return 7\n",
+        "src/pkg/sub/__init__.py": "from .deep import *\n",
+        "src/pkg/sub/deep.py": "def dive():\n    return 8\n",
+        "src/pkg/untouched.py": "def lonely():\n    return 9\n",
+        "tests/test_server.py": "from pkg import build_server, open_connection\n",
+        "tests/test_star.py": "from pkg import *\nfrom pkg.sub import *\n",
+        "tests/test_facade.py": "from pkg.facade import read_header, wrap\n",
+    }
+    for name, text in files.items():
+        (tmp_path / name).parent.mkdir(parents=True, exist_ok=True)
+        (tmp_path / name).write_text(text)
+    untested = sorted(Path(f["file"]).relative_to(tmp_path).as_posix()
+                      for f in run_detector("find_untested_modules.py", tmp_path)
+                      if f["smell_type"] == "untested_module")
+    assert untested == ["src/pkg/engine.py", "src/pkg/internal.py", "src/pkg/untouched.py"]
+
+
 def _git(repo: Path, *args: str) -> None:
     subprocess.run(
         ["git", "-c", "user.email=t@t.co", "-c", "user.name=t", "-c", "commit.gpgsign=false", *args],
