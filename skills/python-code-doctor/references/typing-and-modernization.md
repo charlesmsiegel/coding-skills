@@ -88,7 +88,13 @@ versions that float (so "works today" doesn't mean "works tomorrow").
   works only because the package happens to be installed. A clean install breaks.
   Add it to the manifest. (Mind the import-vs-distribution name gap — `import yaml`
   ↔ `PyYAML`, `import bs4` ↔ `beautifulsoup4`, `import cv2` ↔ `opencv-python`; the
-  detector knows the common ones and stays quiet when unsure.)
+  detector knows the common ones and stays quiet when unsure.) An import inside a
+  `try` whose `except` names `ImportError` or `ModuleNotFoundError` is not reported:
+  the code handles the package being absent, so it is optional by construction. If
+  users should be able to install it, declare it as an extra
+  (`[project.optional-dependencies]`), where it counts as used. One unguarded import
+  of the same name anywhere makes it required again, and a bare `except:` or
+  `except Exception:` does not count as a guard.
 - **`unused_dependency` (declared, never imported).** Usually cruft from deleted
   code; remove it. But confirm by reading first — some deps are real without an
   `import`: build/runtime plugins, CLI tools, things imported via entry points or
