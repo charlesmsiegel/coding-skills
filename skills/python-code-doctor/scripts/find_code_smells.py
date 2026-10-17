@@ -171,6 +171,7 @@ class CodeSmellDetector(ast.NodeVisitor):
         # ids of literals that already have a name or a self-explaining
         # position, so visit_Constant can skip them:
         #   NAME = 30              the assignment names it
+        #   obj.timeout = 30       an attribute also names the value
         #   def f(timeout=30)      the parameter names it
         #   get(url, timeout=30)   the keyword names it
         #   text[:200]             slice bounds
@@ -185,6 +186,9 @@ class CodeSmellDetector(ast.NodeVisitor):
                     for sub in ast.walk(value):
                         if isinstance(sub, ast.Constant):
                             self._named_constants.add(id(sub))
+                elif isinstance(_unwrap_negative(value), ast.Constant) and any(
+                        isinstance(t, ast.Attribute) for t in targets):
+                    self._named_constants.add(id(_unwrap_negative(value)))
             elif isinstance(parent, ast.keyword):
                 value = _unwrap_negative(parent.value)
                 if isinstance(value, ast.Constant):

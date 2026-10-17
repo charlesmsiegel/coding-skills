@@ -74,6 +74,12 @@ unshadowed shared state is a finding. Quoted constant SQL identifiers are also
 candidates, since identifiers cannot be passed as query parameters; ordinary
 interpolated SQL values remain findings.
 
+Direct literal assignments to named attributes, like named local assignments,
+already explain the value's role; arithmetic and comparison thresholds still need
+review. Required unittest and Django lifecycle names are exempt from snake-case
+checks only on proven imported framework bases. Plain classes, custom camelCase
+methods and unresolved inheritance retain the normal naming checks.
+
 ## Workflow
 
 **Cleaning up a whole poorly-written repo from cold?** The steps below assume the

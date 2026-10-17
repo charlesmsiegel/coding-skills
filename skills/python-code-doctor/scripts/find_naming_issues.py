@@ -51,11 +51,11 @@ _SNAKE = re.compile(r"^_{0,2}[a-z][a-z0-9_]*_{0,2}$")
 
 # Names a framework calls, so the override must spell them its way:
 # BaseHTTPRequestHandler dispatches `do_GET`, ast.NodeVisitor `visit_ClassDef`,
-# unittest `setUp`, logging and SAX their camelCase hooks. Renaming one to
+# logging and SAX their camelCase hooks. Renaming one to
 # snake_case would silently stop it being called.
+# Test-class lifecycle hooks instead require the imported base identity below.
 _FRAMEWORK_HOOK = re.compile(r"^(?:do_[A-Z]+|visit_[A-Z]\w*|depart_[A-Z]\w*)$")
 _FRAMEWORK_NAMES = frozenset({
-    "setUp", "tearDown", "setUpClass", "tearDownClass", "asyncSetUp", "asyncTearDown",
     "setUpModule", "tearDownModule",
     "handleError", "createLock",
     "startDocument", "endDocument", "startElement", "endElement", "startElementNS",
@@ -75,6 +75,70 @@ def _get_line(lines, lineno):
     return ""
 
 
+_TEST_HOOKS = frozenset({"setUp", "tearDown", "setUpClass", "tearDownClass"})
+_TEST_BASES = {
+    **{f"{module}.{name}": _TEST_HOOKS
+       for module in ("unittest", "unittest.case")
+       for name in ("TestCase", "FunctionTestCase")},
+    **{f"{module}.IsolatedAsyncioTestCase": _TEST_HOOKS | {"asyncSetUp", "asyncTearDown"}
+       for module in ("unittest", "unittest.async_case")},
+    **{f"{module}.{name}": _TEST_HOOKS | ({"setUpTestData"} if name == "TestCase" else set())
+       for module in ("django.test", "django.test.testcases")
+       for name in ("SimpleTestCase", "TransactionTestCase", "TestCase", "LiveServerTestCase")},
+}
+
+
+def _stable_imports(tree):
+    """Resolve only unconditional imports with no other bindings or mutations."""
+    bindings = defaultdict(list)
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.Import, ast.ImportFrom)):
+            for alias in node.names:
+                if alias.name == '*':
+                    return {}
+                bindings[alias.asname or alias.name.split('.')[0]].append(node)
+        elif isinstance(node, ast.Name) and isinstance(node.ctx, (ast.Store, ast.Del)):
+            bindings[node.id].append(node)
+        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            bindings[node.name].append(node)
+        elif isinstance(node, ast.arg):
+            bindings[node.arg].append(node)
+        elif isinstance(node, (ast.ExceptHandler, ast.MatchAs, ast.MatchStar)) and node.name:
+            bindings[node.name].append(node)
+        elif isinstance(node, ast.MatchMapping) and node.rest:
+            bindings[node.rest].append(node)
+        elif isinstance(node, (ast.Attribute, ast.Subscript)) and isinstance(node.ctx, (ast.Store, ast.Del)):
+            root = node.value
+            while isinstance(root, (ast.Attribute, ast.Subscript)):
+                root = root.value
+            if isinstance(root, ast.Name):
+                bindings[root.id].append(node)
+    imports = {}
+    for node in tree.body:
+        if not isinstance(node, (ast.Import, ast.ImportFrom)):
+            continue
+        if isinstance(node, ast.ImportFrom) and node.level:
+            continue
+        for alias in node.names:
+            name = alias.asname or alias.name.split('.')[0]
+            if bindings[name] == [node]:
+                imports[name] = ((f"{node.module}.{alias.name}" if isinstance(node, ast.ImportFrom)
+                                 else alias.name if alias.asname else name), node.lineno)
+    return imports
+
+
+def _imported_name(node, imports, lineno):
+    suffix = []
+    while isinstance(node, ast.Attribute):
+        suffix.append(node.attr)
+        node = node.value
+    if isinstance(node, ast.Name) and node.id in imports:
+        path, imported_at = imports[node.id]
+        if imported_at < lineno:
+            return '.'.join([path, *reversed(suffix)])
+    return None
+
+
 class NamingDetector(ast.NodeVisitor):
     def __init__(self, filename, lines, ignore):
         self.filename = filename
@@ -84,6 +148,20 @@ class NamingDetector(ast.NodeVisitor):
         self._reported = set()   # (line, name, type) to avoid duplicate shadow reports
         self._namespace_classes = set()  # id() of classes defined directly in a class body
         self._methods: set[int] = set()   # ids of defs directly in a class body
+        self._required_hooks = set()
+
+    def visit_Module(self, node):
+        imports = _stable_imports(node)
+        for cls in ast.walk(node):
+            if isinstance(cls, ast.ClassDef):
+                hooks = set()
+                for base in cls.bases:
+                    hooks.update(_TEST_BASES.get(_imported_name(base, imports, cls.lineno), ()))
+                self._required_hooks.update(
+                    id(method) for method in cls.body
+                    if isinstance(method, (ast.FunctionDef, ast.AsyncFunctionDef)) and method.name in hooks
+                )
+        self.generic_visit(node)
 
     def _add(self, line, st, desc, sug, sev):
         if st in self.ignore:
@@ -112,7 +190,7 @@ class NamingDetector(ast.NodeVisitor):
             # naming one after a builtin hides nothing outside its class body.
             if not method:
                 self._shadow(node.name, node.lineno)
-            if not _SNAKE.match(node.name) and not (
+            if not _SNAKE.match(node.name) and id(node) not in self._required_hooks and not (
                     node.name in _FRAMEWORK_NAMES or _FRAMEWORK_HOOK.match(node.name)):
                 self._add(node.lineno, "non_snake_case_function",
                     f"Function '{node.name}' is not snake_case",
