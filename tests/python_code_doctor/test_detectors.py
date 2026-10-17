@@ -2629,6 +2629,34 @@ def test_unnamed_threshold_is_still_a_magic_number(tmp_path):
     assert "magic_number" in smell_types(run_detector("find_code_smells.py", tmp_path))
 
 
+_CONSTANT_DEFINITIONS = (
+    "MEGAPIXEL = 1_000_000\n"
+    "MAX_UPLOAD_PIXELS = 50 * MEGAPIXEL\n"
+    "RULE = '=' * 78\n"
+    "PAG_BLOCKS: tuple[int, ...] = tuple(range(8, 16))\n"
+    "LOW, HIGH = 3 * 7, 5 * 9\n"
+    "if WINDOWS:\n"
+    "    _MAX_PATH = 260 - 13\n"
+    "class Limits:\n"
+    "    WEEK = 7 * 86400\n"
+    "ratio = scale * 41  # fires\n"
+    "HANDLER = lambda n: n * 43  # fires\n"
+    "def area(width):\n"
+    "    SIDE = width * 47  # fires\n"
+    "    return SIDE * 53  # fires\n"
+)
+
+
+def test_a_literal_in_a_constants_definition_is_not_a_magic_number(tmp_path):
+    """`MAX_UPLOAD_PIXELS = 50 * MEGAPIXEL` is where 50 gets its name, just as
+    `TIMEOUT = 30` is; a compound value does not make the literal anonymous. A
+    lowercase module variable, a lambda body and a function's locals still are."""
+    (tmp_path / "sample.py").write_text(_CONSTANT_DEFINITIONS)
+    magic = sorted({f["line"] for f in run_detector("find_code_smells.py", tmp_path)
+                    if f["smell_type"] == "magic_number"})
+    assert magic == _lines_marked(_CONSTANT_DEFINITIONS)
+
+
 def test_declared_dataclass_is_not_a_data_class_smell(tmp_path):
     (tmp_path / "sample.py").write_text(
         "from dataclasses import dataclass\n"
