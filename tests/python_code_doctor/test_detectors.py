@@ -5765,3 +5765,66 @@ def test_deferring_a_first_party_module_that_loads_torch_is_a_heavy_import(tmp_p
     assert sorted(n for n, r in records.items() if r["kind"] == "finding") == _lines_marked(_CHECKPOINTS)
     assert "torch" in records[_lines_marked(_CHECKPOINTS, "# lead")[1]]["description"], \
         "the record says which heavy package makes the module slow, and through what"
+
+
+_COMMAND_HELPERS = (
+    "import typer\n"
+    "\n"
+    "app = typer.Typer()\n"
+    "\n"
+    "@app.command()\n"
+    "def download():\n"
+    "    _fetch_adapter()\n"
+    "\n"
+    "def _fetch_adapter():\n"
+    "    from pkg.light import fetch  # lead\n"
+    "    _unpack()\n"
+    "    return fetch\n"
+    "\n"
+    "def _unpack():\n"
+    "    import json  # lead\n"
+    "    return json\n"
+    "\n"
+    "def _shared():\n"
+    "    import csv  # fires\n"
+    "    return csv\n"
+    "\n"
+    "@app.command()\n"
+    "def export():\n"
+    "    return _shared()\n"
+    "\n"
+    "def report():\n"
+    "    return _shared()\n"
+    "\n"
+    "def _uncalled():\n"
+    "    import gzip  # fires\n"
+    "    return gzip\n"
+    "\n"
+    "def _passed_around():\n"
+    "    import zlib  # fires\n"
+    "    return zlib\n"
+    "\n"
+    "@app.command()\n"
+    "def compress():\n"
+    "    return run(_passed_around)\n"
+    "\n"
+    "def public_helper():\n"
+    "    import bz2  # fires\n"
+    "    return bz2\n"
+    "\n"
+    "@app.command()\n"
+    "def bz():\n"
+    "    return public_helper()\n"
+)
+
+
+def test_a_helper_only_cli_commands_call_defers_like_a_command(tmp_path):
+    """`_download_ip_adapter` exists only to split the `download` command, so its
+    deferred imports keep `--help` fast exactly as the command's own do. A helper
+    anything else calls, uses as a value, or could be imported elsewhere is not one."""
+    (tmp_path / "cli.py").write_text(_COMMAND_HELPERS)
+    records = {r["line"]: r["kind"] for r in run_detector("find_local_imports.py", tmp_path)
+               if r["smell_type"] == "local_import"}
+    assert sorted(n for n, k in records.items() if k == "candidate") == \
+        _lines_marked(_COMMAND_HELPERS, "# lead")
+    assert sorted(n for n, k in records.items() if k == "finding") == _lines_marked(_COMMAND_HELPERS)
