@@ -111,11 +111,9 @@ def _loaded_modules(node, path: Path) -> list:
         return [alias.name for alias in node.names]
     if node.level:
         parts, _ = _package(path)
-        if path.name == "__init__.py":
-            parts = parts + ["__init__"]  # so level 1 is the package itself
+        # _package already names the containing package, including for __init__.py.
+        # Each dot after the first therefore removes exactly one package component.
         base = parts[:len(parts) - node.level + 1] if node.level <= len(parts) else []
-        if path.name == "__init__.py":
-            base = [p for p in base if p != "__init__"]
         module = ".".join([*base, *(node.module.split(".") if node.module else [])])
     else:
         module = node.module or ""
