@@ -24,11 +24,15 @@ Initializers are the exception — unrelated classes built from the same three
 values are exactly the clump this looks for.
 
 A clump is one body of code's design, so its members are counted within one
-body. Code marked `# doctor: verbatim-upstream` keeps upstream's signatures and
-is a body of its own: it never makes up the numbers for a clump charged to the
-project's code. A clump wholly inside it, or one that takes marked code to
-reach the threshold, is reported at a marked member, where analyze_all
-withholds it and counts it as not charged.
+body: the project's code, its tests, or code marked `# doctor:
+verbatim-upstream`. A test's signature is shaped by what it drives, so test
+functions never make up the numbers for a clump charged to production code;
+test helpers that share a group among themselves are still a clump. A test
+double (a fake's method or a closure) that copies a production signature
+(common.copied_signatures) is that interface again, not a member at all.
+Marked code keeps upstream's signatures: a clump wholly inside it, or one
+that takes marked code to reach the threshold, is reported at a marked
+member, where analyze_all withholds it and counts it as not charged.
 """
 
 import ast
@@ -38,7 +42,8 @@ from pathlib import Path
 from dataclasses import dataclass, asdict, field
 from itertools import combinations
 from collections import defaultdict
-from common import configure_output, find_python_files, is_test_file, upstream_marks, warn_detector_error, warn_unparseable, looks_like_test, is_route_handler
+from common import (configure_output, copied_signatures, find_python_files, is_test_file,
+                    upstream_marks, warn_detector_error, warn_unparseable, looks_like_test, is_route_handler)
 
 
 @dataclass
@@ -109,7 +114,9 @@ def _collect(path: Path):
     ``identity`` is what makes two definitions the same function for counting:
     a method's name (all methods named `advance` are one contract), and the
     definition's own location for anything else. ``body`` is the code it is
-    counted with: "upstream" for code marked as a verbatim copy, else "project".
+    counted with: "upstream" for code marked as a verbatim copy, "tests" for
+    the rest of a test file, "project" for the rest. A test double that copies
+    a production signature is left out.
     """
     out = []
     for filepath in find_python_files(path):
@@ -126,17 +133,19 @@ def _collect(path: Path):
         methods = {id(item) for node in ast.walk(tree) if isinstance(node, ast.ClassDef)
                    for item in node.body if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef))}
         marks = upstream_marks(str(filepath.resolve()))
+        doubles = copied_signatures(tree, filepath, limit=MIN_GROUP - 1) if in_tests else frozenset()
         for node in ast.walk(tree):
-            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                if _framework_called(node, in_tests):
-                    continue
-                names = _param_names(node.args)
-                if MIN_GROUP <= len(names) <= MAX_PARAMS:
-                    identity = (("method", node.name)
-                                if id(node) in methods and node.name not in _INITIALIZERS
-                                else ("def", str(filepath), node.lineno))
-                    body = "upstream" if marks.covers(node.lineno) else "project"
-                    out.append((frozenset(names), str(filepath), node.lineno, node.name, identity, body))
+            if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            body = "upstream" if marks.covers(node.lineno) else ("tests" if in_tests else "project")
+            if _framework_called(node, in_tests) or (body == "tests" and id(node) in doubles):
+                continue
+            names = _param_names(node.args)
+            if MIN_GROUP <= len(names) <= MAX_PARAMS:
+                identity = (("method", node.name)
+                            if id(node) in methods and node.name not in _INITIALIZERS
+                            else ("def", str(filepath), node.lineno))
+                out.append((frozenset(names), str(filepath), node.lineno, node.name, identity, body))
     return out
 
 
