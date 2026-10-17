@@ -53,9 +53,15 @@ LABEL_FIELDS = frozenset({
     "human_rating", "annotation", "annotations", "rating", "relevance", "relevant",
     "is_correct", "verdict",
 })
-# Where a JSON object hides its records.
+# Where a JSON object hides its records. A benchmark's `problems` is as
+# dataset-shaped as its `questions`; leaving it and `entries` out made one real
+# repository's 20 labelled corpus records invisible.
 RECORD_KEYS = ("data", "examples", "rows", "records", "cases", "items", "tests",
-               "samples", "results", "questions", "evals", "dataset")
+               "samples", "results", "questions", "problems", "evals", "dataset", "entries")
+# Record keys that are not evidence of a dataset on their own: a changelog or a
+# feed holds `entries` too. Records found under one still count when a
+# ground-truth field or a dataset-like name says the file is measurement data.
+GENERIC_RECORD_KEYS = frozenset({"entries"})
 # Names and directories that make a file plausibly measurement data. A malformed
 # `settings.json` in a tree with no eval data is a broken config file, and
 # reporting it as corrupted measurement input manufactures a finding.
@@ -274,7 +280,7 @@ def looks_like_a_record(fields) -> bool:
 def wrapper_key(payload) -> bool:
     """Whether a dict payload holds its records under a dataset-only wrapper key."""
     return isinstance(payload, dict) and any(
-        isinstance(payload.get(key), list) for key in RECORD_KEYS
+        isinstance(payload.get(key), list) for key in RECORD_KEYS if key not in GENERIC_RECORD_KEYS
     )
 
 

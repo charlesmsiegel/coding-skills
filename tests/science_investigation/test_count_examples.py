@@ -425,3 +425,43 @@ def test_a_name_that_merely_starts_with_a_hint_is_not_a_dataset(tmp_path):
 def test_a_hint_as_a_whole_segment_still_counts(tmp_path):
     (tmp_path / "eval_runs.json").write_text('[{"host":"a"}]', encoding="utf-8")
     assert run(tmp_path)["counts"]["datasets"] == 1
+
+
+# ---- a real repository (hardy) ------------------------------------------------ #
+
+def test_records_under_an_entries_key_are_counted_with_their_labels(tmp_path):
+    """hardy's corpus is `{"entries": [...]}`, 20 records each carrying `expected`,
+    and the headline said no recognized ground-truth field existed."""
+    corpus = tmp_path / "corpus" / "problems"
+    corpus.mkdir(parents=True)
+    entries = [{"id": "p" + str(i), "input": "claim", "expected": "true"} for i in range(20)]
+    (corpus / "11.json").write_text(
+        json.dumps({"schema_version": 2, "corpus_version": "0.2.1", "entries": entries}), encoding="utf-8"
+    )
+    payload = run(tmp_path)
+    assert payload["counts"]["records_total"] == 20
+    assert payload["counts"]["records_labeled_max"] == 20
+    assert "no recognized ground-truth field" not in payload["headline"]
+
+
+def test_a_problems_file_is_a_dataset(tmp_path):
+    (tmp_path / "acceptance").mkdir()
+    problems = [{"id": "odd-sum", "input": "a claim"}, {"id": "sqrt-two", "input": "another"}]
+    (tmp_path / "acceptance" / "problems.json").write_text(
+        json.dumps({"schema_version": 1, "problems": problems}), encoding="utf-8"
+    )
+    payload = run(tmp_path)
+    assert payload["counts"]["datasets"] == 1
+    assert payload["counts"]["records_total"] == 2
+    assert kinds(payload, "no_label_field")
+
+
+def test_an_entries_list_alone_is_not_measurement_data(tmp_path):
+    """`entries` is also a changelog's or a feed's key: records are looked for
+    under it, but it is not evidence of a dataset on its own."""
+    (tmp_path / "changelog.json").write_text(
+        json.dumps({"entries": [{"version": "1.0", "date": "2026-01-01"}]}), encoding="utf-8"
+    )
+    payload = run(tmp_path)
+    assert payload["counts"]["datasets"] == 0
+    assert "reference metrics have no inputs" not in payload["headline"]
