@@ -94,6 +94,22 @@ def _multi_relation_names(ctx):
             if isinstance(related, ast.Constant):
                 reverse_kind = "many" if kind in {"ForeignKey", "ManyToManyField"} else "one"
                 kinds.setdefault(str(related.value), set()).add(reverse_kind)
+    # The context keeps only the first class with a given name. Inspect every
+    # duplicate body so an omitted FK/O2O cannot masquerade as a known manager.
+    for _, tree in ctx.python_trees():
+        for node in ast.walk(tree):
+            if not (isinstance(node, ast.ClassDef) and node.name in ctx.duplicates):
+                continue
+            for stmt in node.body:
+                if not isinstance(stmt, ast.Assign):
+                    continue
+                for target in stmt.targets:
+                    if isinstance(target, ast.Name):
+                        kinds.setdefault(target.id, set()).add("ambiguous")
+                if isinstance(stmt.value, ast.Call):
+                    related = keyword(stmt.value, "related_name")
+                    if isinstance(related, ast.Constant):
+                        kinds.setdefault(str(related.value), set()).add("ambiguous")
     return {name for name, values in kinds.items()
             if values <= {"ManyToManyField", "many"}}
 
