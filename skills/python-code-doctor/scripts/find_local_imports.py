@@ -26,12 +26,14 @@ the author knows):
 """
 
 import ast
+import functools
 import json
+import warnings
 import argparse
 from pathlib import Path
 from dataclasses import dataclass, asdict
 from collections import defaultdict
-from common import is_cli_command, sort_findings, cached_parse, SEVERITY_ICONS, configure_output, find_python_files, warn_detector_error, warn_unparseable
+from common import is_cli_command, project_root, sort_findings, cached_parse, SEVERITY_ICONS, configure_output, find_python_files, warn_detector_error, warn_unparseable
 
 
 @dataclass
@@ -59,7 +61,11 @@ _HEAVY_MODULES = frozenset({
     "torch", "torchvision", "torchaudio", "tensorflow", "jax", "transformers",
     "diffusers", "accelerate", "ultralytics", "xformers", "triton", "onnxruntime",
     "numba", "cv2", "scipy", "sklearn", "pandas", "matplotlib", "spacy", "nltk",
+    "safetensors",  # its .torch half imports torch, and it is deferred alongside it
 })
+
+# How many first-party modules deep a load is followed before giving up.
+_MAX_LOAD_DEPTH = 6
 
 _HEAVY_REASONS = (
     "deliberate deferral of a slow-to-import module to keep startup fast: a CLI's "
@@ -73,6 +79,118 @@ _CLI_REASONS = (
     "only the command that runs pays for what it imports",
     "the subcommand's dependency is an optional extra the other commands must work without",
 )
+
+def _package(path: Path) -> tuple[list, Path]:
+    """A module file's package parts, and the directory its top-level package sits in."""
+    parts, directory = [], path.parent
+    while (directory / "__init__.py").exists() and directory.parent != directory:
+        parts.insert(0, directory.name)
+        directory = directory.parent
+    return parts, directory
+
+
+def _module_file(dotted: str, bases) -> Path | None:
+    parts = [p for p in dotted.split(".") if p]
+    if not parts:
+        return None
+    for base in bases:
+        module = base.joinpath(*parts[:-1], parts[-1] + ".py")
+        if module.is_file():
+            return module
+        package = base.joinpath(*parts, "__init__.py")
+        if package.is_file():
+            return package
+    return None
+
+
+def _loaded_modules(node, path: Path) -> list:
+    """Dotted names one import statement in ``path`` loads: the module and, for a
+    `from X import y`, X.y in case y is a submodule. Relative names are resolved
+    against the file's own package."""
+    if isinstance(node, ast.Import):
+        return [alias.name for alias in node.names]
+    if node.level:
+        parts, _ = _package(path)
+        if path.name == "__init__.py":
+            parts = parts + ["__init__"]  # so level 1 is the package itself
+        base = parts[:len(parts) - node.level + 1] if node.level <= len(parts) else []
+        if path.name == "__init__.py":
+            base = [p for p in base if p != "__init__"]
+        module = ".".join([*base, *(node.module.split(".") if node.module else [])])
+    else:
+        module = node.module or ""
+    return [module, *(f"{module}.{alias.name}" if module else alias.name for alias in node.names)]
+
+
+def _module_level_imports(tree):
+    """Import statements that run when the module is loaded: top-level ones and
+    those under module-level if/try, but not under `if TYPE_CHECKING:`."""
+    stack = list(tree.body)
+    while stack:
+        node = stack.pop(0)
+        if isinstance(node, (ast.Import, ast.ImportFrom)):
+            yield node
+        elif isinstance(node, ast.If):
+            if not _is_typechecking_test(node.test):
+                stack.extend(node.body)
+            stack.extend(node.orelse)
+        elif isinstance(node, ast.Try):
+            stack.extend([*node.body, *node.orelse, *node.finalbody])
+            for handler in node.handlers:
+                stack.extend(handler.body)
+
+
+def _bases(path: Path) -> tuple:
+    """Where an absolute first-party module name is looked up from ``path``."""
+    _, package_base = _package(path)
+    root = project_root(path)
+    return tuple(dict.fromkeys([package_base, root, root / "src"]))
+
+
+def _heavy_chain(node, path: Path, seen: frozenset = frozenset()) -> str | None:
+    """How one import statement in ``path`` reaches a heavy package, or None."""
+    for dotted in _loaded_modules(node, path):
+        if dotted.split(".")[0] in _HEAVY_MODULES:
+            return dotted.split(".")[0]
+        target = _module_file(dotted, _bases(path))
+        if target is not None:
+            chain = _load_cost(str(target.resolve()), seen)
+            if chain:
+                return f"{dotted} → {chain}"
+    return None
+
+
+@functools.lru_cache(maxsize=None)
+def _load_cost(path_str: str, seen: frozenset = frozenset()) -> str | None:
+    """The chain by which loading this module file imports a heavy package, or None.
+
+    Followed through first-party modules to _MAX_LOAD_DEPTH; a cycle stops.
+    """
+    if path_str in seen or len(seen) >= _MAX_LOAD_DEPTH:
+        return None
+    path = Path(path_str)
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            tree = ast.parse(path.read_text(encoding="utf-8", errors="replace"))
+    except (OSError, SyntaxError, ValueError):
+        return None
+    for node in _module_level_imports(tree):
+        chain = _heavy_chain(node, path, seen | {path_str})
+        if chain:
+            return chain
+    return None
+
+
+def _deferred_chain(node, path: Path) -> str | None:
+    """How a deferred import statement reaches a heavy package, or None. Every
+    name an `import a, b` loads must be heavy, as for the package rule; a
+    `from X import y` is one load."""
+    if isinstance(node, ast.Import) and len(node.names) > 1:
+        chains = [_heavy_chain(ast.Import(names=[alias]), path) for alias in node.names]
+        return "; ".join(chains) if all(chains) else None
+    return _heavy_chain(node, path)
+
 
 def _imported_packages(node) -> list:
     """Top-level package each name of an import statement loads ('' if relative)."""
@@ -170,12 +288,17 @@ def detect(tree, filename, lines, ignore):
                             if isinstance(child, ast.Import)
                             else "from " + ("." * getattr(child, "level", 0)) + (child.module or "") + " import ...")
                     heavy = all(pkg in _HEAVY_MODULES for pkg in _imported_packages(child))
+                    chain = None
+                    if not heavy:  # first-party: is it slow because of what *it* loads?
+                        chain = _deferred_chain(child, Path(filename))
+                        heavy = chain is not None
                     if heavy or in_command:
                         reasons = (_HEAVY_REASONS if heavy else ()) + (_CLI_REASONS if in_command else ())
                         where = "a CLI command" if in_command else "a function"
+                        loads = f", which loads {chain} at import time" if chain else ""
                         add(child.lineno, "local_import",
-                            f"Import deferred into {where} ('{what}') — usually to keep startup "
-                            "fast; confirm it is not a circular-import workaround",
+                            f"Import deferred into {where} ('{what}'){loads} — usually to keep "
+                            "startup fast; confirm it is not a circular-import workaround",
                             "", "low", kind="candidate", also_caused_by=reasons)
                     else:
                         add(child.lineno, "local_import",

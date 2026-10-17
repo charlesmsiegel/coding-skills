@@ -5706,3 +5706,62 @@ def test_nonetype_and_an_exact_type_assertion_are_not_type_comparisons(tmp_path)
                    if r["smell_type"] == "type_comparison")
     assert found == sorted([("config.py", n) for n in _lines_marked(source)]
                            + [("test_prompting.py", n) for n in _lines_marked(test)])
+
+
+_CHECKPOINTS = (
+    "def load():\n"
+    "    from pkg.models.loading import load_pipeline  # lead\n"
+    "    return load_pipeline\n"
+    "\n"
+    "def serve():\n"
+    "    from pkg.api import app  # lead\n"
+    "    return app\n"
+    "\n"
+    "def relative():\n"
+    "    from .models import loading  # lead\n"
+    "    return loading\n"
+    "\n"
+    "def weights():\n"
+    "    from safetensors.torch import load_file  # lead\n"
+    "    return load_file\n"
+    "\n"
+    "def light():\n"
+    "    from pkg.models.light import parse  # fires\n"
+    "    return parse\n"
+    "\n"
+    "def lazy():\n"
+    "    from pkg.lazy_heavy import encode  # fires\n"
+    "    return encode\n"
+    "\n"
+    "def typed():\n"
+    "    from pkg.typed import Shape  # fires\n"
+    "    return Shape\n"
+)
+
+
+def test_deferring_a_first_party_module_that_loads_torch_is_a_heavy_import(tmp_path):
+    """`from pkg.models.loading import ...` costs what loading.py imports at module
+    level — torch — so deferring it is the same startup choice as deferring torch."""
+    (tmp_path / "pyproject.toml").write_text('[project]\nname = "pkg"\nversion = "0"\n')
+    files = {
+        "pkg/__init__.py": "",
+        "pkg/models/__init__.py": "",
+        "pkg/models/loading.py": "import torch\n\ndef load_pipeline():\n    return torch\n",
+        "pkg/models/light.py": "import json\n\ndef parse(text):\n    return json.loads(text)\n",
+        "pkg/api.py": "from pkg.models import loading\n\napp = loading\n",
+        "pkg/lazy_heavy.py": "def encode():\n    import torch\n    return torch\n",
+        "pkg/typed.py": ("from typing import TYPE_CHECKING\n\nif TYPE_CHECKING:\n    import torch\n\n"
+                         "Shape = tuple\n"),
+        "pkg/checkpoints.py": _CHECKPOINTS,
+    }
+    for rel, content in files.items():
+        (tmp_path / rel).parent.mkdir(parents=True, exist_ok=True)
+        (tmp_path / rel).write_text(content)
+
+    records = {r["line"]: r for r in run_detector("find_local_imports.py", tmp_path)
+               if r["smell_type"] == "local_import" and Path(r["file"]).name == "checkpoints.py"}
+    assert sorted(n for n, r in records.items() if r["kind"] == "candidate") == \
+        _lines_marked(_CHECKPOINTS, "# lead")
+    assert sorted(n for n, r in records.items() if r["kind"] == "finding") == _lines_marked(_CHECKPOINTS)
+    assert "torch" in records[_lines_marked(_CHECKPOINTS, "# lead")[1]]["description"], \
+        "the record says which heavy package makes the module slow, and through what"
