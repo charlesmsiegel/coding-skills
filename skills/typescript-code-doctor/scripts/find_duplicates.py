@@ -15,12 +15,20 @@ from collections import defaultdict
 from pathlib import Path
 
 from common import Finding, is_declaration_file, is_test_file, run_tree_detector
+from tsparse import iter_calls
 from tsproject import load_project
 
 WINDOW = 50          # tokens; roughly 8-12 statements
 MIN_DISTINCT_NAMES = 12
 MIN_LITERAL_REPEATS = 5
 MIN_LITERAL_LENGTH = 8
+
+# Where a string is a CSS class list: the value of a JSX class attribute, or an
+# argument of a function that joins, merges or builds class lists (clsx and
+# classnames, shadcn's `cn`, tailwind-merge, class-variance-authority and
+# tailwind-variants).
+CLASS_ATTRIBUTES = frozenset({"className", "class"})
+CLASS_LIST_HELPERS = frozenset({"clsx", "cn", "cx", "classNames", "classnames", "twMerge", "twJoin", "cva", "tv"})
 
 
 def _normalise(tsfile, start: int, stop: int) -> str:
@@ -133,14 +141,59 @@ def _check_types(project, add) -> None:
             "medium", related=[ln for _, ln, _ in occurrences[1:4]])
 
 
+def _class_list_strings(tsfile) -> set[int]:
+    """Indices of the string tokens that are CSS class lists.
+
+    Repeating utility classes in markup is how Tailwind styles things, and
+    Tailwind's own answer to the repetition is a component, not a string
+    constant: `"flex items-center gap-2"` written five times is five elements
+    styled alike, not one value a rename could miss. Hoisting it into
+    `const ROW = "…"` would only hide which element looks how.
+
+    A string is a class list when it is the value of a JSX `className` or
+    `class` attribute — directly, or anywhere inside its `{…}` (a ternary, an
+    `&&`) — or an argument of a class-list helper. The innermost enclosing
+    call decides, so `className={theme.pick("primary")}` passes a lookup key
+    to `pick`, and that key is still counted. (A template literal is a single
+    token whose interior is never counted at all.)
+    """
+    tokens = tsfile.tokens
+    marked: set[int] = set()
+    regions: dict[int, tuple[int, bool]] = {}  # opening index -> (closing index, holds class lists)
+    for paren, callee in iter_calls(tsfile):
+        close = tsfile.closer(paren)
+        if close > paren:
+            regions[paren] = (close, callee.rsplit(".", 1)[-1] in CLASS_LIST_HELPERS)
+    for index in range(1, len(tokens) - 1):
+        if not (tokens[index].is_op("=") and tokens[index - 1].kind == "name"
+                and tokens[index - 1].value in CLASS_ATTRIBUTES):
+            continue
+        value = tokens[index + 1]
+        if value.kind == "str":
+            marked.add(index + 1)
+        elif value.is_op("{") and tsfile.closer(index + 1) > index + 1:
+            regions[index + 1] = (tsfile.closer(index + 1), True)
+    # Brackets nest, so the open regions form a stack whose top is innermost.
+    stack: list[tuple[int, bool]] = []
+    for index, token in enumerate(tokens):
+        while stack and stack[-1][0] < index:
+            stack.pop()
+        if index in regions:
+            stack.append(regions[index])
+        if token.kind == "str" and stack and stack[-1][1]:
+            marked.add(index)
+    return marked
+
+
 def _check_literals(project, add) -> None:
     occurrences: dict[str, list[tuple[Path, int]]] = defaultdict(list)
     for path, tsfile in project.analyzable.items():
         if is_test_file(path) or is_declaration_file(path):
             continue
         import_lines = {record.line for record in tsfile.imports}
-        for token in tsfile.tokens:
-            if token.kind != "str" or token.line in import_lines:
+        class_lists = _class_list_strings(tsfile)
+        for index, token in enumerate(tsfile.tokens):
+            if token.kind != "str" or token.line in import_lines or index in class_lists:
                 continue
             literal = token.value.strip("'\"")
             if len(literal) < MIN_LITERAL_LENGTH or literal.startswith(("http", "./", "../")):
