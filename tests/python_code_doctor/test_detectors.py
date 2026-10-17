@@ -5334,3 +5334,57 @@ def test_envy_of_a_library_or_builtin_type_is_not_reported(tmp_path):
     envy = sorted(r["line"] for r in run_detector("find_coupling_issues.py", tmp_path)
                   if r["issue_type"] == "feature_envy")
     assert envy == _lines_marked(_EXTERNAL_ENVY)
+
+
+def test_one_methods_implementations_are_a_contract_not_a_data_clump(tmp_path):
+    """`advance(self, i, x, denoised)` on a Protocol and its three solvers is one
+    signature implemented four times. Same-named methods count once; constructors
+    do not, and neither do free functions."""
+    (tmp_path / "solvers.py").write_text(
+        "from typing import Protocol\n"
+        "\n"
+        "class Solver(Protocol):\n"
+        "    def advance(self, i, x, denoised): ...\n"
+        "\n"
+        "class Euler:\n"
+        "    def advance(self, i, x, denoised):\n"
+        "        return x\n"
+        "\n"
+        "class Heun:\n"
+        "    def advance(self, i, x, denoised):\n"
+        "        return x + denoised\n"
+        "\n"
+        "class Dpm:\n"
+        "    def advance(self, i, x, denoised):\n"
+        "        return denoised\n"
+        "\n"
+        "    def _higher_stages(self, i, x, denoised):\n"
+        "        return i\n"
+    )
+    (tmp_path / "net.py").write_text(
+        "def connect(host, port, timeout):\n"
+        "    return host\n"
+        "\n"
+        "def ping(host, port, timeout):\n"
+        "    return port\n"
+        "\n"
+        "def close_conn(host, port, timeout):\n"
+        "    return timeout\n"
+    )
+    (tmp_path / "clients.py").write_text(
+        "class Http:\n"
+        "    def __init__(self, url, retries, backoff):\n"
+        "        self.url = url\n"
+        "\n"
+        "class Grpc:\n"
+        "    def __init__(self, url, retries, backoff):\n"
+        "        self.url = url\n"
+        "\n"
+        "class Ws:\n"
+        "    def __init__(self, url, retries, backoff):\n"
+        "        self.url = url\n"
+    )
+    clumps = sorted(r["description"].split(" appear")[0]
+                    for r in run_detector("find_parameter_objects.py", tmp_path))
+    assert clumps == ["Parameters ['backoff', 'retries', 'url']",
+                      "Parameters ['host', 'port', 'timeout']"]

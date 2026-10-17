@@ -16,6 +16,12 @@ Finds:
 In a test file the parameters of a `test*` function or a `@pytest.fixture` are
 fixture requests — pytest's dependency injection — so they are left out: a
 suite whose tests share fixtures repeats their names by design.
+
+Methods that share a name count once: `advance(self, i, x, denoised)` declared
+on a Protocol and implemented by three solvers (or mirrored by a fake) is one
+signature, a contract, not four functions passing the same loose values.
+Initializers are the exception — unrelated classes built from the same three
+values are exactly the clump this looks for.
 """
 
 import ast
@@ -43,6 +49,7 @@ MIN_GROUP = 3        # smallest clump size to consider
 MIN_FUNCS = 3        # how many functions must share the group
 MAX_PARAMS = 8       # skip very long signatures (already flagged elsewhere)
 _SKIP = {"self", "cls"}
+_INITIALIZERS = {"__init__", "__new__", "__post_init__"}
 
 
 def _param_names(args: ast.arguments):
@@ -68,7 +75,12 @@ def _requests_fixtures(node) -> bool:
 
 
 def _collect(path: Path):
-    """Return list of (frozenset_of_params, file, line, funcname)."""
+    """Return list of (frozenset_of_params, file, line, funcname, identity).
+
+    ``identity`` is what makes two definitions the same function for counting:
+    a method's name (all methods named `advance` are one contract), and the
+    definition's own location for anything else.
+    """
     out = []
     root = path if path.is_dir() else path.parent
     for filepath in find_python_files(path):
@@ -85,13 +97,18 @@ def _collect(path: Path):
         except Exception as exc:
             warn_detector_error(filepath, exc)
             continue
+        methods = {id(item) for node in ast.walk(tree) if isinstance(node, ast.ClassDef)
+                   for item in node.body if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef))}
         for node in ast.walk(tree):
             if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 if in_tests and _requests_fixtures(node):
                     continue
                 names = _param_names(node.args)
                 if MIN_GROUP <= len(names) <= MAX_PARAMS:
-                    out.append((frozenset(names), str(filepath), node.lineno, node.name))
+                    identity = (("method", node.name)
+                                if id(node) in methods and node.name not in _INITIALIZERS
+                                else ("def", str(filepath), node.lineno))
+                    out.append((frozenset(names), str(filepath), node.lineno, node.name, identity))
     return out
 
 
@@ -102,11 +119,13 @@ def detect(path: Path, ignore: set):
 
     # Count every MIN_GROUP-sized subset of params, tracking where it occurs.
     triple_locs = defaultdict(list)   # frozenset(3 names) -> [(file, line, name)]
-    for names, f, ln, fn in functions:
+    identities = defaultdict(set)     # frozenset(3 names) -> distinct functions
+    for names, f, ln, fn, identity in functions:
         for combo in combinations(sorted(names), MIN_GROUP):
             triple_locs[frozenset(combo)].append((f, ln, fn))
+            identities[frozenset(combo)].add(identity)
 
-    qualifying = {t: locs for t, locs in triple_locs.items() if len(locs) >= MIN_FUNCS}
+    qualifying = {t: locs for t, locs in triple_locs.items() if len(identities[t]) >= MIN_FUNCS}
 
     # Merge triples that share the exact same support into one (maximal) clump,
     # so a recurring 4-name group is reported once rather than as 4 triples.
@@ -115,6 +134,7 @@ def detect(path: Path, ignore: set):
         key = frozenset(locs)
         by_support[key]["names"].update(t)
         by_support[key]["locs"] = locs
+        by_support[key]["functions"] = len(identities[t])
 
     issues = []
     for key, data in by_support.items():
@@ -125,7 +145,10 @@ def detect(path: Path, ignore: set):
         more = "" if len(locs) <= 5 else f" (+{len(locs) - 5} more)"
         issues.append(CodeSmell(
             file=f0, line=ln0, smell_type="data_clump",
-            description=f"Parameters {names} appear together in {len(locs)} functions: {where}{more}",
+            description=(f"Parameters {names} appear together in {data['functions']} functions"
+                         + (f" ({len(locs)} definitions; same-named methods count once)"
+                            if len(locs) != data["functions"] else "")
+                         + f": {where}{more}"),
             suggestion="Group them into a dataclass (e.g. a single typed object) and pass that instead of the loose parameters.",
             severity="medium", code_snippet="",
         ))
