@@ -33,7 +33,7 @@ import argparse
 from pathlib import Path
 from dataclasses import dataclass, asdict
 from collections import defaultdict
-from common import project_parts, sort_findings, cached_parse, SEVERITY_ICONS, configure_output, find_python_files, warn_detector_error, warn_unparseable
+from common import project_parts, sort_findings, cached_parse, SEVERITY_ICONS, configure_output, find_python_files, warn_detector_error, warn_unparseable, is_route_handler
 
 
 @dataclass
@@ -82,21 +82,6 @@ def _is_stub_body(node) -> bool:
             return True
         # String constant = docstring-only body
         if isinstance(val, ast.Constant) and isinstance(val.value, str):
-            return True
-    return False
-
-
-# The verbs a router or app object registers a handler under: FastAPI and
-# Starlette (get/post/.../api_route/websocket), Flask and friends (route).
-_ROUTE_VERBS = frozenset({"get", "post", "put", "patch", "delete", "head", "options",
-                          "api_route", "route", "websocket"})
-
-
-def _is_route_handler(node) -> bool:
-    """True for a function registered by a decorator call like `@router.get(...)`."""
-    for dec in node.decorator_list:
-        if (isinstance(dec, ast.Call) and isinstance(dec.func, ast.Attribute)
-                and dec.func.attr in _ROUTE_VERBS):
             return True
     return False
 
@@ -179,7 +164,7 @@ def detect(tree, filename, lines, ignore):
         is_method = id(node) in method_ids
         # Missing annotations are judged on the API surface only; a route
         # handler is exempt from both kinds.
-        judge_missing = id(node) in surface and not _is_route_handler(node)
+        judge_missing = id(node) in surface and not is_route_handler(node)
 
         # Skip all dunder methods
         if fname.startswith("__") and fname.endswith("__"):
