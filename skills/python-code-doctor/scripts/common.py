@@ -69,14 +69,69 @@ def registers_config(func) -> bool:
     return False
 
 
-def signature_is_a_contract(func) -> bool:
+# Framework hooks whose parameter list the framework fixes: the method name,
+# the package whose base class declares it, and its parameters after self/cls.
+# Deliberately short. An nn.Module's forward() is also an override, but its
+# parameters are the author's own design, so it is not here.
+FRAMEWORK_HOOKS = (
+    ("settings_customise_sources", "pydantic_settings",
+     ("settings_cls", "init_settings", "env_settings", "dotenv_settings", "file_secret_settings")),
+    ("__get_pydantic_core_schema__", "pydantic", ("source_type", "handler")),
+    ("emit", "logging", ("record",)),            # logging.Handler
+    ("default", "json", ("o",)),                 # json.JSONEncoder
+    ("__call__", "argparse", ("parser", "namespace", "values", "option_string")),  # argparse.Action
+)
+
+
+def framework_hook_overrides(tree) -> frozenset:
+    """id() of every method in ``tree`` that overrides a FRAMEWORK_HOOKS entry.
+
+    Narrow on purpose, all three must hold: the method's class has a base
+    imported from the hook's package, the name is the hook's, and the parameter
+    list after self/cls is exactly the framework's.
+    """
+    imports: dict[str, str] = {}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                imports[alias.asname or alias.name.split(".")[0]] = alias.name.split(".")[0]
+        elif isinstance(node, ast.ImportFrom) and not node.level and node.module:
+            for alias in node.names:
+                imports[alias.asname or alias.name] = node.module.split(".")[0]
+    found = set()
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.ClassDef):
+            continue
+        packages = set()
+        for base in node.bases:
+            root = base.value if isinstance(base, ast.Subscript) else base
+            while isinstance(root, ast.Attribute):
+                root = root.value
+            if isinstance(root, ast.Name) and root.id in imports:
+                packages.add(imports[root.id])
+        if not packages:
+            continue
+        for item in node.body:
+            if not isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            params = tuple(a.arg for a in [*item.args.posonlyargs, *item.args.args,
+                                           *item.args.kwonlyargs])[1:]
+            if any(item.name == name and package in packages and params == expected
+                   for name, package, expected in FRAMEWORK_HOOKS):
+                found.add(id(item))
+    return frozenset(found)
+
+
+def signature_is_a_contract(func, hooks: frozenset = frozenset()) -> bool:
     """Whether a framework dictates `func`'s parameter list, so its length is not a design choice.
 
     A `@register_to_config` `__init__` (the flat kwargs are the serialised
-    config) and a CLI command (each parameter is one of its flags). The
-    parameter-count detectors exempt these; nothing else about them is exempt.
+    config), a CLI command (each parameter is one of its flags), and an
+    override of a framework hook — ``hooks`` is framework_hook_overrides() of
+    the module. The parameter-count detectors exempt these; nothing else about
+    them is exempt.
     """
-    return registers_config(func) or is_cli_command(func)
+    return registers_config(func) or is_cli_command(func) or id(func) in hooks
 
 
 # The signature size a function may reach before analyze_complexity reports it.

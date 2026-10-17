@@ -10,7 +10,7 @@ import json
 import argparse
 from pathlib import Path
 from dataclasses import dataclass, asdict
-from common import count_parameters, parameter_severity, signature_is_a_contract, sort_findings, cached_parse, SEVERITY_ICONS, configure_output, find_python_files, warn_detector_error
+from common import count_parameters, framework_hook_overrides, parameter_severity, signature_is_a_contract, sort_findings, cached_parse, SEVERITY_ICONS, configure_output, find_python_files, warn_detector_error
 
 
 @dataclass
@@ -45,6 +45,11 @@ class ComplexityVisitor(ast.NodeVisitor):
         self.config = config
         self.issues: list[ComplexityIssue] = []
         self.current_class = None
+        self._hooks: frozenset = frozenset()
+
+    def visit_Module(self, node: ast.Module):
+        self._hooks = framework_hook_overrides(node)
+        self.generic_visit(node)
 
     def _severity(self, value: int, threshold: int) -> str:
         ratio = value / threshold
@@ -170,7 +175,7 @@ class ComplexityVisitor(ast.NodeVisitor):
         
         # Parameter count
         params = count_parameters(node)
-        if params > self.config.max_params and not signature_is_a_contract(node):
+        if params > self.config.max_params and not signature_is_a_contract(node, self._hooks):
             self.issues.append(ComplexityIssue(
                 file=self.filename, line=node.lineno, name=name,
                 issue_type="parameter_count", value=params,
