@@ -571,3 +571,184 @@ def test_a_corrupt_notebook_cell_skips_the_file_rather_than_the_audit(tmp_path):
     payload = run(tmp_path)
     assert payload["counts"]["files_skipped_unread"] == 1
     assert "NOT read" in payload["headline"]
+
+
+# ---- a real repository (hardy) ------------------------------------------------ #
+# Run from the root of a real project: 17 rows came from a committed bundle, all
+# 26 composite weights were arithmetic inside strings (Lean proofs in JSON, a test
+# polynomial), 20 of 42 zero defaults were a command's exit status, and "map"
+# matched `source_map` and `identity_map` 40 times. Each fix sits beside a test
+# that the true shape is still reported.
+
+def test_a_minified_bundle_is_not_mined_for_metrics(tmp_path):
+    bundle = tmp_path / "static" / "assets" / "index-U_FZj3ND.js"
+    bundle.parent.mkdir(parents=True)
+    line = "function a(e){var accuracy=0.4*e.r+0.6*e.f;if(score>=0.8)return 0;return accuracy}" * 12
+    bundle.write_text((line + "\n") * 3, encoding="utf-8")
+    payload = run(tmp_path)
+    assert payload["candidates"] == []
+    assert payload["counts"]["files_skipped_generated"] == 1
+    assert "index-U_FZj3ND.js" in payload["caveat"]
+
+
+def test_the_same_code_written_by_hand_is_still_mined(tmp_path):
+    (tmp_path / "score.js").write_text(
+        "function a(e) {\n"
+        "  var accuracy = 0.4 * e.r + 0.6 * e.f;\n"
+        "  if (score >= 0.8) return 0;\n"
+        "  return accuracy;\n"
+        "}\n",
+        encoding="utf-8",
+    )
+    payload = run(tmp_path)
+    assert kinds(payload, "composite_weight") and kinds(payload, "threshold")
+    assert payload["counts"]["files_skipped_generated"] == 0
+
+
+def test_a_one_line_metrics_json_is_still_read(tmp_path):
+    (tmp_path / "metrics.json").write_text(
+        '{"pad": "' + "x" * 800 + '", "accuracy": 0.81}', encoding="utf-8"
+    )
+    assert any(row["detail"].startswith("accuracy") for row in kinds(run(tmp_path), "metric_definition"))
+
+
+def test_an_overlong_line_is_read_up_to_the_bound_and_says_so(tmp_path):
+    (tmp_path / "metrics.json").write_text(
+        '{"accuracy": 0.81, "pad": "' + "x" * 20_000 + '"}\n', encoding="utf-8"
+    )
+    payload = run(tmp_path)
+    assert kinds(payload, "metric_definition")
+    assert payload["counts"]["lines_truncated"] == 1
+    assert "1 line(s)" in payload["caveat"]
+
+
+@pytest.mark.parametrize("name,body", [
+    ("trajectory.json", '{"proof": "by\\n  nlinarith [sq_nonneg (2 * a + 3 * b)]"}\n'),
+    ("test_cas.py", 'assert out == "x**4 + 4*x**3*y + 6*x**2*y**2"\n'),
+    ("notes.json", '{"note": "the weight of evidence is 0.5"}\n'),
+])
+def test_arithmetic_inside_a_string_is_not_a_composite_weight(tmp_path, name, body):
+    (tmp_path / name).write_text(body, encoding="utf-8")
+    assert not kinds(run(tmp_path), "composite_weight")
+
+
+@pytest.mark.parametrize("name,body", [
+    ("score.py", "quality = 0.4 * relevance + 0.6 * faithfulness\n"),
+    ("weights.yaml", "relevance_weight: 0.4\n"),
+    ("weights.json", '{"relevance_weight": 0.4, "latency_weight": 0.6}\n'),
+    ("rubric.yaml", "composite: 0.4 * relevance + 0.6 * faithfulness\n"),
+])
+def test_a_weight_written_as_a_value_is_still_found(tmp_path, name, body):
+    (tmp_path / name).write_text(body, encoding="utf-8")
+    assert kinds(run(tmp_path), "composite_weight")
+
+
+def test_a_commands_exit_status_is_not_a_zero_default(tmp_path):
+    """hardy's library and evals commands return 0 for success, like any CLI."""
+    (tmp_path / "commands.py").write_text(
+        "import argparse\n"
+        "import sys\n"
+        "ACCURACY_THRESHOLD = 0.8\n"
+        "\n"
+        "def _list(held) -> int:\n"
+        "    for record in held.records():\n"
+        "        print(record.accuracy)\n"
+        "    return 0\n"
+        "\n"
+        "def run_todo(args: argparse.Namespace, config) -> int:\n"
+        "    if not args.problems:\n"
+        "        print('nothing to do', file=sys.stderr)\n"
+        "        return 2\n"
+        "    print(summarize(args))\n"
+        "    return 0\n"
+        "\n"
+        "def main(argv=None) -> int:\n"
+        "    return run_todo(parse(argv), None)\n"
+        "\n"
+        "def report(\n"
+        "    cost,\n"
+        "    *,\n"
+        "    calls=None,\n"
+        ") -> int:\n"
+        '    """Print the measurement; exit nonzero when it could not answer."""\n'
+        "    print(cost)\n"
+        "    if cost.median is None:\n"
+        "        return 1\n"
+        "    if calls is not None:\n"
+        "        return 0 if cost.consistent else 1\n"
+        "    return 0\n",
+        encoding="utf-8",
+    )
+    assert not kinds(run(tmp_path), "zero_default")
+
+
+@pytest.mark.parametrize("body", [
+    "def accuracy(rows):\n    if not rows:\n        return 0\n    return sum(rows) / len(rows)\n",
+    # Printing does not make a metric a command: it still returns a computed value.
+    "def accuracy(rows):\n    if not rows:\n        print('empty')\n        return 0\n"
+    "    return correct(rows) / len(rows)\n",
+    # Nor does returning only integers, when nothing about it is a command.
+    "def win_rate(rows):\n    if not rows:\n        return 0\n    return 1\n",
+])
+def test_a_metric_returning_zero_is_still_a_zero_default(tmp_path, body):
+    (tmp_path / "score.py").write_text(body, encoding="utf-8")
+    assert kinds(run(tmp_path), "zero_default")
+
+
+@pytest.mark.parametrize("name", ["source_map", "identity_map", "structural_map", "map_span"])
+def test_map_inside_an_identifier_is_not_a_measure(finder, name):
+    assert not finder.is_metric_name(name)
+
+
+@pytest.mark.parametrize("name", ["map_at_10", "mapAt5", "MAP_AT_K", "val_map_score"])
+def test_a_metric_shaped_map_is_still_a_measure(finder, name):
+    assert finder.is_metric_name(name)
+
+
+def test_a_limit_on_a_map_is_not_a_measurement_threshold(finder):
+    assert not finder.is_threshold_name("MAX_MAP_NODES")
+    assert finder.is_threshold_name("MIN_MAP_AT_10")
+
+
+@pytest.mark.parametrize("name,body", [
+    ("Chat.jsx", "const map = new Map();\n"),
+    ("tools.py", 'payload = {"map": [entry(e) for e in shown], "map_truncated": False}\n'),
+    ("library.py", "def _map(args, held) -> int:\n    return 1\n"),
+    ("tree.py", "source_map = build(tree)\nidentity_map = {}\n"),
+])
+def test_a_mapping_is_not_reported_as_a_metric(tmp_path, name, body):
+    (tmp_path / name).write_text(body, encoding="utf-8")
+    payload = run(tmp_path)
+    assert not kinds(payload, "metric_definition") and not kinds(payload, "threshold")
+
+
+@pytest.mark.parametrize("name,body,kind", [
+    ("results.json", '{"map": 0.42, "ndcg": 0.51}\n', "metric_definition"),
+    ("gate.py", "if map >= 0.5:\n    ship()\n", "threshold"),
+])
+def test_a_standalone_map_with_a_number_is_still_a_measure(tmp_path, name, body, kind):
+    (tmp_path / name).write_text(body, encoding="utf-8")
+    assert any(row["detail"].startswith("map") for row in kinds(run(tmp_path), kind))
+
+
+def test_a_bundle_still_counts_as_a_consumer(tmp_path):
+    """Not mined is not unread: a bundle may be the only committed reader of a
+    number, and calling the metric dead would manufacture a finding."""
+    (tmp_path / "metric.py").write_text("quality_score = compute()\n", encoding="utf-8")
+    bundle = tmp_path / "assets" / "index-abc123.js"
+    bundle.parent.mkdir()
+    bundle.write_text(("render(row.quality_score);" * 40 + "\n") * 2, encoding="utf-8")
+    payload = run(tmp_path)
+    assert payload["counts"]["files_skipped_generated"] == 1
+    assert not kinds(payload, "no_consumer")
+
+
+@pytest.mark.parametrize("line,leaf", [
+    ("if scores[kind].precision >= 0.5:\n    ship()\n", "precision"),
+    ("if evaluate(rows).accuracy >= 0.8:\n    ship()\n", "accuracy"),
+    ("ok = (report\n    .accuracy >= 0.8)\n", "accuracy"),
+])
+def test_a_gate_on_an_attribute_of_a_subscript_or_call_is_a_threshold(tmp_path, line, leaf):
+    """Anchoring the comparison at the start of a name must not lose `x[k].precision`."""
+    (tmp_path / "gate.py").write_text(line, encoding="utf-8")
+    assert any(row["detail"].startswith(leaf) for row in kinds(run(tmp_path), "threshold"))
