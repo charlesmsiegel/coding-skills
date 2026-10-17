@@ -23,7 +23,8 @@ class ImportSite:
     file: str
     line: int
     # How an enclosing `except ImportError` bears on it: "" (none), "optional"
-    # (the handler carries on), "exits" (every such handler raises or exits), or
+    # (a handler visibly degrades), "exits" (no handler visibly degrades: it
+    # raises, exits, or does something the reader cannot call a degrade), or
     # "shared" (the handler replaces other imports of the same try, not this one).
     guard: str = ""
     # The line of a sys.path addition that runs before this import and that the
@@ -62,16 +63,50 @@ def _import_error_handlers(node) -> list:
     return found
 
 
-# A handler whose last statement is one of these does not carry on.
-_EXIT_CALLS = frozenset({"sys.exit", "exit", "quit", "os._exit"})
+def _canonical(aliases: dict, dotted: str) -> str:
+    """`dotted` with its first name replaced by what the file imported it as."""
+    head, dot, rest = dotted.partition(".")
+    return aliases.get(head, head) + dot + rest
 
 
-def _stops(handler: ast.ExceptHandler) -> bool:
-    """The handler ends by raising or exiting, so the program does not run on without the import."""
+def _rebound(stmt) -> set[str]:
+    """The names an assignment or import statement binds."""
+    if isinstance(stmt, (ast.Import, ast.ImportFrom)):
+        return _bound_names(stmt)
+    targets = stmt.targets if isinstance(stmt, ast.Assign) else [getattr(stmt, "target", None)]
+    return {n.id for t in targets if t is not None for n in ast.walk(t)
+            if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Store)}
+
+
+# Loggers a degrading handler reports through, by the name of the object called.
+_LOGGERS = frozenset({"logging", "logger", "log"})
+
+
+def _reports(dotted: str) -> bool:
+    """A warnings.warn or logging call: `logging.warning`, `logger.info`, `self.log.debug`."""
+    return dotted == "warnings.warn" or any(part.lstrip("_").lower() in _LOGGERS
+                                            for part in dotted.split(".")[:-1])
+
+
+def _carries_on(handler: ast.ExceptHandler, guarded: set[str], aliases: dict) -> bool:
+    """The handler visibly degrades, so the program runs on without the import.
+
+    Only a last statement that says so counts: `pass`, `continue`, a falsy
+    `return` (None, False, 0), a rebinding of a guarded name (`x = None`,
+    `x = fallback`, a fallback import of the same name), or a warnings.warn or
+    logging call. Anything else — a raise, an exit under any name, a helper
+    that may exit, `return 1` from main(), argparse's error() — is not read as
+    carrying on, and the import becomes a lead rather than nothing.
+    """
     last = handler.body[-1]
-    return isinstance(last, ast.Raise) or (
-        isinstance(last, ast.Expr) and isinstance(last.value, ast.Call)
-        and _dotted(last.value.func) in _EXIT_CALLS)
+    if isinstance(last, (ast.Pass, ast.Continue)):
+        return True
+    if isinstance(last, ast.Return):
+        return last.value is None or (isinstance(last.value, ast.Constant) and not last.value.value)
+    if isinstance(last, (ast.Assign, ast.AnnAssign, ast.Import, ast.ImportFrom)):
+        return bool(_rebound(last) & guarded)
+    return (isinstance(last, ast.Expr) and isinstance(last.value, ast.Call)
+            and _reports(_canonical(aliases, _dotted(last.value.func))))
 
 
 def _bound_names(node) -> set[str]:
@@ -95,13 +130,14 @@ def _imports_in(stmts: list) -> list:
 @dataclass(frozen=True)
 class _Guard:
     """A `try` whose ImportError handlers bear on the imports in its body."""
-    carries_on: bool        # some handler that catches the error finishes normally
+    carries_on: bool        # some handler that catches the error visibly degrades
     fallbacks: frozenset    # names those handlers bind by importing a replacement
     shared: bool            # the body imports more than one module
 
     @classmethod
-    def of(cls, node, handlers: list) -> "_Guard":
-        carrying = [h for h in handlers if not _stops(h)]
+    def of(cls, node, handlers: list, aliases: dict) -> "_Guard":
+        guarded = {name for n in _imports_in(node.body) for name in _bound_names(n)}
+        carrying = [h for h in handlers if _carries_on(h, guarded, aliases)]
         fallbacks = frozenset(name for h in carrying for n in _imports_in(h.body) for name in _bound_names(n))
         modules = {key for n in _imports_in(node.body) for key in _module_keys(n)}
         return cls(bool(carrying), fallbacks, len(modules) > 1)
@@ -121,7 +157,7 @@ def _guard_of(node, guards: tuple) -> str:
     return "optional" if "optional" in verdicts else (verdicts[-1] if verdicts else "")
 
 
-def _walk(tree: ast.AST):
+def _walk(tree: ast.AST, aliases: dict):
     """Every node, with the ImportError guards around it and the functions it
     sits in (both innermost last).
 
@@ -137,7 +173,7 @@ def _walk(tree: ast.AST):
             guards, scopes = (), (*scopes, node)
         handlers = _import_error_handlers(node) if isinstance(node, (ast.Try, ast.TryStar)) else []
         if handlers:
-            inner = (*guards, _Guard.of(node, handlers))
+            inner = (*guards, _Guard.of(node, handlers, aliases))
             stack.extend((stmt, inner, scopes) for stmt in node.body)
             stack.extend((part, guards, scopes) for part in (*node.handlers, *node.orelse, *node.finalbody))
         else:
@@ -254,9 +290,8 @@ class _PathReader:
     plain assignment, in the scope that reads it.
     """
 
-    def __init__(self, filepath: Path, module: ast.Module, root: Path):
-        self.filepath, self.module, self.root = filepath, module, root
-        self.aliases = _import_aliases(module)
+    def __init__(self, filepath: Path, module: ast.Module, root: Path, aliases: dict):
+        self.filepath, self.module, self.root, self.aliases = filepath, module, root, aliases
         # Each name binding is read once. A binding met again while it is still
         # being read is defined in terms of itself (`ROOT = join(ROOT, ...)`) and
         # names no directory; without both, such a name fans out exponentially.
@@ -276,7 +311,7 @@ class _PathReader:
         """`node` reads a function parameter, the environment, sys.argv, or a name
         bound more than once — directly or through names bound once."""
         for child in ast.walk(node):
-            dotted = self._canonical(_dotted(child)) if isinstance(child, (ast.Name, ast.Attribute)) else ""
+            dotted = _canonical(self.aliases, _dotted(child)) if isinstance(child, (ast.Name, ast.Attribute)) else ""
             if any(dotted == source or dotted.startswith(source + ".") for source in _RUN_TIME_SOURCES):
                 return True
             if isinstance(child, ast.Name) and self._name_decided_at_run_time(child.id, scopes, seen):
@@ -301,11 +336,6 @@ class _PathReader:
             return False
         seen.add(key)
         return self.decided_at_run_time(value, scopes, seen)
-
-    def _canonical(self, dotted: str) -> str:
-        """`dotted` with its first name replaced by what the file imported it as."""
-        head, dot, rest = dotted.partition(".")
-        return self.aliases.get(head, head) + dot + rest
 
     def _anchored(self, path: PurePath) -> PurePath:
         # A relative sys.path entry is relative to the working directory, taken
@@ -364,7 +394,7 @@ class _PathReader:
         return self._ancestor(node.value.value, index, scopes, depth) if index is not None else None
 
     def _call(self, node: ast.Call, scopes: tuple, depth: int) -> PurePath | None:
-        name, args = self._canonical(_dotted(node.func)), node.args
+        name, args = _canonical(self.aliases, _dotted(node.func)), node.args
         method = node.func.attr if isinstance(node.func, ast.Attribute) else ""
         if node.keywords:
             return None
@@ -424,9 +454,10 @@ def _after_path(position: tuple, in_function: bool, additions: list) -> int:
 
 def import_sites(tree: ast.Module, filepath: Path, root: Path):
     """(top-level module, ImportSite) for every absolute import in one parsed file."""
-    reader = _PathReader(filepath, tree, root)
+    aliases = _import_aliases(tree)
+    reader = _PathReader(filepath, tree, root, aliases)
     found, additions = [], []
-    for node, guards, scopes in _walk(tree):
+    for node, guards, scopes in _walk(tree, aliases):
         if isinstance(node, (ast.Import, ast.ImportFrom)):
             found.append((node, _guard_of(node, guards), bool(scopes)))
             continue

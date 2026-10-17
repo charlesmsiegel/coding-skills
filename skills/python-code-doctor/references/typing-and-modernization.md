@@ -89,13 +89,16 @@ versions that float (so "works today" doesn't mean "works tomorrow").
   Add it to the manifest. (Mind the import-vs-distribution name gap — `import yaml`
   ↔ `PyYAML`, `import bs4` ↔ `beautifulsoup4`, `import cv2` ↔ `opencv-python`; the
   detector knows the common ones and stays quiet when unsure.) An import inside a
-  `try` whose `except` names `ImportError` or `ModuleNotFoundError` and then carries
-  on (`x = None`, `return False`, a fallback import) is not reported: the code runs
-  without the package, so it is optional by construction. If users should be able
-  to install it, declare it as an extra (`[project.optional-dependencies]`), where
-  it counts as used. A handler that ends by raising or exiting (`sys.exit("pip
-  install x")`, `raise ImportError(...)`, a bare `raise`) does not make it optional:
-  that is how a script says x is required, so the module is a *candidate*, as is
+  `try` whose `except` names `ImportError` or `ModuleNotFoundError` and visibly
+  degrades — its last statement is `pass`, `continue`, a falsy `return`, `x = None`,
+  `x = fallback` or a fallback import of the same name, or a `warnings.warn` or
+  logging call — is not reported: the code runs on without the package, so it is
+  optional by construction. If users should be able to install it, declare it as
+  an extra (`[project.optional-dependencies]`), where it counts as used. Any other
+  handler does not make it optional: `sys.exit("pip install x")`, `raise
+  ImportError(...)` or a bare `raise` is how a script says x is required, and a
+  `die()` helper, an aliased exit or `return 1` from `main()` may be too. So the
+  module is a *candidate* (a wrong guess costs a lead, not a silence), as is
   one imported in a `try` with other imports whose handler replaces only the
   others. One guarded site that carries on makes the module optional everywhere;
   one unguarded import of the same name anywhere makes it required again; a bare

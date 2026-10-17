@@ -10,6 +10,7 @@ fix cannot pass by switching the check off.
 import json
 import subprocess
 import sys
+import textwrap
 from pathlib import Path
 
 import pytest
@@ -114,7 +115,7 @@ def test_what_the_guard_does_not_cover_still_fires(tmp_path):
           "try:\n"
           "    import simdjson\n"
           "except ImportError:\n"
-          "    import fallback_json\n"
+          "    import fallback_json as simdjson\n"
           "else:\n"
           "    import else_dep\n"
           "finally:\n"
@@ -232,3 +233,55 @@ def test_an_except_importerror_behind_a_catch_all_is_not_a_guard(tmp_path, broad
           "try:\n    import requests\nexcept (ImportError, " + broad.strip("()") + "):\n    requests = None\n"
           "try:\n    import yaml\nexcept ImportError:\n    yaml = None\nexcept " + broad + ":\n    raise\n")
     assert kinds(tmp_path) == {}, "a handler that names ImportError ahead of the catch-all still guards"
+
+
+_PRELUDE = (
+    "import argparse\nimport logging\nimport sys\nimport sys as _sys\nimport warnings\n"
+    "from sys import exit as bye\n\nlogger = logging.getLogger(__name__)\n"
+    "parser = argparse.ArgumentParser()\n\n\ndef die(message):\n    sys.exit(message)\n\n\n"
+)
+
+
+def _guarded(handler: str) -> str:
+    return "try:\n    import yaml\nexcept ImportError:\n" + textwrap.indent(handler, "    ") + "\n"
+
+
+def _in_main(handler: str) -> str:
+    return ("def main():\n    try:\n        import yaml\n    except ImportError:\n"
+            + textwrap.indent(handler, "        ") + "\n    return yaml\n")
+
+
+# Source after the prelude -> what the guarded `yaml` becomes: a lead, or nothing.
+_HANDLER_CASES = {
+    _guarded("die('pip install pyyaml')"): "candidate",
+    _guarded("_sys.exit('pip install pyyaml')"): "candidate",
+    _guarded("bye('pip install pyyaml')"): "candidate",
+    _guarded("if sys.platform == 'win32':\n    sys.exit('pip install pyyaml')\nelse:\n    raise"): "candidate",
+    _guarded("parser.error('pip install pyyaml')"): "candidate",
+    _guarded("print('yaml is missing')"): "candidate",
+    _in_main("print('pip install pyyaml')\nreturn 1"): "candidate",
+    _guarded("pass"): None,
+    _guarded("yaml = None"): None,
+    _guarded("warnings.warn('yaml missing; reading JSON instead')"): None,
+    _guarded("logging.warning('yaml missing')"): None,
+    _guarded("logger.info('yaml missing')"): None,
+    _in_main("return None"): None,
+    _in_main("return False"): None,
+    _in_main("return"): None,
+    "for attempt in range(2):\n" + textwrap.indent(_guarded("continue"), "    "): None,
+}
+
+
+def test_a_handler_carries_on_only_when_its_last_statement_visibly_degrades(tmp_path):
+    """Anything a handler might do besides degrading — a helper that exits, an
+    aliased sys.exit, an if/else that stops both ways, `return 1` from main(),
+    argparse's error() — is a lead, never silence."""
+    wrong = {}
+    for number, (source, expected) in enumerate(_HANDLER_CASES.items()):
+        root = tmp_path / f"case{number}"
+        write(root, "pyproject.toml", MANIFEST)
+        write(root, "tool.py", _PRELUDE + source)
+        got = kinds(root)
+        if got != ({"yaml": expected} if expected else {}):
+            wrong[source] = got
+    assert not wrong, wrong
