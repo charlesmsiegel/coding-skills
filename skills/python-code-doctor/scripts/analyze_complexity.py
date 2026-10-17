@@ -288,8 +288,9 @@ class ComplexityVisitor(ast.NodeVisitor):
                 excluded |= _docstring_lines(inner)
         return self._code_lines(node.lineno, node.end_lineno, excluded)
 
-    def _parameter_count(self, node) -> int | None:
-        """What a caller must pass, or None when no caller passes anything.
+    def _parameter_count(self, node) -> tuple[int, int] | None:
+        """(positional, total): what a caller must pass, or None when no caller
+        passes anything.
 
         A pytest test or fixture is called by the framework with fixtures it
         resolves by name, so its parameter list is a dependency declaration,
@@ -305,7 +306,8 @@ class ComplexityVisitor(ast.NodeVisitor):
         if id(node) in self._methods and not is_static and positional \
                 and positional[0].arg in _BOUND_FIRST:
             positional = positional[1:]
-        return len(positional) + len(args.kwonlyargs) + bool(args.vararg) + bool(args.kwarg)
+        in_order = len(positional) + bool(args.vararg)
+        return in_order, in_order + len(args.kwonlyargs) + bool(args.kwarg)
 
     # ----------------------------------------------------------------- #
     # Reporting
@@ -362,17 +364,37 @@ class ComplexityVisitor(ast.NodeVisitor):
                 description=f"{lines} code lines (threshold {self.config.max_function_lines})",
             ))
 
-        # Parameter count
-        params = self._parameter_count(node)
-        if params is not None and params > self.config.max_params and not signature_is_a_contract(node, self._hooks):
-            self.issues.append(ComplexityIssue(
-                file=self.filename, line=node.lineno, name=name,
-                issue_type="parameter_count", value=params,
-                threshold=self.config.max_params,
-                severity=self._severity(params, self.config.max_params),
-                suggestion="Use a config object or dataclass",
-                description=f"{params} parameters (threshold {self.config.max_params})",
-            ))
+        # Parameter count. The defect is the parade of positional values a caller
+        # has to line up, so positional parameters meet the threshold. Keyword-only
+        # ones are named at every call site -- the remedy the refactoring catalog
+        # itself prescribes -- so they count only toward a total held to twice
+        # the threshold: past that, even named inputs say the function does too
+        # much.
+        counted = self._parameter_count(node)
+        if counted is not None:
+            positional, total = counted
+            limit, total_limit = self.config.max_params, 2 * self.config.max_params
+            over_positional = positional > limit
+            over_total = total > total_limit
+            if over_positional or over_total:
+                severity = max((self._severity(positional, limit) if over_positional else "low",
+                                self._severity(total, total_limit) if over_total else "low"),
+                               key=("low", "medium", "high").index)
+                if over_positional:
+                    value, threshold = positional, limit
+                    description = f"{positional} positional parameters (threshold {limit})"
+                else:
+                    value, threshold = total, total_limit
+                    description = (f"{total} parameters, {positional} positional "
+                                   f"(threshold {total_limit} when the rest are keyword-only)")
+                self.issues.append(ComplexityIssue(
+                    file=self.filename, line=node.lineno, name=name,
+                    issue_type="parameter_count", value=value, threshold=threshold,
+                    severity=severity,
+                    suggestion="Make the trailing options keyword-only, or group the values "
+                               "that travel together into a dataclass",
+                    description=description,
+                ))
 
     def visit_ClassDef(self, node: ast.ClassDef):
         old_class = self.current_class

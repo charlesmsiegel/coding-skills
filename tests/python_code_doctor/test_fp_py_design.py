@@ -332,6 +332,27 @@ def test_pytest_fixture_requests_are_not_a_parameter_list(tmp_path):
     assert [(r["name"], r["issue_type"]) for r in found] == [("build", "parameter_count")]
 
 
+def test_keyword_only_options_are_named_at_every_call_site(tmp_path):
+    """The refactoring catalog's own remedy for a long parameter list is keyword
+    arguments: options a caller must name cannot be lined up in the wrong order."""
+    write(tmp_path, {"sample.py": """\
+        def render(cid, sid, *, model="", images=0, budget=None, fence=True):
+            return cid
+
+        def lined_up(a, b, c, d, e, f):
+            return a
+
+        def everything(a, b, *, c, d, e, f, g, h, i, j):
+            return a
+        """})
+    found = run_detector("analyze_complexity.py", tmp_path)
+    by_name = {r["name"]: r for r in found if r["issue_type"] == "parameter_count"}
+    assert set(by_name) == {"lined_up", "everything"}
+    assert by_name["lined_up"]["value"] == 6, "six positional values still parade"
+    assert by_name["everything"]["value"] == 11, "named or not, eleven inputs is too many"
+    assert "keyword-only" in by_name["everything"]["description"]
+
+
 # --------------------------------------------------------------------------- #
 # find_code_smells
 # --------------------------------------------------------------------------- #

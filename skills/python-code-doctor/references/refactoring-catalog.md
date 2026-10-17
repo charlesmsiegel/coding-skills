@@ -69,8 +69,10 @@ function could just take?"
 Parameter with Method Call when the callee could fetch the value itself; Introduce
 Parameter Object when the group recurs. Boolean steering flags: split the function
 (see `find_boolean_params.py`).
-**Detector:** `analyze_complexity.py` (`parameter_count`: `self`/`cls` and pytest
-tests and fixtures, whose parameters are fixtures resolved by name, are not counted).
+**Detector:** `analyze_complexity.py` (`parameter_count`: positional parameters meet
+the threshold, keyword-only ones only a total of twice it — a keyword-only option is
+already the fix — and `self`/`cls` and pytest tests and fixtures, whose parameters are
+fixtures resolved by name, are not counted).
 **Ignore when:** bundling would couple modules that are deliberately independent —
 explicit parameters are sometimes the honest dependency injection.
 
