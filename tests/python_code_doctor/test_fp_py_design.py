@@ -591,6 +591,19 @@ def test_a_name_used_only_in_a_string_annotation_is_used(tmp_path):
     assert _dead(run_detector("find_dead_code.py", tmp_path), "unused_import") == [("sample.py", "Unused")]
 
 
+def test_a_literal_string_in_a_signature_does_not_use_an_import(tmp_path):
+    # Literal["os"] is a value, not a forward reference: it must not hide that
+    # `os` is never used, in a parameter annotation or a return annotation.
+    write(tmp_path, {"sample.py": """\
+        import os
+        from typing import Literal
+
+        def pick(mode: Literal["os"]) -> Literal["os"]:
+            return mode
+        """})
+    assert _dead(run_detector("find_dead_code.py", tmp_path), "unused_import") == [("sample.py", "os")]
+
+
 def test_a_yield_that_makes_a_generator_is_not_unreachable(tmp_path):
     write(tmp_path, {"sample.py": """\
         async def failing_stream():

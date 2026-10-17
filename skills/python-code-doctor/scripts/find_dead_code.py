@@ -418,10 +418,6 @@ class ScopeTracker(ast.NodeVisitor):
                 self.own_package_imports.add(name)
         self.generic_visit(node)
 
-    def visit_arg(self, node: ast.arg):
-        self.used_names.update(_string_annotation_names(node.annotation))
-        self.generic_visit(node)
-
     def visit_Name(self, node: ast.Name):
         if isinstance(node.ctx, (ast.Store, ast.Del)):
             self._annotation_scopes[-1][1].pop(node.id, None)
@@ -484,7 +480,6 @@ class ScopeTracker(ast.NodeVisitor):
         self._signature_references(node)
         if node.col_offset == 0:
             self.functions[node.name] = node
-        self.used_names.update(_string_annotation_names(node.returns))
         self._check_unreachable(node)
         self._check_unused_params(node)
         self.function_stack.append(node)
@@ -502,7 +497,6 @@ class ScopeTracker(ast.NodeVisitor):
         self._signature_references(node)
         if node.col_offset == 0:
             self.functions[node.name] = node
-        self.used_names.update(_string_annotation_names(node.returns))
         self._check_unreachable(node)
         self._check_unused_params(node)
         self.function_stack.append(node)
