@@ -93,6 +93,11 @@ may make it safe, so unresolved cases are candidates. Likewise, `commit=False`
 without a visible `save_m2m()` is a candidate when the form's many-to-many fields
 and caller lifecycle cannot be established.
 
+Form-save checks follow the constructed form receiver, rather than confusing
+unrelated model saves with form saves. A missing explicit `is_valid()` call is a
+candidate, not proof that validation was bypassed: Django ModelForm saves trigger
+validation through `self.errors`, and custom saves can validate or avoid writes.
+
 ### The three findings to read first
 
 - **`missing_ownership_filter`** / **`unscoped_viewset_queryset`** — a view or a
