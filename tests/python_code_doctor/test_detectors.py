@@ -2825,6 +2825,57 @@ def test_simple_function_has_no_complexity_findings(tmp_path):
     assert run_detector("analyze_complexity.py", tmp_path) == []
 
 
+def _cyclomatic(tmp_path, name: str, source: str) -> dict[str, int]:
+    """Function name -> reported cyclomatic complexity, for those over the threshold."""
+    (tmp_path / name).write_text(source)
+    return {r["name"]: r["value"] for r in run_detector("analyze_complexity.py", tmp_path)
+            if r["issue_type"] == "cyclomatic_complexity"}
+
+
+def test_asserts_are_not_decision_points(tmp_path):
+    """A test that checks twelve things has one path through it. An assert either
+    holds or ends the function, and `assert a and b` says what `assert a; assert b`
+    does, so nothing inside an assert counts toward cyclomatic complexity."""
+    checks = "".join(f"    assert job.images[{n}] == expected[{n}]\n" for n in range(9))
+    source = (
+        "def test_the_detailer_saves_beside_the_original(job, expected):\n"
+        "    run(job)\n"
+        + checks +
+        "    assert job.height % 16 == 0 and job.width % 16 == 0 or job.empty\n"
+        "    assert all(key.startswith('vision.') for key in job.keys)\n"
+        "    assert {key: value for key, value in job.items()} == expected\n"
+    )
+    assert _cyclomatic(tmp_path, "test_detailer.py", source) == {}
+
+
+def test_branches_beside_an_assert_still_count(tmp_path):
+    """if, elif, for, while, each except, and/or and a comprehension are decision
+    points wherever they sit; an assert in the same function adds nothing."""
+    source = (
+        "def route(items, flag, other):\n"
+        "    total = 0\n"
+        "    if flag:\n"
+        "        total += 1\n"
+        "    elif other:\n"
+        "        total -= 1\n"
+        "    for item in items:\n"
+        "        while item > 0:\n"
+        "            item -= 1\n"
+        "    try:\n"
+        "        total += len(items)\n"
+        "    except TypeError:\n"
+        "        pass\n"
+        "    except ValueError:\n"
+        "        pass\n"
+        "    if flag and other or total:\n"
+        "        total += 1\n"
+        "    evens = [item for item in items]\n"
+        "    assert total and evens\n"
+        "    return total, evens\n"
+    )
+    assert _cyclomatic(tmp_path, "router.py", source) == {"route": 11}
+
+
 # ---- find_boolean_params -------------------------------------------------- #
 
 
