@@ -590,8 +590,9 @@ def _describe_groups(groups: list[list[str]]) -> str:
 def coupling_issues(tree: ast.AST, filename: str, in_tests: bool = False) -> list[CouplingIssue]:
     """Coupling findings for every class in ``tree``.
 
-    ``in_tests`` drops low_cohesion: a test double's methods are shaped by the
-    interface it fakes, and a test class's by the cases it holds.
+    ``in_tests`` drops low_cohesion and feature_envy: a test double's methods
+    are shaped by the interface it fakes (a recording fake reads the argument
+    it records), and a test class's by the cases it holds.
     """
     module_names = {alias.asname or alias.name.split(".")[0]
                     for node in ast.walk(tree) if isinstance(node, (ast.Import, ast.ImportFrom))
@@ -641,8 +642,9 @@ def _analyze_class(node: ast.ClassDef, filename: str, module_names: set,
             severity="medium" if len(groups) == 2 else "high",
         ))
 
-    # Feature Envy — reported at the envious method, which is what moves.
-    for method in methods.values():
+    # Feature Envy — reported at the envious method, which is what moves. Not in
+    # test files: a fake reading the argument it records is doing its job.
+    for method in ([] if in_tests else methods.values()):
         self_accesses = len(set(method.self_names) | method.derived_reads)
         for other_obj, count in method.other.items():
             # A constructor building itself from the configuration it was handed is
