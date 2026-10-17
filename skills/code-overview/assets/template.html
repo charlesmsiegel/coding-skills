@@ -53,7 +53,10 @@ main{max-width:1280px;margin:0 auto;padding:26px 28px 80px}
 
 /* ---------- tabs: code-visualization's contract, so one shell serves all four
    documents. code-overview forces this template on assemble.py and on
-   build_measurement.py, so the markup those two emit has to fit here. ------- */
+   build_measurement.py, so the markup those two emit has to fit here. An atlas
+   needs no renderer code from this shell — assemble.py inlines its own — only
+   this contract: panels are .panel, the shown one is .active, and showing one
+   dispatches `tab:shown`, which is when a hidden tab's graphs are drawn. ---- */
 nav.tabs{
   display:flex;gap:2px;flex-wrap:wrap;max-width:1280px;margin:18px auto 0;
   padding:0 28px;border-bottom:1px solid var(--border);
@@ -83,6 +86,8 @@ a{color:var(--accent)}
 code,.mono{font-family:var(--mono);font-size:.92em}
 p code,li code,td code{background:var(--surface-2);border:1px solid var(--border);border-radius:4px;padding:1px 5px;overflow-wrap:anywhere}
 .card{background:var(--surface);border:1px solid var(--border);border-radius:10px;padding:18px 20px;margin:12px 0}
+.card.hero{border-color:var(--border-strong);background:linear-gradient(180deg,var(--accent-dim),var(--surface) 60%)}
+pre{background:var(--surface);border:1px solid var(--border);border-radius:8px;padding:14px 16px;overflow-x:auto;font-family:var(--mono);font-size:13px;line-height:1.5;margin:10px 0}
 .grid{display:grid;gap:14px;margin:12px 0}
 .grid.cols-2{grid-template-columns:repeat(auto-fit,minmax(min(100%,420px),1fr))}
 .grid.cols-3{grid-template-columns:repeat(auto-fit,minmax(240px,1fr))}

@@ -256,10 +256,14 @@ skill directory has to be self-contained to be zipped and installed on its own,
 so the duplication is deliberate, not drift. `assemble.py` is identical except
 for one line (the `--label` default) across *three* skills — those two and
 literature-survey, which assembles its report with the same fragment protocol —
-and CI checks all three copies against each other. Two files differ on purpose
-and are NOT synced: `assets/template.html` (each skill has its own theme; the
-renderers and placeholders match, which a test pins) and `references/llm-tabs.md`
-(different tab sets).
+and CI checks all three copies against each other. The renderers — sortable
+tables, force graph, treemap, Mermaid — are `assets/renderers.css` and
+`assets/renderers.js`, byte-identical in both visualization skills and
+CI-enforced; `assemble.py` inlines them into whatever page shell `--template`
+names, which is what lets code-overview restyle an atlas without losing its
+graphs. Two files differ on purpose and are NOT synced: `assets/template.html`
+(each skill has its own theme around the same placeholders and tab contract)
+and `references/llm-tabs.md` (different tab sets).
 
 literature-survey ships a `common.py` of its own that is **not** a copy of
 anybody's: same filename, entirely different subject (HTTP transport, the corpus
