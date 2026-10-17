@@ -350,14 +350,6 @@ class ExceptionIssueDetector(ast.NodeVisitor):
         return False
 
     # -- helpers for catches_baseexception --------------------------------
-    # Calls that read an exception rather than deliver it: passing the bound
-    # name to one of these still leaves the exception trapped right here.
-    _INSPECTS = frozenset({
-        "str", "repr", "type", "isinstance", "issubclass", "print", "format", "id", "hash",
-        "getattr", "hasattr", "vars", "dir", "bool",
-        "format_exception", "format_exception_only", "print_exception", "format_tb", "print_tb",
-    }) | _LOG_ATTRS | {"debug", "info", "log"}
-
     @staticmethod
     def _hands_on(handler: ast.ExceptHandler) -> bool:
         """True when the handler re-raises or passes the exception on.
@@ -372,17 +364,31 @@ class ExceptionIssueDetector(ast.NodeVisitor):
         Ctrl-C still stops here.
         """
         bound = handler.name
-        for n in _same_scope_nodes(handler.body, stop_types=(ast.ExceptHandler,)):
-            if isinstance(n, ast.Raise):
-                if n.exc is None:
-                    return True
-                if bound and isinstance(n.exc, ast.Name) and n.exc.id == bound:
-                    return True
-            if bound and isinstance(n, ast.Call) and _callee_leaf(n) not in ExceptionIssueDetector._INSPECTS:
-                values = list(n.args) + [kw.value for kw in n.keywords]
-                if any(isinstance(v, ast.Name) and v.id == bound for v in values):
-                    return True
-        return False
+
+        def forwards(call):
+            # Passing an error to an arbitrary function may only inspect or
+            # discard it. Recognize the explicit delivery shapes instead.
+            return (bound is not None and isinstance(call, ast.Call)
+                    and isinstance(call.func, ast.Attribute)
+                    and call.func.attr in {"set_exception", "append"}
+                    and any(isinstance(value, ast.Name) and value.id == bound
+                            for value in [*call.args, *(kw.value for kw in call.keywords)]))
+
+        def propagates(body):
+            if not body:
+                return False
+            if any(isinstance(n, (ast.Return, ast.Break, ast.Continue))
+                   for n in _same_scope_nodes(body[:-1])):
+                return False
+            last = body[-1]
+            if isinstance(last, ast.Raise):
+                return last.exc is None or (bound is not None and isinstance(last.exc, ast.Name)
+                                             and last.exc.id == bound)
+            if isinstance(last, ast.If):
+                return propagates(last.body) and propagates(last.orelse)
+            return isinstance(last, (ast.Expr, ast.Return)) and forwards(last.value)
+
+        return propagates(handler.body)
 
     # -- BaseException + raise-without-from (per handler) -----------------
     def visit_ExceptHandler(self, node: ast.ExceptHandler):

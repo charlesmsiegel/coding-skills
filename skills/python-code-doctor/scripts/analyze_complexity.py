@@ -45,7 +45,7 @@ import json
 import argparse
 from pathlib import Path
 from dataclasses import dataclass, asdict
-from common import count_parameters, framework_hook_overrides, parameter_severity, signature_is_a_contract, sort_findings, cached_parse, SEVERITY_ICONS, configure_output, find_python_files, warn_detector_error, looks_like_test
+from common import framework_hook_overrides, signature_is_a_contract, sort_findings, cached_parse, SEVERITY_ICONS, configure_output, find_python_files, warn_detector_error, looks_like_test
 
 
 @dataclass
@@ -371,7 +371,7 @@ class ComplexityVisitor(ast.NodeVisitor):
         # the threshold: past that, even named inputs say the function does too
         # much.
         counted = self._parameter_count(node)
-        if counted is not None:
+        if counted is not None and not signature_is_a_contract(node, self._hooks):
             positional, total = counted
             limit, total_limit = self.config.max_params, 2 * self.config.max_params
             over_positional = positional > limit

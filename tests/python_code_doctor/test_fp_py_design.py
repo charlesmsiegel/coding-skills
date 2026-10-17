@@ -444,7 +444,7 @@ def test_overlapping_parameter_groups_are_one_clump(tmp_path):
     found = run_detector("find_parameter_objects.py", tmp_path)
     assert len(found) == 1, [r["description"] for r in found]
     assert found[0]["line"] == 1
-    assert found[0]["related_lines"] == [4, 7]
+    assert found[0]["related_lines"] == [4, 7, 10]
 
 
 def test_disjoint_groups_on_one_function_are_two_clumps(tmp_path):
@@ -700,7 +700,7 @@ def test_interfaces_value_objects_and_stateless_hooks_are_not_low_cohesion(tmp_p
         "from abc import ABC\nfrom dataclasses import dataclass\nfrom typing import Protocol\n\n"
         "class Provider(ABC):\n" + _disjoint_methods(6) + "\n"
         "class View(Protocol):\n" + _disjoint_methods(6) + "\n"
-        "@dataclass(frozen=True)\nclass Target:\n    field_0: int = 0\n\n" + _disjoint_methods(6) + "\n"
+        "@dataclass(frozen=True)\nclass Target:\n" + "".join(f"    field_{n}: int = 0\n" for n in range(6)) + "\n" + _disjoint_methods(6) + "\n"
         "class Hook:\n" + "".join(f"    def step_{n}(self, row):\n        return row + {n}\n\n"
                                   for n in range(6))
     )})
@@ -753,7 +753,7 @@ def test_one_short_switch_is_a_lead_and_a_repeated_or_long_one_a_finding(tmp_pat
     assert_candidate_shape(next(r for r in found if r["kind"] == "candidate"))
 
 
-def test_a_private_this_module_defines_is_same_module_access(tmp_path):
+def test_a_matching_local_private_name_keeps_unknown_ownership_unscored(tmp_path):
     write(tmp_path, {"loop.py": """\
         class _Loop:
             def __init__(self):
@@ -770,7 +770,13 @@ def test_a_private_this_module_defines_is_same_module_access(tmp_path):
                 return request._foreign
         """})
     found = of_type(run_detector("find_design_smells.py", tmp_path), "inappropriate_intimacy")
-    assert [r["description"].split("'")[1] for r in found] == ["request._foreign"]
+    assert [r["description"].split("'")[1] for r in found if r["kind"] == "finding"] == ["request._foreign"]
+    # A matching name is a possible local owner, not proof that every receiver
+    # has that owner. Preserve these as leads without charging healthy access.
+    candidates = [r for r in found if r["kind"] == "candidate"]
+    assert sorted(r["description"].split("'")[1] for r in candidates) == ["loop._trace", "request._usable"]
+    for record in candidates:
+        assert_candidate_shape(record)
 
 
 def test_a_sibling_modules_private_is_a_lead_and_a_stdlib_one_is_not(tmp_path):

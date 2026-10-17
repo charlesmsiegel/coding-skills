@@ -503,7 +503,7 @@ def test_pydantic_field_defaults_are_copied_not_shared(tmp_path, header):
     assert records("find_mutation_hazards.py", tmp_path, source, "mutable_class_attribute") == []
 
 
-def test_a_basemodel_lookalike_is_still_flagged(tmp_path):
+def test_a_basemodel_lookalike_keeps_shared_state_visible(tmp_path):
     found = records("find_mutation_hazards.py", tmp_path,
                     "class BaseModel:\n"
                     "    pass\n"
@@ -512,7 +512,8 @@ def test_a_basemodel_lookalike_is_still_flagged(tmp_path):
                     "    def add(self, t):\n"
                     "        self.tags.append(t)\n",
                     "mutable_class_attribute")
-    assert len(findings(found)) == 1
+    assert len(found) == 1
+    assert_candidate_shape(found[0])
 
 
 @pytest.mark.parametrize("source", [
@@ -535,7 +536,8 @@ def test_a_ctypes_class_still_reports_its_other_mutable_state(tmp_path):
                     "    def note(self):\n"
                     "        S.seen.append(self)\n",
                     "mutable_class_attribute")
-    assert [r["code_snippet"] for r in findings(found)] == ["seen = []"]
+    assert [r["code_snippet"] for r in found] == ["seen = []"]
+    assert_candidate_shape(found[0])
 
 
 def test_a_class_mutable_nothing_mutates_is_a_candidate(tmp_path):
@@ -557,7 +559,7 @@ def test_a_class_mutable_nothing_mutates_is_a_candidate(tmp_path):
     "self.items += [x]",
     "heapq.heappush(self.items, x)",
 ])
-def test_a_class_mutable_something_mutates_is_a_finding(tmp_path, mutation):
+def test_a_class_mutable_mutation_retains_a_record(tmp_path, mutation):
     found = records("find_mutation_hazards.py", tmp_path,
                     "import heapq\n"
                     "class R:\n"
@@ -565,7 +567,15 @@ def test_a_class_mutable_something_mutates_is_a_finding(tmp_path, mutation):
                     "    def add(self, x):\n"
                     f"        {mutation}\n",
                     "mutable_class_attribute")
-    assert len(findings(found)) == 1
+    assert len(found) == 1
+    # Explicit class access and augmented/rebinding-capable operations need
+    # ownership evidence; the earlier shared-instance proof remains narrower.
+    expected = "candidate" if mutation in {
+        "R.items.append(x)", "self.items += [x]", "heapq.heappush(self.items, x)"
+    } else "finding"
+    assert found[0]["kind"] == expected
+    if expected == "candidate":
+        assert_candidate_shape(found[0])
 
 
 def test_a_nested_defs_mutation_is_not_charged_to_the_outer_default(tmp_path):
@@ -673,11 +683,16 @@ def test_kwargs_that_only_swallow_typos_are_still_flagged(tmp_path, source):
     "conn.execute('SELECT * FROM \"{}\"'.format(n))",
     "conn.execute('SELECT * FROM %s' % quote_ident(n))",
 ])
-def test_sql_a_bound_parameter_cannot_replace_is_a_candidate(tmp_path, statement):
+def test_sql_identifiers_need_scoped_proof_beyond_a_quoting_name(tmp_path, statement):
     found = records("find_security_issues.py", tmp_path,
                     f"def f(conn, n, col, v):\n    {statement}\n", "sql_injection")
     assert len(found) == 1
-    assert_candidate_shape(found[0])
+    if any(keyword in statement for keyword in ("DROP ", "CREATE ", "ALTER ")):
+        assert_candidate_shape(found[0])
+    else:
+        # A name such as quote_ident is not evidence about its implementation;
+        # a raw quote around n does not prove escaping embedded quotes either.
+        assert len(findings(found)) == 1
 
 
 @pytest.mark.parametrize("statement", [

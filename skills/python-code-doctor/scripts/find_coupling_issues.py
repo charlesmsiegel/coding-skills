@@ -577,6 +577,8 @@ def _read_method(func, module_names: set, types: "_ExternalTypes | None" = None)
                 pass  # a module has no class to move the method to
             elif types is not None and types.name(base, derivation):
                 pass  # a library or builtin object: nowhere to move the method to
+            elif key is not None and all(id(v) in derivation.iterated for v in derivation.bindings[key]):
+                pass  # iteration elements are consumed here; the loop is not their owner
             elif key is not None and id(node) not in called and isinstance(node.ctx, ast.Load):
                 # Only local objects' distinct data reads count. Calls delegate work;
                 # free names can be modules, classes or constants rather than instances.
