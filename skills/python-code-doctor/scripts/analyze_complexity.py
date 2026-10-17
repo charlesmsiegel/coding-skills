@@ -21,9 +21,8 @@ What each measure counts, and why:
     measured on its own, so its branches, nesting and lines are not charged to
     the function that encloses it as well.
   - cyclomatic complexity (McCabe): +1 per if/elif, loop, except clause,
-    boolean operand and comprehension `for`. An `assert` in production code is
-    a conditional raise and counts; in a test file it states an expectation,
-    and a run of them is one straight path, so it does not.
+    boolean operand and comprehension `for`. An `assert`, including its
+    condition, checks a claim without opening a second path and does not count.
   - cognitive complexity (Sonar-style): +1 plus the current nesting level for
     if, loop, except, ternary, lambda and list/set/dict comprehension; +1 flat
     for each `elif` and `else`; boolean operands as for cyclomatic. Only
@@ -113,12 +112,12 @@ def _decorator_name(decorator: ast.AST) -> str | None:
     return None
 
 
-def _own_nodes(node: ast.AST):
-    """Every node of ``node`` except the insides of nested functions and classes."""
+def _own_nodes(node: ast.AST, *, skip_asserts: bool = False):
+    """Own-scope nodes, optionally excluding whole assertions for cyclomatic flow."""
     stack = list(ast.iter_child_nodes(node))
     while stack:
         child = stack.pop()
-        if isinstance(child, _SCOPES):
+        if isinstance(child, _SCOPES) or (skip_asserts and isinstance(child, ast.Assert)):
             continue
         yield child
         stack.extend(ast.iter_child_nodes(child))
@@ -177,17 +176,23 @@ class ComplexityVisitor(ast.NodeVisitor):
     # ----------------------------------------------------------------- #
 
     def _cyclomatic(self, node: ast.AST) -> int:
-        """Calculate cyclomatic complexity (McCabe)."""
+        """Calculate cyclomatic complexity (McCabe): 1 + the decision points.
+
+        An `assert` is not one, and neither is anything in its condition. It
+        checks a claim and either continues or ends the function, so there is
+        no second path to trace, which is why mccabe treats it as a plain
+        statement. `assert a and b` says the same as `assert a; assert b`, so
+        the `and` cannot count either, or splitting an assert would change the
+        score. Counting asserts charged tests for having many of them.
+        """
         complexity = 1
-        for child in _own_nodes(node):
+        for child in _own_nodes(node, skip_asserts=True):
             if isinstance(child, (ast.If, ast.While, ast.For, ast.AsyncFor, ast.ExceptHandler)):
                 complexity += 1
             elif isinstance(child, ast.BoolOp):
                 complexity += len(child.values) - 1
             elif isinstance(child, (ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp)):
                 complexity += sum(1 for _ in child.generators)
-            elif isinstance(child, ast.Assert) and not self.is_test_file:
-                complexity += 1
         return complexity
 
     def _cognitive(self, node: ast.AST, nesting: int = 0) -> int:
