@@ -1,5 +1,5 @@
 """
-Scope-aware AST helpers for find_design_smells.py.
+Scope-aware AST helpers for find_design_smells.py and find_dependency_issues.py.
 
 A smell about a function is a smell about its own scope: a name bound in a
 nested def, class or lambda is a different variable, and a flag set in an inner

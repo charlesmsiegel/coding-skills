@@ -19,17 +19,31 @@ Deliberately NOT charged as missing:
     anywhere else still makes it required. A bare `except:` or `except
     Exception:` also catches the error but does not say the import was meant to
     be optional, so it does not count.
+
+Reported as a candidate, not a finding:
+  - an undeclared module every import of which follows, in its own file, a
+    sys.path addition (sys.path.insert/append/extend, `sys.path += [...]`,
+    site.addsitedir) whose directory the source cannot place inside the project:
+    a parameter, an environment variable, sys.argv, or a path that resolves
+    outside the repository. A harness run under another program's interpreter
+    imports that program's modules this way, and no manifest here could declare
+    them. A directory the source does resolve inside the project explains
+    nothing (every module there is already first-party), and a module-level
+    import is not served by an addition inside a function, which cannot have
+    run yet when the module loads.
 """
 
 import ast
+import os
 import sys
 import json
 import argparse
 import functools
 import re
-from pathlib import Path
+from pathlib import Path, PurePath
 from dataclasses import dataclass, asdict
 from collections import defaultdict
+from ast_scopes import walk_same_scope
 from common import (sort_findings, SEVERITY_ICONS, configure_output, find_python_files,
                     first_party_modules, in_nested_repository, warn_detector_error, warn_unparseable)
 
@@ -50,6 +64,22 @@ class CodeSmell:
     suggestion: str
     severity: str
     code_snippet: str = ""
+    # A scored defect by default; "candidate" for a lead the downstream merge
+    # must not score. A candidate carries no fix and names, in also_caused_by,
+    # the ways a healthy codebase produces the same observation.
+    kind: str = "finding"
+    also_caused_by: tuple[str, ...] = ()
+
+
+# Why a module imported only after its file puts an unreadable directory on
+# sys.path need not be a dependency this project should declare.
+_RUNTIME_PATH_REASONS = (
+    "the file runs inside another program's checkout or interpreter (a test harness, a plugin "
+    "host, a script driving a vendored tree) and imports that program's own modules from the "
+    "directory it puts on sys.path, which no manifest of this project could declare",
+    "the directory comes from a command-line argument, an environment variable or a path outside "
+    "this repository, so only the machine the code runs on shows what it provides",
+)
 
 
 # ---------------------------------------------------------------------------
@@ -201,6 +231,10 @@ class _ImportSite:
     file: str
     line: int
     optional: bool = False  # an enclosing try handles its ImportError
+    # The line of a sys.path addition that runs before this import and that the
+    # source cannot place inside the project, so the import may be served from
+    # it; 0 when there is none.
+    after_path: int = 0
 
 
 _IMPORT_ERRORS = frozenset({"ImportError", "ModuleNotFoundError"})
@@ -213,27 +247,26 @@ def _catches_import_error(handler: ast.ExceptHandler) -> bool:
                or (isinstance(t, ast.Attribute) and t.attr in _IMPORT_ERRORS) for t in caught)
 
 
-def _imports_with_guard(tree: ast.AST):
-    """Every import statement, with whether an enclosing try handles its ImportError.
+def _walk(tree: ast.AST):
+    """Every node, with whether an enclosing try handles ImportError there and
+    the functions it sits in (innermost last).
 
     Only a `try` body is guarded: its handlers, `else` and `finally` run outside
     it. A function defined in the body imports when it is called, after the try
     has finished, so a def starts unguarded again.
     """
-    stack = [(tree, False)]
+    stack = [(tree, False, ())]
     while stack:
-        node, optional = stack.pop()
-        if isinstance(node, (ast.Import, ast.ImportFrom)):
-            yield node, optional
-            continue
+        node, optional, scopes = stack.pop()
+        yield node, optional, scopes
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
-            optional = False
+            optional, scopes = False, (*scopes, node)
         if isinstance(node, (ast.Try, ast.TryStar)):
             guarded = optional or any(_catches_import_error(h) for h in node.handlers)
-            stack.extend((stmt, guarded) for stmt in node.body)
-            stack.extend((part, optional) for part in (*node.handlers, *node.orelse, *node.finalbody))
+            stack.extend((stmt, guarded, scopes) for stmt in node.body)
+            stack.extend((part, optional, scopes) for part in (*node.handlers, *node.orelse, *node.finalbody))
         else:
-            stack.extend((child, optional) for child in ast.iter_child_nodes(node))
+            stack.extend((child, optional, scopes) for child in ast.iter_child_nodes(node))
 
 
 def _top_level_names(node) -> list[str]:
@@ -245,6 +278,183 @@ def _top_level_names(node) -> list[str]:
     else:
         names = [node.module.split(".")[0]]
     return [n for n in names if n and n != "__future__"]
+
+
+# ---------------------------------------------------------------------------
+# Directories a module puts on sys.path
+# ---------------------------------------------------------------------------
+
+def _is_sys_path(node) -> bool:
+    return (isinstance(node, ast.Attribute) and node.attr == "path"
+            and isinstance(node.value, ast.Name) and node.value.id == "sys")
+
+
+def _entries(node) -> list:
+    """The items of a list or tuple display; anything else is one opaque entry."""
+    return list(node.elts) if isinstance(node, (ast.List, ast.Tuple)) else [node]
+
+
+def _added_paths(node) -> list | None:
+    """What a statement puts on sys.path, or None if it is not such a statement:
+    sys.path.insert/append/extend, `sys.path += [...]`, or site.addsitedir."""
+    if isinstance(node, ast.AugAssign):
+        adds = isinstance(node.op, ast.Add) and _is_sys_path(node.target)
+        return _entries(node.value) if adds else None
+    if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Attribute):
+        return None
+    owner, method, args = node.func.value, node.func.attr, node.args
+    if isinstance(owner, ast.Name) and owner.id == "site":
+        return args[:1] if method == "addsitedir" else None
+    if not _is_sys_path(owner):
+        return None
+    if method == "extend":
+        return _entries(args[0]) if len(args) == 1 else None
+    arity = {"insert": 2, "append": 1}.get(method)
+    return args[-1:] if arity is not None and len(args) == arity else None
+
+
+def _dotted(node) -> str:
+    if isinstance(node, ast.Name):
+        return node.id
+    if isinstance(node, ast.Attribute):
+        base = _dotted(node.value)
+        return f"{base}.{node.attr}" if base else ""
+    return ""
+
+
+def _sole_assignment(stmts: list, name: str) -> tuple[bool, ast.expr | None]:
+    """Whether one scope binds `name`, and the value when its only binding is a
+    plain `name = value` (not a loop target, an import, a def, a second assignment...)."""
+    binds, values = 0, []
+    for node in walk_same_scope(stmts):
+        if isinstance(node, ast.Name):
+            binds += node.id == name and isinstance(node.ctx, ast.Store)
+        elif isinstance(node, ast.alias):
+            binds += (node.asname or node.name.split(".")[0]) == name
+        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.ExceptHandler)):
+            binds += node.name == name
+        elif isinstance(node, (ast.Global, ast.Nonlocal)):
+            binds += name in node.names
+        if isinstance(node, (ast.Assign, ast.AnnAssign)) and node.value is not None:
+            targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+            if len(targets) == 1 and isinstance(targets[0], ast.Name) and targets[0].id == name:
+                values.append(node.value)
+    return binds > 0, (values[0] if binds == 1 and len(values) == 1 else None)
+
+
+# Calls that hand back where their one argument points.
+_SAME_PATH = frozenset({"Path", "PurePath", "pathlib.Path", "pathlib.PurePath", "str", "os.fspath",
+                        "os.path.abspath", "os.path.realpath", "os.path.normpath"})
+_MAX_PATH_DEPTH = 12
+
+
+class _PathReader:
+    """Reads where a path expression in one file points, when the source alone says.
+
+    It follows string literals, `__file__`, Path()/str()/os.fspath(), .parent,
+    .parents[n], .resolve(), .absolute(), .joinpath(), `/`, os.path's dirname,
+    abspath, realpath, normpath and join, and a name bound once, by a plain
+    assignment, in the scope that reads it. Anything else — a parameter, an
+    environment variable, sys.argv, a config value — is decided at run time.
+    """
+
+    def __init__(self, filepath: Path, module: ast.Module, root: Path):
+        self.filepath, self.module, self.root = filepath, module, root
+
+    def inside(self, node, scopes: tuple) -> bool:
+        """True when `node` provably names a directory inside the project."""
+        path = self.read(node, scopes)
+        return path is not None and self._anchored(path).is_relative_to(self.root)
+
+    def _anchored(self, path: PurePath) -> PurePath:
+        # A relative sys.path entry is relative to the working directory, taken
+        # to be the project root.
+        return PurePath(os.path.normpath(path if path.is_absolute() else PurePath(self.root, path)))
+
+    def _binding(self, name: str, scopes: tuple):
+        """The expression `name` holds where it is read, and the scopes to read it
+        in; None for a parameter or a name bound any way but once, plainly."""
+        for depth in range(len(scopes), 0, -1):
+            scope = scopes[depth - 1]
+            args = scope.args
+            if name in {a.arg for a in (*args.posonlyargs, *args.args, *args.kwonlyargs,
+                                        args.vararg, args.kwarg) if a is not None}:
+                return None
+            if isinstance(scope, ast.Lambda):
+                continue
+            bound, value = _sole_assignment(scope.body, name)
+            if bound:
+                return (value, scopes[:depth]) if value is not None else None
+        value = _sole_assignment(self.module.body, name)[1]
+        return (value, ()) if value is not None else None
+
+    def read(self, node, scopes: tuple, depth: int = 0) -> PurePath | None:
+        if depth > _MAX_PATH_DEPTH:
+            return None
+        found = self._step(node, scopes, depth + 1)
+        return PurePath(os.path.normpath(found)) if found is not None else None
+
+    def _step(self, node, scopes: tuple, depth: int) -> PurePath | None:
+        if isinstance(node, ast.Constant):
+            return PurePath(node.value) if isinstance(node.value, str) else None
+        if isinstance(node, ast.Name):
+            if node.id == "__file__":
+                return PurePath(self.filepath)
+            bound = self._binding(node.id, scopes)
+            return self.read(bound[0], bound[1], depth) if bound else None
+        if isinstance(node, ast.BinOp):
+            return self._joined([node.left, node.right], scopes, depth) if isinstance(node.op, ast.Div) else None
+        if isinstance(node, ast.Call):
+            return self._call(node, scopes, depth)
+        if isinstance(node, ast.Attribute) and node.attr == "parent":
+            return self._ancestor(node.value, 0, scopes, depth)
+        index = _parents_index(node)
+        return self._ancestor(node.value.value, index, scopes, depth) if index is not None else None
+
+    def _call(self, node: ast.Call, scopes: tuple, depth: int) -> PurePath | None:
+        name, args = _dotted(node.func), node.args
+        method = node.func.attr if isinstance(node.func, ast.Attribute) else ""
+        if node.keywords:
+            return None
+        if name in _SAME_PATH and len(args) == 1:
+            return self.read(args[0], scopes, depth)
+        if name == "os.path.dirname" and len(args) == 1:
+            return self._ancestor(args[0], 0, scopes, depth)
+        if name == "os.path.join" and args:
+            return self._joined(args, scopes, depth)
+        if method in {"resolve", "absolute"} and not args:
+            return self.read(node.func.value, scopes, depth)
+        return self._joined([node.func.value, *args], scopes, depth) if method == "joinpath" else None
+
+    def _joined(self, parts: list, scopes: tuple, depth: int) -> PurePath | None:
+        paths = [self.read(part, scopes, depth) for part in parts]
+        return None if None in paths else PurePath(*paths)
+
+    def _ancestor(self, node, index: int, scopes: tuple, depth: int) -> PurePath | None:
+        """`node`'s parents[index]: .parent and os.path.dirname are index 0."""
+        base = self.read(node, scopes, depth)
+        above = self._anchored(base).parents if base is not None else ()
+        return above[index] if index < len(above) else None
+
+
+def _parents_index(node) -> int | None:
+    """n, for a `<path>.parents[n]` subscript with a literal, non-negative n."""
+    if not (isinstance(node, ast.Subscript) and isinstance(node.value, ast.Attribute)
+            and node.value.attr == "parents" and isinstance(node.slice, ast.Constant)):
+        return None
+    index = node.slice.value
+    return index if type(index) is int and index >= 0 else None
+
+
+def _after_path(position: tuple, in_function: bool, additions: list) -> int:
+    """The line of the first opaque sys.path addition that runs before an import at
+    `position`, or 0. Module-level code runs top to bottom when the module loads,
+    before any function can be called, so an addition inside a function precedes
+    only imports that are themselves inside a function."""
+    for where, adds_in_function in additions:
+        if where < position and (in_function or not adds_in_function):
+            return where[0]
+    return 0
 
 
 def _collect_imports(root: Path) -> dict[str, list[_ImportSite]]:
@@ -263,9 +473,20 @@ def _collect_imports(root: Path) -> dict[str, list[_ImportSite]]:
         except Exception as exc:
             warn_detector_error(filepath, exc)
             continue
-        for node, optional in _imports_with_guard(tree):
+        reader = _PathReader(filepath, tree, root)
+        found, additions = [], []
+        for node, optional, scopes in _walk(tree):
+            if isinstance(node, (ast.Import, ast.ImportFrom)):
+                found.append((node, optional, bool(scopes)))
+                continue
+            added = _added_paths(node)
+            if added and not all(reader.inside(entry, scopes) for entry in added):
+                additions.append(((node.lineno, node.col_offset), bool(scopes)))
+        additions.sort()
+        for node, optional, in_function in found:
+            after = _after_path((node.lineno, node.col_offset), in_function, additions)
             for top in _top_level_names(node):
-                imports[top].append(_ImportSite(str(filepath), node.lineno, optional))
+                imports[top].append(_ImportSite(str(filepath), node.lineno, optional, after))
     return imports
 
 
@@ -370,6 +591,26 @@ def _is_local(name: str, root: Path) -> bool:
     return name in _compute_local_packages(root)
 
 
+def _runtime_path_lead(mod: str, sites: list[_ImportSite]) -> CodeSmell:
+    """The candidate for an undeclared module every import of which follows a
+    sys.path addition the source cannot place inside the project."""
+    first = min(sites, key=lambda s: (s.file, s.line))
+    return CodeSmell(
+        file=first.file,
+        line=first.line,
+        smell_type="missing_dependency",
+        description=(
+            f"Module '{mod}' is not declared in any dependency manifest, but every import of it "
+            f"follows a sys.path addition the source cannot place inside this project "
+            f"(here, line {first.after_path}), so it may be served from that directory"
+        ),
+        suggestion="",
+        severity="high",
+        kind="candidate",
+        also_caused_by=_RUNTIME_PATH_REASONS,
+    )
+
+
 def analyze(root: Path, ignore: set) -> list[CodeSmell]:
     issues: list[CodeSmell] = []
     root = root.resolve()
@@ -472,7 +713,11 @@ def analyze(root: Path, ignore: set) -> list[CodeSmell]:
     # ------------------------------------------------------------------ #
     # 4. No manifest at all
     # ------------------------------------------------------------------ #
-    if not has_manifest and third_party_imports:
+    # A module imported only after its file puts a directory the source cannot
+    # read on sys.path may come from that directory: a lead, reported below.
+    unexplained = {mod for mod, sites in third_party_imports.items()
+                   if any(not s.after_path for s in sites)}
+    if not has_manifest and unexplained:
         if "no_dependency_manifest" not in ignore:
             issues.append(CodeSmell(
                 file=str(root),
@@ -480,7 +725,7 @@ def analyze(root: Path, ignore: set) -> list[CodeSmell]:
                 smell_type="no_dependency_manifest",
                 description=(
                     f"No requirements*.txt or pyproject.toml found, but "
-                    f"{len(third_party_imports)} third-party module(s) are imported"
+                    f"{len(unexplained)} third-party module(s) are imported"
                 ),
                 suggestion=(
                     "Add a pyproject.toml (or requirements.txt) declaring your "
@@ -503,8 +748,11 @@ def analyze(root: Path, ignore: set) -> list[CodeSmell]:
             mapped = _IMPORT_TO_DIST.get(mod.lower())
             if mapped and _normalize(mapped) in declared:
                 continue
+            if mod not in unexplained:
+                issues.append(_runtime_path_lead(mod, sites))
+                continue
             # Not found — report once, pointing at the root
-            example_file = sorted({s.file for s in sites})[0]
+            example_file = sorted({s.file for s in sites if not s.after_path})[0]
             issues.append(CodeSmell(
                 file=str(root),
                 line=1,
@@ -573,6 +821,17 @@ def analyze_tree(path: Path, ignore: set) -> list:
     return findings
 
 
+def to_record(issue: CodeSmell) -> dict:
+    """The JSON shape this detector emits, shared with the runner.
+
+    `kind` is always present, so a consumer never reads an absent key as a
+    classification; the reasons tuple serialises as a list.
+    """
+    record = asdict(issue)
+    record["also_caused_by"] = list(record["also_caused_by"])
+    return record
+
+
 def main():
     configure_output()
     parser = argparse.ArgumentParser(description="Detect dependency management issues in Python")
@@ -587,7 +846,7 @@ def main():
     sort_findings(all_issues)
 
     if args.format == "json":
-        print(json.dumps([asdict(i) for i in all_issues], indent=2))
+        print(json.dumps([to_record(i) for i in all_issues], indent=2))
     else:
         if not all_issues:
             print("✅ No dependency issues found!")
@@ -595,17 +854,27 @@ def main():
         by_type: dict[str, int] = defaultdict(int)
         for i in all_issues:
             by_type[i.smell_type] += 1
-        print(f"Found {len(all_issues)} dependency issue(s):\n\nSummary:")
+        # A candidate is a lead, not a defect, so it is counted apart.
+        leads = sum(1 for i in all_issues if i.kind == "candidate")
+        print(f"Found {len(all_issues) - leads} dependency issue(s), "
+              f"{leads} candidate(s):\n\nSummary:")
         for s, c in sorted(by_type.items(), key=lambda x: -x[1]):
             print(f"  {s}: {c}")
         print()
         icons = SEVERITY_ICONS
         for i in all_issues:
-            print(f"{icons[i.severity]} [{i.severity.upper()}] {i.file}:{i.line}")
+            # A severity icon on a lead reads as a verdict the evidence does not support.
+            marker = ("? [CANDIDATE]" if i.kind == "candidate"
+                      else f"{icons[i.severity]} [{i.severity.upper()}]")
+            print(f"{marker} {i.file}:{i.line}")
             print(f"   {i.smell_type}: {i.description}")
             if i.code_snippet:
                 print(f"   Code: {i.code_snippet}")
-            print(f"   → {i.suggestion}\n")
+            if i.suggestion:
+                print(f"   → {i.suggestion}")
+            for reason in i.also_caused_by:
+                print(f"   ? also caused by: {reason}")
+            print()
 
 
 if __name__ == "__main__":

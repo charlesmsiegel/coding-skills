@@ -94,7 +94,14 @@ versions that float (so "works today" doesn't mean "works tomorrow").
   users should be able to install it, declare it as an extra
   (`[project.optional-dependencies]`), where it counts as used. One unguarded import
   of the same name anywhere makes it required again, and a bare `except:` or
-  `except Exception:` does not count as a guard.
+  `except Exception:` does not count as a guard. A module imported only after its
+  own file puts a directory on `sys.path` that the source cannot place inside the
+  repo — a checkout named on the command line, an environment variable, a path
+  outside the tree — is reported as a *candidate*: a harness run under another
+  program's interpreter imports that program's modules this way, and no manifest
+  here could declare them. Confirm which it is before adding anything. A directory
+  the source resolves inside the repo explains nothing, so imports after one stay
+  findings.
 - **`unused_dependency` (declared, never imported).** Usually cruft from deleted
   code; remove it. But confirm by reading first — some deps are real without an
   `import`: build/runtime plugins, CLI tools, things imported via entry points or
