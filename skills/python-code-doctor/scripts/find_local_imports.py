@@ -192,6 +192,45 @@ def _deferred_chain(node, path: Path) -> str | None:
     return _heavy_chain(node, path)
 
 
+def _command_helpers(tree) -> set:
+    """Module-level private functions that only CLI commands (or other such
+    helpers) call: the pieces a command was split into.
+
+    A helper qualifies when it is referenced at least once and every reference
+    in the module is a call made from a command or from another qualifying
+    helper. A function nothing calls, one also called from elsewhere or used as
+    a value, and a public one (another module may call it, which this file
+    cannot see) do not.
+    """
+    functions = {node.name: node for node in tree.body
+                 if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))}
+    commands = {name for name, node in functions.items() if is_cli_command(node)}
+    references: dict[str, list] = defaultdict(list)  # helper -> [(caller or None, is_call)]
+    calls = {id(n.func) for n in ast.walk(tree) if isinstance(n, ast.Call)}
+
+    def collect(node, caller):
+        for child in ast.iter_child_nodes(node):
+            if isinstance(child, ast.Name) and child.id in functions:
+                references[child.id].append((caller, id(child) in calls))
+            collect(child, caller)
+
+    for node in tree.body:
+        collect(node, node.name if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) else None)
+
+    helpers: set = set()
+    changed = True
+    while changed:
+        changed = False
+        for name in functions:
+            if name in commands or name in helpers or not name.startswith("_"):
+                continue
+            refs = [r for r in references.get(name, []) if r[0] != name]  # recursion is not a caller
+            if refs and all(is_call and caller in commands | helpers for caller, is_call in refs):
+                helpers.add(name)
+                changed = True
+    return helpers
+
+
 def _imported_packages(node) -> list:
     """Top-level package each name of an import statement loads ('' if relative)."""
     if isinstance(node, ast.Import):
@@ -278,6 +317,7 @@ def detect(tree, filename, lines, ignore):
                                 kind, tuple(also_caused_by)))
 
     guarded = _collect_guarded(tree)
+    helpers = _command_helpers(tree)
 
     # Case 1: imports inside functions/methods (deferred imports).
     def walk(node, in_function, in_command):
@@ -308,7 +348,8 @@ def detect(tree, filename, lines, ignore):
                             "dependency the program must run without belongs in try/except ImportError, at module top.",
                             "medium")
             if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                walk(child, True, in_command or is_cli_command(child))
+                commandlike = is_cli_command(child) or (node is tree and child.name in helpers)
+                walk(child, True, in_command or commandlike)
             elif isinstance(child, ast.Lambda):
                 walk(child, True, in_command)
             else:
