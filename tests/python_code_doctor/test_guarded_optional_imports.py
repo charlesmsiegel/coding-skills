@@ -216,3 +216,19 @@ def test_a_site_that_degrades_makes_the_module_optional_and_one_that_stops_does_
 
     write(tmp_path, "app/available.py", DETECTORS[:split])
     assert kinds(tmp_path) == {}
+
+
+@pytest.mark.parametrize("broad", ["Exception", "BaseException", "(OSError, Exception)", "builtins.Exception"])
+def test_an_except_importerror_behind_a_catch_all_is_not_a_guard(tmp_path, broad):
+    """Only the first matching handler runs. Behind `except Exception:` the
+    `except ImportError:` never does, and the broad handler is no guard."""
+    write(tmp_path, "pyproject.toml", MANIFEST)
+    write(tmp_path, "app.py",
+          "try:\n    import requests\nexcept " + broad + ":\n    requests = None\n"
+          "except ImportError:\n    pass\n")
+    assert kinds(tmp_path) == {"requests": "finding"}
+
+    write(tmp_path, "app.py",
+          "try:\n    import requests\nexcept (ImportError, " + broad.strip("()") + "):\n    requests = None\n"
+          "try:\n    import yaml\nexcept ImportError:\n    yaml = None\nexcept " + broad + ":\n    raise\n")
+    assert kinds(tmp_path) == {}, "a handler that names ImportError ahead of the catch-all still guards"
