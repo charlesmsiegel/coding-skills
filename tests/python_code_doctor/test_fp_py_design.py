@@ -14,6 +14,7 @@ Fixtures are written to tmp_path at runtime, as in test_detectors.py.
 
 import ast
 import json
+import os
 import subprocess
 import sys
 import textwrap
@@ -1035,3 +1036,10 @@ def test_a_lone_commented_import_is_a_lead(tmp_path):
     assert sorted((r["line"], r["kind"]) for r in found) == [
         (3, "candidate"), (5, "finding"), (6, "finding")]
     assert_candidate_shape(next(r for r in found if r["kind"] == "candidate"))
+
+
+def test_a_test_module_is_not_a_god_module_for_having_many_tests(tmp_path):
+    many = "".join(f"def test_case_{i}():\n    assert {i} == {i}\n\n" for i in range(45))
+    write(tmp_path, {"tests/test_many.py": many, "pkg/many.py": many.replace("test_case_", "helper_")})
+    found = [r for r in run_detector("find_import_cycles.py", tmp_path) if r["smell_type"] == "god_module"]
+    assert [r["file"].replace(os.sep, "/").rsplit("/", 2)[-2:] for r in found] == [["pkg", "many.py"]]
