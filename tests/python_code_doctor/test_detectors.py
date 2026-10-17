@@ -5400,12 +5400,16 @@ def test_fixture_requests_are_dependency_injection_not_a_data_clump(tmp_path):
         "\n"
         "def grow(width, height, depth):\n"
         "    return height\n"
+        "\n"
+        "def shrink(width, height, depth):\n"
+        "    return depth\n"
     )
     (tmp_path / "shapes.py").write_text("def area(width, height, depth):\n    return depth\n")
 
-    clumps = [r["description"] for r in run_detector("find_parameter_objects.py", tmp_path)]
+    clumps = [(Path(r["file"]).name, r["description"]) for r in run_detector("find_parameter_objects.py", tmp_path)]
     assert len(clumps) == 1, clumps
-    assert "['depth', 'height', 'width']" in clumps[0], "plain helpers, in tests or not, still clump"
+    assert clumps[0][0] == "test_service.py" and "['depth', 'height', 'width']" in clumps[0][1] \
+        and "in 3 functions" in clumps[0][1], "plain test helpers still clump among themselves"
 
 
 def test_cli_flags_and_a_fakes_signature_are_not_boolean_flag_smells(tmp_path):
@@ -5696,6 +5700,60 @@ def test_code_marked_verbatim_upstream_is_not_a_member_of_the_projects_clumps(tm
     withheld = {Path(f).name: entry["by_category"] for f, entry in report["meta"]["not_charged"].items()}
     assert withheld["attention_reference.py"].get("parameter_objects") == 1
     assert withheld["test_reference.py"].get("parameter_objects") == 1
+
+
+def test_test_doubles_and_test_functions_do_not_make_up_a_production_clump(tmp_path):
+    """Closures handed in as the input-patch hook take `(block_index, target, x)`
+    because `InputPatch.__call__` does: they are that signature again, not four
+    more functions passing loose values. A test's `watch(block_index, block, out,
+    emb, cross_input)` is not a copy of either production hook, but a test
+    function never makes up the numbers for a clump charged to production code:
+    `after` and `after_block` are two, not three. Production code's own clump and
+    test helpers sharing a group among themselves are still reported."""
+    (tmp_path / "pkg").mkdir()
+    (tmp_path / "tests").mkdir()
+    (tmp_path / "pkg" / "hooks.py").write_text(
+        "class InputPatch:\n"
+        "    def __call__(self, block_index, target, x):\n"
+        "        return x\n"
+        "\n"
+        "def after(block, out, emb, cross_input):\n    return out\n"
+        "\n"
+        "def after_block(block_index, block, x, emb, cross_input):\n    return x\n"
+    )
+    (tmp_path / "pkg" / "net.py").write_text(
+        "def connect(host, port, timeout):\n    return host\n"
+        "\n"
+        "def ping(host, port, timeout):\n    return port\n"
+        "\n"
+        "def close_conn(host, port, timeout):\n    return timeout\n"
+    )
+    (tmp_path / "tests" / "test_patch.py").write_text(
+        "def _zero(block_index, target, x):\n    return x * 0\n"
+        "\n"
+        "def test_identity(dit):\n"
+        "    def identity(block_index, target, x):\n        return x\n"
+        "    def watch(block_index, target, x):\n        return x\n"
+        "    def patch(block_index, target, x):\n        return x + 1\n"
+        "    dit(identity, watch, patch, _zero)\n"
+        "\n"
+        "def test_blocks(model):\n"
+        "    def watch(block_index, block, out, emb, cross_input):\n        return out\n"
+        "    model(watch)\n"
+    )
+    (tmp_path / "tests" / "helpers.py").write_text(
+        "def dit_inputs(batch, height, width, seed):\n    return batch\n"
+        "\n"
+        "def latents(batch, height, width):\n    return height\n"
+        "\n"
+        "def picture(batch, height, width, mode):\n    return width\n"
+    )
+    clumps = sorted((Path(r["file"]).relative_to(tmp_path).as_posix(), r["description"].split(":")[0])
+                    for r in run_detector("find_parameter_objects.py", tmp_path))
+    assert clumps == [
+        ("pkg/net.py", "Parameters ['host', 'port', 'timeout'] appear together in 3 functions"),
+        ("tests/helpers.py", "Parameters ['batch', 'height', 'width'] appear together in 3 functions"),
+    ]
 
 
 _FRAMEWORK_HOOKS = (
