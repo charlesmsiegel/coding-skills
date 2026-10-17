@@ -99,3 +99,54 @@ def test_rebound_object_name_is_not_proven_builtin(tmp_path, prefix):
     assert len(findings) == 1
     assert findings[0]['kind'] == 'candidate'
     assert not findings[0]['suggestion']
+
+
+@pytest.mark.parametrize(('imports', 'base'), [
+    ('from django.db import models', 'models.Model'),
+    ('from django.db.models import Model as Entity', 'Entity'),
+    ('import django.db.models as orm', 'orm.Model'),
+    ('from django.db.models.base import Model', 'Model'),
+    ('from django import forms', 'forms.ModelForm'),
+    ('from django.forms import ModelForm as Editor', 'Editor'),
+    ('from django.forms.models import ModelForm', 'ModelForm'),
+])
+def test_meta_of_proven_direct_consuming_base_is_configuration(tmp_path, imports, base):
+    body = '\n'.join('    ' + line for line in CONFIG.splitlines())
+    source = f'{imports}\nclass Parent({base}):\n    class Meta:{body}\n'
+    assert records(tmp_path, source) == []
+
+
+@pytest.mark.parametrize(('prefix', 'base'), [
+    ('', 'object'),
+    ('class Model: pass', 'Model'),
+    ('from custom import Model', 'Model'),
+    ('from django.db import models\nmodels.Model = Custom', 'models.Model'),
+    ('from django.forms import ModelForm\nModelForm = Custom', 'ModelForm'),
+    ('from django.forms import ModelForm\nclass Local(ModelForm): pass', 'Local'),
+    ('from django.forms import BaseModelForm', 'BaseModelForm'),
+    ('from django.forms.models import BaseModelForm', 'BaseModelForm'),
+    ('from django.forms import Form', 'Form'),
+])
+def test_meta_without_proven_consuming_parent_is_retained(tmp_path, prefix, base):
+    body = '\n'.join('    ' + line for line in CONFIG.splitlines())
+    source = f'{prefix}\nclass Parent({base}):\n    class Meta:{body}\n'
+    findings = records(tmp_path, source)
+    assert len(findings) == 1
+    assert findings[0]['kind'] == 'finding'
+    assert 'Class Meta' in findings[0]['description']
+
+
+def test_meta_contract_does_not_leak_to_siblings_or_nested_scopes(tmp_path):
+    source = ('from django.db.models import Model\n'
+              'class Parent(Model):\n'
+              '    class Meta:\n        first=1\n        second=2\n        third=3\n        fourth=4\n'
+              '    class Helper:\n'
+              '        class Meta:\n            first=1\n            second=2\n            third=3\n            fourth=4\n'
+              '    def method(self):\n'
+              '        class Meta:\n            first=1\n            second=2\n            third=3\n            fourth=4\n'
+              'class Sibling:\n'
+              '    class Meta:\n        first=1\n        second=2\n        third=3\n        fourth=4\n'
+              'class Meta:\n    first=1\n    second=2\n    third=3\n    fourth=4\n')
+    findings = records(tmp_path, source)
+    assert len(findings) == 4
+    assert all('Class Meta' in f['description'] and f['kind'] == 'finding' for f in findings)

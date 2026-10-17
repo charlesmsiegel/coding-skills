@@ -84,6 +84,8 @@ Declarative Django model, form and admin classes inherit behavior; proven built-
 bases are not data-container refactoring targets. When other inherited behavior
 cannot be resolved, a data-only local declaration is a candidate without a
 dataclass replacement recommendation. Plain classes retain the normal check.
+Immediate `Meta` classes on proven Django Model/ModelForm parents are configuration;
+the same name on unrelated or unresolved parents grants no exemption.
 
 ## Workflow
 
