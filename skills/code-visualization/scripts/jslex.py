@@ -27,13 +27,18 @@ _REGEX_KEYWORDS = frozenset({
     "return", "throw", "typeof", "void", "yield"})
 
 
-def _regex_allowed(text, i):
+def _regex_allowed(text, i, comment_starts):
     """Whether a `/` at text[i] opens a regex literal, judged by the token
     before it: an operand (identifier, number, `)`, `]`, a literal) makes it
     a division."""
     j = i - 1
-    while j >= 0 and text[j] in " \t\r\n":
-        j -= 1
+    while j >= 0:
+        if text[j] in " \t\r\n":
+            j -= 1
+        elif j + 1 in comment_starts:
+            j = comment_starts[j + 1] - 1
+        else:
+            break
     if j < 0 or text[j] in _REGEX_AFTER:
         return True
     k = j
@@ -55,6 +60,7 @@ def scan_js(text):
     """
     n = len(text)
     out, literals = [], []
+    comment_starts = {}  # comment end -> start, for finding the preceding code token
     resume = []  # brace depth at each open ${ substitution, innermost last
     depth = copied = i = 0
 
@@ -101,10 +107,11 @@ def scan_js(text):
             else:
                 end = text.find("*/", i + 2)
                 end = n if end < 0 else end + 2
+            comment_starts[end] = i
             out += [text[copied:i], re.sub(r"[^\n]", " ", text[i:end])]
             copied = i = end
         else:
-            m = _REGEX.match(text, i) if _regex_allowed(text, i) else None
+            m = _REGEX.match(text, i) if _regex_allowed(text, i, comment_starts) else None
             if m:
                 literals.append(m.span())
             i = m.end() if m else i + 1
