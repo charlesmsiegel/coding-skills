@@ -38,7 +38,9 @@ Reported as a candidate, not a finding:
   - an undeclared module every import of which follows, in its own file, a
     sys.path addition (sys.path.insert/append/extend, `sys.path += [...]`,
     site.addsitedir) whose directory the source cannot place inside the project:
-    one that resolves outside the repository, or one that reads a function
+    one that resolves outside the repository (a relative entry is read from the
+    project root and from the file's own directory, the two working
+    directories that occur, and is inside if either is), or one that reads a function
     parameter, os.environ/os.getenv, sys.argv, or a name bound more than once.
     A harness run under another program's interpreter imports that program's
     modules this way, and no manifest here could declare them. A directory the

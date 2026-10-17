@@ -303,9 +303,13 @@ class _PathReader:
         one it resolves outside, or one only the run decides. An expression the
         reader merely cannot follow, with no run-time source in it, is neither."""
         path = self.read(node, scopes)
-        if path is not None:
-            return not self._anchored(path).is_relative_to(self.root)
-        return self.decided_at_run_time(node, scopes, set())
+        if path is None:
+            return self.decided_at_run_time(node, scopes, set())
+        # A relative entry is relative to the working directory, and the two that
+        # occur are the project root and the file's own directory (Sphinx runs
+        # docs/conf.py from docs/). It is inside when either lands inside.
+        anchors = [path] if path.is_absolute() else [PurePath(self.root, path), PurePath(self.filepath.parent, path)]
+        return not any(PurePath(os.path.normpath(a)).is_relative_to(self.root) for a in anchors)
 
     def decided_at_run_time(self, node, scopes: tuple, seen: set) -> bool:
         """`node` reads a function parameter, the environment, sys.argv, or a name
@@ -336,11 +340,6 @@ class _PathReader:
             return False
         seen.add(key)
         return self.decided_at_run_time(value, scopes, seen)
-
-    def _anchored(self, path: PurePath) -> PurePath:
-        # A relative sys.path entry is relative to the working directory, taken
-        # to be the project root.
-        return PurePath(os.path.normpath(path if path.is_absolute() else PurePath(self.root, path)))
 
     def _binding(self, name: str, scopes: tuple):
         """The expression `name` holds where it is read, the scopes to read it in,
@@ -426,10 +425,15 @@ class _PathReader:
         return None if None in paths else PurePath(*paths)
 
     def _ancestor(self, node, index: int, scopes: tuple, depth: int) -> PurePath | None:
-        """`node`'s parents[index]: .parent and os.path.dirname are index 0."""
+        """`node`'s parents[index]: .parent and os.path.dirname are index 0. A
+        relative path stays relative (the parent of `.` is `..`), so where it
+        lands is decided against the working directories it may run from."""
         base = self.read(node, scopes, depth)
-        above = self._anchored(base).parents if base is not None else ()
-        return above[index] if index < len(above) else None
+        if base is None:
+            return None
+        if not base.is_absolute():
+            return PurePath(os.path.normpath(base.joinpath(*[".."] * (index + 1))))
+        return base.parents[index] if index < len(base.parents) else None
 
 
 def _parents_index(node) -> int | None:
