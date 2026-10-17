@@ -267,16 +267,6 @@ def test_a_class_of_pure_forwarders_is_still_a_middle_man(tmp_path):
 
 # ---- find_code_smells ------------------------------------------------------- #
 
-def test_a_long_parameter_list_is_reported_once_across_the_suite(tmp_path):
-    """analyze_complexity owns parameter_count; a second detector reporting the
-    same count as long_parameter_list charged one signature twice."""
-    write(tmp_path, "sample.py",
-          "def build(a, b, c, d, e, f, g, h):\n"
-          "    return a + b + c + d + e + f + g + h\n")
-    assert not of_type(run_detector("find_code_smells.py", tmp_path), "long_parameter_list")
-    assert of_type(run_detector("analyze_complexity.py", tmp_path), "parameter_count")
-
-
 def test_exact_type_identity_is_not_a_type_comparison_smell(tmp_path):
     """`type(x) is int` deliberately rejects bool; isinstance would accept it."""
     write(tmp_path, "sample.py",

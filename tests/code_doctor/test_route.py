@@ -231,3 +231,11 @@ def test_a_real_setup_script_is_still_evidence(repo, run_script):
 
     assert skills_in(payload) == ["python-code-doctor"]
     assert payload["routes"][0]["evidence"] == ["setup.py"]
+
+
+def test_a_setup_import_after_another_module_is_still_evidence(repo, run_script):
+    repo.write("setup.py", "import os, setuptools\nsetuptools.setup(name='x')\n")
+    repo.commit()
+    payload = routes_for(repo, run_script)
+    assert skills_in(payload) == ["python-code-doctor"]
+    assert payload["routes"][0]["evidence"] == ["setup.py"]

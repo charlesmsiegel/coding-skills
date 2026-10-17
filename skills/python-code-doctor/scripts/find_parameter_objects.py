@@ -133,9 +133,12 @@ def _families(clumps: list[dict]) -> list[dict]:
                 parent[root(j)] = root(i)
     joined: dict[int, dict] = {}
     for i, clump in enumerate(clumps):
-        family = joined.setdefault(root(i), {"names": set(), "locs": set()})
+        family = joined.setdefault(root(i), {"names": set(), "locs": set(), "identities": set()})
         family["names"] |= clump["names"]
         family["locs"] |= set(clump["locs"])
+        family["identities"] |= clump["identities"]
+    for family in joined.values():
+        family["functions"] = len(family["identities"])
     return list(joined.values())
 
 
@@ -156,12 +159,12 @@ def detect(path: Path, ignore: set):
 
     # Merge triples that share the exact same support into one (maximal) clump,
     # so a recurring 4-name group is reported once rather than as 4 triples.
-    by_support = defaultdict(lambda: {"names": set(), "locs": None})
+    by_support = defaultdict(lambda: {"names": set(), "locs": None, "identities": set()})
     for t, locs in qualifying.items():
         key = frozenset(locs)
         by_support[key]["names"].update(t)
         by_support[key]["locs"] = locs
-        by_support[key]["functions"] = len(identities[t])
+        by_support[key]["identities"].update(identities[t])
 
     issues = []
     for data in _families(list(by_support.values())):

@@ -70,6 +70,18 @@ def _declared_fields(node: ast.ClassDef) -> set:
 # would join every group into one and hide exactly the split being measured.
 _INITIALIZERS = frozenset({"__init__", "__new__", "__post_init__", "__init_subclass__"})
 _METHOD_TYPES = (ast.FunctionDef, ast.AsyncFunctionDef)
+_VALIDATOR_DECORATORS = frozenset({
+    "model_validator", "field_validator", "validator", "root_validator",
+    "validates", "validates_schema",
+})
+
+
+def _is_validator(method) -> bool:
+    for decorator in method.decorator_list:
+        target = decorator.func if isinstance(decorator, ast.Call) else decorator
+        if getattr(target, "id", getattr(target, "attr", None)) in _VALIDATOR_DECORATORS:
+            return True
+    return False
 
 
 def _is_dunder(name: str) -> bool:
@@ -489,10 +501,11 @@ class _Method:
     receiver: str | None
     self_names: list = field(default_factory=list)   # `self.<name>`, in source order
     derived_reads: set = field(default_factory=set)   # `<self-derived local>.<name>`
-    other: dict = field(default_factory=dict)        # foreign name -> access count
+    other: dict = field(default_factory=dict)        # foreign name -> distinct data attributes
     chains: list = field(default_factory=list)
     params: set = field(default_factory=set)          # the method's own parameter names
     constructs: bool = False                          # builds the object (see _constructs)
+    validates: bool = False                           # one field invariant, not a responsibility
 
 
 def _constructs(func, receiver) -> bool:
@@ -515,6 +528,8 @@ def _read_method(func, module_names: set, types: "_ExternalTypes | None" = None)
     method.params = {a.arg for a in [*func.args.posonlyargs, *func.args.args, *func.args.kwonlyargs,
                                      func.args.vararg, func.args.kwarg] if a is not None}
     method.constructs = _constructs(func, receiver)
+    method.validates = _is_validator(func)
+    called = {id(node.func) for node in _method_nodes(func.body) if isinstance(node, ast.Call)}
     for node in _method_nodes(func.body):
         if not isinstance(node, ast.Attribute):
             continue
@@ -531,8 +546,10 @@ def _read_method(func, module_names: set, types: "_ExternalTypes | None" = None)
                 pass  # a module has no class to move the method to
             elif types is not None and types.name(base, derivation):
                 pass  # a library or builtin object: nowhere to move the method to
-            else:
-                method.other[base.id] = method.other.get(base.id, 0) + 1
+            elif key is not None and id(node) not in called and isinstance(node.ctx, ast.Load):
+                # Only local objects' distinct data reads count. Calls delegate work;
+                # free names can be modules, classes or constants rather than instances.
+                method.other.setdefault(base.id, set()).add(node.attr)
         length = _chain_length(node)
         if length >= 3:
             method.chains.append(length)
@@ -549,7 +566,7 @@ def _groups(methods: dict, fields: set = frozenset()) -> list[list[str]]:
     so is a method with no edge at all: one that uses no instance state is a
     static-method candidate, not evidence that the class splits.
     """
-    names = [n for n in methods if n not in _INITIALIZERS]
+    names = [n for n in methods if n not in _INITIALIZERS and not methods[n].validates]
     parent = {n: n for n in names}
 
     def find(n):
@@ -617,11 +634,12 @@ def _analyze_class(node: ast.ClassDef, filename: str, module_names: set,
             merged = methods[func.name]
             merged.self_names += read.self_names
             merged.derived_reads |= read.derived_reads
-            for name, count in read.other.items():
-                merged.other[name] = merged.other.get(name, 0) + count
+            for name, attributes in read.other.items():
+                merged.other.setdefault(name, set()).update(attributes)
             merged.chains += read.chains
             merged.params |= read.params
             merged.constructs = merged.constructs and read.constructs
+            merged.validates = merged.validates or read.validates
         else:
             methods[func.name] = read
 
@@ -646,21 +664,23 @@ def _analyze_class(node: ast.ClassDef, filename: str, module_names: set,
     # test files: a fake reading the argument it records is doing its job.
     for method in ([] if in_tests else methods.values()):
         self_accesses = len(set(method.self_names) | method.derived_reads)
-        for other_obj, count in method.other.items():
-            # A constructor building itself from the configuration it was handed is
-            # what a parameter object is for; moving it onto that object is no remedy.
-            if method.constructs and other_obj in method.params:
-                continue
-            if count > self_accesses and count >= 3:
-                issues.append(CouplingIssue(
-                    file=filename, line=method.line,
-                    issue_type="feature_envy",
-                    name=f"{class_name}.{method.name}",
-                    description=f"Method '{method.name}' accesses '{other_obj}' ({count}x) more than self ({self_accesses}x)",
-                    metric_value=count,
-                    suggestion=f"Consider moving method to {other_obj}'s class",
-                    severity="medium",
-                ))
+        # Lanza & Marinescu: concentrated interest in foreign data, measured
+        # consistently on distinct attributes while retaining self-derived locals.
+        foreign = {name: attributes for name, attributes in method.other.items()
+                   if not (method.constructs and name in method.params)}
+        atfd = sum(len(attributes) for attributes in foreign.values())
+        if atfd >= 3 and self_accesses * 3 < self_accesses + atfd and len(foreign) <= 2:
+            other_obj = max(foreign, key=lambda name: len(foreign[name]))
+            count = len(foreign[other_obj])
+            issues.append(CouplingIssue(
+                file=filename, line=method.line,
+                issue_type="feature_envy",
+                name=f"{class_name}.{method.name}",
+                description=f"Method '{method.name}' reads {count} of '{other_obj}'s attributes and {self_accesses} of its own",
+                metric_value=atfd,
+                suggestion=f"Consider moving method to {other_obj}'s class",
+                severity="medium",
+            ))
 
     # Message Chains
     for method in methods.values():

@@ -66,12 +66,45 @@ def _same_scope_nodes(stmts, stop_types=()):
             stack.append(child)
 
 
-def _is_mutable_value(value) -> bool:
-    if isinstance(value, (ast.List, ast.Dict, ast.Set, ast.ListComp, ast.DictComp, ast.SetComp)):
-        return True
+def _mutable_type(value) -> str | None:
+    for nodes, name in (((ast.List, ast.ListComp), "list"),
+                        ((ast.Dict, ast.DictComp), "dict"),
+                        ((ast.Set, ast.SetComp), "set")):
+        if isinstance(value, nodes):
+            return name
     if isinstance(value, ast.Call) and isinstance(value.func, ast.Name) and value.func.id in _MUTABLE_BUILTINS:
-        return True
-    return False
+        return value.func.id
+    return None
+
+
+def _is_mutable_value(value) -> bool:
+    return _mutable_type(value) is not None
+
+
+def _ignored_model_types(node: ast.ClassDef) -> set[str] | None:
+    """A local field-discovery override; None inherits, an empty set resets it."""
+    values = []
+    for item in node.body:
+        if isinstance(item, ast.ClassDef) and item.name == "Config":
+            for option in item.body:
+                if isinstance(option, ast.Assign) and any(
+                        isinstance(t, ast.Name) and t.id == "keep_untouched" for t in option.targets):
+                    values.append(option.value)
+        if not isinstance(item, ast.Assign) or not any(
+                isinstance(t, ast.Name) and t.id == "model_config" for t in item.targets):
+            continue
+        config = item.value
+        if isinstance(config, ast.Dict):
+            values.extend(value for key, value in zip(config.keys, config.values)
+                          if isinstance(key, ast.Constant) and key.value == "ignored_types")
+        elif isinstance(config, ast.Call):
+            values.extend(kw.value for kw in config.keywords if kw.arg == "ignored_types")
+    if not values:
+        return None
+    value = values[-1]
+    names = ({elt.id for elt in value.elts if isinstance(elt, ast.Name)}
+             if isinstance(value, (ast.Tuple, ast.List, ast.Set)) else set())
+    return _MUTABLE_BUILTINS if "object" in names else names & _MUTABLE_BUILTINS
 
 
 def _annotation_is_classvar_or_final(annotation) -> bool:
@@ -151,6 +184,7 @@ class ClassFamilyResolver:
         self.path = path
         self.bindings: dict[str, list[tuple[tuple[int, int], str, object]]] = defaultdict(list)
         self._families: dict[ast.ClassDef, set[str]] = {}
+        self._ignored_types: dict[ast.ClassDef, set[str] | None] = {}
         for node in ast.walk(tree):
             if not self._at_module_scope(node):
                 continue
@@ -219,12 +253,17 @@ class ClassFamilyResolver:
         if kind == "import":
             return kind, value + (separator + rest if separator else "")
         if kind == "relimport":
-            level, module, name = value
-            return kind, (level, [*module.split("."), name] if module else [name],
-                          rest.split(".") if separator else [])
+            return kind, self._relative_binding(value, rest if separator else "")
         if kind == "class" and not separator:
             return kind, value
         return kind, None
+
+    @staticmethod
+    def _relative_binding(value, rest=""):
+        """Normalize a stored relative import for both bases and re-exports."""
+        level, module, name = value
+        return (level, [*module.split("."), name] if module else [name],
+                rest.split(".") if rest else [])
 
     @staticmethod
     def _imported_family(canonical: str | None) -> str | None:
@@ -241,19 +280,19 @@ class ClassFamilyResolver:
             return "copying_model"
         return None
 
-    def _external_families(self, directories: list[Path], parts: list[str], depth: int) -> set[str]:
-        """Families of the class `parts` names, found as a module path plus one
+    def _external_class(self, directories: list[Path], parts: list[str], depth: int):
+        """Resolver and name of the class `parts` names, found as a module path plus one
         class name under the first of ``directories`` that holds the module."""
         if depth > _MAX_RESOLUTION_DEPTH or len(parts) < 2:
-            return set()
+            return None
         for directory in directories:
             for split in range(len(parts) - 1, 0, -1):
                 module = _module_file(directory, parts[:split])
                 if module is None or len(parts) - split != 1:
                     continue
                 resolver = _resolver_for(module)
-                return resolver.named_families(parts[-1], depth + 1) if resolver else set()
-        return set()
+                return (resolver, parts[-1]) if resolver else None
+        return None
 
     def named_families(self, name: str, depth: int) -> set[str]:
         """Families of the module-level class ``name`` — defined here or re-exported."""
@@ -263,6 +302,8 @@ class ClassFamilyResolver:
         _position, kind, value = events[-1]
         if kind == "class" and isinstance(value, ast.ClassDef):
             return self.families(value, depth=depth)
+        if kind == "relimport":
+            value = self._relative_binding(value)
         return self._binding_families(kind, value, depth)
 
     def _binding_families(self, kind: str, value, depth: int) -> set[str]:
@@ -270,19 +311,80 @@ class ClassFamilyResolver:
             imported = self._imported_family(value)
             if imported:
                 return {imported}
-            if self.path is None:
-                return set()
+        imported_class = self._imported_class(kind, value, depth)
+        if imported_class is None:
+            return set()
+        resolver, name = imported_class
+        return resolver.named_families(name, depth + 1)
+
+    def _imported_class(self, kind: str, value, depth: int):
+        """Use the same import graph for ancestry and inherited configuration."""
+        if self.path is None:
+            return None
+        if kind == "import":
+            if self._imported_family(value):
+                return None  # framework defaults are not defined in first-party source
             # An absolute first-party import is found the way the interpreter
             # would find it from a source root: under some ancestor directory.
-            return self._external_families([self.path.parent, *self.path.parent.parents],
-                                           value.split("."), depth)
-        if kind == "relimport" and self.path is not None:
+            return self._external_class([self.path.parent, *self.path.parent.parents],
+                                        value.split("."), depth)
+        if kind == "relimport":
             level, parts, rest = value
             anchor = self.path.parent
             for _ in range(level - 1):
                 anchor = anchor.parent
-            return self._external_families([anchor], [*parts, *rest], depth)
-        return set()
+            return self._external_class([anchor], [*parts, *rest], depth)
+        return None
+
+    def named_ignored_types(self, name: str, depth: int) -> set[str] | None:
+        """Ignored mutable types of a class defined here or re-exported."""
+        events = self.bindings.get(name)
+        if not events:
+            return None
+        _position, kind, value = events[-1]
+        if kind == "class" and isinstance(value, ast.ClassDef):
+            return self.ignored_model_types(value, depth=depth)
+        if kind == "relimport":
+            value = self._relative_binding(value)
+        imported_class = self._imported_class(kind, value, depth)
+        if imported_class is None:
+            return None
+        resolver, name = imported_class
+        return resolver.named_ignored_types(name, depth + 1)
+
+    def ignored_model_types(self, node: ast.ClassDef, visiting=None, depth: int = 0) -> set[str] | None:
+        """Static inherited field-discovery config, including explicit resets.
+
+        Pydantic merges configuration keys from bases, then the subclass: a
+        frozen=True override keeps ignored_types, while ignored_types=() clears
+        it. Annotated fields are still copied, even when their type is ignored.
+        """
+        if node in self._ignored_types:
+            return self._ignored_types[node]
+        visiting = set() if visiting is None else visiting
+        if node in visiting or depth > _MAX_RESOLUTION_DEPTH:
+            return None
+        visiting.add(node)
+        ignored = None
+        for base in node.bases:
+            binding = self._binding_at(base)
+            if binding is None:
+                continue
+            kind, value = binding
+            if kind == "class" and isinstance(value, ast.ClassDef):
+                inherited = self.ignored_model_types(value, visiting, depth)
+            else:
+                imported_class = self._imported_class(kind, value, depth)
+                inherited = (imported_class[0].named_ignored_types(imported_class[1], depth + 1)
+                             if imported_class is not None else None)
+            if inherited is not None:
+                ignored = inherited
+        visiting.remove(node)
+        local = _ignored_model_types(node)
+        if local is not None:
+            ignored = local
+        self._ignored_types[node] = ignored
+        return ignored
 
     def families(self, node: ast.ClassDef, visiting=None, depth: int = 0) -> set[str]:
         if node in self._families:
@@ -344,13 +446,17 @@ class MutationHazardDetector(ast.NodeVisitor):
         return False
 
     def visit_ClassDef(self, node: ast.ClassDef):
-        if self.classes.is_family(node, "copying_model"):
-            # pydantic and friends copy each field default per instance.
-            self.generic_visit(node)
-            return
+        copying_model = self.classes.is_family(node, "copying_model")
+        ignored_types = (self.classes.ignored_model_types(node) or set()) if copying_model else set()
         for item in node.body:
             if isinstance(item, ast.Assign) and _is_mutable_value(item.value):
+                # Fields are copied, but ignored_types/keep_untouched leave
+                # unannotated attributes as ordinary, shared class state.
+                if copying_model and _mutable_type(item.value) not in ignored_types:
+                    continue
                 for target in item.targets:
+                    if copying_model and isinstance(target, ast.Name) and target.id == "model_config":
+                        continue
                     if isinstance(target, ast.Name) and not _is_dunder(target.id) \
                             and not self._is_django_declaration(node, target.id):
                         self._add(item.lineno, "mutable_class_attribute",
@@ -358,6 +464,8 @@ class MutationHazardDetector(ast.NodeVisitor):
                             "Assign it in __init__ instead, or use an immutable constant (tuple/frozenset). "
                             "If a shared class variable is truly intended, annotate it ClassVar and document it.")
             elif isinstance(item, ast.AnnAssign) and item.value is not None and _is_mutable_value(item.value):
+                if copying_model:
+                    continue
                 if _annotation_is_classvar_or_final(item.annotation):
                     continue
                 if isinstance(item.target, ast.Name) and not _is_dunder(item.target.id) \

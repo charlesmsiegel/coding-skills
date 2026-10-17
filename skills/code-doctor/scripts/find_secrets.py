@@ -55,7 +55,7 @@ DOCUMENTED_EXAMPLES = frozenset({
 SECRET_NAME = re.compile(
     r"\b(\w*(?:secret|passwd|password|token|apikey|api_key|access_key|private_key)\w*)\b"
     r"\s*[:=]\s*"
-    r"""(?:['"]([^'"]{16,})['"]|([^\s'"#;,]{16,}))""",
+    r"""(?:['"]([^'"]{16,})['"]|([^\s'"`#;,]{16,})|`([^`]{16,})`)""",
     re.IGNORECASE,
 )
 
@@ -81,6 +81,21 @@ EXPRESSION_LANGUAGE_SUFFIXES = frozenset({
     ".cs", ".fs", ".swift", ".dart", ".c", ".h", ".cc", ".cpp", ".cxx", ".hpp",
     ".m", ".mm", ".lua", ".vue", ".svelte", ".ex", ".exs", ".jl", ".zig",
 })
+
+BACKTICK_LITERAL_SUFFIXES = frozenset({
+    ".go", ".js", ".jsx", ".mjs", ".cjs", ".ts", ".tsx", ".mts", ".cts",
+    ".vue", ".svelte",
+})
+
+
+def _is_source_literal(match: re.Match, suffix: str) -> bool:
+    if match.group(2):
+        return True
+    value = match.group(4)
+    # Go raw strings have no interpolation; JS templates with interpolation
+    # compute a value rather than spelling out a credential.
+    return (value is not None and suffix in BACKTICK_LITERAL_SUFFIXES
+            and (suffix == ".go" or "${" not in value))
 
 # also_caused_by prose, shared between the private-key and cloud-credential
 # paths since the underlying tracking states (and the reasoning behind them)
@@ -236,8 +251,11 @@ def analyze(path: Path, text: str, report: Reporter, tracked_here: bool | None =
     # variable. In code only a quoted value is a literal; in a bundler's output
     # nobody typed anything, and `tokens=` recurs hundreds of times per line.
     # Key material and recognisable credentials are matched regardless.
-    bare_values_are_literals = path.suffix.lower() not in EXPRESSION_LANGUAGE_SUFFIXES
-    check_names = not looks_minified(text)
+    suffix = path.suffix.lower()
+    bare_values_are_literals = suffix not in EXPRESSION_LANGUAGE_SUFFIXES
+    # Long config values are still configuration, including short secrets on
+    # other lines of the same file. Only source expressions may be bundled.
+    check_names = bare_values_are_literals or not looks_minified(text)
     for index, line in enumerate(lines):
         number = index + 1
         key_match = KEY_BLOCK.search(line)
@@ -302,9 +320,9 @@ def analyze(path: Path, text: str, report: Reporter, tracked_here: bool | None =
         # rules below set aside; a quoted literal later on the same line
         # (`call(token=t, api_secret="…")`) is still owed its candidate.
         assignment = next((match for match in SECRET_NAME.finditer(line)
-                           if match.group(2) or bare_values_are_literals), None)
+                           if _is_source_literal(match, suffix) or bare_values_are_literals), None)
         if assignment:
-            group_index = 2 if assignment.group(2) else 3
+            group_index = 2 if assignment.group(2) else (4 if assignment.group(4) else 3)
             value = assignment.group(group_index)
             value_span = assignment.span(group_index)
             # Suppress only when this candidate would restate a credential

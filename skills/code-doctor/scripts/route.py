@@ -20,8 +20,8 @@ Over-routing fabricates findings.
 from __future__ import annotations
 
 import argparse
+import ast
 import json
-import re
 import sys
 import tomllib
 from dataclasses import dataclass
@@ -133,9 +133,6 @@ def _package_json_dependencies(text: str) -> list[str]:
     return names
 
 
-_SETUP_IMPORT = re.compile(r"^\s*(?:from|import)\s+(?:setuptools|distutils)\b", re.MULTILINE)
-
-
 def is_setup_script(path: Path) -> bool:
     """Whether a file named `setup.py` is a packaging script.
 
@@ -144,9 +141,16 @@ def is_setup_script(path: Path) -> bool:
     setuptools or distutils to call their `setup()`.
     """
     try:
-        return bool(_SETUP_IMPORT.search(read_text(path)))
-    except OSError:
+        tree = ast.parse(read_text(path))
+    except (OSError, SyntaxError):
         return False
+    return any(
+        (isinstance(node, ast.Import)
+         and any(alias.name.split(".")[0] in {"setuptools", "distutils"} for alias in node.names))
+        or (isinstance(node, ast.ImportFrom)
+            and node.level == 0 and (node.module or "").split(".")[0] in {"setuptools", "distutils"})
+        for node in ast.walk(tree)
+    )
 
 
 def _gather(root: Path) -> dict[str, list[Path]]:
