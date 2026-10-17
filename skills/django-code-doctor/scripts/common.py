@@ -207,17 +207,19 @@ def configure_output() -> None:
 
 def is_test_file(filepath: Path) -> bool:
     """A test module or test infrastructure: test_*.py, *_test.py, conftest.py,
-    or anything under a tests/ (or test/) directory.
+    or anything under a tests/ (or test/) directory *of its project*.
 
     Detectors that judge design use it to stand down where a test's shape is set
     by what it tests: a literal there is an expected value, a fake mirrors the
     interface it stands in for, and each test function is a case, not a
-    responsibility.
+    responsibility. The directory rule reads project_parts(), so a checkout that
+    lives under a directory named `tests` is not all tests.
     """
     name = filepath.name
     if name.startswith("test_") or name.endswith("_test.py") or name == "conftest.py":
         return True
-    return "tests" in filepath.parts or "test" in filepath.parts
+    directories = project_parts(filepath)[:-1]
+    return "tests" in directories or "test" in directories
 
 
 def in_nested_repository(root: Path, path: Path, cache: dict | None = None) -> bool:
@@ -245,7 +247,18 @@ def in_nested_repository(root: Path, path: Path, cache: dict | None = None) -> b
 
 def find_python_files(path: Path) -> Iterator[Path]:
     """Yield the .py files under ``path``, skipping vendored/generated dirs and
-    any repository nested below it (see in_nested_repository)."""
+    any repository nested below it (see in_nested_repository).
+
+    Records ``path`` as the analysis root (see set_analysis_root) before
+    walking: this is where a run says what it is analysing.
+    """
+    set_analysis_root(path)
+    return _python_files(path)
+
+
+def _python_files(path: Path) -> Iterator[Path]:
+    """find_python_files' walk, without recording an analysis root."""
+    path = Path(path)
     if path.is_file() and path.suffix == ".py":
         yield path
     elif path.is_dir():
@@ -259,21 +272,75 @@ def find_python_files(path: Path) -> Iterator[Path]:
 # Files whose presence marks the top of a project.
 _PROJECT_MARKERS = (".git", "pyproject.toml", "setup.py", "setup.cfg")
 
+# The directory this run analyses, resolved; None for a single file. A per-file
+# detector is handed one path and nothing else, so this is how it learns which
+# part of that path is the project and which is merely where the project was
+# checked out. find_python_files() records it, and the runner passes it to every
+# worker as a parameter rather than trusting fork to copy a global.
+_ANALYSIS_ROOT: Path | None = None
+
+
+def set_analysis_root(path) -> None:
+    """Record what this run analyses: a directory, or None for a single file."""
+    global _ANALYSIS_ROOT
+    candidate = Path(path) if path is not None else None
+    _ANALYSIS_ROOT = candidate.resolve() if candidate is not None and candidate.is_dir() else None
+
+
+def analysis_root() -> Path | None:
+    """The directory this run analyses, or None (a single file, or nothing yet)."""
+    return _ANALYSIS_ROOT
+
+
+@functools.lru_cache(maxsize=4096)
+def _has_marker(directory: Path) -> bool:
+    return any(os.path.lexists(directory / marker) for marker in _PROJECT_MARKERS)
+
+
+def _anchor(path: Path) -> Path | None:
+    """The directory a file's place in its project is measured from.
+
+    The nearest enclosing directory with a project marker, so analysing a
+    project's own `tests/` directory still sees `tests` in the parts below its
+    root; the analysis root when no directory above the file is marked; for a
+    lone file with neither, None.
+    """
+    resolved = Path(path).resolve()
+    for directory in resolved.parents:
+        if _has_marker(directory):
+            return directory
+    root = _ANALYSIS_ROOT
+    if root is not None and (resolved == root or root in resolved.parents):
+        return root
+    return None
+
+
+def project_parts(path: Path) -> tuple[str, ...]:
+    """``path``'s parts below its project (see _anchor); its own parts when it
+    belongs to none.
+
+    `/home/runner/work/tests/tests/src/app.py` is ("src", "app.py"): the
+    `tests` directories are where CI checked the repository out, not part of it.
+    """
+    anchor = _anchor(path)
+    if anchor is not None:
+        return Path(path).resolve().relative_to(anchor).parts
+    return Path(path).parts
+
 
 def project_root(path: Path) -> Path:
-    """The project a file belongs to: the nearest enclosing directory holding a
-    project marker (.git, pyproject.toml, setup.py, setup.cfg); failing that,
-    the directory its top-level package sits in.
+    """The project a file belongs to: its anchor (a project marker, bounded by
+    the analysis root, or that root); failing that, the directory its top-level
+    package sits in.
 
     A per-file detector knows only the file it was handed, so this is how one
     finds the tree that first_party_modules describes.
     """
-    path = path.resolve()
-    start = path if path.is_dir() else path.parent
-    for directory in (start, *start.parents):
-        if any(os.path.lexists(directory / marker) for marker in _PROJECT_MARKERS):
-            return directory
-    base = start
+    anchor = _anchor(path)
+    if anchor is not None:
+        return anchor
+    path = Path(path).resolve()
+    base = path if path.is_dir() else path.parent
     while (base / "__init__.py").exists() and base.parent != base:
         base = base.parent
     return base
@@ -290,7 +357,7 @@ def first_party_modules(root: Path) -> frozenset:
     the coupling detector's for a type a method could be moved onto.
     """
     names = set()
-    for p in find_python_files(root):
+    for p in _python_files(root):  # walking another tree must not move the analysis root
         rel = p.relative_to(root).parts
         names.add(p.parent.name if p.name == "__init__.py" else p.stem)
         if len(rel) >= 2:

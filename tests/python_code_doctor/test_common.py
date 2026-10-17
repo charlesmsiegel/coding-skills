@@ -105,3 +105,45 @@ def test_the_scanned_root_may_itself_be_inside_a_worktree(common, tmp_path):
     _tree_with_nested_repositories(tmp_path)
     worktree = tmp_path / ".worktrees" / "ui"
     assert [p.name for p in common.find_python_files(worktree)] == ["app.py"]
+
+
+def test_a_file_is_judged_by_where_it_sits_in_its_project(common, tmp_path):
+    """A checkout under a directory named `tests` (a CI runner's
+    `/home/runner/work/tests/tests`) is not test code; its own tests/ still is."""
+    project = tmp_path / "tests" / "app"
+    (project / "src").mkdir(parents=True)
+    (project / "tests").mkdir()
+    (project / "pyproject.toml").write_text("")
+    for rel in ("src/core.py", "tests/helpers.py", "tests/test_core.py"):
+        (project / rel).write_text("x = 1\n")
+
+    list(common.find_python_files(project))
+    assert common.project_parts(project / "src" / "core.py") == ("src", "core.py")
+    assert not common.is_test_file(project / "src" / "core.py")
+    assert common.is_test_file(project / "tests" / "helpers.py")
+
+    # Analysing the project's own tests/ directory: the marker above it still
+    # anchors the parts, so a helper there stays test code.
+    list(common.find_python_files(project / "tests"))
+    assert common.is_test_file(project / "tests" / "helpers.py")
+
+
+def test_without_a_marker_the_analysed_root_anchors_the_parts(common, tmp_path):
+    """No pyproject or .git anywhere: the directory analysed is the project."""
+    project = tmp_path / "tests" / "dump"
+    (project / "tests").mkdir(parents=True)
+    (project / "core.py").write_text("x = 1\n")
+    (project / "tests" / "helpers.py").write_text("x = 1\n")
+
+    list(common.find_python_files(project))
+    assert common.project_parts(project / "core.py") == ("core.py",)
+    assert not common.is_test_file(project / "core.py")
+    assert common.is_test_file(project / "tests" / "helpers.py")
+
+
+def test_a_lone_file_with_no_project_keeps_its_own_parts(common, tmp_path):
+    lone = tmp_path / "tests" / "helpers.py"
+    lone.parent.mkdir()
+    lone.write_text("x = 1\n")
+    list(common.find_python_files(lone))
+    assert common.is_test_file(lone), "nothing to anchor to: the path is all there is"

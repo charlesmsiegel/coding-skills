@@ -19,7 +19,7 @@ from pathlib import Path
 from dataclasses import dataclass, asdict
 from typing import Set, List, Tuple, Optional
 from collections import defaultdict
-from common import sort_findings, SEVERITY_ICONS, configure_output, find_python_files, warn_detector_error, warn_unparseable
+from common import project_parts, sort_findings, SEVERITY_ICONS, configure_output, find_python_files, warn_detector_error, warn_unparseable
 
 
 @dataclass
@@ -58,8 +58,9 @@ def _is_test_file(p: Path) -> bool:
         return True
     if name.startswith("test_") or name.endswith("_test.py"):
         return True
-    # Any path segment named "tests" or "test"
-    for part in p.parts[:-1]:  # exclude the filename itself (already checked)
+    # Any directory of its project named "tests" or "test" — measured below the
+    # project, so a checkout that lives under a `tests/` directory is not all tests.
+    for part in project_parts(p)[:-1]:  # exclude the filename itself (already checked)
         if part in ("tests", "test"):
             return True
     return False

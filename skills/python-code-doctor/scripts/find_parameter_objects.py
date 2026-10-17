@@ -82,12 +82,8 @@ def _collect(path: Path):
     definition's own location for anything else.
     """
     out = []
-    root = path if path.is_dir() else path.parent
     for filepath in find_python_files(path):
-        try:
-            in_tests = is_test_file(filepath.relative_to(root))
-        except ValueError:
-            in_tests = is_test_file(filepath)
+        in_tests = is_test_file(filepath)  # judged below its project, see common.project_parts
         try:
             source = filepath.read_text(encoding="utf-8", errors="replace")
             tree = ast.parse(source, filename=str(filepath))

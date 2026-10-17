@@ -5478,3 +5478,91 @@ def test_a_constructor_reading_the_configuration_it_was_handed_is_not_envy(tmp_p
     moving `__init__` onto it is not a remedy."""
     envy = sorted(r["line"] for r in _coupling(tmp_path, _CONSTRUCTOR_ENVY, "feature_envy"))
     assert envy == _lines_marked(_CONSTRUCTOR_ENVY)
+
+
+# --------------------------------------------------------------------------- #
+# Round four: where a project is checked out says nothing about its files.
+# --------------------------------------------------------------------------- #
+
+_LOCATED_PROJECT = {
+    "pyproject.toml": '[project]\nname = "app"\nversion = "0"\ndependencies = []\n',
+    "src/app/__init__.py": "",
+    "src/app/core.py": (
+        "class Order:\n"
+        "    def __init__(self):\n"
+        "        self.total = 0\n"
+        "\n"
+        "    def ship(self, parcel):\n"
+        "        return parcel.street + parcel.city + parcel.zip + parcel.country\n"
+        "\n"
+        "    def label(self):\n"
+        "        return str(self.total)\n"
+        "\n"
+        "def area(width, strict=False):\n"
+        "    assert width > 0\n"
+        "    print(width)\n"
+        "    return width * 7 + other._secret\n"
+    ),
+    "tests/test_misc.py": (
+        "def test_numbers():\n"
+        "    for value in (17, 33):\n"
+        "        assert value * 3\n"
+    ),
+}
+
+
+def _write_project(base: Path) -> Path:
+    for rel, content in _LOCATED_PROJECT.items():
+        target = base / rel
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(content)
+    return base
+
+
+def _report_below(root: Path, records) -> list:
+    """Records with the checkout's location taken out, comparable across locations."""
+    out = []
+    for r in records:
+        r = dict(r)
+        path = Path(r["file"])
+        r["file"] = (path.relative_to(root) if path.is_absolute() else path).as_posix()
+        r["description"] = str(r.get("description", "")).replace(str(root), "<root>")
+        out.append(json.dumps(r, sort_keys=True))
+    return sorted(out)
+
+
+_LOCATION_SENSITIVE = [
+    "find_code_smells.py", "find_boolean_params.py", "find_coupling_issues.py",
+    "find_design_smells.py", "find_exception_issues.py", "find_missing_docstrings.py",
+    "find_type_gaps.py", "find_test_smells.py", "find_debug_leftovers.py",
+    "find_untested_modules.py", "find_dead_code.py",
+]
+
+
+@pytest.mark.parametrize("script", _LOCATION_SENSITIVE)
+def test_a_detector_reports_the_same_project_wherever_it_is_checked_out(tmp_path, script):
+    neutral = _write_project(tmp_path / "work" / "app")
+    under_tests = _write_project(tmp_path / "tests" / "app")
+    under_scripts = _write_project(tmp_path / "scripts" / "app")
+
+    expected = _report_below(neutral, run_detector(script, neutral))
+    assert expected, f"{script} must find something in the fixture for this test to mean anything"
+    for checkout in (under_tests, under_scripts):
+        assert _report_below(checkout, run_detector(script, checkout)) == expected, checkout
+
+
+def test_the_aggregate_report_is_the_same_wherever_the_project_is_checked_out(tmp_path):
+    """Through the runner's worker pool too: workers learn the root as a parameter."""
+    def categories(root: Path) -> dict:
+        report = json.loads(subprocess.run(
+            [sys.executable, str(SCRIPTS_DIR / "analyze_all.py"), str(root),
+             "--format", "json", "--skip-duplicates", "--jobs", "2"],
+            capture_output=True, text=True, timeout=300, check=True).stdout)
+        return {c: _report_below(root, v["issues"]) for c, v in report["categories"].items()}
+
+    neutral = categories(_write_project(tmp_path / "work" / "app"))
+    assert any("magic_number" in r and "src/app/core.py" in r for r in neutral["code_smells"])
+    assert any("tests/test_misc.py" in r for r in neutral["test_smells"]), \
+        "a real tests/ directory inside the project is still test code"
+    assert categories(_write_project(tmp_path / "tests" / "app")) == neutral
+    assert categories(_write_project(tmp_path / "scripts" / "app")) == neutral

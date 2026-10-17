@@ -27,7 +27,7 @@ import argparse
 from pathlib import Path
 from dataclasses import dataclass, asdict
 from collections import defaultdict
-from common import sort_findings, cached_parse, SEVERITY_ICONS, configure_output, find_python_files, warn_detector_error, warn_unparseable
+from common import project_parts, sort_findings, cached_parse, SEVERITY_ICONS, configure_output, find_python_files, warn_detector_error, warn_unparseable
 
 
 @dataclass
@@ -181,7 +181,8 @@ def _looks_like_test(path_str: str) -> bool:
     stem = p.stem
     if stem.startswith("test_") or stem.endswith("_test"):
         return True
-    parts = {part.lower() for part in p.parts}
+    # Below its project, not wherever the project is checked out.
+    parts = {part.lower() for part in project_parts(p)[:-1]}
     return "tests" in parts or "test" in parts
 
 

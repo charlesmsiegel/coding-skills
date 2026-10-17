@@ -443,11 +443,7 @@ def analyze(root: Path, ignore: Set[str]) -> List[CodeSmell]:
     for fp_abs, tree in trees.items():
         fp = Path(fp_abs)
         lines = file_lines[fp_abs]
-        try:  # judged below the root, so a checkout under a `tests/` directory is not all tests
-            in_tests = is_test_file(fp.relative_to(root))
-        except ValueError:
-            in_tests = is_test_file(fp)
-        gm = _check_god_module(tree, fp, lines, ignore, in_tests)
+        gm = _check_god_module(tree, fp, lines, ignore, is_test_file(fp))
         if gm:
             issues.append(gm)
         issues.extend(_check_wildcard_imports(tree, fp, lines, ignore))
