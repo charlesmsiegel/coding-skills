@@ -43,7 +43,7 @@ from dataclasses import dataclass, asdict, field
 from itertools import combinations
 from collections import defaultdict
 from common import (configure_output, copied_signatures, find_python_files, is_test_file,
-                    upstream_marks, warn_detector_error, warn_unparseable, looks_like_test, is_route_handler)
+                    upstream_marks, warn_detector_error, warn_unparseable, is_route_handler)
 
 
 @dataclass
