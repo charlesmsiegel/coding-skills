@@ -770,7 +770,6 @@ def test_a_project_switch_is_still_default_off(tmp_path, line):
 @pytest.mark.parametrize("line", [
     "short = hashlib.sha256(data).hexdigest()[:12]",
     'log.info("detail %s", text[:200])',
-    "domain = entry.msc[0][:2]",
     'label = f"{record.digest[:12]} ({record.id})"',
     "attempt_id = uuid4().hex[:8]",
     'slug = re.sub("[^a-z]+", "-", title.lower()).strip("-")[:48]',
@@ -790,6 +789,7 @@ def test_a_string_slice_for_display_or_identity_is_not_a_cap(tmp_path, line):
     "results = [score(e) for e in fixtures.ENTRIES[:2]]",
     "batch = load_cases(path)[:50]",
     "first = splits[0][:100]",
+    "domain = entry.msc[0][:2]",
     "head = (rows if full else sample)[:20]",
 ])
 def test_a_slice_of_a_collection_is_still_a_cap(tmp_path, line):
