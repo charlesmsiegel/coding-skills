@@ -499,6 +499,48 @@ def test_the_same_defect_from_two_doctors_is_charged_once(run_script, sized_repo
     assert "merged" in out.read_text()
 
 
+def test_one_files_length_is_charged_once_across_doctors(run_script, sized_repo):
+    """code-doctor, typescript-code-doctor and python-code-doctor each charge
+    "this file is too long" at line 1 under their own name — and python's
+    import-cycle detector spells the path absolute while the others do not."""
+    absolute = str((sized_repo.path / "src/app/mod0.py").resolve())
+    raw = sized_repo.path / "raw.json"
+    raw.write_text(json.dumps([{"file": "src/app/mod0.py", "line": 1,
+                                "smell_type": "oversized_file", "severity": "medium"}]))
+    py = sized_repo.path / "py.json"
+    py.write_text(json.dumps([{"file": absolute, "line": 1,
+                               "smell_type": "god_module", "severity": "medium"}]))
+    ts = sized_repo.path / "ts.json"
+    ts.write_text(json.dumps([{"file": "src/app/mod0.py", "line": 1,
+                               "issue_type": "long_file", "severity": "high"}]))
+    out = sized_repo.path / "src/app/docs/health.html"
+    run_script(BUILD_HEALTH, "--out", out, "--findings", raw, "--findings", py,
+               "--findings", ts, "--repo", sized_repo.path, "--name", "app",
+               "--root-dir", "src/app", "--doctor", "django-code-doctor")
+    meta = read_meta(out)
+    assert meta["findings_total"] == 1
+    assert meta["duplicates_merged"] == 2
+    assert meta["findings_by_severity"]["high"] == 1, "the harsher call survives"
+
+
+def test_different_defects_on_one_line_keep_their_own_charges(run_script, sized_repo):
+    """Only names for the same measurement fold together: a long file that also
+    has an import cycle reported at line 1 is two defects."""
+    report = sized_repo.path / "f.json"
+    a = sized_repo.path / "a.json"
+    a.write_text(json.dumps([{"file": "src/app/mod0.py", "line": 1,
+                              "smell_type": "oversized_file", "severity": "medium"}]))
+    report.write_text(json.dumps([{"file": "src/app/mod0.py", "line": 1,
+                                   "smell_type": "import_cycle", "severity": "medium"}]))
+    out = sized_repo.path / "src/app/docs/health.html"
+    run_script(BUILD_HEALTH, "--out", out, "--findings", a, "--findings", report,
+               "--repo", sized_repo.path, "--name", "app", "--root-dir", "src/app",
+               "--doctor", "django-code-doctor")
+    meta = read_meta(out)
+    assert meta["findings_total"] == 2
+    assert meta["duplicates_merged"] == 0
+
+
 def test_the_same_finding_in_two_packages_is_not_merged(run_script, repo):
     """Basename-keyed dedup would collapse these; monorepos produce them constantly."""
     for package in ("a", "b"):

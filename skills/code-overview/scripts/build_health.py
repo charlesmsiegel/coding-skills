@@ -553,7 +553,7 @@ def build(args, reports: list[dict], candidates: list[dict] | None = None,
         # reason a finding about it would be.
         candidates = [record for record in candidates if in_scope(record)]
 
-    findings, duplicates = common.dedupe(reports)
+    findings, duplicates = common.dedupe(reports, repo)
 
     # Per doctor, not the flat pool `load_reports` handed `main()` — that pool
     # is empty on the --merged path entirely (it is built only from

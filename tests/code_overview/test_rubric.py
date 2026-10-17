@@ -106,6 +106,18 @@ def test_findings_from_every_doctor_land_in_a_sensible_category(rubric, finding,
     assert (category, matched) == (expected, True)
 
 
+def test_a_type_override_outranks_its_detectors_category(rubric):
+    """The exception detector's headline is Correctness, but a `raise` without
+    `from` keeps its cause as implicit context and a narrow `except X: pass`
+    rewrites to `contextlib.suppress(X)` with no change in behaviour."""
+    for smell in ("raise_without_from", "suppressible_exception"):
+        finding = {"category": "exception_issues", "smell_type": smell}
+        assert rubric.categorize(finding) == ("hygiene", True)
+    swallowed = {"category": "exception_issues", "smell_type": "swallowed_exception"}
+    assert rubric.categorize(swallowed) == ("correctness", True)
+    assert set(rubric.TYPE_CATEGORY_OVERRIDES.values()) <= set(rubric.CATEGORY_KEYS)
+
+
 def test_an_unknown_type_falls_back_and_is_flagged(rubric):
     category, matched = rubric.categorize({"smell_type": "zzz_brand_new_detector"})
     assert category == rubric.FALLBACK_CATEGORY
