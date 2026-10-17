@@ -89,12 +89,17 @@ versions that float (so "works today" doesn't mean "works tomorrow").
   Add it to the manifest. (Mind the import-vs-distribution name gap — `import yaml`
   ↔ `PyYAML`, `import bs4` ↔ `beautifulsoup4`, `import cv2` ↔ `opencv-python`; the
   detector knows the common ones and stays quiet when unsure.) An import inside a
-  `try` whose `except` names `ImportError` or `ModuleNotFoundError` is not reported:
-  the code handles the package being absent, so it is optional by construction. If
-  users should be able to install it, declare it as an extra
-  (`[project.optional-dependencies]`), where it counts as used. One unguarded import
-  of the same name anywhere makes it required again, and a bare `except:` or
-  `except Exception:` does not count as a guard. A module imported only after its
+  `try` whose `except` names `ImportError` or `ModuleNotFoundError` and then carries
+  on (`x = None`, `return False`, a fallback import) is not reported: the code runs
+  without the package, so it is optional by construction. If users should be able
+  to install it, declare it as an extra (`[project.optional-dependencies]`), where
+  it counts as used. A handler that ends by raising or exiting (`sys.exit("pip
+  install x")`, `raise ImportError(...)`, a bare `raise`) does not make it optional:
+  that is how a script says x is required, so the module is a *candidate*, as is
+  one imported in a `try` with other imports whose handler replaces only the
+  others. One guarded site that carries on makes the module optional everywhere;
+  one unguarded import of the same name anywhere makes it required again; a bare
+  `except:` or `except Exception:` does not count as a guard. A module imported only after its
   own file puts a directory on `sys.path` that the source cannot place inside the
   repo — a checkout named on the command line, an environment variable, a path
   outside the tree — is reported as a *candidate*: a harness run under another

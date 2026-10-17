@@ -12,6 +12,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
+
 SCRIPTS_DIR = Path(__file__).resolve().parents[2] / "skills" / "python-code-doctor" / "scripts"
 
 MANIFEST = '[project]\nname = "x"\nversion = "0"\ndependencies = []\n'
@@ -55,6 +57,11 @@ def write(root: Path, rel: str, text: str) -> None:
 def missing(root: Path) -> list[str]:
     return sorted(f["description"].split("'")[1] for f in run_detector("find_dependency_issues.py", root)
                   if f["smell_type"] == "missing_dependency")
+
+
+def kinds(root: Path) -> dict[str, str]:
+    return {f["description"].split("'")[1]: f["kind"] for f in run_detector("find_dependency_issues.py", root)
+            if f["smell_type"] == "missing_dependency"}
 
 
 def test_an_import_guarded_by_except_importerror_is_not_a_missing_dependency(tmp_path):
@@ -159,3 +166,53 @@ def test_the_local_import_detector_exempts_the_guard_and_nothing_else(tmp_path):
 
     local = [f for f in run_detector("find_local_imports.py", tmp_path) if f["smell_type"] == "local_import"]
     assert [(f["line"], f["kind"]) for f in local] == [(DETECTORS.count("\n") + 4, "finding")]
+
+
+@pytest.mark.parametrize("stop", [
+    'sys.exit("PyYAML is required: pip install pyyaml")',
+    'raise ImportError("PyYAML is required; pip install pyyaml")',
+    "raise",
+    "raise SystemExit(1)",
+    'exit("pip install pyyaml")',
+    "quit()",
+    "os._exit(1)",
+])
+def test_a_handler_that_stops_the_program_leaves_a_lead(tmp_path, stop):
+    """`except ImportError: sys.exit("X is required")` is how a script says it cannot
+    run without X. The guard does not make that optional, and silence would hide it."""
+    write(tmp_path, "pyproject.toml", MANIFEST)
+    write(tmp_path, "tool.py",
+          "import os\nimport sys\n\ntry:\n    import yaml\nexcept ImportError:\n"
+          "    print('missing', file=sys.stderr)\n    " + stop + "\n")
+
+    lead = next(f for f in run_detector("find_dependency_issues.py", tmp_path)
+                if f["smell_type"] == "missing_dependency")
+    assert "'yaml'" in lead["description"]
+    assert lead["kind"] == "candidate" and lead["severity"] == "high"
+    assert lead["also_caused_by"] and not lead["suggestion"]
+    assert lead["file"].replace("\\", "/").endswith("tool.py") and lead["line"] == 5
+
+
+def test_a_shared_guard_spares_only_the_import_its_handler_replaces(tmp_path):
+    """A handler that falls back for one import says nothing about the others in the
+    same try: `requests` is a NameError waiting to happen when it is absent."""
+    write(tmp_path, "pyproject.toml", MANIFEST)
+    write(tmp_path, "client.py",
+          "try:\n    import requests\n    import ujson as json\nexcept ImportError:\n    import json\n"
+          "try:\n    import numpy, scipy\nexcept ImportError:\n    numpy = scipy = None\n"
+          "try:\n    from PIL import Image, ImageDraw\nexcept ImportError:\n    Image = ImageDraw = None\n")
+
+    assert kinds(tmp_path) == {"requests": "candidate", "numpy": "candidate", "scipy": "candidate"}
+
+
+def test_a_site_that_degrades_makes_the_module_optional_and_one_that_stops_does_not(tmp_path):
+    """anima-ui's detect() re-raises as DetectorUnavailable: alone, that is a lead.
+    Beside library_available(), which returns False, the program demonstrably runs
+    without the package."""
+    split = DETECTORS.index("def detect")
+    write(tmp_path, "pyproject.toml", MANIFEST)
+    write(tmp_path, "app/detect.py", DETECTORS[split:])
+    assert kinds(tmp_path) == {"ultralytics": "candidate"}
+
+    write(tmp_path, "app/available.py", DETECTORS[:split])
+    assert kinds(tmp_path) == {}
