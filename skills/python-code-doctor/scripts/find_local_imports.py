@@ -362,6 +362,23 @@ def _is_dunder_assign(stmt) -> bool:
     return False
 
 
+def _is_sys_path_setup(stmt) -> bool:
+    """`sys.path.insert(0, here)`, alone or as the whole body of an `if` guard.
+
+    The one piece of code ruff's E402 (and pycodestyle's, for the guarded form)
+    allows above an import: a script run with `python -I` has to put its own
+    directory back before it can import a sibling, and nowhere else will do.
+    """
+    if isinstance(stmt, ast.If):
+        return not stmt.orelse and all(_is_sys_path_setup(s) for s in stmt.body)
+    if not (isinstance(stmt, ast.Expr) and isinstance(stmt.value, ast.Call)):
+        return False
+    func = stmt.value.func
+    return (isinstance(func, ast.Attribute) and func.attr in {"insert", "append", "extend"}
+            and isinstance(func.value, ast.Attribute) and func.value.attr == "path"
+            and isinstance(func.value.value, ast.Name) and func.value.value.id == "sys")
+
+
 def _only_imports(stmt) -> bool:
     """True if an If/Try statement contains only imports (a top-of-file guard block)."""
     if not isinstance(stmt, (ast.If, ast.Try)):
@@ -442,7 +459,7 @@ def detect(tree, filename, lines, ignore):
         # statements allowed above imports without counting as "real code"
         if i == 0 and isinstance(stmt, ast.Expr) and isinstance(stmt.value, ast.Constant) and isinstance(stmt.value.value, str):
             continue  # module docstring
-        if _is_dunder_assign(stmt) or _only_imports(stmt) or _is_bootstrap(stmt):
+        if _is_dunder_assign(stmt) or _only_imports(stmt) or (_is_bootstrap(stmt) or _is_sys_path_setup(stmt)):
             continue
         seen_code = True
 
