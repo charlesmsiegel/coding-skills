@@ -127,7 +127,7 @@ class DesignSmellDetector(ast.NodeVisitor):
         self._ladder_members: set[int] = set()
         # Qualifying type switches, held until the whole module is read: whether
         # one is a finding depends on whether its subject is switched elsewhere.
-        self._switches: list[tuple[ast.If, str, str, int]] = []
+        self._switches: list[tuple[ast.If, str, str, int, tuple[str, ...]]] = []
         # A matching private name is evidence of a possible local owner, not
         # proof of ownership for every receiver with that spelling.
         self.module_privates: set[str] = self._collect_module_privates(tree)
@@ -413,9 +413,10 @@ class DesignSmellDetector(ast.NodeVisitor):
             left, right = test.left, test.comparators[0]
             return ast.dump(right if ast.dump(left) == subject_dump else left)
 
-        if len({case_of(t) for t in tests}) != len(tests):
+        cases = tuple(sorted(case_of(t) for t in tests))
+        if len(set(cases)) != len(tests):
             return
-        self._switches.append((node, subject_dump, kind, len(tests)))
+        self._switches.append((node, subject_dump, kind, len(tests), cases))
 
     def visit_Module(self, node: ast.Module):
         self.generic_visit(node)
@@ -425,15 +426,15 @@ class DesignSmellDetector(ast.NodeVisitor):
         """A long ladder, or a subject switched in several ladders, is the smell;
         one short ladder alone is a lead."""
         ladders_per_subject = defaultdict(int)
-        for _, subject_dump, kind, _ in self._switches:
-            ladders_per_subject[(subject_dump, kind)] += 1
-        for node, subject_dump, kind, branches in self._switches:
+        for _, subject_dump, kind, _, cases in self._switches:
+            ladders_per_subject[(subject_dump, kind, cases)] += 1
+        for node, subject_dump, kind, branches, cases in self._switches:
             subject_src = ast.unparse(next(
                 s for t in [node.test] for s, k in self._switch_candidates(t)
                 if ast.dump(s) == subject_dump and k == kind))
             via = "isinstance checks on" if kind == "isinstance" else "comparisons against"
             description = f"if/elif ladder with {branches} branches dispatching via {via} '{subject_src}'"
-            repeated = ladders_per_subject[(subject_dump, kind)]
+            repeated = ladders_per_subject[(subject_dump, kind, cases)]
             # The description depends on the ladder alone, never on its siblings:
             # analyze_diff matches a pre-existing finding by its description, and
             # a new ladder elsewhere must not make an unchanged one look new.
