@@ -32,11 +32,13 @@ Reported as a candidate, not a finding:
   - an undeclared module every import of which follows, in its own file, a
     sys.path addition (sys.path.insert/append/extend, `sys.path += [...]`,
     site.addsitedir) whose directory the source cannot place inside the project:
-    a parameter, an environment variable, sys.argv, or a path that resolves
-    outside the repository. A harness run under another program's interpreter
-    imports that program's modules this way, and no manifest here could declare
-    them. A directory the source does resolve inside the project explains
-    nothing (every module there is already first-party), and a module-level
+    one that resolves outside the repository, or one that reads a function
+    parameter, os.environ/os.getenv, sys.argv, or a name bound more than once.
+    A harness run under another program's interpreter imports that program's
+    modules this way, and no manifest here could declare them. A directory the
+    source does resolve inside the project explains nothing (every module there
+    is already first-party), nor does one spelled in a way the path reader cannot
+    follow but with none of those run-time sources in it, and a module-level
     import is not served by an addition inside a function, which cannot have
     run yet when the module loads.
 """
@@ -85,8 +87,9 @@ _RUNTIME_PATH_REASONS = (
     "the file runs inside another program's checkout or interpreter (a test harness, a plugin "
     "host, a script driving a vendored tree) and imports that program's own modules from the "
     "directory it puts on sys.path, which no manifest of this project could declare",
-    "the directory comes from a command-line argument, an environment variable or a path outside "
-    "this repository, so only the machine the code runs on shows what it provides",
+    "the directory comes from a function argument, the environment, sys.argv or a name rebound as "
+    "the program runs, or resolves outside this repository, so only the machine the code runs on "
+    "shows what it provides",
 )
 
 
@@ -415,9 +418,27 @@ def _dotted(node) -> str:
     return ""
 
 
-def _sole_assignment(stmts: list, name: str) -> tuple[bool, ast.expr | None]:
-    """Whether one scope binds `name`, and the value when its only binding is a
-    plain `name = value` (not a loop target, an import, a def, a second assignment...)."""
+def _parameters(function) -> set[str]:
+    args = function.args
+    return {a.arg for a in (*args.posonlyargs, *args.args, *args.kwonlyargs, args.vararg, args.kwarg)
+            if a is not None}
+
+
+def _import_aliases(module: ast.Module) -> dict[str, str]:
+    """Each name an import binds to something else -> the dotted name it imports:
+    `osp` -> `os.path`, `join` -> `os.path.join`, `P` -> `pathlib.Path`."""
+    aliases = {}
+    for node in ast.walk(module):
+        if isinstance(node, ast.Import):
+            aliases.update({a.asname: a.name for a in node.names if a.asname})
+        elif isinstance(node, ast.ImportFrom) and node.module and not node.level:
+            aliases.update({a.asname or a.name: f"{node.module}.{a.name}" for a in node.names if a.name != "*"})
+    return aliases
+
+
+def _sole_assignment(stmts: list, name: str) -> tuple[int, ast.expr | None]:
+    """How many times one scope binds `name`, and the value when its only binding
+    is a plain `name = value` (not a loop target, an import, a def...)."""
     binds, values = 0, []
     for node in walk_same_scope(stmts):
         if isinstance(node, ast.Name):
@@ -432,12 +453,15 @@ def _sole_assignment(stmts: list, name: str) -> tuple[bool, ast.expr | None]:
             targets = node.targets if isinstance(node, ast.Assign) else [node.target]
             if len(targets) == 1 and isinstance(targets[0], ast.Name) and targets[0].id == name:
                 values.append(node.value)
-    return binds > 0, (values[0] if binds == 1 and len(values) == 1 else None)
+    return binds, (values[0] if binds == 1 and len(values) == 1 else None)
 
 
 # Calls that hand back where their one argument points.
 _SAME_PATH = frozenset({"Path", "PurePath", "pathlib.Path", "pathlib.PurePath", "str", "os.fspath",
                         "os.path.abspath", "os.path.realpath", "os.path.normpath"})
+_RENAMES = frozenset({"with_name", "with_stem", "with_suffix"})
+# What only the run decides: a directory read from one of these is opaque.
+_RUN_TIME_SOURCES = ("os.environ", "os.getenv", "sys.argv")
 _MAX_PATH_DEPTH = 12
 
 
@@ -445,19 +469,59 @@ class _PathReader:
     """Reads where a path expression in one file points, when the source alone says.
 
     It follows string literals, `__file__`, Path()/str()/os.fspath(), .parent,
-    .parents[n], .resolve(), .absolute(), .joinpath(), `/`, os.path's dirname,
-    abspath, realpath, normpath and join, and a name bound once, by a plain
-    assignment, in the scope that reads it. Anything else — a parameter, an
-    environment variable, sys.argv, a config value — is decided at run time.
+    .parents[n], .resolve(), .absolute(), .joinpath(), .with_name/.with_stem/
+    .with_suffix, `/`, os.path's dirname, abspath, realpath, normpath and join —
+    under whatever names the file imports them as — and a name bound once, by a
+    plain assignment, in the scope that reads it.
     """
 
     def __init__(self, filepath: Path, module: ast.Module, root: Path):
         self.filepath, self.module, self.root = filepath, module, root
+        self.aliases = _import_aliases(module)
 
-    def inside(self, node, scopes: tuple) -> bool:
-        """True when `node` provably names a directory inside the project."""
+    def reaches_outside(self, node, scopes: tuple) -> bool:
+        """`node` names a directory the source cannot place inside the project:
+        one it resolves outside, or one only the run decides. An expression the
+        reader merely cannot follow, with no run-time source in it, is neither."""
         path = self.read(node, scopes)
-        return path is not None and self._anchored(path).is_relative_to(self.root)
+        if path is not None:
+            return not self._anchored(path).is_relative_to(self.root)
+        return self.decided_at_run_time(node, scopes, set())
+
+    def decided_at_run_time(self, node, scopes: tuple, seen: set) -> bool:
+        """`node` reads a function parameter, the environment, sys.argv, or a name
+        bound more than once — directly or through names bound once."""
+        for child in ast.walk(node):
+            dotted = self._canonical(_dotted(child)) if isinstance(child, (ast.Name, ast.Attribute)) else ""
+            if any(dotted == source or dotted.startswith(source + ".") for source in _RUN_TIME_SOURCES):
+                return True
+            if isinstance(child, ast.Name) and self._name_decided_at_run_time(child.id, scopes, seen):
+                return True
+        return False
+
+    def _name_decided_at_run_time(self, name: str, scopes: tuple, seen: set) -> bool:
+        for depth in range(len(scopes), 0, -1):
+            scope = scopes[depth - 1]
+            if name in _parameters(scope):
+                return True
+            binds, value = _sole_assignment(scope.body, name) if not isinstance(scope, ast.Lambda) else (0, None)
+            if binds:
+                return self._binding_decided(binds, value, (id(scope), name), scopes[:depth], seen)
+        binds, value = _sole_assignment(self.module.body, name)
+        return self._binding_decided(binds, value, (id(self.module), name), (), seen)
+
+    def _binding_decided(self, binds: int, value, key: tuple, scopes: tuple, seen: set) -> bool:
+        if binds > 1:
+            return True
+        if value is None or key in seen:
+            return False
+        seen.add(key)
+        return self.decided_at_run_time(value, scopes, seen)
+
+    def _canonical(self, dotted: str) -> str:
+        """`dotted` with its first name replaced by what the file imported it as."""
+        head, dot, rest = dotted.partition(".")
+        return self.aliases.get(head, head) + dot + rest
 
     def _anchored(self, path: PurePath) -> PurePath:
         # A relative sys.path entry is relative to the working directory, taken
@@ -469,9 +533,7 @@ class _PathReader:
         in; None for a parameter or a name bound any way but once, plainly."""
         for depth in range(len(scopes), 0, -1):
             scope = scopes[depth - 1]
-            args = scope.args
-            if name in {a.arg for a in (*args.posonlyargs, *args.args, *args.kwonlyargs,
-                                        args.vararg, args.kwarg) if a is not None}:
+            if name in _parameters(scope):
                 return None
             if isinstance(scope, ast.Lambda):
                 continue
@@ -505,10 +567,12 @@ class _PathReader:
         return self._ancestor(node.value.value, index, scopes, depth) if index is not None else None
 
     def _call(self, node: ast.Call, scopes: tuple, depth: int) -> PurePath | None:
-        name, args = _dotted(node.func), node.args
+        name, args = self._canonical(_dotted(node.func)), node.args
         method = node.func.attr if isinstance(node.func, ast.Attribute) else ""
         if node.keywords:
             return None
+        if method in _RENAMES:
+            return self._renamed(node, scopes, depth)
         if name in _SAME_PATH and len(args) == 1:
             return self.read(args[0], scopes, depth)
         if name == "os.path.dirname" and len(args) == 1:
@@ -518,6 +582,17 @@ class _PathReader:
         if method in {"resolve", "absolute"} and not args:
             return self.read(node.func.value, scopes, depth)
         return self._joined([node.func.value, *args], scopes, depth) if method == "joinpath" else None
+
+    def _renamed(self, node: ast.Call, scopes: tuple, depth: int) -> PurePath | None:
+        """`base.with_name("x")` and its siblings, for a literal argument."""
+        args = node.args
+        if len(args) != 1 or not isinstance(args[0], ast.Constant) or not isinstance(args[0].value, str):
+            return None
+        base = self.read(node.func.value, scopes, depth)
+        try:
+            return getattr(base, node.func.attr)(args[0].value) if base is not None else None
+        except ValueError:  # an empty name, a suffix without a dot
+            return None
 
     def _joined(self, parts: list, scopes: tuple, depth: int) -> PurePath | None:
         paths = [self.read(part, scopes, depth) for part in parts]
@@ -573,7 +648,7 @@ def _collect_imports(root: Path) -> dict[str, list[_ImportSite]]:
                 found.append((node, _guard_of(node, guards), bool(scopes)))
                 continue
             added = _added_paths(node)
-            if added and not all(reader.inside(entry, scopes) for entry in added):
+            if added and any(reader.reaches_outside(entry, scopes) for entry in added):
                 additions.append(((node.lineno, node.col_offset), bool(scopes)))
         additions.sort()
         for node, guard, in_function in found:
