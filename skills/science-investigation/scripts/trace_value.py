@@ -11,9 +11,9 @@ Two questions this answers that a plain grep does not:
     measurement systems, different populations, one word, and someone will cite
     the wrong one to settle a question only the other could answer.
 
-Hits are classified as definitions, comparisons, config, docs, and tests, because
-the mix is the finding: many comparisons and no definition means the value is
-repeated at the point of use.
+Hits are classified as definitions, declarations, comparisons, config, docs, and
+tests, because the mix is the finding: many comparisons and no definition means
+the value is repeated at the point of use.
 
 Usage:
   python trace_value.py 0.7 .
@@ -28,8 +28,8 @@ from pathlib import Path
 
 from common import (
     CODE_SUFFIXES, CONFIG_SUFFIXES, DOC_SUFFIXES, add_common_args, candidate, configure_output,
-    emit, envelope, is_config, iter_files, mask_strings, read_source, rel, relocate,
-    skipped_note, split_comment, unpack_source,
+    coverage_note, emit, envelope, is_config, iter_files, looks_generated, mask_strings,
+    read_source, rel, relocate, skipped_note, split_comment, unpack_source,
 )
 
 # Leading-dot and exponent forms count as numbers here too. Without this, tracing
@@ -51,6 +51,22 @@ _DECLARE_RE = re.compile(r"\b(?:def|function|func|fun|fn|sub|class|const|let|var
                          r"|^\s*(?:(?:public|private|protected|static|final)\s+)*"
                          r"[A-Za-z_][\w:<>,\[\] ]*?[\w>\]]\s+$")
 
+# `solve_rate: float | None` on a model, `solve_rate: number;` in an interface: a
+# name given a type and no value. Counting that as a definition beside the one
+# place that computes it reported one real repository's solve rate "defined
+# independently in 2 places". Only a bare annotation, or one defaulting to null,
+# declares without defining — `QUALITY_THRESHOLD: float = 0.7` sets the value.
+# Plain JavaScript has no annotations, so there `name: rate` stays a definition.
+_ANNOTATION_RE = re.compile(r"^\s*\??\s*:(?![:=])\s*([^=]*?)\s*"
+                            r"(?:(?<![=!<>])=(?![=>])\s*(.*?))?\s*[;,]?\s*$")
+_TYPE_SHAPED_RE = re.compile(r"^[A-Za-z_][\w.\[\]<>|, ?]*$")
+_NULL_DEFAULT_RE = re.compile(r"^(?:None|null|nil|undefined)$")
+# Where a declaration can start: a statement, a parameter, a field of self/this,
+# or after a declaring keyword. Not after `cond ?`, whose `:` is a ternary.
+_DECLARATION_SITE_RE = re.compile(r"(?:^|[({,;]|\b(?:self|this)\.|"
+                                  r"\b(?:let|var|val|const|readonly|public|private|protected|static|declare)\s)\s*$")
+UNTYPED_SUFFIXES = frozenset({".js", ".jsx", ".mjs", ".cjs"})
+
 CONFIRM = {
     "text":
         "the value appears inside a string here, so it gates nothing — confirm it is not a "
@@ -58,6 +74,7 @@ CONFIRM = {
     "comment":
         "a commented-out site: confirm whether the live value moved on without it",
     "definition": "confirm this is the source of truth, and that the other sites read it rather than repeat it",
+    "declaration": "the name is typed here and given no value; confirm the place that computes it is the only one",
     "comparison": "confirm what decision this gates and that it means the same thing as the other sites",
     "config": "confirm which run actually loads this config; a stale config reads as an active threshold",
     "doc": "confirm the documented value still matches the code — docs drift silently",
@@ -86,7 +103,28 @@ def build_pattern(needle: str, as_regex: bool) -> re.Pattern:
     return re.compile(r"\b" + re.escape(needle) + r"\b")
 
 
-def classify(line: str, display: str, path: Path, span: tuple, numeric: bool = True) -> str:
+def declares_only(before: str, after: str) -> bool:
+    """Whether the name between `before` and `after` is annotated and given no value."""
+    if not _DECLARATION_SITE_RE.search(before):
+        return False
+    annotation = _ANNOTATION_RE.match(after)
+    if annotation is None or not _TYPE_SHAPED_RE.match(annotation.group(1)):
+        return False
+    default = annotation.group(2)
+    return default is None or bool(_NULL_DEFAULT_RE.match(default))
+
+
+def line_views(line: str, path: Path) -> tuple:
+    """(length of the code before any comment, the line with string bodies masked).
+
+    Computed once per line rather than once per occurrence: a one-letter needle
+    in a long line was masking the whole line again for every hit.
+    """
+    code = split_comment(line)[0]
+    return len(code), (line if is_config(path) else mask_strings(line))
+
+
+def classify(line: str, display: str, path: Path, span: tuple, numeric: bool = True, views=None) -> str:
     """Which kind of site this is.
 
     Deliberately classifies on the path *relative to the scanned root*: an
@@ -103,13 +141,12 @@ def classify(line: str, display: str, path: Path, span: tuple, numeric: bool = T
     if is_config(path):
         return "config"
 
-    code, comment = split_comment(line)
-    if span[0] >= len(code):
+    code_length, scannable = views if views is not None else line_views(line, path)
+    if span[0] >= code_length:
         return "comment"     # `# QUALITY_THRESHOLD = 0.7` is not a source of truth
 
     # Masked so the operators around the match are read from code, not from a
     # message: `message = "quality_score > 0.7"` is not a live comparison.
-    scannable = line if is_config(path) else mask_strings(line)
     if scannable[span[0]:span[1]] != line[span[0]:span[1]]:
         return "text"     # the match is inside a string literal, not in code
     before, after = scannable[:span[0]], scannable[span[1]:]
@@ -127,6 +164,8 @@ def classify(line: str, display: str, path: Path, span: tuple, numeric: bool = T
     # as a second definition produced a false "defined independently" headline.
     if numeric and _ASSIGN_RE.search(before) and not before.rstrip().endswith(","):
         return "definition"
+    if not numeric and path.suffix not in UNTYPED_SUFFIXES and declares_only(before, after):
+        return "declaration"
     if _TARGET_RE.match(after) or _DECLARE_RE.search(before):
         return "definition"
     if not before.strip(" \t\"'-") and after.lstrip().startswith(":"):
@@ -142,7 +181,7 @@ def scan(root: Path, pattern: re.Pattern, numeric: bool = True) -> tuple:
     are then one per (line, role): repeating an identical row for each occurrence
     would pad the list an auditor has to read without adding a place to look.
     """
-    rows, skipped, seen = [], [], set()
+    rows, skipped, generated, seen = [], [], [], set()
     notebooks: dict = {}
     scanned = 0
     for path in iter_files(root, CODE_SUFFIXES | CONFIG_SUFFIXES | DOC_SUFFIXES):
@@ -151,18 +190,27 @@ def scan(root: Path, pattern: re.Pattern, numeric: bool = True) -> tuple:
         if reason:
             skipped.append((display, reason))
             continue
+        if looks_generated(path, lines):
+            # A bundle's sites cannot be opened (one 145K-character line) and repeat
+            # the source it was built from; tracing a short name through one took
+            # minutes. Named in the caveat rather than dropped silently.
+            generated.append(display)
+            continue
         scanned += 1
         if locations:
             notebooks[display] = locations
         for lineno, line in enumerate(lines, 1):
+            views = None
             for match in pattern.finditer(line):
+                if views is None:
+                    views = line_views(line, path)
                 kind = classify(line, display, path, match.span(),
-                                numeric or bool(_NUMERIC_RE.match(match.group(0))))
+                                numeric or bool(_NUMERIC_RE.match(match.group(0))), views)
                 if (display, lineno, kind) in seen:
                     continue
                 seen.add((display, lineno, kind))
                 rows.append(candidate(kind, display, lineno, kind + " site", CONFIRM[kind], line.strip()))
-    return relocate(rows, notebooks), skipped, scanned
+    return relocate(rows, notebooks), skipped, scanned, generated
 
 
 def headline_for(needle: str, rows: list, files: int = 1) -> str:
@@ -219,7 +267,9 @@ CAVEAT = (
     "stored in a database, or scaled on the way in (0.7 written as 70 elsewhere is invisible). "
     "Classification is heuristic — a multi-line expression or an unusual layout can land in 'other'. "
     "A site is one (line, role) pair, so a line using the value twice the same way counts once. "
-    "A numeric needle deliberately does not match inside a longer number, so search 0.75 separately."
+    "A numeric needle deliberately does not match inside a longer number, so search 0.75 separately. "
+    "A name annotated with no value, or a null default (`solve_rate: float | None`), is a declaration, "
+    "not a definition; a declaration that the code then assigns elsewhere is the definition's job to find."
 )
 
 
@@ -242,17 +292,19 @@ def main() -> int:
         print("error: bad regular expression: " + str(exc), file=sys.stderr)
         return 2
 
-    rows, skipped, scanned = scan(root, pattern, bool(_NUMERIC_RE.match(args.needle)) and not args.regex)
-    order = ["definition", "comparison", "config", "doc", "test", "comment", "text", "other"]
+    rows, skipped, scanned, generated = scan(root, pattern, bool(_NUMERIC_RE.match(args.needle)) and not args.regex)
+    order = ["definition", "declaration", "comparison", "config", "doc", "test", "comment", "text", "other"]
     rows.sort(key=lambda r: (order.index(r["kind"]) if r["kind"] in order else 99, r["file"], r["line"]))
     counts = {"needle": args.needle, "sites": len(rows), "files": len({r["file"] for r in rows}),
-              "files_scanned": scanned, "files_skipped_unread": len(skipped)}
+              "files_scanned": scanned, "files_skipped_unread": len(skipped),
+              "files_skipped_generated": len(generated)}
     for kind in order:
         found = sum(1 for r in rows if r["kind"] == kind)
         if found:
             counts[kind] = found
     headline = headline_for(args.needle, rows, scanned) + skipped_note(skipped)
-    emit(envelope("trace_value", root, headline, CAVEAT, counts, rows[:args.limit]), args.format)
+    caveat = CAVEAT + coverage_note(generated)
+    emit(envelope("trace_value", root, headline, caveat, counts, rows[:args.limit]), args.format)
     return 0
 
 
