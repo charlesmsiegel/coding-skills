@@ -10,6 +10,15 @@ Finds:
   - unused_dependency     : declared dependency never imported anywhere
   - unpinned_dependency   : requirements.txt entry with no version specifier
   - no_dependency_manifest: third-party imports exist but no manifest at all
+
+Deliberately NOT charged as missing:
+  - an optional import: one inside the body of a `try` whose `except` names
+    ImportError or ModuleNotFoundError. The code handles the package being
+    absent, so it is optional by construction. It still counts as a use of a
+    declared dependency (an extra), and an unguarded import of the same name
+    anywhere else still makes it required. A bare `except:` or `except
+    Exception:` also catches the error but does not say the import was meant to
+    be optional, so it does not count.
 """
 
 import ast
@@ -186,12 +195,64 @@ def _collect_pyproject_deps(root: Path):
     return deps
 
 
-def _collect_imports(root: Path) -> dict[str, list[str]]:
+@dataclass(frozen=True)
+class _ImportSite:
+    """One absolute import of a top-level module, and what surrounds it."""
+    file: str
+    line: int
+    optional: bool = False  # an enclosing try handles its ImportError
+
+
+_IMPORT_ERRORS = frozenset({"ImportError", "ModuleNotFoundError"})
+
+
+def _catches_import_error(handler: ast.ExceptHandler) -> bool:
+    """An `except` that names ImportError or ModuleNotFoundError, alone or in a tuple."""
+    caught = handler.type.elts if isinstance(handler.type, ast.Tuple) else [handler.type]
+    return any((isinstance(t, ast.Name) and t.id in _IMPORT_ERRORS)
+               or (isinstance(t, ast.Attribute) and t.attr in _IMPORT_ERRORS) for t in caught)
+
+
+def _imports_with_guard(tree: ast.AST):
+    """Every import statement, with whether an enclosing try handles its ImportError.
+
+    Only a `try` body is guarded: its handlers, `else` and `finally` run outside
+    it. A function defined in the body imports when it is called, after the try
+    has finished, so a def starts unguarded again.
+    """
+    stack = [(tree, False)]
+    while stack:
+        node, optional = stack.pop()
+        if isinstance(node, (ast.Import, ast.ImportFrom)):
+            yield node, optional
+            continue
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+            optional = False
+        if isinstance(node, (ast.Try, ast.TryStar)):
+            guarded = optional or any(_catches_import_error(h) for h in node.handlers)
+            stack.extend((stmt, guarded) for stmt in node.body)
+            stack.extend((part, optional) for part in (*node.handlers, *node.orelse, *node.finalbody))
+        else:
+            stack.extend((child, optional) for child in ast.iter_child_nodes(node))
+
+
+def _top_level_names(node) -> list[str]:
+    """The top-level module each name of an absolute import loads."""
+    if isinstance(node, ast.Import):
+        names = [alias.name.split(".")[0] for alias in node.names]
+    elif node.level or not node.module:
+        return []  # relative import
+    else:
+        names = [node.module.split(".")[0]]
+    return [n for n in names if n and n != "__future__"]
+
+
+def _collect_imports(root: Path) -> dict[str, list[_ImportSite]]:
     """
     Walk all Python files and collect top-level module imports.
-    Returns dict: module_name -> [filepath, ...]
+    Returns dict: module_name -> [_ImportSite, ...]
     """
-    imports: dict[str, list[str]] = defaultdict(list)
+    imports: dict[str, list[_ImportSite]] = defaultdict(list)
     for filepath in find_python_files(root):
         try:
             source = filepath.read_text(encoding="utf-8", errors="replace")
@@ -202,19 +263,9 @@ def _collect_imports(root: Path) -> dict[str, list[str]]:
         except Exception as exc:
             warn_detector_error(filepath, exc)
             continue
-        for node in ast.walk(tree):
-            if isinstance(node, ast.Import):
-                for alias in node.names:
-                    top = alias.name.split(".")[0]
-                    if top and top != "__future__":
-                        imports[top].append(str(filepath))
-            elif isinstance(node, ast.ImportFrom):
-                if node.level and node.level > 0:
-                    continue  # relative import
-                if node.module:
-                    top = node.module.split(".")[0]
-                    if top and top != "__future__":
-                        imports[top].append(str(filepath))
+        for node, optional in _imports_with_guard(tree):
+            for top in _top_level_names(node):
+                imports[top].append(_ImportSite(str(filepath), node.lineno, optional))
     return imports
 
 
@@ -401,8 +452,8 @@ def analyze(root: Path, ignore: set) -> list[CodeSmell]:
     # ------------------------------------------------------------------ #
     # 3. Classify imports as third-party
     # ------------------------------------------------------------------ #
-    third_party_imports: dict[str, list[str]] = {}
-    for mod, files in all_imports.items():
+    third_party_imports: dict[str, list[_ImportSite]] = {}
+    for mod, sites in all_imports.items():
         if _is_stdlib(mod):
             continue
         if _is_local(mod, root):
@@ -411,10 +462,12 @@ def analyze(root: Path, ignore: set) -> list[CodeSmell]:
         # file's directory on sys.path, so `from test_chat import helper` in
         # tests/ resolves to the file next door. No manifest declares that, and
         # a tests/ directory needs no __init__.py for it to work.
-        unresolved = [f for f in files if not _resolves_beside(mod, Path(f))]
-        if not unresolved:
+        # An optional import is one the code runs without: the package being
+        # absent is handled where it is imported, so no manifest owes it.
+        required = [s for s in sites if not s.optional and not _resolves_beside(mod, Path(s.file))]
+        if not required:
             continue
-        third_party_imports[mod] = unresolved
+        third_party_imports[mod] = required
 
     # ------------------------------------------------------------------ #
     # 4. No manifest at all
@@ -441,7 +494,7 @@ def analyze(root: Path, ignore: set) -> list[CodeSmell]:
     # 5. missing_dependency: imported but not declared
     # ------------------------------------------------------------------ #
     if "missing_dependency" not in ignore:
-        for mod, files in sorted(third_party_imports.items()):
+        for mod, sites in sorted(third_party_imports.items()):
             norm_mod = _normalize(mod)
             # Check direct match
             if norm_mod in declared:
@@ -451,7 +504,7 @@ def analyze(root: Path, ignore: set) -> list[CodeSmell]:
             if mapped and _normalize(mapped) in declared:
                 continue
             # Not found — report once, pointing at the root
-            example_file = sorted(set(files))[0]
+            example_file = sorted({s.file for s in sites})[0]
             issues.append(CodeSmell(
                 file=str(root),
                 line=1,

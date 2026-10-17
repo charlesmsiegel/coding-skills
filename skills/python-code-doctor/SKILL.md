@@ -153,7 +153,7 @@ python "$SKILL/scripts/find_security_issues.py" .       # eval/exec, shell=True,
 
 # Architecture & repo structure (cross-file)
 python "$SKILL/scripts/find_import_cycles.py" .         # Circular imports, god modules, wildcard imports, logic in __init__
-python "$SKILL/scripts/find_dependency_issues.py" .     # Missing/unused/unpinned third-party deps vs. the manifest
+python "$SKILL/scripts/find_dependency_issues.py" .     # Missing/unused/unpinned third-party deps vs. the manifest (try/except ImportError = optional, not missing)
 
 # Safety net (build this BEFORE refactoring — see references/safety-net-and-testing.md)
 python "$SKILL/scripts/find_untested_modules.py" .      # Source modules no test references; "no tests in repo" alarm
