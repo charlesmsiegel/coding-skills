@@ -5654,3 +5654,27 @@ def test_code_marked_verbatim_upstream_is_not_charged_but_is_accounted_for(tmp_p
         [sys.executable, str(SCRIPTS_DIR / "analyze_all.py"), str(tmp_path), "--skip-duplicates"],
         capture_output=True, text=True, timeout=300, check=True).stdout
     assert "not charged" in text
+
+
+_RECORDING_FAKE = (
+    "class RecordingPipeline:\n"
+    "    def __init__(self):\n"
+    "        self.calls = []\n"
+    "\n"
+    "    def __call__(self, params):\n"
+    "        self.calls.append((params.prompt, params.seed, params.steps, params.width, params.height))\n"
+    "\n"
+    "    def reset(self):\n"
+    "        self.calls.clear()\n"
+)
+
+
+def test_a_recording_fake_reads_the_argument_it_records(tmp_path):
+    """A fake that records its argument reads that argument; that is not envy of
+    the argument's class. The same class outside tests is still reported."""
+    (tmp_path / "tests").mkdir()
+    (tmp_path / "tests" / "fakes.py").write_text(_RECORDING_FAKE)
+    (tmp_path / "pipeline.py").write_text(_RECORDING_FAKE)
+    envy = [Path(r["file"]).name for r in run_detector("find_coupling_issues.py", tmp_path)
+            if r["issue_type"] == "feature_envy"]
+    assert envy == ["pipeline.py"]
