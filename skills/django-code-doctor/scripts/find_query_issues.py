@@ -8,7 +8,9 @@ performance detector that fires on every loop teaches people to skip the output.
 
 So an N+1 is only reported when all three hold: the loop iterates a queryset, the
 body reaches through a relation on the loop variable, and the queryset has no
-select_related/prefetch_related/only/values in its chain.
+select_related/prefetch_related/only/values in its chain. Accessing a known
+multi-valued manager solely to add/remove/set/clear related objects is a write,
+not a related-row read that prefetching can eliminate.
 
 One finding here is not about speed at all. `read_modify_write_race` and
 `update_without_f` are correctness: they describe a lost update that appears only
@@ -76,6 +78,39 @@ def _relation_fields(ctx):
     return relations
 
 
+def _multi_relation_names(ctx):
+    """Names known only as multi-valued relations; collisions stay conservative."""
+    kinds = {}
+    for info in ctx.models.values():
+        for attr, kind in info.fields.items():
+            kinds.setdefault(attr, set()).add(kind)
+        for stmt in info.node.body:
+            if not (isinstance(stmt, ast.Assign) and isinstance(stmt.value, ast.Call)):
+                continue
+            kind = call_name(stmt.value)
+            if kind not in RELATION_FIELDS:
+                continue
+            related = keyword(stmt.value, "related_name")
+            if isinstance(related, ast.Constant):
+                reverse_kind = "many" if kind in {"ForeignKey", "ManyToManyField"} else "one"
+                kinds.setdefault(str(related.value), set()).add(reverse_kind)
+    return {name for name, values in kinds.items()
+            if values <= {"ManyToManyField", "many"}}
+
+
+def _mutation_receivers(tree, multi_relations):
+    """Exclude the manager receiver only, never reads in mutation arguments."""
+    receivers = set()
+    for node in ast.walk(tree):
+        if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                and node.func.attr in {"add", "remove", "set", "clear"}):
+            continue
+        receiver = node.func.value
+        if isinstance(receiver, ast.Attribute) and receiver.attr in multi_relations:
+            receivers.add(receiver)
+    return receivers
+
+
 def _walk_loops(tree):
     for node in ast.walk(tree):
         if isinstance(node, (ast.For, ast.AsyncFor)):
@@ -116,8 +151,10 @@ def _attribute_assignments_then_save(node):
 def collect(ctx):
     findings = []
     relations = _relation_fields(ctx)
+    multi_relations = _multi_relation_names(ctx)
 
     for path, tree in ctx.python_trees():
+        mutation_receivers = _mutation_receivers(tree, multi_relations)
         for loop in _walk_loops(tree):
             loop_vars = _loop_var_names(loop.target)
             iterates_queryset = _is_queryset_expr(loop.iter)
@@ -160,7 +197,8 @@ def collect(ctx):
                         and isinstance(node, ast.Attribute)
                         and isinstance(node.value, ast.Name)
                         and node.value.id in loop_vars
-                        and node.attr in relations):
+                        and node.attr in relations
+                        and node not in mutation_receivers):
                     kind = relations[node.attr]
                     helper = ("select_related" if kind in FORWARD_RELATIONS
                               else "prefetch_related")
