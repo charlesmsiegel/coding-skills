@@ -19,6 +19,7 @@ what they are.
 import ast
 import json
 import argparse
+import re
 from pathlib import Path
 from dataclasses import dataclass, asdict
 from collections import defaultdict
@@ -193,6 +194,47 @@ def _unwrap_negative(node: ast.AST) -> ast.AST:
     return node
 
 
+_CONSTANT_NAME = re.compile(r"_*[A-Z][A-Z0-9_]*")
+
+
+def _defines_constants(stmt) -> bool:
+    """`MAX = ...`, `LIMIT: int = ...`, `LOW, HIGH = ...`: every name bound is UPPER_CASE."""
+    targets = stmt.targets if isinstance(stmt, ast.Assign) else [stmt.target]
+    names = []
+    for target in targets:
+        for element in target.elts if isinstance(target, (ast.Tuple, ast.List)) else [target]:
+            if not isinstance(element, ast.Name):
+                return False
+            names.append(element.id)
+    return bool(names) and all(_CONSTANT_NAME.fullmatch(name) for name in names)
+
+
+def _value_literals(node: ast.AST):
+    """The literals in an expression, leaving out lambda bodies: code that runs later."""
+    if isinstance(node, ast.Constant):
+        yield node
+    elif not isinstance(node, ast.Lambda):
+        for child in ast.iter_child_nodes(node):
+            yield from _value_literals(child)
+
+
+def _constant_definition_literals(node: ast.AST):
+    """The literals in the value of a module- or class-level constant.
+
+    `MAX_UPLOAD_PIXELS = 50 * MEGAPIXEL` and `RULE = "=" * 78` are where 50 and
+    78 get their names: the expression is the constant's definition, exactly as
+    `TIMEOUT = 30` is. Assignments inside a function are not constants, and a
+    lambda's body runs later, so literals there are still judged.
+    """
+    for child in ast.iter_child_nodes(node):
+        if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+            continue
+        if (isinstance(child, (ast.Assign, ast.AnnAssign)) and child.value is not None
+                and _defines_constants(child)):
+            yield from _value_literals(child.value)
+        yield from _constant_definition_literals(child)
+
+
 def _is_type_call(node) -> bool:
     """`type(x)` asking an object's type. `type(None)` is not one: it names
     NoneType, as when an annotation's arguments are compared against it."""
@@ -236,10 +278,12 @@ class CodeSmellDetector(ast.NodeVisitor):
         # position, so visit_Constant can skip them:
         #   NAME = 30              the assignment names it
         #   obj.timeout = 30       an attribute also names the value
+        #   MAX = 50 * MEGAPIXEL   so does a module/class constant's definition
         #   def f(timeout=30)      the parameter names it
         #   get(url, timeout=30)   the keyword names it
         #   text[:200]             slice bounds
         #   [1, 30, 5] / {...}     data tables, not control values
+        self._named_constants = {id(literal) for literal in _constant_definition_literals(node)}
         for parent in ast.walk(node):
             if isinstance(parent, (ast.Assign, ast.AnnAssign)):
                 targets = parent.targets if isinstance(parent, ast.Assign) else [parent.target]
