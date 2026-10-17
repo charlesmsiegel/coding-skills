@@ -41,6 +41,14 @@ def _unwrap_negative(node: ast.AST) -> ast.AST:
     return node
 
 
+def _is_type_call(node) -> bool:
+    """`type(x)` asking an object's type. `type(None)` is not one: it names
+    NoneType, as when an annotation's arguments are compared against it."""
+    return (isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "type"
+            and not (len(node.args) == 1 and isinstance(node.args[0], ast.Constant)
+                     and node.args[0].value is None))
+
+
 class CodeSmellDetector(ast.NodeVisitor):
     # Values so conventional a name would add nothing.
     MAGIC_NUMBER_WHITELIST = frozenset({
@@ -61,6 +69,7 @@ class CodeSmellDetector(ast.NodeVisitor):
         self.class_info: dict[str, dict] = {}
         self._named_constants: set[int] = set()
         self._hooks: frozenset = frozenset()
+        self._in_assert = 0
 
     def visit_Module(self, node: ast.Module):
         self._hooks = framework_hook_overrides(node)
@@ -166,18 +175,20 @@ class CodeSmellDetector(ast.NodeVisitor):
                 "Extract to named constant", "low")
         self.generic_visit(node)
 
+    def visit_Assert(self, node: ast.Assert):
+        # In a test, `assert type(x) is float` pins the exact type on purpose —
+        # isinstance would accept a subclass, which is what the test rules out.
+        self._in_assert += 1
+        self.generic_visit(node)
+        self._in_assert -= 1
+
     def visit_Compare(self, node: ast.Compare):
-        for comparator in node.comparators:
-            if isinstance(comparator, ast.Call):
-                if isinstance(comparator.func, ast.Name) and comparator.func.id == 'type':
+        if not (self.is_test_file and self._in_assert):
+            for operand in [node.left, *node.comparators]:
+                if _is_type_call(operand):
                     self._add(node.lineno, "type_comparison",
                         "Using type() for comparison",
                         "Use isinstance() instead", "medium")
-        if isinstance(node.left, ast.Call):
-            if isinstance(node.left.func, ast.Name) and node.left.func.id == 'type':
-                self._add(node.lineno, "type_comparison",
-                    "Using type() for comparison",
-                    "Use isinstance() instead", "medium")
         self.generic_visit(node)
 
     def visit_ClassDef(self, node: ast.ClassDef):

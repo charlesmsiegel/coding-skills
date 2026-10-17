@@ -5678,3 +5678,31 @@ def test_a_recording_fake_reads_the_argument_it_records(tmp_path):
     envy = [Path(r["file"]).name for r in run_detector("find_coupling_issues.py", tmp_path)
             if r["issue_type"] == "feature_envy"]
     assert envy == ["pipeline.py"]
+
+
+def test_nonetype_and_an_exact_type_assertion_are_not_type_comparisons(tmp_path):
+    """`type(None)` names NoneType; it tests no object's type. In a test,
+    `assert type(x) is float` pins the exact type on purpose, which isinstance
+    would not. Everywhere else, comparing type() is still the smell."""
+    source = (
+        "def optional_inner(annotation, get_args):\n"
+        "    return [a for a in get_args(annotation) if a is not type(None)]\n"
+        "\n"
+        "def kind(x, Foo):\n"
+        "    if type(x) == Foo:  # fires\n"
+        "        return 1\n"
+        "    assert type(x) is Foo  # fires\n"
+        "    return 0\n"
+    )
+    test = (
+        "def test_strength_is_a_float(spec):\n"
+        "    assert type(spec.strength) is float\n"
+        "    if type(spec.strength) is float:  # fires\n"
+        "        assert spec\n"
+    )
+    (tmp_path / "config.py").write_text(source)
+    (tmp_path / "test_prompting.py").write_text(test)
+    found = sorted((Path(r["file"]).name, r["line"]) for r in run_detector("find_code_smells.py", tmp_path)
+                   if r["smell_type"] == "type_comparison")
+    assert found == sorted([("config.py", n) for n in _lines_marked(source)]
+                           + [("test_prompting.py", n) for n in _lines_marked(test)])
