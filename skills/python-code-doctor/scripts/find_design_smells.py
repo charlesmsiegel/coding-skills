@@ -102,6 +102,48 @@ MIN_EQ_BRANCHES = 4
 MIN_ISINSTANCE_BRANCHES = 4
 
 
+def _is_self_attribute(node: ast.AST, attr: str) -> bool:
+    return isinstance(node, ast.Attribute) and node.attr == attr \
+        and isinstance(node.value, ast.Name) and node.value.id == "self"
+
+
+def _repeated(nodes: list[ast.AST]) -> set[int]:
+    """Ids of the nodes a loop among `nodes` can run more than once: each loop's
+    body, and a while loop's test."""
+    loops = [node for node in nodes if isinstance(node, (ast.For, ast.AsyncFor, ast.While))]
+    return {id(inner) for loop in loops
+            for inner in walk_same_scope(loop.body + ([loop.test] if isinstance(loop, ast.While) else []))}
+
+
+def _writes_self_attribute(stmt: ast.AST, attr: str) -> bool:
+    if isinstance(stmt, ast.Assign):
+        targets = stmt.targets
+    elif isinstance(stmt, (ast.AnnAssign, ast.AugAssign)):
+        targets = [stmt.target]
+    else:
+        return False
+    return any(_is_self_attribute(sub, attr) for target in targets for sub in ast.walk(target))
+
+
+def _reads_before_writing(body: list[ast.stmt], attr: str) -> bool:
+    """Whether a call to this method reads `self.<attr>` before writing it,
+    with the read outside any loop.
+
+    That read can only see what an earlier call (or __init__) left there:
+    `if self._key != key: ...; self._key = key` remembers what is cached, and
+    `self._total = add(self._total, x)` carries a running value. A write takes
+    effect when its statement ends, so the read in `self.x = f(self.x)` comes
+    first. A read inside a loop may see this call's own earlier write, so it
+    proves nothing.
+    """
+    nodes = list(walk_same_scope(body))
+    repeated = _repeated(nodes)
+    reads = [(node.lineno, node.col_offset) for node in nodes
+             if _is_self_attribute(node, attr) and isinstance(node.ctx, ast.Load) and id(node) not in repeated]
+    writes = [(stmt.end_lineno, stmt.end_col_offset) for stmt in nodes if _writes_self_attribute(stmt, attr)]
+    return bool(reads) and (not writes or min(reads) < min(writes))
+
+
 class DesignSmellDetector(ast.NodeVisitor):
     def __init__(self, filename: str, source_lines: list[str], tree: ast.Module,
                  ignore: set[str] = None, is_test_file: bool = False):
@@ -717,12 +759,14 @@ class DesignSmellDetector(ast.NodeVisitor):
         returned_in: dict[str, set[str]] = defaultdict(set)
         reset_in: dict[str, set[str]] = defaultdict(set)
         accessor_like: set[str] = set()
+        bodies: dict = {}
         for klass, method in ((k, m) for k in relatives for m in self._methods(k)):
             if klass is node and method.name == "__init__":
                 continue
             # Identity-keyed: same-named classes in different containers must
             # not collapse into one method.
             qualname = (id(klass), f"{klass.name}.{method.name}")
+            bodies[qualname] = method.body
             decorators = decorator_names(method)
             if decorators & PROPERTY_DECORATORS or {"setter", "getter", "deleter"} & decorators:
                 accessor_like.add(qualname)
@@ -765,13 +809,16 @@ class DesignSmellDetector(ast.NodeVisitor):
             # populated is dead weight; a reset back to None proves the "None
             # except during one operation" lifecycle. Without a reset, a field
             # the method *returns* is an output for callers (part of the state
-            # model), and a field only written is an output too — only a field
-            # populated and read back without being exposed is method-local
-            # scratch.
+            # model), and a field only written is an output too. A field the
+            # method reads before writing it carries what the previous call left
+            # (a cache key, a running value), so it persists by design. Only a
+            # field populated and then read back without being exposed is
+            # method-local scratch.
             is_temporary = only_key in populated.get(attr, set()) and (
                 only_key in reset_in.get(attr, set())
                 or (only_key in loaded_in.get(attr, set())
-                    and only_key not in returned_in.get(attr, set())))
+                    and only_key not in returned_in.get(attr, set())
+                    and not _reads_before_writing(bodies[only_key], attr)))
             if is_temporary:
                 only = only_key[1]
                 self._add(line, "temporary_field",

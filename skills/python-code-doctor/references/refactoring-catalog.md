@@ -123,6 +123,9 @@ and its scratch state into its own small object (the method-object move).
 **Detector:** `find_design_smells.py` (`temporary_field`).
 **Ignore when:** a lazy-init cache behind a `@property`/`@cached_property` is
 idiomatic — better yet, use `functools.cached_property` and delete the field.
+A field the method reads before it writes it (the key of what is cached, a
+running total) holds what the previous call left, so it persists by design;
+the detector does not report it.
 
 ### Refused bequest
 **Spot it:** a subclass that inherits methods it doesn't want and overrides them
