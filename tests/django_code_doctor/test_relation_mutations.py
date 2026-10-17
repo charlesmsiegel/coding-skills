@@ -72,3 +72,16 @@ def test_duplicate_model_class_cannot_hide_a_single_relation(tmp_path, reverse):
     project = build_project(tmp_path / "p", files)
     assert any(f["smell_type"] == "n_plus_one_query"
                for f in run_detector("find_query_issues.py", project))
+
+
+@pytest.mark.parametrize("statement", ["obj.owner = None", "obj.owner: Person = None"])
+def test_plain_relation_assignment_does_not_read_descriptor(tmp_path, statement):
+    assert not query_hits(tmp_path, statement)
+
+
+@pytest.mark.parametrize("statement", [
+    "obj.owner.name = 'New'", "obj.owner += other", "obj.owner = obj.owner",
+    "obj.owner.name: str = 'New'",
+])
+def test_assignment_descriptor_reads_remain_visible(tmp_path, statement):
+    assert query_hits(tmp_path, statement)
