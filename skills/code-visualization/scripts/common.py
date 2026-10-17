@@ -86,6 +86,7 @@ def scope_roots(repo: Path, roots) -> tuple:
     """
     repo = repo.resolve()
     out = set()
+    whole_repo = False
     for raw in roots or ():
         p = (repo / raw).resolve()
         if p != repo and repo not in p.parents:
@@ -93,8 +94,11 @@ def scope_roots(repo: Path, roots) -> tuple:
         if not p.is_dir():
             raise ValueError(f"--root {raw} is not a directory in {repo}")
         if p == repo:
-            return ()
-        out.add(p.relative_to(repo).as_posix())
+            whole_repo = True
+        else:
+            out.add(p.relative_to(repo).as_posix())
+    if whole_repo:
+        return ()
     return tuple(sorted(r for r in out if not any(r.startswith(o + "/") for o in out)))
 
 
