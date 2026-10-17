@@ -460,6 +460,13 @@ def main() -> int:
                if s["samples"] else "") + "</li>"
             for lang, s in under)
         resolution_html = f"""<div class="callout warn"><b>Import graph likely under-resolved</b> — imports that appear to name this repo's own code could not be matched to files, so the graph understates coupling. Treat sparse areas as a resolution gap, not as decoupling; the <code>resolution</code> block in the analyzer summary has per-language numbers.<ul style="margin-top:8px">{rows}</ul></div>"""
+    skipped = stats.mostly_skipped()
+    if skipped:
+        rows = "".join(
+            f"<li><b>{esc(lang)}</b>: {s['skipped_in_strings']} skipped, "
+            f"{s['first_party'] + s['external']} counted</li>"
+            for lang, s in skipped)
+        resolution_html += f"""<div class="callout warn"><b>Many import statements sat inside string literals</b> and were skipped as text. That is right for a code generator or a docs page, and wrong everywhere else — check a few before trusting the graph's sparseness.<ul style="margin-top:8px">{rows}</ul></div>"""
 
     top_assets = sorted(loaders_of.items(), key=lambda kv: (-len(kv[1]), kv[0]))[:25]
     resource_html = ""

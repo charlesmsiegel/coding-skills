@@ -2184,6 +2184,136 @@ def test_deps_js_import_text_inside_a_string_is_ignored(repo, tabs, run_script):
     summary = _deps_summary(repo, tabs, run_script)
 
     assert summary["import_edges"] == 0
+    assert summary["resolution"]["TypeScript"]["skipped_in_strings"] == 1
+
+
+# The in-string guard used to look at the character before an `import` after
+# stripping ALL whitespace, newlines included. In semicolon-free code the line
+# above an import usually ends in its own spec's quote, so every import but the
+# first was dropped — and never counted, so the summary still read 100%
+# resolved. On a real 300-file Vite app: 66 of 695 relative imports seen.
+
+
+def test_deps_js_semicolon_free_consecutive_imports_all_count(repo, tabs, run_script):
+    repo.write("src/a.ts", "export const a = 1\n")
+    repo.write("src/b.ts", "export const b = 2\n")
+    repo.write("src/c.ts", "export const c = 3\n")
+    repo.write("src/d.ts", "export const d = 4\n")
+    repo.write("src/main.ts",
+               "import { a } from './a'\n"
+               "import { b } from \"./b\"\n"
+               "export { c } from './c'\n"
+               "const { d } = require('./d')\n")
+
+    summary = _deps_summary(repo, tabs, run_script)
+
+    fan_in = {row["path"]: row["fan_in"] for row in summary["top_fan_in_files"]}
+    assert {f: fan_in.get(f) for f in ("src/a.ts", "src/b.ts", "src/c.ts", "src/d.ts")} \
+        == dict.fromkeys(("src/a.ts", "src/b.ts", "src/c.ts", "src/d.ts"), 1)
+    res = summary["resolution"]["TypeScript"]
+    assert res["first_party"] == 4 and res["skipped_in_strings"] == 0
+
+
+def test_deps_js_import_after_a_line_ending_in_a_string_counts(repo, tabs, run_script):
+    repo.write("src/dep.ts", "export const x = 1\n")
+    repo.write("src/lazy.ts", "export const y = 2\n")
+    repo.write("src/main.ts",
+               "export const greeting = 'hello'\n"
+               "import { x } from './dep'\n"
+               "const tpl = `${greeting} world`\n"
+               "export const later = () => import('./lazy')\n")
+
+    summary = _deps_summary(repo, tabs, run_script)
+
+    fan_in = {row["path"]: row["fan_in"] for row in summary["top_fan_in_files"]}
+    assert fan_in.get("src/dep.ts") == 1
+    assert fan_in.get("src/lazy.ts") == 1
+
+
+def test_deps_js_import_text_in_template_and_mid_line_strings_is_skipped(
+        repo, tabs, run_script):
+    """The guard is about what encloses the `import`, not the character
+    before it: a template literal spanning lines and a string whose import
+    text starts mid-sentence are both literal text, and both are counted as
+    skipped so a reader can see the guard fired."""
+    repo.write("src/dep.ts", "export const x = 1\n")
+    repo.write("src/docs.ts",
+               "export const usage = `\n"
+               "Usage:\n"
+               "  import { x } from './dep'\n"
+               "`\n"
+               "export const hint = \"see: import x from './dep' for details\"\n"
+               "export const nested = `${usage} and import('./dep') too`\n")
+
+    summary = _deps_summary(repo, tabs, run_script)
+
+    assert summary["import_edges"] == 0
+    assert summary["resolution"]["TypeScript"]["skipped_in_strings"] == 3
+
+
+def test_deps_js_template_substitution_and_regex_literals_are_code(repo, tabs, run_script):
+    """A `${...}` substitution is code, so a dynamic import inside one counts;
+    a backtick or quote inside a regex literal opens nothing, so the import
+    on the next line is still seen."""
+    repo.write("src/dep.ts", "export const x = 1\n")
+    repo.write("src/other.ts", "export const y = 2\n")
+    repo.write("src/main.ts",
+               "export const m = `${await import('./dep')}`\n"
+               "const tick = /`'\"/g\n"
+               "import { y } from './other'\n")
+
+    summary = _deps_summary(repo, tabs, run_script)
+
+    fan_in = {row["path"]: row["fan_in"] for row in summary["top_fan_in_files"]}
+    assert fan_in.get("src/dep.ts") == 1
+    assert fan_in.get("src/other.ts") == 1
+
+
+def test_deps_js_string_text_never_swallows_the_next_real_import(repo, tabs, run_script):
+    """Import-shaped text inside a string must not be matched onward into the
+    real statement that follows it on the same line."""
+    repo.write("src/dep.ts", "export const x = 1\n")
+    repo.write("src/main.ts",
+               "const s = \"import \"; import { x } from './dep'\n")
+
+    summary = _deps_summary(repo, tabs, run_script)
+
+    fan_in = {row["path"]: row["fan_in"] for row in summary["top_fan_in_files"]}
+    assert fan_in.get("src/dep.ts") == 1
+
+
+def test_deps_js_comments_with_quotes_hide_nothing(repo, tabs, run_script):
+    repo.write("src/a.ts", "export const a = 1\n")
+    repo.write("src/b.ts", "export const b = 2\n")
+    repo.write("src/main.tsx",
+               "// don't import this: import z from './gone'\n"
+               "import { a } from './a'\n"
+               "/* `unclosed backtick in a comment */\n"
+               "const url = 'http://example.com' // it's fine\n"
+               "export const el = <p>Don't panic</p>\n"
+               "import { b } from './b'\n")
+
+    summary = _deps_summary(repo, tabs, run_script)
+
+    fan_in = {row["path"]: row["fan_in"] for row in summary["top_fan_in_files"]}
+    assert fan_in.get("src/a.ts") == 1
+    assert fan_in.get("src/b.ts") == 1
+    assert summary["resolution"]["TypeScript"]["first_party"] == 2
+
+
+def test_deps_js_mass_skips_are_flagged_in_the_tab(repo, tabs, run_script, fragment):
+    """A file that is mostly import text inside strings (a code generator, a
+    docs page) is legitimate — but a skip count that rivals the real imports
+    is what a broken guard looks like, so the tab says so."""
+    repo.write("src/dep.ts", "export const x = 1\n")
+    repo.write("src/gen.ts", "".join(
+        f"export const t{i} = \"import x{i} from './dep'\"\n" for i in range(12)))
+
+    summary = _deps_summary(repo, tabs, run_script)
+
+    assert summary["resolution"]["TypeScript"]["skipped_in_strings"] == 12
+    body = fragment.body(tabs / "03-dependencies.html")
+    assert "inside string literals" in body
 
 
 def test_deps_js_bare_suffix_fallback_requires_ts_config(repo, tabs, run_script):
