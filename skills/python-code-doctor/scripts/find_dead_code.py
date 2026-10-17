@@ -422,10 +422,6 @@ class ScopeTracker(ast.NodeVisitor):
         self.used_names.update(_string_annotation_names(node.annotation))
         self.generic_visit(node)
 
-    def visit_AnnAssign(self, node: ast.AnnAssign):
-        self.used_names.update(_string_annotation_names(node.annotation))
-        self.generic_visit(node)
-
     def visit_Name(self, node: ast.Name):
         if isinstance(node.ctx, (ast.Store, ast.Del)):
             self._annotation_scopes[-1][1].pop(node.id, None)

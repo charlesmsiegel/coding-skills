@@ -932,7 +932,6 @@ def main():
         print(json.dumps([asdict(i) for i in all_issues], indent=2))
     else:
         proven = [issue for issue in all_issues if issue.kind == "finding"]
-        candidates = [issue for issue in all_issues if issue.kind == "candidate"]
         if not all_issues:
             print("✅ No design smells found!")
             return
