@@ -4208,6 +4208,7 @@ def test_a_marked_upstream_copy_is_not_a_member_of_the_projects_duplication(tmp_
     # upstream groups at a marked occurrence, regardless of filesystem order.
     anchors = {tuple(members(r)): Path(r["file"]).name for r in records}
     assert anchors[("a_upstream.py", "a_upstream.py")] == "a_upstream.py"
+    assert anchors[("b_one.py", "c_two.py")] == "b_one.py"
     assert anchors[("e_ported.py", "f_upstream.py")] == "f_upstream.py"
 
     report = json.loads(subprocess.run(
@@ -4218,6 +4219,21 @@ def test_a_marked_upstream_copy_is_not_a_member_of_the_projects_duplication(tmp_
     withheld = {Path(f).name: entry["by_category"].get("duplicates")
                 for f, entry in report["meta"]["not_charged"].items()}
     assert withheld == {"a_upstream.py": 1, "f_upstream.py": 1}
+
+
+def test_a_duplicate_group_is_anchored_at_its_first_copy_in_path_order(load_module):
+    """Group identity must not depend on the filesystem's traversal order."""
+    duplicates = load_module(SCRIPTS_DIR, "find_duplicates")
+
+    def block(file, line):
+        return {"file": file, "line": line, "end_line": line + 6, "name": "f", "type": "function",
+                "preview": "", "lines": 6, "exact_hash": "same"}
+
+    walked = [block("pkg/c_two.py", 1), block("pkg/b_one.py", 9), block("pkg/b_one.py", 1)]
+    (group,) = duplicates._group(walked, "exact_hash", exact=True)
+
+    assert [(o["file"], o["line"]) for o in group.occurrences] == [
+        ("pkg/b_one.py", 1), ("pkg/b_one.py", 9), ("pkg/c_two.py", 1)]
 
 
 def test_docstrings_do_not_count_toward_duplicate_size(tmp_path):
