@@ -357,3 +357,12 @@ def test_a_test_package_is_not_proposed_as_an_importable_unit(run_script, repo):
     proposal = propose(run_script, repo)
     assert all(package["roots"] != ["tests/tui"] for package in proposal["packages"])
     assert all(package["roots"] != ["tests"] for package in proposal["packages"])
+
+
+def test_a_setup_import_after_another_module_still_names_a_package(run_script, repo):
+    repo.write("lib/setup.py", "import os, setuptools\nname = 'legacy-lib'\n"
+               "setuptools.setup(name=name)\n")
+    for module in ("a", "b", "c"):
+        repo.write(f"lib/legacy/{module}.py", "x = 1\n")
+    proposal = propose(run_script, repo)
+    assert "legacy-lib" in names(proposal)

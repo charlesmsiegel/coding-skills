@@ -202,11 +202,15 @@ class CodeSmellDetector(ast.NodeVisitor):
 
     def visit_Compare(self, node: ast.Compare):
         if not (self.is_test_file and self._in_assert):
-            for operand in [node.left, *node.comparators]:
-                if _is_type_call(operand):
+            # Identity deliberately requests an exact type; only equality
+            # suggests an accidental substitute for isinstance.
+            operands = [node.left, *node.comparators]
+            for operator, left, right in zip(node.ops, operands, operands[1:]):
+                if isinstance(operator, (ast.Eq, ast.NotEq)) and (_is_type_call(left) or _is_type_call(right)):
                     self._add(node.lineno, "type_comparison",
                         "Using type() for comparison",
-                        "Use isinstance() instead", "medium")
+                        "Use isinstance() for subclasses, or `type(x) is T` for an exact type", "medium")
+                    break
         self.generic_visit(node)
 
     def visit_ClassDef(self, node: ast.ClassDef):

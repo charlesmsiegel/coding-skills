@@ -23,6 +23,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import ast
 import json
 import os
 import re
@@ -109,9 +110,6 @@ def scan(repo: Path, excluded: set[str]) -> dict[str, list[Path]]:
     return found
 
 
-_SETUP_IMPORT = re.compile(r"^\s*(?:from|import)\s+(?:setuptools|distutils)\b", re.MULTILINE)
-
-
 def is_manifest(path: Path) -> bool:
     """Whether a manifest-named file is one.
 
@@ -123,9 +121,16 @@ def is_manifest(path: Path) -> bool:
     if path.name != "setup.py":
         return True
     try:
-        return bool(_SETUP_IMPORT.search(path.read_text(encoding="utf-8", errors="replace")))
-    except OSError:
+        tree = ast.parse(path.read_text(encoding="utf-8", errors="replace"))
+    except (OSError, SyntaxError):
         return False
+    return any(
+        (isinstance(node, ast.Import)
+         and any(alias.name.split(".")[0] in {"setuptools", "distutils"} for alias in node.names))
+        or (isinstance(node, ast.ImportFrom)
+            and node.level == 0 and (node.module or "").split(".")[0] in {"setuptools", "distutils"})
+        for node in ast.walk(tree)
+    )
 
 
 def manifest_name(path: Path) -> str:

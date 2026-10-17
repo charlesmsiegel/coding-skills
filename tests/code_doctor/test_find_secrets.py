@@ -3,6 +3,8 @@
 import json
 from pathlib import Path
 
+import pytest
+
 SKILL = Path(__file__).resolve().parent.parent.parent / "skills" / "code-doctor"
 SCRIPT = SKILL / "scripts" / "find_secrets.py"
 
@@ -329,3 +331,24 @@ def test_a_credential_inside_a_minified_bundle_is_still_found(repo, run_script):
     repo.commit("bundle")
     result = run_script(SCRIPT, repo.path, "--format", "json")
     assert records_of(result, "cloud_credential")
+
+
+def test_long_config_values_do_not_hide_an_unrelated_secret(repo, run_script):
+    repo.write("settings.env", "API_SECRET=aB3dE6gH9kL2nP5rT8wY1zC4\n"
+               "PUBLIC_CERT=" + "x" * 1600 + "\n")
+    result = run_script(SCRIPT, repo.path, "--format", "json")
+    found = records_of(result, "hardcoded_secret_assignment")
+    assert len(found) == 1 and found[0]["line"] == 1
+
+
+@pytest.mark.parametrize("suffix", ["js", "go"])
+def test_a_static_backtick_secret_is_a_literal(repo, run_script, suffix):
+    repo.write("settings." + suffix, "const apiToken = `aB3dE6gH9kL2nP5rT8wY1zC4`;\n")
+    result = run_script(SCRIPT, repo.path, "--format", "json")
+    assert records_of(result, "hardcoded_secret_assignment")
+
+
+def test_an_interpolated_template_is_an_expression(repo, run_script):
+    repo.write("settings.js", "const apiToken = `${config.publicValue}${session.identifier}`;\n")
+    result = run_script(SCRIPT, repo.path, "--format", "json")
+    assert not records_of(result, "hardcoded_secret_assignment")

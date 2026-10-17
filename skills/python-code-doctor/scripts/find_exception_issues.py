@@ -167,6 +167,8 @@ def _same_scope_nodes(stmts, stop_types=()):
     stack = list(stmts)
     while stack:
         node = stack.pop()
+        if isinstance(node, _SCOPE_BOUNDARIES) or (stop_types and isinstance(node, stop_types)):
+            continue
         yield node
         for child in ast.iter_child_nodes(node):
             if isinstance(child, _SCOPE_BOUNDARIES) or (stop_types and isinstance(child, stop_types)):
@@ -320,14 +322,17 @@ class ExceptionIssueDetector(ast.NodeVisitor):
         name the handler bound, re-raises (the same exemption Ruff's BLE001
         makes). Raising something else, or nothing, does trap it.
         """
-        for n in _same_scope_nodes(node.body, stop_types=(ast.ExceptHandler,)):
-            if not isinstance(n, ast.Raise):
-                continue
-            if n.exc is None:
-                return True
-            if node.name and isinstance(n.exc, ast.Name) and n.exc.id == node.name:
-                return True
-        return False
+        # A raise in just one branch does not establish propagation. Require a
+        # terminal re-raise, with no earlier path returning or leaving a loop.
+        # More involved control flow stays visible for review.
+        last = node.body[-1] if node.body else None
+        if not isinstance(last, ast.Raise):
+            return False
+        if any(isinstance(n, (ast.Return, ast.Break, ast.Continue))
+               for n in _same_scope_nodes(node.body[:-1])):
+            return False
+        return last.exc is None or (
+            node.name is not None and isinstance(last.exc, ast.Name) and last.exc.id == node.name)
 
     # -- BaseException + raise-without-from (per handler) -----------------
     def visit_ExceptHandler(self, node: ast.ExceptHandler):
