@@ -15,6 +15,7 @@ that never touches sys.path is exactly as missing as before.
 import json
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -276,3 +277,32 @@ def test_an_unread_path_is_opaque_only_when_the_run_decides_it(tmp_path):
         if got != expected:
             wrong[addition] = got
     assert not wrong, wrong
+
+
+_FAN_OUT = ", ".join(["ROOT"] * 30)
+_CHAIN = "".join(f"{name} = os.path.join({', '.join([below] * 30)})\n"
+                 for name, below in zip("ABCDEF", "BCDEFG")) + "G = os.path.dirname(__file__)\n"
+
+
+@pytest.mark.parametrize("bindings,added", [
+    ("from cfg import *\n\nROOT = os.path.join(" + _FAN_OUT + ")\n", "ROOT"),
+    (_CHAIN, "A"),
+], ids=["self-referential", "fan-out-chain"])
+def test_a_path_built_from_itself_or_a_wide_chain_is_read_quickly(tmp_path, bindings, added):
+    """`ROOT = os.path.join(ROOT, ROOT, ...)` names itself; a chain of names each
+    joining the next thirty times is a tree of 30**6 reads if nothing is remembered."""
+    write(tmp_path, "pyproject.toml", MANIFEST)
+    write(tmp_path, "plugin.py",
+          "import os\nimport sys\n\n" + bindings + f"sys.path.insert(0, {added})\n\nimport requests\n")
+
+    started = time.monotonic()
+    try:
+        result = subprocess.run(
+            [sys.executable, str(SCRIPTS_DIR / "find_dependency_issues.py"), str(tmp_path), "--format", "json"],
+            capture_output=True, text=True, timeout=20, check=True)
+    except subprocess.TimeoutExpired:
+        pytest.fail("the path reader did not finish in 20 s")
+    assert time.monotonic() - started < 20
+    kinds = {r["description"].split("'")[1]: r["kind"] for r in json.loads(result.stdout)
+             if r["smell_type"] == "missing_dependency"}
+    assert kinds["requests"] == "finding", "a path that reads nothing the run decides explains nothing"
