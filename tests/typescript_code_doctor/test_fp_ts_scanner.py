@@ -409,7 +409,10 @@ def test_inline_type_specifiers_are_recorded(ts):
 
 
 def test_missing_import_type_skips_an_inline_type_specifier(tmp_path):
+    # Under verbatimModuleSyntax, where a value-form import of a type is the
+    # thing that survives into the bundle and the rule applies at all.
     root = project(tmp_path, {
+        "tsconfig.json": '{ "compilerOptions": { "verbatimModuleSyntax": true } }',
         "src/client.ts": "export interface Entry { id: string }\nexport interface Row { id: string }\n"
                          "export function api(e: { id: string }): string { return e.id; }\n",
         "src/a.ts": 'import { api, type Entry, Row } from "./client";\n'
