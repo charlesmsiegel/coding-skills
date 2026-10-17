@@ -474,6 +474,8 @@ def _record_import(found: _Bindings, stmt: ast.ImportFrom) -> None:
 
 
 def _record_assignment(found: _Bindings, stmt: ast.Assign | ast.AnnAssign | ast.AugAssign) -> None:
+    if isinstance(stmt, ast.AnnAssign) and stmt.value is None:
+        return  # An annotation alone leaves an existing module binding intact.
     targets = stmt.targets if isinstance(stmt, ast.Assign) else [stmt.target]
     names = {node.id for target in targets for node in ast.walk(target)
              if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store)}
@@ -496,6 +498,11 @@ def _bindings(tree: ast.Module) -> _Bindings:
             found.imported.pop(stmt.name, None)
         elif isinstance(stmt, ast.ImportFrom):
             _record_import(found, stmt)
+        elif isinstance(stmt, ast.Import):
+            for alias in stmt.names:
+                name = alias.asname or alias.name.split(".")[0]
+                found.defined.add(name)
+                found.imported.pop(name, None)
         elif isinstance(stmt, (ast.Assign, ast.AnnAssign, ast.AugAssign)):
             _record_assignment(found, stmt)
     return found

@@ -188,15 +188,14 @@ def test_nested_function_branches_belong_to_the_nested_function(tmp_path):
     assert [(r["name"], r["issue_type"]) for r in found] == [("inner", "cyclomatic_complexity")]
 
 
-def test_assertions_in_a_test_are_not_branches(tmp_path):
+def test_assertions_are_not_branches(tmp_path):
     asserts = "".join(f"    assert result[{n}] == {n}\n" for n in range(14))
     body = "def test_values(result):\n" + asserts
     write(tmp_path, {"tests/test_values.py": body, "checks.py": body.replace("def test_", "def check_")})
     found = run_detector("analyze_complexity.py", tmp_path)
-    # In production code an assert is a conditional raise, and fourteen of them
-    # are fourteen ways out; in a test they are one straight path of expectations.
-    assert [(Path(r["file"]).name, r["issue_type"]) for r in found] == [
-        ("checks.py", "cyclomatic_complexity")]
+    # Assertions describe invariants in both tests and production code. Their
+    # conditions do not add decision points to the implementation's branches.
+    assert found == []
 
 
 def test_one_control_flow_finding_names_every_measure_it_exceeds(tmp_path):

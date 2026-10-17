@@ -36,6 +36,10 @@ def test_wrapper_state_belongs_to_the_enclosing_receiver(run_script, tmp_path, n
     ("def build():\n    return 0\n", True, []),
     ("build = None\n", False, ["server.py"]),
     ("def build():\n    return 0\n", False, ["server.py"]),
+    ("import math as build\n", True, []),
+    ("import math as build\n", False, ["server.py"]),
+    ("build: object\n", True, []),
+    ("build: object\n", False, []),
 ])
 def test_reexport_identity_follows_the_last_direct_binding(
         run_script, tmp_path, declaration, late_import, expected):
