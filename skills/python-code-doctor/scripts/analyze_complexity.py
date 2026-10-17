@@ -44,7 +44,7 @@ import json
 import argparse
 from pathlib import Path
 from dataclasses import dataclass, asdict
-from common import framework_hook_overrides, signature_is_a_contract, sort_findings, cached_parse, SEVERITY_ICONS, configure_output, find_python_files, warn_detector_error, looks_like_test
+from common import framework_hook_overrides, copied_signatures, signature_is_a_contract, sort_findings, cached_parse, SEVERITY_ICONS, configure_output, find_python_files, warn_detector_error, looks_like_test
 
 
 @dataclass
@@ -160,7 +160,7 @@ class ComplexityVisitor(ast.NodeVisitor):
         self._hooks: frozenset = frozenset()
 
     def visit_Module(self, node: ast.Module):
-        self._hooks = framework_hook_overrides(node)
+        self._hooks = framework_hook_overrides(node) | copied_signatures(node, Path(self.filename))
         self.generic_visit(node)
 
     def _severity(self, value: int, threshold: int) -> str:

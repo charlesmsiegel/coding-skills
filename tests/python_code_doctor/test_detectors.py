@@ -5630,6 +5630,70 @@ def test_a_framework_hook_override_keeps_the_frameworks_signature(tmp_path, scri
     assert lines == expected
 
 
+_COPIED_SIGNATURES = {
+    "pkg/pipeline.py": (
+        "class Pipeline:\n"
+        "    def __call__(self, params, *, generator=None, output_type='pil',  # fires\n"
+        "                 callback=None, conditioning=None, strength=1.0):\n"
+        "        return params\n"
+        "\n"
+        "def blend(a, b, c, d, e, f, g):  # fires\n"
+        "    return a\n"
+    ),
+    "pkg/proxy.py": (
+        "class Proxy:\n"
+        "    def __call__(self, params, *, generator, callback, conditioning, strength, **kwargs):  # fires\n"
+        "        return params\n"
+    ),
+    "tests/test_jobs.py": (
+        "class _Recording:\n"
+        "    def __call__(self, params, *, generator, callback=None, conditioning=None, strength=1.0, **_):\n"
+        "        return params\n"
+        "\n"
+        "def test_the_hook_sees_every_call(install):\n"
+        "    def record(params, generator, output_type, callback, conditioning, strength):\n"
+        "        return params\n"
+        "    install(record)\n"
+        "\n"
+        "def mix(a, b, c, d, e, f, g):  # fires\n"
+        "    return a\n"
+        "\n"
+        "class _Builder:\n"
+        "    def build(self, recipe, size, seed, steps, scale, name):  # fires\n"
+        "        return a\n"
+        "\n"
+        "class _Renamed:\n"
+        "    def __call__(self, params, *, generator, seed, steps, width, height):  # fires\n"
+        "        return params\n"
+        "\n"
+        "def spread(params, generator, output_type, a, b, c, d):  # fires\n"
+        "    return params\n"
+    ),
+}
+
+
+@pytest.mark.parametrize("script,finding_type,key", [
+    ("analyze_complexity.py", "parameter_count", "issue_type"),
+    ("find_code_smells.py", "long_parameter_list", "smell_type"),
+])
+def test_a_test_double_copying_a_production_signature_is_not_charged_for_it(tmp_path, script,
+                                                                            finding_type, key):
+    """A fake pipeline's `__call__` takes what the real `Pipeline.__call__` takes,
+    because the code under test calls it that way, and so does a closure handed
+    in as a hook, whatever it is called; the length is reported once, at the
+    real definition. A test class's own method, a fake whose parameters are not
+    all the real one's, one whose parameters come from two different functions,
+    a module-level helper (the tests call it; it is not handed to the code under
+    test), and a production class copying another's signature are still charged."""
+    for name, text in _COPIED_SIGNATURES.items():
+        (tmp_path / name).parent.mkdir(parents=True, exist_ok=True)
+        (tmp_path / name).write_text(text)
+    found = sorted((Path(f["file"]).relative_to(tmp_path).as_posix(), f["line"])
+                   for f in run_detector(script, tmp_path) if f.get(key) == finding_type)
+    assert found == sorted((name, line) for name, text in _COPIED_SIGNATURES.items()
+                           for line in _lines_marked(text))
+
+
 _CONSTRUCTOR_ENVY = (
     "class Adapter:\n"
     "    def __init__(self, geometry):\n"

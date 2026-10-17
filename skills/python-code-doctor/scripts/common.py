@@ -127,13 +127,14 @@ def framework_hook_overrides(tree) -> frozenset:
 
 
 def signature_is_a_contract(func, hooks: frozenset = frozenset()) -> bool:
-    """Whether a framework dictates `func`'s parameter list, so its length is not a design choice.
+    """Whether something other than `func` dictates its parameter list, so its length is not a design choice.
 
     A `@register_to_config` `__init__` (the flat kwargs are the serialised
-    config), a CLI command (each parameter is one of its flags), and an
-    override of a framework hook — ``hooks`` is framework_hook_overrides() of
-    the module. The parameter-count detectors exempt these; nothing else about
-    them is exempt.
+    config), a CLI command (each parameter is one of its flags), and a method
+    in ``hooks``: an override of a framework hook (framework_hook_overrides())
+    or, in a test file, a copy of a production signature (copied_signatures()).
+    The parameter-count detectors exempt these; nothing else about them is
+    exempt.
     """
     return registers_config(func) or is_cli_command(func) or id(func) in hooks
 
@@ -160,6 +161,65 @@ def parameter_severity(count: int, limit: int = PARAMETER_LIMIT) -> str:
     """
     ratio = count / limit
     return "high" if ratio >= 2.0 else ("medium" if ratio >= 1.5 else "low")
+
+
+def _parameter_names(func) -> frozenset:
+    """The parameters a caller can pass by position or keyword, self and cls aside."""
+    args = func.args
+    return frozenset(a.arg for a in [*args.posonlyargs, *args.args, *args.kwonlyargs]) - {"self", "cls"}
+
+
+@functools.lru_cache(maxsize=None)
+def _production_signatures(root: Path) -> tuple:
+    """The parameter names of every function and method in ``root``'s non-test code."""
+    signatures = set()
+    for path in _python_files(root):  # walking the project must not move the analysis root
+        if is_test_file(path):
+            continue
+        try:
+            tree = ast.parse(path.read_text(encoding="utf-8", errors="replace"))
+        except (SyntaxError, ValueError, OSError):
+            continue
+        signatures.update(_parameter_names(node) for node in ast.walk(tree)
+                          if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)))
+    signatures.discard(frozenset())
+    return tuple(signatures)
+
+
+def _copies_production_signature(func: ast.FunctionDef | ast.AsyncFunctionDef, filepath: Path) -> bool:
+    """Whether ``func`` takes only parameters that one function or method in
+    the project's own code also takes."""
+    names = _parameter_names(func)
+    return bool(names) and any(names <= real for real in _production_signatures(project_root(Path(filepath))))
+
+
+def copied_signatures(tree: ast.AST, filepath: Path, limit: int = PARAMETER_LIMIT) -> frozenset:
+    """id() of every test double in a test file, over ``limit`` parameters, that
+    copies a production signature.
+
+    A test double is a method of a class there or a function defined inside
+    another: a fake pipeline's `__call__`, a stand-in transformer's `forward`,
+    a closure handed to the code under test as a hook. It copies a production
+    signature when every parameter it names is a parameter of one function or
+    method in the project's own code. It takes what the real one takes because
+    the code under test calls it that way, and the parameter names are what is
+    copied, not the function's own name, since a callback can be called
+    anything. Such a signature belongs to the interface it copies and is judged
+    once, where that interface is defined. A module-level function in a test
+    file is a helper the tests call, so it is judged on its own even when its
+    parameters match.
+
+    Only definitions over ``limit`` are looked up, so a run with none never
+    reads the rest of the project.
+    """
+    if not is_test_file(Path(filepath)):
+        return frozenset()
+    nested = {id(inner): inner for node in ast.walk(tree)
+              if isinstance(node, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef))
+              for inner in ast.walk(node)
+              if inner is not node and isinstance(inner, (ast.FunctionDef, ast.AsyncFunctionDef))}
+    return frozenset(key for key, func in nested.items()
+                     if count_parameters(func) > limit and _copies_production_signature(func, filepath))
 
 
 # One defect that two detectors report under different names: alias -> canonical.
