@@ -37,7 +37,7 @@ import argparse
 from pathlib import Path
 from dataclasses import dataclass, asdict
 from collections import defaultdict
-from ast_scopes import (body_kind, decorator_names, is_dotted_name, is_dunder, local_bindings,
+from ast_scopes import (_reads_before_writing, body_kind, decorator_names, is_dotted_name, is_dunder, local_bindings,
                         walk_loop_level, walk_same_scope)
 from common import (is_test_file, sort_findings, cached_parse, SEVERITY_ICONS, configure_output, find_python_files,
                     warn_detector_error, warn_unparseable)
@@ -100,48 +100,6 @@ PROPERTY_DECORATORS = frozenset({"property", "cached_property"})
 # often the clearest form, and conservatism keeps the output trustworthy.
 MIN_EQ_BRANCHES = 4
 MIN_ISINSTANCE_BRANCHES = 4
-
-
-def _is_self_attribute(node: ast.AST, attr: str) -> bool:
-    return isinstance(node, ast.Attribute) and node.attr == attr \
-        and isinstance(node.value, ast.Name) and node.value.id == "self"
-
-
-def _repeated(nodes: list[ast.AST]) -> set[int]:
-    """Ids of the nodes a loop among `nodes` can run more than once: each loop's
-    body, and a while loop's test."""
-    loops = [node for node in nodes if isinstance(node, (ast.For, ast.AsyncFor, ast.While))]
-    return {id(inner) for loop in loops
-            for inner in walk_same_scope(loop.body + ([loop.test] if isinstance(loop, ast.While) else []))}
-
-
-def _writes_self_attribute(stmt: ast.AST, attr: str) -> bool:
-    if isinstance(stmt, ast.Assign):
-        targets = stmt.targets
-    elif isinstance(stmt, (ast.AnnAssign, ast.AugAssign)):
-        targets = [stmt.target]
-    else:
-        return False
-    return any(_is_self_attribute(sub, attr) for target in targets for sub in ast.walk(target))
-
-
-def _reads_before_writing(body: list[ast.stmt], attr: str) -> bool:
-    """Whether a call to this method reads `self.<attr>` before writing it,
-    with the read outside any loop.
-
-    That read can only see what an earlier call (or __init__) left there:
-    `if self._key != key: ...; self._key = key` remembers what is cached, and
-    `self._total = add(self._total, x)` carries a running value. A write takes
-    effect when its statement ends, so the read in `self.x = f(self.x)` comes
-    first. A read inside a loop may see this call's own earlier write, so it
-    proves nothing.
-    """
-    nodes = list(walk_same_scope(body))
-    repeated = _repeated(nodes)
-    reads = [(node.lineno, node.col_offset) for node in nodes
-             if _is_self_attribute(node, attr) and isinstance(node.ctx, ast.Load) and id(node) not in repeated]
-    writes = [(stmt.end_lineno, stmt.end_col_offset) for stmt in nodes if _writes_self_attribute(stmt, attr)]
-    return bool(reads) and (not writes or min(reads) < min(writes))
 
 
 class DesignSmellDetector(ast.NodeVisitor):
