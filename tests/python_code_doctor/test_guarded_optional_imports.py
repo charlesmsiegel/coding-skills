@@ -40,6 +40,12 @@ DETECTORS = (
 )
 
 
+# library_available() alone: the guard that degrades (it returns False).
+AVAILABLE = DETECTORS[:DETECTORS.index("def detect")]
+# The line of detect()'s import, whose handler re-raises as an error of its own.
+DETECT_LINE = DETECTORS.splitlines().index("        from ultralytics import YOLO") + 1
+
+
 def run_detector(script: str, target: Path) -> list[dict]:
     result = subprocess.run(
         [sys.executable, str(SCRIPTS_DIR / script), str(target), "--format", "json"],
@@ -66,12 +72,17 @@ def kinds(root: Path) -> dict[str, str]:
 
 
 def test_an_import_guarded_by_except_importerror_is_not_a_missing_dependency(tmp_path):
+    """anima-ui's detectors.py: library_available()'s guard degrades and is not
+    reported; detect()'s re-raises, so that one site is an unscored lead."""
     write(tmp_path, "pyproject.toml", MANIFEST)
     write(tmp_path, "src/app/__init__.py", "")
     write(tmp_path, "src/app/detectors.py", DETECTORS)
     write(tmp_path, "src/app/cli.py", "def serve():\n    import anyio\n    return anyio\n")
 
-    assert missing(tmp_path) == ["anyio"], "the unguarded import still fires; the guarded one does not"
+    records = {f["description"].split("'")[1]: f for f in run_detector("find_dependency_issues.py", tmp_path)
+               if f["smell_type"] == "missing_dependency"}
+    assert {name: r["kind"] for name, r in records.items()} == {"anyio": "finding", "ultralytics": "candidate"}
+    assert records["ultralytics"]["line"] == DETECT_LINE
 
 
 def test_every_spelling_of_the_guard_counts(tmp_path):
@@ -151,7 +162,7 @@ def test_a_declared_optional_dependency_imported_only_under_the_guard_is_used(tm
 
 
 def test_no_manifest_is_not_charged_for_optional_imports_alone(tmp_path):
-    write(tmp_path, "detectors.py", DETECTORS)
+    write(tmp_path, "detectors.py", AVAILABLE)
     assert run_detector("find_dependency_issues.py", tmp_path) == []
 
     write(tmp_path, "client.py", "import requests\n")
@@ -206,17 +217,24 @@ def test_a_shared_guard_spares_only_the_import_its_handler_replaces(tmp_path):
     assert kinds(tmp_path) == {"requests": "candidate", "numpy": "candidate", "scipy": "candidate"}
 
 
-def test_a_site_that_degrades_makes_the_module_optional_and_one_that_stops_does_not(tmp_path):
-    """anima-ui's detect() re-raises as DetectorUnavailable: alone, that is a lead.
-    Beside library_available(), which returns False, the program demonstrably runs
-    without the package."""
-    split = DETECTORS.index("def detect")
+def test_a_guard_that_stops_stays_a_lead_however_the_module_is_guarded_elsewhere(tmp_path):
+    """One optional guard does not speak for every site: a test that sets
+    `requests = None` to skip network tests says nothing about the entry point
+    that exits without it. A plain import anywhere is still a finding."""
     write(tmp_path, "pyproject.toml", MANIFEST)
-    write(tmp_path, "app/detect.py", DETECTORS[split:])
-    assert kinds(tmp_path) == {"ultralytics": "candidate"}
+    write(tmp_path, "app/main.py",
+          "import sys\n\ntry:\n    import requests\nexcept ImportError:\n"
+          "    sys.exit('requests is required: pip install requests')\n")
+    write(tmp_path, "tests/test_net.py", "try:\n    import requests\nexcept ImportError:\n    requests = None\n")
+    lead = next(f for f in run_detector("find_dependency_issues.py", tmp_path) if f["smell_type"] == "missing_dependency")
+    assert lead["kind"] == "candidate" and lead["file"].replace("\\", "/").endswith("app/main.py") and lead["line"] == 4
 
-    write(tmp_path, "app/available.py", DETECTORS[:split])
-    assert kinds(tmp_path) == {}
+    write(tmp_path, "app/available.py", AVAILABLE)
+    write(tmp_path, "app/detect.py", DETECTORS[len(AVAILABLE):])
+    assert kinds(tmp_path) == {"requests": "candidate", "ultralytics": "candidate"}
+
+    write(tmp_path, "app/fetch.py", "import requests\n")
+    assert kinds(tmp_path) == {"requests": "finding", "ultralytics": "candidate"}
 
 
 @pytest.mark.parametrize("broad", ["Exception", "BaseException", "(OSError, Exception)", "builtins.Exception"])

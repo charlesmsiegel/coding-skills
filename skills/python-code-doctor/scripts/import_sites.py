@@ -2,7 +2,7 @@
 
 find_dependency_issues.py asks two questions of every import before it charges
 a missing dependency. Is an ImportError raised here handled — by a handler
-that carries on (an optional import), or one that raises or exits? And does
+that visibly degrades (an optional import), or by one that does not? And does
 the import run after the file puts a directory on sys.path that the source
 cannot place inside the project, so the module may be served from there? Both
 are read from the one file's AST; the whole-tree reconciliation against the

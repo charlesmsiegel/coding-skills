@@ -100,8 +100,11 @@ versions that float (so "works today" doesn't mean "works tomorrow").
   `die()` helper, an aliased exit or `return 1` from `main()` may be too. So the
   module is a *candidate* (a wrong guess costs a lead, not a silence), as is
   one imported in a `try` with other imports whose handler replaces only the
-  others. One guarded site that carries on makes the module optional everywhere;
-  one unguarded import of the same name anywhere makes it required again; a bare
+  others. A guarded site that degrades speaks only for itself: another site of the
+  same module whose handler stops is still a candidate, and one unguarded import of
+  the same name anywhere makes it required again. (A repo with no manifest whose
+  third-party imports are all exit-guarded gets one candidate per module rather
+  than the `no_dependency_manifest` finding.) A bare
   `except:` or `except Exception:` does not count as a guard, and neither does an
   `except ImportError:` written after one, which never runs. A module imported only after its
   own file puts a directory on `sys.path` that the source cannot place inside the

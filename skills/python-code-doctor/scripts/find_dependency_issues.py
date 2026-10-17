@@ -19,9 +19,10 @@ Deliberately NOT charged as missing:
     name), or a warnings.warn / logging call. The code runs on without the
     package, so it is optional by construction. When the try body
     imports more than one module, only an import the handler replaces with
-    another import of the same name is optional. One such site anywhere makes
-    the module optional, unless an unguarded import of it elsewhere makes it
-    required. It still counts as a use of a declared dependency (an extra). A
+    another import of the same name is optional. An optional site speaks only
+    for itself: another site of the same module that stops is still a lead, and
+    an unguarded one is still a finding. It still counts as a use of a declared
+    dependency (an extra). A
     bare `except:` or `except Exception:` also catches the error but does not
     say the import was meant to be optional, so it does not count — and an
     `except ImportError:` placed after one never runs, so it does not count either.
@@ -34,7 +35,9 @@ Reported as a candidate, not a finding:
     detector cannot call a degrade (a helper that may exit, `return 1`,
     argparse's error()) — or the try body imports other modules and the handler
     replaces none of this one's names. An unrecognised handler costs a lead,
-    never silence.
+    never silence. One residual: a repo with no manifest whose third-party
+    imports are all guarded this way gets one candidate per module, not the
+    no_dependency_manifest finding.
   - an undeclared module every import of which follows, in its own file, a
     sys.path addition (sys.path.insert/append/extend, `sys.path += [...]`,
     site.addsitedir) whose directory the source cannot place inside the project:
@@ -507,11 +510,9 @@ def analyze(root: Path, ignore: set) -> list[CodeSmell]:
         # a tests/ directory needs no __init__.py for it to work.
         sites = [s for s in sites if not _resolves_beside(mod, Path(s.file))]
         # An optional import is one the code runs without: the package being
-        # absent is handled where it is imported, so no manifest owes it. One
-        # such site shows the program is built to run without the module, unless
-        # a plain import elsewhere makes it required.
-        if not any(s.plain for s in sites) and any(s.guard == "optional" for s in sites):
-            continue
+        # absent is handled where it is imported, so no manifest owes it. It
+        # speaks only for itself: a site that stops, or follows an opaque
+        # sys.path addition, stays a lead, and a plain import stays a finding.
         sites = [s for s in sites if s.guard != "optional"]
         if sites:
             third_party_imports[mod] = sites
