@@ -491,12 +491,30 @@ class _Method:
     derived_reads: set = field(default_factory=set)   # `<self-derived local>.<name>`
     other: dict = field(default_factory=dict)        # foreign name -> access count
     chains: list = field(default_factory=list)
+    params: set = field(default_factory=set)          # the method's own parameter names
+    constructs: bool = False                          # builds the object (see _constructs)
+
+
+def _constructs(func, receiver) -> bool:
+    """`__init__` / `__new__` / `__post_init__`, or a `from_*` classmethod that
+    returns `cls(...)`: a method whose job is to build the object from what it
+    was handed."""
+    if func.name in _INITIALIZERS - {"__init_subclass__"}:
+        return True
+    is_classmethod = any(getattr(dec, "id", getattr(dec, "attr", None)) == "classmethod"
+                         for dec in func.decorator_list)
+    return (is_classmethod and func.name.startswith("from_") and receiver is not None
+            and any(isinstance(n, ast.Call) and isinstance(n.func, ast.Name) and n.func.id == receiver
+                    for n in _method_nodes(func.body)))
 
 
 def _read_method(func, module_names: set, types: "_ExternalTypes | None" = None) -> _Method:
     receiver = _receiver(func)
     derivation = _Derivation(func, receiver)
     method = _Method(func.name, func.lineno, receiver)
+    method.params = {a.arg for a in [*func.args.posonlyargs, *func.args.args, *func.args.kwonlyargs,
+                                     func.args.vararg, func.args.kwarg] if a is not None}
+    method.constructs = _constructs(func, receiver)
     for node in _method_nodes(func.body):
         if not isinstance(node, ast.Attribute):
             continue
@@ -601,6 +619,8 @@ def _analyze_class(node: ast.ClassDef, filename: str, module_names: set,
             for name, count in read.other.items():
                 merged.other[name] = merged.other.get(name, 0) + count
             merged.chains += read.chains
+            merged.params |= read.params
+            merged.constructs = merged.constructs and read.constructs
         else:
             methods[func.name] = read
 
@@ -625,6 +645,10 @@ def _analyze_class(node: ast.ClassDef, filename: str, module_names: set,
     for method in methods.values():
         self_accesses = len(set(method.self_names) | method.derived_reads)
         for other_obj, count in method.other.items():
+            # A constructor building itself from the configuration it was handed is
+            # what a parameter object is for; moving it onto that object is no remedy.
+            if method.constructs and other_obj in method.params:
+                continue
             if count > self_accesses and count >= 3:
                 issues.append(CouplingIssue(
                     file=filename, line=method.line,

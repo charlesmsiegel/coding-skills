@@ -5440,3 +5440,41 @@ def test_a_framework_hook_override_keeps_the_frameworks_signature(tmp_path, scri
     if finding_type == "parameter_count":
         expected = sorted(expected + _lines_marked(_FRAMEWORK_HOOKS, "# fires: count"))
     assert lines == expected
+
+
+_CONSTRUCTOR_ENVY = (
+    "class Adapter:\n"
+    "    def __init__(self, geometry):\n"
+    "        self.dim = geometry.dim\n"
+    "        self.heads = geometry.heads\n"
+    "        self.layers = geometry.layers\n"
+    "        self.width = geometry.width + geometry.depth + geometry.ratio\n"
+    "\n"
+    "    @classmethod\n"
+    "    def from_config(cls, config):\n"
+    "        return cls(config.a, config.b, config.c, config.d)\n"
+    "\n"
+    "    @classmethod\n"
+    "    def from_text(cls, config):  # fires\n"
+    "        return build(config.a, config.b, config.c, config.d)\n"
+    "\n"
+    "    def configure(self, geometry):  # fires\n"
+    "        return (geometry.a + geometry.b + geometry.c + geometry.d + geometry.e + geometry.f\n"
+    "                + geometry.g + geometry.h + geometry.i + geometry.j + geometry.k + geometry.l\n"
+    "                + self.x + self.y)\n"
+    "\n"
+    "class Loaded:\n"
+    "    def __init__(self, path):  # fires\n"
+    "        config = load(path)\n"
+    "        self.a = config.a + config.b + config.c + config.d\n"
+    "\n"
+    "    def size(self):\n"
+    "        return self.a\n"
+)
+
+
+def test_a_constructor_reading_the_configuration_it_was_handed_is_not_envy(tmp_path):
+    """Building yourself from a parameter object is what the parameter object is for;
+    moving `__init__` onto it is not a remedy."""
+    envy = sorted(r["line"] for r in _coupling(tmp_path, _CONSTRUCTOR_ENVY, "feature_envy"))
+    assert envy == _lines_marked(_CONSTRUCTOR_ENVY)
