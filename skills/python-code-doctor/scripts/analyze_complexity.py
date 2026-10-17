@@ -45,7 +45,7 @@ import json
 import argparse
 from pathlib import Path
 from dataclasses import dataclass, asdict
-from common import count_parameters, framework_hook_overrides, parameter_severity, signature_is_a_contract, sort_findings, cached_parse, SEVERITY_ICONS, configure_output, find_python_files, warn_detector_error
+from common import count_parameters, framework_hook_overrides, parameter_severity, signature_is_a_contract, sort_findings, cached_parse, SEVERITY_ICONS, configure_output, find_python_files, warn_detector_error, looks_like_test
 
 
 @dataclass
@@ -104,15 +104,6 @@ _SUGGESTIONS = {
 }
 
 
-def _looks_like_test(path: Path) -> bool:
-    """A test module or test scaffolding, judged by its path alone."""
-    if path.name == "conftest.py":
-        return True
-    if path.stem.startswith("test_") or path.stem.endswith("_test"):
-        return True
-    return bool({part.lower() for part in path.parts} & {"tests", "test"})
-
-
 def _decorator_name(decorator: ast.AST) -> str | None:
     target = decorator.func if isinstance(decorator, ast.Call) else decorator
     if isinstance(target, ast.Attribute):
@@ -163,7 +154,7 @@ class ComplexityVisitor(ast.NodeVisitor):
         self.ignore = ignore
         self.issues: list[ComplexityIssue] = []
         self.current_class = None
-        self.is_test_file = _looks_like_test(Path(filename))
+        self.is_test_file = looks_like_test(Path(filename))
         # Functions written directly in a class body: the ones Python binds a
         # first argument for.
         self._methods: set[int] = set()

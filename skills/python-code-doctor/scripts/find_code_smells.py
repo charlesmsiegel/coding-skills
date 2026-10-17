@@ -22,16 +22,7 @@ import argparse
 from pathlib import Path
 from dataclasses import dataclass, asdict
 from collections import defaultdict
-from common import count_parameters, framework_hook_overrides, is_test_file, parameter_severity, signature_is_a_contract, sort_findings, cached_parse, SEVERITY_ICONS, configure_output, find_python_files, warn_detector_error, warn_unparseable
-
-
-def _looks_like_test(path: Path) -> bool:
-    """A test module or test scaffolding, judged by its path alone."""
-    if path.name == "conftest.py":
-        return True
-    if path.stem.startswith("test_") or path.stem.endswith("_test"):
-        return True
-    return bool({part.lower() for part in path.parts} & {"tests", "test"})
+from common import count_parameters, framework_hook_overrides, is_test_file, parameter_severity, signature_is_a_contract, sort_findings, cached_parse, SEVERITY_ICONS, configure_output, find_python_files, warn_detector_error, warn_unparseable, looks_like_test
 
 
 # Callables whose first positional argument is an HTTP status code.
@@ -234,7 +225,7 @@ class CodeSmellDetector(ast.NodeVisitor):
         self._framework_imports = {}
         self._object_is_builtin = True
         self._framework_meta_nodes = set()
-        self.is_test_file = _looks_like_test(Path(filename))
+        self.is_test_file = looks_like_test(Path(filename))
 
     def visit_Module(self, node: ast.Module):
         self._hooks = framework_hook_overrides(node)

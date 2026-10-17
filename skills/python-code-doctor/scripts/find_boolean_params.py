@@ -31,7 +31,7 @@ import argparse
 from pathlib import Path
 from dataclasses import dataclass, asdict
 from collections import defaultdict
-from common import is_cli_command, is_test_file, sort_findings, cached_parse, SEVERITY_ICONS, configure_output, find_python_files, warn_detector_error, warn_unparseable
+from common import is_cli_command, is_test_file, sort_findings, cached_parse, SEVERITY_ICONS, configure_output, find_python_files, warn_detector_error, warn_unparseable, is_route_handler
 
 
 @dataclass
@@ -49,21 +49,10 @@ class CodeSmell:
 
 _SKIP = {"self", "cls"}
 
-# Decorator methods that register a web route handler.
-_ROUTE_DECORATORS = frozenset({
-    "get", "post", "put", "patch", "delete", "head", "options",
-    "api_route", "route", "websocket",
-})
-
 _KEYWORD_FLAGS_REASONS = (
     "every flag is keyword-only, so each call site names what it turns on, and "
     "options that tune one operation are not several operations",
 )
-
-
-def _is_route_handler(node) -> bool:
-    return any(isinstance(d, ast.Call) and isinstance(d.func, ast.Attribute)
-               and d.func.attr in _ROUTE_DECORATORS for d in node.decorator_list)
 
 
 def _is_bool_const(node) -> bool:
@@ -99,7 +88,7 @@ class BooleanParamDetector(ast.NodeVisitor):
         bool_positional = []   # bool-default params that can be passed positionally
         bool_total = 0
         # The framework binds a route handler's arguments by name.
-        keyword_bound = _is_route_handler(node)
+        keyword_bound = is_route_handler(node)
 
         if defaults:
             for arg, default in zip(positional[-len(defaults):], defaults):

@@ -33,7 +33,7 @@ from pathlib import Path
 from dataclasses import dataclass, asdict
 from typing import Set, List, Tuple, Optional
 from collections import defaultdict
-from common import project_parts, sort_findings, SEVERITY_ICONS, configure_output, find_python_files, warn_detector_error, warn_unparseable
+from common import project_parts, sort_findings, SEVERITY_ICONS, configure_output, find_python_files, warn_detector_error, warn_unparseable, ROUTE_VERBS
 
 
 @dataclass
@@ -347,12 +347,6 @@ def _collect_dynamic_imports(tree: ast.AST, nodes: list) -> tuple[Set[str], List
 # Web routes
 # ---------------------------------------------------------------------------
 
-# The verbs a router or app object registers a handler under: FastAPI and
-# Starlette (get/post/.../api_route/websocket), Flask and friends (route).
-_ROUTE_VERBS = frozenset({"get", "post", "put", "patch", "delete", "head", "options",
-                          "api_route", "route", "websocket"})
-
-
 def _route_templates(tree: ast.AST) -> List[str]:
     """The path templates of every route handler the module registers.
 
@@ -365,7 +359,7 @@ def _route_templates(tree: ast.AST) -> List[str]:
             continue
         for dec in node.decorator_list:
             if not (isinstance(dec, ast.Call) and isinstance(dec.func, ast.Attribute)
-                    and dec.func.attr in _ROUTE_VERBS):
+                    and dec.func.attr in ROUTE_VERBS):
                 continue
             path = dec.args[0] if dec.args else next(
                 (kw.value for kw in dec.keywords if kw.arg in ("path", "rule")), None)

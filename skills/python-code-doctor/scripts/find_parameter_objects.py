@@ -31,7 +31,7 @@ from pathlib import Path
 from dataclasses import dataclass, asdict, field
 from itertools import combinations
 from collections import defaultdict
-from common import configure_output, find_python_files, is_test_file, warn_detector_error, warn_unparseable
+from common import configure_output, find_python_files, is_test_file, warn_detector_error, warn_unparseable, looks_like_test, is_route_handler
 
 
 @dataclass
@@ -54,10 +54,6 @@ _SKIP = {"self", "cls"}
 _INITIALIZERS = {"__init__", "__new__", "__post_init__"}
 
 
-ROUTE_DECORATORS = frozenset({
-    "get", "post", "put", "patch", "delete", "head", "options",
-    "api_route", "route", "websocket",
-})
 
 def _decorator_name(decorator: ast.AST) -> str | None:
     target = decorator.func if isinstance(decorator, ast.Call) else decorator
@@ -75,10 +71,7 @@ def _framework_called(node, in_test_file: bool) -> bool:
     for decorator in node.decorator_list:
         if _decorator_name(decorator) == "fixture":
             return True
-        if isinstance(decorator, ast.Call) and isinstance(decorator.func, ast.Attribute) \
-                and decorator.func.attr in ROUTE_DECORATORS:
-            return True  # route handler: bound from the request
-    return False
+    return is_route_handler(node)  # route handler: bound from the request
 
 
 def _param_names(args: ast.arguments):

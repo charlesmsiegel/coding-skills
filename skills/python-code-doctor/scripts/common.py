@@ -391,6 +391,23 @@ def looks_like_test(path) -> bool:
     return is_test_file(Path(path))
 
 
+# The verbs a router or app object registers a handler under: FastAPI and
+# Starlette (get/post/.../api_route/websocket), Flask and friends (route).
+ROUTE_VERBS = frozenset({"get", "post", "put", "patch", "delete", "head", "options",
+                         "api_route", "route", "websocket"})
+
+
+def is_route_handler(node) -> bool:
+    """True for a function registered by a decorator call like `@router.get(...)`.
+
+    The framework, not the author, calls it: its parameters are bound by name from
+    the request, and its return annotation becomes the response model, so several
+    rules that are about a function's callers do not apply to it.
+    """
+    return any(isinstance(dec, ast.Call) and isinstance(dec.func, ast.Attribute)
+               and dec.func.attr in ROUTE_VERBS for dec in node.decorator_list)
+
+
 # A noqa comment's code list followed by a separator and some text: the suppression
 # says why. The separators are the ones people actually type after a noqa list;
 # the reason must start with something other than another separator character,
