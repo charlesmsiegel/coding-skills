@@ -195,15 +195,6 @@ class TsFile:
             return self.lines[line - 1].strip()[:width]
         return ""
 
-    def comments_between(self, open_index: int, close_index: int) -> list[Token]:
-        """Comments lying strictly between the tokens at two indices.
-
-        Comments are not tokens, so they have no token index to compare: their
-        position is a character offset, and so is the boundary each side.
-        """
-        low, high = self.tokens[open_index].end, self.tokens[close_index].start
-        return [c for c in self.comments if low <= c.start < high]
-
     def names(self, start: int = 0, stop: int | None = None):
         """Every identifier the code in [start, stop) names, template substitutions included.
 
