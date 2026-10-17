@@ -11,8 +11,8 @@ import re
 
 # In code the scanner jumps between the characters that can open a comment or
 # a literal (and, inside a ${...} substitution, the braces that can close it).
-_CODE_STOP = re.compile(r"[\"'`/]")
-_SUBST_STOP = re.compile(r"[\"'`/{}]")
+_CODE_STOP = re.compile(r"[\"'`/()]")
+_SUBST_STOP = re.compile(r"[\"'`/(){}]")
 _STRING = {
     "'": re.compile(r"'(?:[^'\\\n]|\\.)*'", re.S),
     '"': re.compile(r'"(?:[^"\\\n]|\\.)*"', re.S),
@@ -27,10 +27,8 @@ _REGEX_KEYWORDS = frozenset({
     "return", "throw", "typeof", "void", "yield"})
 
 
-def _regex_allowed(text, i, comment_starts):
-    """Whether a `/` at text[i] opens a regex literal, judged by the token
-    before it: an operand (identifier, number, `)`, `]`, a literal) makes it
-    a division."""
+def _previous_code_end(text, i, comment_starts):
+    """Last code character before i; comments and whitespace have no token value."""
     j = i - 1
     while j >= 0:
         if j + 1 in comment_starts:
@@ -39,7 +37,13 @@ def _regex_allowed(text, i, comment_starts):
             j -= 1
         else:
             break
-    if j < 0 or text[j] in _REGEX_AFTER:
+    return j
+
+
+def _regex_allowed(text, i, comment_starts, control_closers):
+    """An operand makes `/` divide; a control condition ends before a statement."""
+    j = _previous_code_end(text, i, comment_starts)
+    if j < 0 or j in control_closers or text[j] in _REGEX_AFTER:
         return True
     k = j
     while k >= 0 and (text[k].isalnum() or text[k] in "_$"):
@@ -61,6 +65,7 @@ def scan_js(text):
     n = len(text)
     out, literals = [], []
     comment_starts = {}  # comment end -> start, for finding the preceding code token
+    parens, control_closers = [], set()
     resume = []  # brace depth at each open ${ substitution, innermost last
     depth = copied = i = 0
 
@@ -83,7 +88,20 @@ def scan_js(text):
             break
         i = stop.start()
         c = text[i]
-        if c == "{":
+        if c == "(":
+            j = _previous_code_end(text, i, comment_starts)
+            k = j
+            while k >= 0 and (text[k].isalnum() or text[k] in "_$"):
+                k -= 1
+            before = _previous_code_end(text, k + 1, comment_starts)
+            parens.append(text[k + 1:j + 1] in {"if", "while", "for", "with"}
+                          and (before < 0 or text[before] != "."))
+            i += 1
+        elif c == ")":
+            if parens and parens.pop():
+                control_closers.add(i)
+            i += 1
+        elif c == "{":
             depth += 1
             i += 1
         elif c == "}":
@@ -111,7 +129,7 @@ def scan_js(text):
             out += [text[copied:i], re.sub(r"[^\n]", " ", text[i:end])]
             copied = i = end
         else:
-            m = _REGEX.match(text, i) if _regex_allowed(text, i, comment_starts) else None
+            m = _REGEX.match(text, i) if _regex_allowed(text, i, comment_starts, control_closers) else None
             if m:
                 literals.append(m.span())
             i = m.end() if m else i + 1
