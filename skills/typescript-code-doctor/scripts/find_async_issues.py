@@ -174,17 +174,43 @@ def _rejection_handler(file: TsFile, start: int, stop: int, seen=frozenset()) ->
     if stop == start + 1 and token.kind == "name":
         if token.value in seen:
             return False
-        # Follow visible simple assignments so `const onErr = undefined` is
-        # not mistaken for a handler merely because it has a name.
+        # Resolve the nearest visible binding, never a same-named property
+        # or an outer binding shadowed by a parameter/local declaration.
+        active = [func for func in file.functions if func.has_body and func.body_open < start < func.body_close]
+        binding_floor = max((func.body_open for func in active
+                             if any(p.name == token.value for p in func.params)), default=-1)
+        for declared in file.functions:
+            if declared.name == token.value and declared.owner is None:
+                owner = file.enclosing_function(declared.start)
+                if owner is None or any(owner is func for func in active):
+                    binding_floor = max(binding_floor, owner.body_open if owner is not None else -1)
+        bindings = []
         for index in range(start):
-            if file.tokens[index].is_name(token.value) and file.value(index + 1) == "=":
-                owner = file.enclosing_function(index)
-                if owner is None or owner.body_open < start < owner.body_close:
-                    end = statement_end(file, index + 2)
-                    if end > index + 2 and file.tokens[end - 1].is_op(";"):
-                        end -= 1
-                    if not _rejection_handler(file, index + 2, end, seen | {token.value}):
-                        return False
+            if not file.tokens[index].is_name(token.value) or file.is_jsx_attribute(index):
+                continue
+            if index and file.tokens[index - 1].is_op(".", "?."):
+                continue
+            assignment = index + 1
+            if file.value(assignment) == ":":
+                declaration = statement_start(file, index)
+                if not file.tokens[declaration].is_name("const", "let", "var"):
+                    continue  # a property/parameter annotation is not a variable initializer
+                assignment = file.find_op("=", assignment + 1, statement_end(file, declaration))
+            if assignment < 0 or file.value(assignment) != "=":
+                continue
+            owner = file.enclosing_function(index)
+            if owner is not None and not owner.body_open < start < owner.body_close:
+                continue
+            depth = owner.body_open if owner is not None else -1
+            if depth >= binding_floor:
+                end = statement_end(file, assignment + 1)
+                if end > assignment + 1 and file.tokens[end - 1].is_op(";"):
+                    end -= 1
+                bindings.append((depth, assignment + 1, end))
+        if bindings:
+            nearest = max(depth for depth, _, _ in bindings)
+            _, begin, end = max((row for row in bindings if row[0] == nearest), key=lambda row: row[1])
+            return _rejection_handler(file, begin, end, seen | {token.value})
     return True
 
 
