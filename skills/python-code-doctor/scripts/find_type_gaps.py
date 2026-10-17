@@ -20,7 +20,7 @@ import argparse
 from pathlib import Path
 from dataclasses import dataclass, asdict
 from collections import defaultdict
-from common import sort_findings, cached_parse, SEVERITY_ICONS, configure_output, find_python_files, warn_detector_error, warn_unparseable
+from common import project_parts, sort_findings, cached_parse, SEVERITY_ICONS, configure_output, find_python_files, warn_detector_error, warn_unparseable
 
 
 @dataclass
@@ -41,7 +41,7 @@ def _get_line(lines, lineno):
 
 
 def _is_test_file(filepath: Path) -> bool:
-    parts = filepath.parts
+    parts = project_parts(filepath)[:-1]  # below its project, not wherever it is checked out
     if "tests" in parts:
         return True
     name = filepath.name

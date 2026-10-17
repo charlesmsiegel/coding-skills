@@ -34,6 +34,7 @@ from typing import Callable
 from common import (
     configure_output,
     find_python_files,
+    set_analysis_root,
     warn_detector_error,
 )
 
@@ -130,9 +131,17 @@ def _records(found, module=None) -> list[dict]:
 # --------------------------------------------------------------------------- #
 
 def run_file_shard(paths: list[Path], specs: list[tuple[str, str]],
-                   ignore: set[str]) -> dict[str, object]:
-    """Ask every file detector about each file in the shard, parsing it once."""
+                   ignore: set[str], root: Path | None = None) -> dict[str, object]:
+    """Ask every file detector about each file in the shard, parsing it once.
+
+    ``root`` is the directory being analysed. It is recorded in this worker
+    (common.set_analysis_root) so a detector can tell a project's `tests/`
+    from the directory it happens to be checked out under; passed as a
+    parameter because a spawned worker does not inherit the parent's globals.
+    """
     configure_output()
+    if root is not None:
+        set_analysis_root(root)
     detectors, modules, out = [], {}, {}
     for category, module_name in specs:
         out[category] = []
@@ -170,6 +179,7 @@ def run_tree_detector(path: Path, category: str, module_name: str,
     to disturb the order.
     """
     configure_output()
+    set_analysis_root(path)
     try:
         module = importlib.import_module(module_name)
         return {category: _records(module.analyze_tree(path, ignore), module)}
@@ -198,7 +208,7 @@ def run_detectors(path: str, file_specs: list[tuple[str, str]],
 
     if jobs == 1:
         for shard in shards:
-            _absorb(results, run_file_shard(shard, file_specs, ignore))
+            _absorb(results, run_file_shard(shard, file_specs, ignore, root))
         for category, module_name in tree_specs:
             _absorb(results, run_tree_detector(root, category, module_name, ignore))
         return _finish(results, file_specs, tree_specs)
@@ -216,7 +226,7 @@ def run_detectors(path: str, file_specs: list[tuple[str, str]],
     died = None
     with pool:
         try:
-            shard_futures = [pool.submit(run_file_shard, shard, file_specs, ignore)
+            shard_futures = [pool.submit(run_file_shard, shard, file_specs, ignore, root)
                              for shard in shards]
             tree_futures = [pool.submit(run_tree_detector, root, category, module_name, ignore)
                             for category, module_name in tree_specs]

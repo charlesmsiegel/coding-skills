@@ -24,7 +24,7 @@ from pathlib import Path
 from dataclasses import dataclass, asdict
 from typing import Iterator
 from collections import defaultdict
-from common import (sort_findings, cached_parse, SEVERITY_ICONS, configure_output, find_python_files,
+from common import (is_test_file, sort_findings, cached_parse, SEVERITY_ICONS, configure_output, find_python_files,
                     warn_detector_error, warn_unparseable)
 
 
@@ -809,10 +809,7 @@ def analyze_file(filepath: Path, ignore: set[str]) -> list[DesignSmell]:
     try:
         source, tree = cached_parse(filepath)
         lines = source.splitlines()
-        is_test_file = (filepath.name.startswith("test_") or filepath.name.endswith("_test.py")
-                        or filepath.name == "conftest.py"
-                        or "tests" in filepath.parts or "test" in filepath.parts)
-        detector = DesignSmellDetector(str(filepath), lines, tree, ignore, is_test_file)
+        detector = DesignSmellDetector(str(filepath), lines, tree, ignore, is_test_file(filepath))
         detector.visit(tree)
         return detector.issues
     except (SyntaxError, ValueError, OSError) as exc:
