@@ -99,8 +99,9 @@ versions that float (so "works today" doesn't mean "works tomorrow").
   ImportError(...)` or a bare `raise` is how a script says x is required, and a
   `die()` helper, an aliased exit or `return 1` from `main()` may be too. So the
   module is a *candidate* (a wrong guess costs a lead, not a silence), as is
-  one imported in a `try` with other imports whose handler replaces only the
-  others. A guarded site that degrades speaks only for itself: another site of the
+  one imported in a `try` with other third-party imports (stdlib and relative
+  ones do not count) whose handler rebinds only the others' names — `x = None`,
+  `x = fallback` or a fallback import is what makes each one optional. A guarded site that degrades speaks only for itself: another site of the
   same module whose handler stops is still a candidate, and one unguarded import of
   the same name anywhere makes it required again. (A repo with no manifest whose
   third-party imports are all exit-guarded gets one candidate per module rather

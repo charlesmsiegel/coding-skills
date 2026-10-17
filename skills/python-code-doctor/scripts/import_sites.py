@@ -11,6 +11,7 @@ manifests stays in the detector.
 
 import ast
 import os
+import sys
 from dataclasses import dataclass
 from pathlib import Path, PurePath
 
@@ -116,11 +117,14 @@ def _bound_names(node) -> set[str]:
     return {a.asname or a.name for a in node.names if a.name != "*"}
 
 
-def _module_keys(node) -> set[str]:
-    """The top-level modules an import statement loads, relative ones by their dots."""
-    if isinstance(node, ast.Import):
-        return {a.name.split(".")[0] for a in node.names}
-    return {"." * node.level + (node.module or "").split(".")[0]}
+def _third_party_keys(node) -> set[str]:
+    """The top-level modules an import statement loads that could need a manifest
+    entry: neither relative nor in the standard library."""
+    if isinstance(node, ast.ImportFrom):
+        names = [] if node.level else [(node.module or "").split(".")[0]]
+    else:
+        names = [a.name.split(".")[0] for a in node.names]
+    return {n for n in names if n and n not in sys.stdlib_module_names}
 
 
 def _imports_in(stmts: list) -> list:
@@ -131,15 +135,17 @@ def _imports_in(stmts: list) -> list:
 class _Guard:
     """A `try` whose ImportError handlers bear on the imports in its body."""
     carries_on: bool        # some handler that catches the error visibly degrades
-    fallbacks: frozenset    # names those handlers bind by importing a replacement
-    shared: bool            # the body imports more than one module
+    fallbacks: frozenset    # names those handlers rebind: `x = None`, `x = y`, a fallback import
+    shared: bool            # the body imports more than one third-party module
 
     @classmethod
     def of(cls, node, handlers: list, aliases: dict) -> "_Guard":
         guarded = {name for n in _imports_in(node.body) for name in _bound_names(n)}
         carrying = [h for h in handlers if _carries_on(h, guarded, aliases)]
-        fallbacks = frozenset(name for h in carrying for n in _imports_in(h.body) for name in _bound_names(n))
-        modules = {key for n in _imports_in(node.body) for key in _module_keys(n)}
+        fallbacks = frozenset(name for h in carrying for stmt in walk_same_scope(h.body)
+                              if isinstance(stmt, (ast.Assign, ast.AnnAssign, ast.Import, ast.ImportFrom))
+                              for name in _rebound(stmt))
+        modules = {key for n in _imports_in(node.body) for key in _third_party_keys(n)}
         return cls(bool(carrying), fallbacks, len(modules) > 1)
 
     def verdict(self, node) -> str:

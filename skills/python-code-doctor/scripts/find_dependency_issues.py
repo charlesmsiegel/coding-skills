@@ -17,9 +17,10 @@ Deliberately NOT charged as missing:
     statement is `pass`, `continue`, a falsy `return`, a rebinding of the
     guarded name (`x = None`, `x = fallback`, a fallback import of the same
     name), or a warnings.warn / logging call. The code runs on without the
-    package, so it is optional by construction. When the try body
-    imports more than one module, only an import the handler replaces with
-    another import of the same name is optional. An optional site speaks only
+    package, so it is optional by construction. When the try body imports
+    more than one third-party module (stdlib and relative imports aside), only
+    an import whose name a degrading handler rebinds — `x = None`, `x =
+    fallback`, or a fallback import — is optional. An optional site speaks only
     for itself: another site of the same module that stops is still a lead, and
     an unguarded one is still a finding. It still counts as a use of a declared
     dependency (an extra). A
@@ -120,8 +121,8 @@ _GUARD_REASONS = {
         "host, a GPU stack, a system package), and the handler is that step's error message",
     ),
     "shared": (
-        "the imports in the try are one optional feature that the handler switches off together "
-        "(placeholders such as `x = None`, or a flag such as `HAVE_X = False`)",
+        "the imports in the try are one optional feature that the handler switches off as a whole, "
+        "through placeholders for some of the names or a flag such as `HAVE_X = False`",
     ),
 }
 
@@ -405,8 +406,8 @@ def _lead(mod: str, sites: list[ImportSite]) -> CodeSmell:
                "how a required dependency announces itself and also how an optional extra's entry "
                "point reports that it is missing")
     elif first.guard == "shared":
-        why = ("it is imported here in a try with other imports, and the ImportError handler replaces "
-               "none of its names, so it may be optional along with them or required and merely caught")
+        why = ("it is imported here in a try with other third-party imports, and the ImportError handler "
+               "rebinds none of its names, so it may be optional along with them or required and merely caught")
     else:
         why = (f"it is imported here after line {first.after_path} puts a directory on sys.path that "
                f"the source cannot place inside this project, so it may be served from that directory")
