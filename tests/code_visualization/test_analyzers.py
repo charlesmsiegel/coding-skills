@@ -3145,3 +3145,140 @@ def test_extraction_gives_coverage_tab_its_canonical_prefix(tmp_path, tabs, run_
     result = run_script(SCRIPTS / "extract_tabs.py", atlas, "--out-dir", tmp_path / "rec")
 
     assert json.loads(result.stdout)["fragments"] == ["01-overview.html", "09-coverage.html"]
+
+
+# --------------------------------------------------------------------------- #
+# Scoping to a package's roots (--root)
+#
+# The failure these pin down: --exclude matches directory NAMES, so a package
+# rooted at `src/app` plus `tests` could not be analyzed without dropping every
+# other `scripts` or `tests` directory too, and the workaround was a sparse
+# clone per package. --root names the directories to report on, repeatable;
+# the rest of the repo is still read where it gives context.
+# --------------------------------------------------------------------------- #
+
+
+def _package_repo(repo):
+    """A package rooted at src/app and tests, beside a top-level scripts/ the
+    package does not own — and a tests/scripts/ it does."""
+    repo.write("src/app/__init__.py", "")
+    repo.write("src/app/core.py", "from shared import util\n\n\ndef run(x):\n"
+               "    return util.twice(x) if x else 0\n")
+    repo.write("src/app/prompts.py", "TEXT = open('prompts/system.md').read()\n")
+    repo.write("tests/test_core.py", "from app import core\n\n\ndef test_run():\n"
+               "    assert core.run(1) == 2\n")
+    repo.write("tests/scripts/fixture_gen.py", "from app import core\n")
+    repo.write("scripts/release.py", "from app import core\n\n\ndef main():\n    core.run(2)\n")
+    repo.write("shared/__init__.py", "")
+    repo.write("shared/util.py", "def twice(x):\n    return 2 * x\n")
+    repo.write("prompts/system.md", "You are terse.\n")
+
+
+def test_inventory_root_keeps_nested_names_the_basename_exclude_would_drop(
+        repo, tabs, run_script):
+    _package_repo(repo)
+
+    summary = json.loads(run_script(SCRIPTS / "analyze_inventory.py", repo.path, "--tabs-dir", tabs,
+                                    "--root", "src/app", "--root", "tests").stdout)
+
+    assert summary["roots"] == ["src/app", "tests"]
+    largest = {row["path"] for row in summary["largest_files"]}
+    assert "tests/scripts/fixture_gen.py" in largest
+    assert not largest & {"scripts/release.py", "shared/util.py"}
+    assert set(summary["top_dirs"]) == {"src", "tests"}
+
+
+def test_deps_root_draws_the_package_and_counts_what_it_reaches_outside(
+        repo, tabs, run_script, fragment):
+    _package_repo(repo)
+
+    summary = json.loads(run_script(SCRIPTS / "analyze_deps.py", repo.path, "--tabs-dir", tabs,
+                                    "--root", "src/app", "--root", "tests").stdout)
+
+    fan_in = {row["path"]: row["fan_in"] for row in summary["top_fan_in_files"]}
+    # tests/ and tests/scripts/ import core; scripts/release.py is outside and unseen.
+    assert fan_in.get("src/app/core.py") == 2
+    # shared/util.py resolved — it is not an unresolved gap — but it is not drawn.
+    assert "shared/util.py" not in fan_in
+    res = summary["resolution"]["Python"]
+    assert res["first_party"] == res["resolved"] == 3
+    # `from shared import util` names the package and the module.
+    assert ({row["path"] for row in summary["outside_roots"]["top"]}
+            == {"shared/__init__.py", "shared/util.py"})
+    # A prompt outside the roots, loaded from inside them, is still a node.
+    assert "prompts/system.md" in summary["asset_nodes"]["paths"]
+    assert "outside those roots" in fragment.body(tabs / "03-dependencies.html")
+
+
+def test_deps_root_finds_manifests_outside_the_roots(repo, tabs, run_script):
+    """go.mod sits at the repo root, above the package being drawn: without it
+    every module-path import would read as external."""
+    repo.write("go.mod", "module example.com/svc\n\ngo 1.22\n")
+    repo.write("pkg/db/db.go", "package db\n\nfunc Open() {}\n")
+    repo.write("pkg/api/api.go",
+               'package api\n\nimport "example.com/svc/pkg/db"\n\nfunc Serve() { db.Open() }\n')
+
+    summary = json.loads(run_script(SCRIPTS / "analyze_deps.py", repo.path, "--tabs-dir", tabs,
+                                    "--root", "pkg").stdout)
+
+    fan_in = {row["path"]: row["fan_in"] for row in summary["top_fan_in_files"]}
+    assert fan_in.get("pkg/db/db.go") == 1
+
+
+def test_hotspots_root_counts_only_commits_that_touch_the_roots(repo, tabs, run_script):
+    _package_repo(repo)
+    repo.commit("init")
+    for i in range(3):
+        repo.write("scripts/release.py", f"def main():\n    return {i}\n")
+        repo.commit(f"release tweak {i}")
+    repo.write("src/app/core.py", "def run(x):\n    if x:\n        return x\n    return 0\n")
+    repo.commit("core")
+
+    summary = json.loads(run_script(SCRIPTS / "analyze_hotspots.py", repo.path, "--tabs-dir", tabs,
+                                    "--root", "src/app", "--root", "tests").stdout)
+
+    assert summary["commits_analyzed"] == 2  # init and core; the release tweaks are elsewhere
+    paths = {row["path"] for row in summary["top_hotspots"]}
+    assert "src/app/core.py" in paths and "scripts/release.py" not in paths
+
+
+def test_coverage_root_limits_rows_not_artifact_matching(repo, tabs, run_script):
+    repo.write("src/core.py", "def f(x):\n    if x:\n        return 1\n    return 0\n")
+    repo.write("src/util.py", "def g():\n    return 2\n")
+    repo.write("tools/util.py", "def h():\n    return 3\n")
+    repo.write("coverage.xml", COBERTURA)
+
+    summary = json.loads(run_script(SCRIPTS / "analyze_coverage.py", repo.path, "--tabs-dir", tabs,
+                                    "--root", "src").stdout)
+
+    assert summary["files_measured"] == 2
+    assert summary["files_unmeasured"] == 0  # tools/util.py is outside the roots
+
+
+def test_llm_root_reports_its_call_sites_with_prompts_from_anywhere(repo, tabs, run_script):
+    call = ("import anthropic\nSYSTEM = open('prompts/system.md').read()\n"
+            "client = anthropic.Anthropic()\n"
+            "def ask(q):\n"
+            "    return client.messages.create(model='claude-opus-5', max_tokens=512,\n"
+            "                                  system=SYSTEM, messages=[])\n")
+    repo.write("agent/run.py", call)
+    repo.write("scripts/batch.py", call)
+    repo.write("prompts/system.md", "You are helpful.\n")
+
+    summary = json.loads(run_script(SCRIPTS / "analyze_llm.py", repo.path, "--tabs-dir", tabs,
+                                    "--root", "agent").stdout)
+
+    assert [site["cite"] for site in summary["sites"]] == ["agent/run.py:5"]
+    assert summary["prompt_assets"] == {"prompts/system.md": ["agent/run.py"]}
+
+
+@pytest.mark.parametrize("script", ["analyze_inventory.py", "analyze_deps.py",
+                                    "analyze_hotspots.py", "analyze_coverage.py",
+                                    "analyze_llm.py"])
+def test_a_root_that_is_not_a_directory_in_the_repo_is_refused(script, repo, tabs, run_script):
+    repo.write("src/a.py", "x = 1\n")
+
+    for bad in ("sorc", "../elsewhere", "src/a.py"):
+        result = run_script(SCRIPTS / script, repo.path, "--tabs-dir", tabs, "--root", bad,
+                            expect_rc=2)
+        assert f"error: --root {bad} is" in result.stderr, result.stderr

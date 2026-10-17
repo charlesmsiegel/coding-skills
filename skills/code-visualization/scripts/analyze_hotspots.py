@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Hotspots tab: churn (git commit frequency) x complexity. Where bugs live.
 
-Usage: python3 analyze_hotspots.py REPO_DIR --tabs-dir TABS_DIR [--since "18 months ago"]
+Usage: python3 analyze_hotspots.py REPO_DIR --tabs-dir TABS_DIR [--since "18 months ago"] [--root DIR ...]
 Emits: TABS_DIR/04-hotspots.html and a JSON summary on stdout.
 Degrades gracefully (empty fragment skipped by assembler) if not a git repo.
 """
@@ -11,9 +11,9 @@ import sys
 from collections import defaultdict
 from pathlib import Path
 
-from common import (CODE_LANGS, bar_cell, detect_lang, esc, git, is_test_path,
-                    json_block, loc_and_complexity, read_text, walk_source,
-                    write_fragment)
+from common import (CODE_LANGS, ROOT_HELP, bar_cell, detect_lang, esc, git,
+                    in_roots, is_test_path, json_block, loc_and_complexity,
+                    read_text, scope_roots, walk_source, write_fragment)
 
 
 def main() -> int:
@@ -22,10 +22,16 @@ def main() -> int:
     ap.add_argument("--tabs-dir", required=True)
     ap.add_argument("--exclude", default="",
                     help="comma-separated extra directory names to skip (e.g. generated,migrations)")
+    ap.add_argument("--root", action="append", default=[], help=ROOT_HELP)
     ap.add_argument("--since", default="24 months ago")
     args = ap.parse_args()
     extra_exclude = {d.strip() for d in args.exclude.split(",") if d.strip()}
     repo = Path(args.repo).resolve()
+    try:
+        roots = scope_roots(repo, args.root)
+    except ValueError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
     tabs = Path(args.tabs_dir)
 
     try:
@@ -64,6 +70,8 @@ def main() -> int:
                 if not path.startswith(prefix):
                     continue  # outside the analyzed subtree
                 path = path[len(prefix):]
+            if not in_roots(path, roots):
+                continue  # outside the analyzed roots: neither churn nor a commit
             churn[path] += 1
             if cur_sha:
                 touched_commits.add(cur_sha)
@@ -73,7 +81,7 @@ def main() -> int:
 
     rows = []
     unranked_churned = []  # churned files outside CODE_LANGS (.tf/.sql/.proto/...)
-    for rel, p in walk_source(repo, extra_exclude=extra_exclude):
+    for rel, p in walk_source(repo, extra_exclude=extra_exclude, roots=roots):
         lang = detect_lang(rel)
         if lang not in CODE_LANGS:
             if churn.get(rel, 0) > 0:
@@ -149,6 +157,7 @@ def main() -> int:
     write_fragment(tabs, "04-hotspots.html", "Hotspots", body)
 
     print(json.dumps({
+        **({"roots": list(roots)} if roots else {}),
         "commits_analyzed": commits, "since": args.since,
         "shallow_history": shallow,
         "top_hotspots": [{k: r[k] for k in ("path", "churn", "branches", "loc", "authors", "score")} for r in top[:12]],

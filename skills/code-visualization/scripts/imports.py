@@ -326,10 +326,12 @@ def resolve_unique_suffix(spec, by_base, exts=("",), scope=None):
 def extract(paths, all_paths, file_set):
     """Resolve every import in every file: (edges: src -> {dst}, ResolutionStats).
 
-    ``paths`` maps repo-relative POSIX path -> Path for code files; ``all_paths``
-    additionally holds non-code files, where the manifests live (go.mod and
-    Cargo.toml are what make Go and Rust imports resolvable); ``file_set`` is
-    ``paths``'s key set (passed separately because callers already hold it).
+    ``paths`` maps repo-relative POSIX path -> Path for the code files whose
+    imports are read; ``all_paths`` holds every file, the non-code ones
+    included, which is where the manifests live (go.mod and Cargo.toml are what
+    make Go and Rust imports resolvable); ``file_set`` is every code file an
+    import may resolve to — ``paths``'s key set for a repo-wide run, the whole
+    repo's code when the caller reports on a few roots of it.
     """
     py_idx = build_python_index(file_set)
     # Path segments that hold Python — the "does the repo plausibly own this
@@ -338,7 +340,7 @@ def extract(paths, all_paths, file_set):
     py_roots = {seg for rel in file_set if rel.endswith((".py", ".pyi"))
                 for seg in rel.rsplit(".", 1)[0].split("/")}
     go_mods, go_replaces, go_work_replaces = go_modules(all_paths)
-    jvm_idx, cs_idx = build_decl_indexes(paths)
+    jvm_idx, cs_idx = build_decl_indexes({rel: all_paths[rel] for rel in file_set})
     rust_ws = RustWorkspace(all_paths)
     npm_by_dir, npm_names, npm_local, npm_ws_roots = npm_packages(all_paths)
     ts_roots = ts_config_roots(all_paths)

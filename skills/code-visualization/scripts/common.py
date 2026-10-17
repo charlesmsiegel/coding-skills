@@ -70,8 +70,41 @@ def is_test_path(path: str) -> bool:
     )
 
 
+ROOT_HELP = ("repo-relative directory to analyze; repeat for a package with several roots "
+             "(default: the whole repo). The rest of the repo is still read where it gives "
+             "context — imports and loads resolve as in a repo-wide run — but nothing outside "
+             "the roots is reported")
+
+
+def scope_roots(repo: Path, roots) -> tuple:
+    """Normalize --root values to the repo-relative POSIX directories they name.
+
+    () means the whole repo. A root may be given relative to the repo or as an
+    absolute path inside it; one nested in another adds nothing and is dropped.
+    Raises ValueError for a root that is not a directory inside the repo — a
+    typo must fail, not produce a confident atlas of nothing.
+    """
+    repo = repo.resolve()
+    out = set()
+    for raw in roots or ():
+        p = (repo / raw).resolve()
+        if p != repo and repo not in p.parents:
+            raise ValueError(f"--root {raw} is outside {repo}")
+        if not p.is_dir():
+            raise ValueError(f"--root {raw} is not a directory in {repo}")
+        if p == repo:
+            return ()
+        out.add(p.relative_to(repo).as_posix())
+    return tuple(sorted(r for r in out if not any(r.startswith(o + "/") for o in out)))
+
+
+def in_roots(rel: str, roots) -> bool:
+    """True when repo-relative ``rel`` lies under one of ``roots`` (or roots is empty)."""
+    return not roots or any(rel == r or rel.startswith(r + "/") for r in roots)
+
+
 def walk_source(repo: Path, max_file_bytes: int = 2_000_000, skipped_large: list | None = None,
-                extra_exclude: set | None = None):
+                extra_exclude: set | None = None, roots: tuple = ()):
     """Yield (relpath_str, Path) for tracked-looking source files.
 
     Excluded directories are pruned during the walk (a node_modules tree is
@@ -79,10 +112,12 @@ def walk_source(repo: Path, max_file_bytes: int = 2_000_000, skipped_large: list
     are skipped; pass a list as skipped_large to learn which, so callers can
     report the omission instead of silently analyzing around a 3 MB god-file.
     extra_exclude adds user-named directory names (e.g. generated code) to the
-    standard exclusion set.
+    standard exclusion set. roots (from scope_roots) limits the walk to those
+    directories; the paths yielded stay relative to repo.
     """
     exclude = EXCLUDE_DIRS | (extra_exclude or set())
-    for dirpath, dirnames, filenames in os.walk(repo):
+    for dirpath, dirnames, filenames in (step for top in roots or ("",)
+                                         for step in os.walk(repo / top)):
         dirnames[:] = sorted(
             d for d in dirnames
             if d not in exclude and not (d.startswith(".") and d != ".github")

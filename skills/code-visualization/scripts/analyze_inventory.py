@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Inventory tab: language breakdown, size, largest/most-complex files, directory map.
 
-Usage: python3 analyze_inventory.py REPO_DIR --tabs-dir TABS_DIR
+Usage: python3 analyze_inventory.py REPO_DIR --tabs-dir TABS_DIR [--root DIR ...]
 Emits: TABS_DIR/02-inventory.html and a JSON summary on stdout (for the agent).
 """
 import argparse
@@ -10,8 +10,9 @@ import sys
 from collections import defaultdict
 from pathlib import Path
 
-from common import (CODE_LANGS, bar_cell, detect_lang, esc, is_test_path,
-                    loc_and_complexity, read_text, walk_source, write_fragment)
+from common import (CODE_LANGS, ROOT_HELP, bar_cell, detect_lang, esc,
+                    is_test_path, loc_and_complexity, read_text, scope_roots,
+                    walk_source, write_fragment)
 
 # Held as a constant rather than inlined: a double-quoted attribute inside a
 # double-quoted f-string needs a backslash, which is a SyntaxError before 3.12.
@@ -24,9 +25,15 @@ def main() -> int:
     ap.add_argument("--tabs-dir", required=True)
     ap.add_argument("--exclude", default="",
                     help="comma-separated extra directory names to skip (e.g. generated,migrations)")
+    ap.add_argument("--root", action="append", default=[], help=ROOT_HELP)
     args = ap.parse_args()
     extra_exclude = {d.strip() for d in args.exclude.split(",") if d.strip()}
     repo = Path(args.repo).resolve()
+    try:
+        roots = scope_roots(repo, args.root)
+    except ValueError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
 
     files = []  # (rel, lang, loc, branches, depth, is_test)
     lang_loc = defaultdict(int)
@@ -37,7 +44,8 @@ def main() -> int:
     other_files = 0
     other_exts = defaultdict(int)
 
-    for rel, p in walk_source(repo, skipped_large=skipped_large, extra_exclude=extra_exclude):
+    for rel, p in walk_source(repo, skipped_large=skipped_large, extra_exclude=extra_exclude,
+                               roots=roots):
         lang = detect_lang(rel)
         if lang == "Other":
             # Unrecognized language: counted and reported, never silently
@@ -151,6 +159,7 @@ def main() -> int:
     write_fragment(Path(args.tabs_dir), "02-inventory.html", "Inventory", body)
 
     summary = {
+        **({"roots": list(roots)} if roots else {}),
         "total_loc": total_loc,
         "source_files": len(files),
         "test_loc_share_pct": round(test_ratio, 1),
