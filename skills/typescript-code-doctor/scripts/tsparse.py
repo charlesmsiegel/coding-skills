@@ -303,6 +303,12 @@ def name_is_shadowed(file: TsFile, name: str, index: int, definition: Func | Non
         parent = file.enclosing_function(probe)
         if (id(parent) if parent is not None else None) not in scopes:
             continue
+        if token.is_name("catch") and file.value(probe + 1) == "(":
+            close = file.closer(probe + 1)
+            body = close + 1
+            if close > probe and file.value(body) == "{" and body < index < file.closer(body) \
+                    and any(file.tokens[i].is_name(name) for i in range(probe + 2, close)):
+                return True  # catch bindings are lexical locals, including destructured bindings
         if token.is_name("const", "let", "var"):
             if statement_start(file, probe) == allowed:
                 continue

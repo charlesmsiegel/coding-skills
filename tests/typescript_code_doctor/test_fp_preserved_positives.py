@@ -136,3 +136,53 @@ def test_default_comparison_still_ends_at_parameter_comma(load_module):
     file = parser.parse_source('function f(x: boolean = a < b, y: number = 1) {}')
     func, = file.functions
     assert [p.name for p in func.params] == ['x', 'y']
+
+
+@pytest.mark.parametrize('source', [
+    'function run(onErr: (e: unknown) => void) {\n'
+    ' const pending = Promise.reject(1);\n holder.onErr = undefined;\n'
+    ' pending.then(undefined, onErr);\n}\n',
+    'const onErr = undefined;\nfunction run(onErr: (e: unknown) => void) {\n'
+    ' const pending = Promise.reject(1);\n pending.then(undefined, onErr);\n}\n',
+    'const onErr = undefined;\nfunction run() {\n const onErr = () => report();\n'
+    ' const pending = Promise.reject(1);\n pending.then(undefined, onErr);\n}\n',
+    'const onErr = undefined;\nfunction run() {\n function onErr() {}\n'
+    ' const pending = Promise.reject(1);\n pending.then(undefined, onErr);\n}\n',
+])
+def test_callable_handler_alias_uses_its_own_binding(tmp_path, run_script, source):
+    assert not records(tmp_path, run_script, 'find_async_issues.py', source, 'floating_promise')
+
+
+def test_catch_binding_does_not_inherit_react_import(tmp_path, run_script):
+    source = ('import { useEffect } from "react";\n'
+              'try {} catch (useEffect) {\n'
+              ' useEffect(() => { if (ready) return 42; return; });\n}\n')
+    found = records(tmp_path, run_script, 'find_code_smells.py', source, 'inconsistent_returns')
+    assert len(found) == 1
+
+
+def test_catch_binding_does_not_inherit_fs_import(tmp_path, run_script):
+    source = ('import * as files from "node:fs/promises";\n'
+              'try {} catch (files) { files.open("dialog"); }\n')
+    assert not records(tmp_path, run_script, 'find_resource_leaks.py', source, 'unreleased_resource')
+
+
+def test_catch_binding_does_not_borrow_assertions(tmp_path, run_script):
+    source = ('function checkOutput() { expect(1).toBe(1); }\n'
+              'test("no assertion", () => { try {} catch (checkOutput) { checkOutput(); } });\n')
+    found = records(tmp_path, run_script, 'find_test_smells.py', source,
+                    'test_without_assertion', 'sample.test.ts')
+    assert len(found) == 1
+
+
+def test_latest_simple_handler_assignment_may_handle_rejection(tmp_path, run_script):
+    source = ('let onErr = undefined;\n onErr = e => report(e);\n'
+              'const pending = Promise.reject(1);\n pending.then(undefined, onErr);\n')
+    assert not records(tmp_path, run_script, 'find_async_issues.py', source, 'floating_promise')
+
+
+def test_typed_noncallable_handler_does_not_handle_rejection(tmp_path, run_script):
+    source = ('const missingHandler: undefined = undefined;\n'
+              'const pending = Promise.reject(1);\n pending.then(undefined, missingHandler);\n')
+    found = records(tmp_path, run_script, 'find_async_issues.py', source, 'floating_promise')
+    assert [r['line'] for r in found] == [3]
