@@ -13,14 +13,22 @@ Finds:
 
 Deliberately NOT charged as missing:
   - an optional import: one inside the body of a `try` whose `except` names
-    ImportError or ModuleNotFoundError. The code handles the package being
-    absent, so it is optional by construction. It still counts as a use of a
-    declared dependency (an extra), and an unguarded import of the same name
-    anywhere else still makes it required. A bare `except:` or `except
-    Exception:` also catches the error but does not say the import was meant to
-    be optional, so it does not count.
+    ImportError or ModuleNotFoundError and carries on — its last statement does
+    not raise or exit (raise, sys.exit, exit, quit, os._exit). The code runs
+    without the package, so it is optional by construction. When the try body
+    imports more than one module, only an import the handler replaces with
+    another import of the same name is optional. One such site anywhere makes
+    the module optional, unless an unguarded import of it elsewhere makes it
+    required. It still counts as a use of a declared dependency (an extra). A
+    bare `except:` or `except Exception:` also catches the error but does not
+    say the import was meant to be optional, so it does not count.
 
 Reported as a candidate, not a finding:
+  - an undeclared module imported only under such a guard, where the guard
+    does not make it optional: the handler raises or exits (how a script says
+    a package is required, and also how an optional feature's entry point
+    reports a missing extra), or the try body imports other modules and the
+    handler replaces none of this one's names.
   - an undeclared module every import of which follows, in its own file, a
     sys.path addition (sys.path.insert/append/extend, `sys.path += [...]`,
     site.addsitedir) whose directory the source cannot place inside the project:
@@ -80,6 +88,22 @@ _RUNTIME_PATH_REASONS = (
     "the directory comes from a command-line argument, an environment variable or a path outside "
     "this repository, so only the machine the code runs on shows what it provides",
 )
+
+
+# Why a module imported only under an ImportError guard that does not carry on
+# need not be a dependency this project should declare.
+_GUARD_REASONS = {
+    "exits": (
+        "the handler turns a missing optional extra into a clear error at the entry point that "
+        "needs it, and every other path through the program runs without the package",
+        "the package is installed by a step the project documents rather than declares (a plugin "
+        "host, a GPU stack, a system package), and the handler is that step's error message",
+    ),
+    "shared": (
+        "the imports in the try are one optional feature that the handler switches off together "
+        "(placeholders such as `x = None`, or a flag such as `HAVE_X = False`)",
+    ),
+}
 
 
 # ---------------------------------------------------------------------------
@@ -230,11 +254,19 @@ class _ImportSite:
     """One absolute import of a top-level module, and what surrounds it."""
     file: str
     line: int
-    optional: bool = False  # an enclosing try handles its ImportError
+    # How an enclosing `except ImportError` bears on it: "" (none), "optional"
+    # (the handler carries on), "exits" (every such handler raises or exits), or
+    # "shared" (the handler replaces other imports of the same try, not this one).
+    guard: str = ""
     # The line of a sys.path addition that runs before this import and that the
     # source cannot place inside the project, so the import may be served from
     # it; 0 when there is none.
     after_path: int = 0
+
+    @property
+    def plain(self) -> bool:
+        """Nothing around the import explains its absence: a missing package fails here."""
+        return not self.guard and not self.after_path
 
 
 _IMPORT_ERRORS = frozenset({"ImportError", "ModuleNotFoundError"})
@@ -247,26 +279,87 @@ def _catches_import_error(handler: ast.ExceptHandler) -> bool:
                or (isinstance(t, ast.Attribute) and t.attr in _IMPORT_ERRORS) for t in caught)
 
 
+# A handler whose last statement is one of these does not carry on.
+_EXIT_CALLS = frozenset({"sys.exit", "exit", "quit", "os._exit"})
+
+
+def _stops(handler: ast.ExceptHandler) -> bool:
+    """The handler ends by raising or exiting, so the program does not run on without the import."""
+    last = handler.body[-1]
+    return isinstance(last, ast.Raise) or (
+        isinstance(last, ast.Expr) and isinstance(last.value, ast.Call)
+        and _dotted(last.value.func) in _EXIT_CALLS)
+
+
+def _bound_names(node) -> set[str]:
+    """The names an import statement binds."""
+    if isinstance(node, ast.Import):
+        return {a.asname or a.name.split(".")[0] for a in node.names}
+    return {a.asname or a.name for a in node.names if a.name != "*"}
+
+
+def _module_keys(node) -> set[str]:
+    """The top-level modules an import statement loads, relative ones by their dots."""
+    if isinstance(node, ast.Import):
+        return {a.name.split(".")[0] for a in node.names}
+    return {"." * node.level + (node.module or "").split(".")[0]}
+
+
+def _imports_in(stmts: list) -> list:
+    return [n for n in walk_same_scope(stmts) if isinstance(n, (ast.Import, ast.ImportFrom))]
+
+
+@dataclass(frozen=True)
+class _Guard:
+    """A `try` whose ImportError handlers bear on the imports in its body."""
+    carries_on: bool        # some handler that catches the error finishes normally
+    fallbacks: frozenset    # names those handlers bind by importing a replacement
+    shared: bool            # the body imports more than one module
+
+    @classmethod
+    def of(cls, node, handlers: list) -> "_Guard":
+        carrying = [h for h in handlers if not _stops(h)]
+        fallbacks = frozenset(name for h in carrying for n in _imports_in(h.body) for name in _bound_names(n))
+        modules = {key for n in _imports_in(node.body) for key in _module_keys(n)}
+        return cls(bool(carrying), fallbacks, len(modules) > 1)
+
+    def verdict(self, node) -> str:
+        if not self.carries_on:
+            return "exits"
+        if self.shared and not _bound_names(node) & self.fallbacks:
+            return "shared"
+        return "optional"
+
+
+def _guard_of(node, guards: tuple) -> str:
+    """An import's guard status: optional if any enclosing guard makes it so,
+    otherwise what the innermost one says, "" when nothing guards it."""
+    verdicts = [g.verdict(node) for g in guards]
+    return "optional" if "optional" in verdicts else (verdicts[-1] if verdicts else "")
+
+
 def _walk(tree: ast.AST):
-    """Every node, with whether an enclosing try handles ImportError there and
-    the functions it sits in (innermost last).
+    """Every node, with the ImportError guards around it and the functions it
+    sits in (both innermost last).
 
     Only a `try` body is guarded: its handlers, `else` and `finally` run outside
     it. A function defined in the body imports when it is called, after the try
     has finished, so a def starts unguarded again.
     """
-    stack = [(tree, False, ())]
+    stack = [(tree, (), ())]
     while stack:
-        node, optional, scopes = stack.pop()
-        yield node, optional, scopes
+        node, guards, scopes = stack.pop()
+        yield node, guards, scopes
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
-            optional, scopes = False, (*scopes, node)
-        if isinstance(node, (ast.Try, ast.TryStar)):
-            guarded = optional or any(_catches_import_error(h) for h in node.handlers)
-            stack.extend((stmt, guarded, scopes) for stmt in node.body)
-            stack.extend((part, optional, scopes) for part in (*node.handlers, *node.orelse, *node.finalbody))
+            guards, scopes = (), (*scopes, node)
+        handlers = ([h for h in node.handlers if _catches_import_error(h)]
+                    if isinstance(node, (ast.Try, ast.TryStar)) else [])
+        if handlers:
+            inner = (*guards, _Guard.of(node, handlers))
+            stack.extend((stmt, inner, scopes) for stmt in node.body)
+            stack.extend((part, guards, scopes) for part in (*node.handlers, *node.orelse, *node.finalbody))
         else:
-            stack.extend((child, optional, scopes) for child in ast.iter_child_nodes(node))
+            stack.extend((child, guards, scopes) for child in ast.iter_child_nodes(node))
 
 
 def _top_level_names(node) -> list[str]:
@@ -475,18 +568,18 @@ def _collect_imports(root: Path) -> dict[str, list[_ImportSite]]:
             continue
         reader = _PathReader(filepath, tree, root)
         found, additions = [], []
-        for node, optional, scopes in _walk(tree):
+        for node, guards, scopes in _walk(tree):
             if isinstance(node, (ast.Import, ast.ImportFrom)):
-                found.append((node, optional, bool(scopes)))
+                found.append((node, _guard_of(node, guards), bool(scopes)))
                 continue
             added = _added_paths(node)
             if added and not all(reader.inside(entry, scopes) for entry in added):
                 additions.append(((node.lineno, node.col_offset), bool(scopes)))
         additions.sort()
-        for node, optional, in_function in found:
+        for node, guard, in_function in found:
             after = _after_path((node.lineno, node.col_offset), in_function, additions)
             for top in _top_level_names(node):
-                imports[top].append(_ImportSite(str(filepath), node.lineno, optional, after))
+                imports[top].append(_ImportSite(str(filepath), node.lineno, guard, after))
     return imports
 
 
@@ -591,23 +684,29 @@ def _is_local(name: str, root: Path) -> bool:
     return name in _compute_local_packages(root)
 
 
-def _runtime_path_lead(mod: str, sites: list[_ImportSite]) -> CodeSmell:
-    """The candidate for an undeclared module every import of which follows a
-    sys.path addition the source cannot place inside the project."""
+def _lead(mod: str, sites: list[_ImportSite]) -> CodeSmell:
+    """The candidate for an undeclared module no import of which is plain: each
+    is guarded without being optional, or follows an opaque sys.path addition."""
     first = min(sites, key=lambda s: (s.file, s.line))
+    if first.guard == "exits":
+        why = ("it is imported here inside a try whose ImportError handler raises or exits, which is "
+               "how a required dependency announces itself and also how an optional extra's entry "
+               "point reports that it is missing")
+    elif first.guard == "shared":
+        why = ("it is imported here in a try with other imports, and the ImportError handler replaces "
+               "none of its names, so it may be optional along with them or required and merely caught")
+    else:
+        why = (f"it is imported here after line {first.after_path} puts a directory on sys.path that "
+               f"the source cannot place inside this project, so it may be served from that directory")
     return CodeSmell(
         file=first.file,
         line=first.line,
         smell_type="missing_dependency",
-        description=(
-            f"Module '{mod}' is not declared in any dependency manifest, but every import of it "
-            f"follows a sys.path addition the source cannot place inside this project "
-            f"(here, line {first.after_path}), so it may be served from that directory"
-        ),
+        description=f"Module '{mod}' is not declared in any dependency manifest, but {why}",
         suggestion="",
         severity="high",
         kind="candidate",
-        also_caused_by=_RUNTIME_PATH_REASONS,
+        also_caused_by=_GUARD_REASONS.get(first.guard, _RUNTIME_PATH_REASONS),
     )
 
 
@@ -703,20 +802,23 @@ def analyze(root: Path, ignore: set) -> list[CodeSmell]:
         # file's directory on sys.path, so `from test_chat import helper` in
         # tests/ resolves to the file next door. No manifest declares that, and
         # a tests/ directory needs no __init__.py for it to work.
+        sites = [s for s in sites if not _resolves_beside(mod, Path(s.file))]
         # An optional import is one the code runs without: the package being
-        # absent is handled where it is imported, so no manifest owes it.
-        required = [s for s in sites if not s.optional and not _resolves_beside(mod, Path(s.file))]
-        if not required:
+        # absent is handled where it is imported, so no manifest owes it. One
+        # such site shows the program is built to run without the module, unless
+        # a plain import elsewhere makes it required.
+        if not any(s.plain for s in sites) and any(s.guard == "optional" for s in sites):
             continue
-        third_party_imports[mod] = required
+        sites = [s for s in sites if s.guard != "optional"]
+        if sites:
+            third_party_imports[mod] = sites
 
     # ------------------------------------------------------------------ #
     # 4. No manifest at all
     # ------------------------------------------------------------------ #
-    # A module imported only after its file puts a directory the source cannot
-    # read on sys.path may come from that directory: a lead, reported below.
-    unexplained = {mod for mod, sites in third_party_imports.items()
-                   if any(not s.after_path for s in sites)}
+    # A module with no plain import is guarded without being optional, or comes
+    # after a sys.path addition the source cannot read: a lead, reported below.
+    unexplained = {mod for mod, sites in third_party_imports.items() if any(s.plain for s in sites)}
     if not has_manifest and unexplained:
         if "no_dependency_manifest" not in ignore:
             issues.append(CodeSmell(
@@ -749,10 +851,10 @@ def analyze(root: Path, ignore: set) -> list[CodeSmell]:
             if mapped and _normalize(mapped) in declared:
                 continue
             if mod not in unexplained:
-                issues.append(_runtime_path_lead(mod, sites))
+                issues.append(_lead(mod, sites))
                 continue
             # Not found — report once, pointing at the root
-            example_file = sorted({s.file for s in sites if not s.after_path})[0]
+            example_file = sorted({s.file for s in sites if s.plain})[0]
             issues.append(CodeSmell(
                 file=str(root),
                 line=1,
