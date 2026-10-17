@@ -484,6 +484,11 @@ class _PathReader:
     def __init__(self, filepath: Path, module: ast.Module, root: Path):
         self.filepath, self.module, self.root = filepath, module, root
         self.aliases = _import_aliases(module)
+        # Each name binding is read once. A binding met again while it is still
+        # being read is defined in terms of itself (`ROOT = join(ROOT, ...)`) and
+        # names no directory; without both, such a name fans out exponentially.
+        self._read: dict[tuple, PurePath | None] = {}
+        self._reading: set[tuple] = set()
 
     def reaches_outside(self, node, scopes: tuple) -> bool:
         """`node` names a directory the source cannot place inside the project:
@@ -535,8 +540,9 @@ class _PathReader:
         return PurePath(os.path.normpath(path if path.is_absolute() else PurePath(self.root, path)))
 
     def _binding(self, name: str, scopes: tuple):
-        """The expression `name` holds where it is read, and the scopes to read it
-        in; None for a parameter or a name bound any way but once, plainly."""
+        """The expression `name` holds where it is read, the scopes to read it in,
+        and the binding's identity; None for a parameter or a name bound any way
+        but once, plainly."""
         for depth in range(len(scopes), 0, -1):
             scope = scopes[depth - 1]
             if name in _parameters(scope):
@@ -545,9 +551,24 @@ class _PathReader:
                 continue
             bound, value = _sole_assignment(scope.body, name)
             if bound:
-                return (value, scopes[:depth]) if value is not None else None
+                return (value, scopes[:depth], (id(scope), name)) if value is not None else None
         value = _sole_assignment(self.module.body, name)[1]
-        return (value, ()) if value is not None else None
+        return (value, (), (id(self.module), name)) if value is not None else None
+
+    def _name(self, name: str, scopes: tuple, depth: int) -> PurePath | None:
+        bound = self._binding(name, scopes)
+        if bound is None:
+            return None
+        value, where, key = bound
+        if key not in self._read:
+            if key in self._reading:
+                return None
+            self._reading.add(key)
+            try:
+                self._read[key] = self.read(value, where, depth)
+            finally:
+                self._reading.discard(key)
+        return self._read[key]
 
     def read(self, node, scopes: tuple, depth: int = 0) -> PurePath | None:
         if depth > _MAX_PATH_DEPTH:
@@ -559,10 +580,7 @@ class _PathReader:
         if isinstance(node, ast.Constant):
             return PurePath(node.value) if isinstance(node.value, str) else None
         if isinstance(node, ast.Name):
-            if node.id == "__file__":
-                return PurePath(self.filepath)
-            bound = self._binding(node.id, scopes)
-            return self.read(bound[0], bound[1], depth) if bound else None
+            return PurePath(self.filepath) if node.id == "__file__" else self._name(node.id, scopes, depth)
         if isinstance(node, ast.BinOp):
             return self._joined([node.left, node.right], scopes, depth) if isinstance(node.op, ast.Div) else None
         if isinstance(node, ast.Call):
