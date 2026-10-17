@@ -1640,3 +1640,127 @@ export interface Loose {
 }
 """})
     assert _lines(run_detector("find_type_gaps.py", root), "all_optional_type") == [1]
+
+
+# --------------------------------------------------------------------------- #
+# A package consumed outside TypeScript is still a used package
+# --------------------------------------------------------------------------- #
+
+def _unused_names(records: list[dict]) -> list[str]:
+    return sorted(r["description"].split("`")[1] for r in records
+                  if r["smell_type"] == "unused_dependency")
+
+
+def _manifest(dependencies: dict, dev: dict | None = None) -> str:
+    return json.dumps({"name": "app", "dependencies": dependencies, "devDependencies": dev or {}},
+                      indent=2)
+
+
+def test_a_package_a_stylesheet_loads_is_not_unused(tmp_path):
+    """Fonts and CSS frameworks ship as packages a stylesheet `@import`s.
+
+    Vite and postcss-import resolve the bare name from node_modules, so no `.ts`
+    file ever mentions it — and an "unused" finding invites deleting the app's
+    fonts. Sass's `@use`, Tailwind 4's `@plugin`, and a `~`-prefixed `url()` are
+    the same kind of reference.
+    """
+    root = write(tmp_path, {
+        "package.json": _manifest({
+            "@fontsource-variable/inter": "^5.1.1", "bootstrap": "^5.3.0",
+            "@fontsource/roboto": "^5.0.0", "@tailwindcss/typography": "^0.5.0",
+        }),
+        "package-lock.json": "{}",
+        "src/index.css": "@import 'tailwindcss';\n@import \"@fontsource-variable/inter\";\n"
+                         "@plugin \"@tailwindcss/typography\";\n",
+        "src/theme.scss": "// the grid comes from bootstrap\n@use \"~bootstrap/scss/grid\";\n",
+        "src/fonts.sass": "@font-face\n  src: url(\"~@fontsource/roboto/files/roboto-400.woff2\")\n",
+        "src/main.ts": "export const m = 1;\n",
+    })
+    assert _unused_names(run_detector("find_dependency_issues.py", root)) == []
+
+
+def test_a_package_an_html_entry_point_loads_is_not_unused(tmp_path):
+    """Vite resolves the bare imports of an inline module script in index.html,
+    and an old-style `<script src>` can point straight into node_modules."""
+    root = write(tmp_path, {
+        "package.json": _manifest({"es-module-shims": "^1.0.0", "htmx.org": "^2.0.0"}),
+        "package-lock.json": "{}",
+        "index.html": "<!doctype html>\n<script type=\"module\">\n  import 'es-module-shims';\n</script>\n"
+                      "<script src=\"./node_modules/htmx.org/dist/htmx.min.js\"></script>\n"
+                      "<script type=\"module\" src=\"/src/main.ts\"></script>\n",
+        "src/main.ts": "export const m = 1;\n",
+    })
+    assert _unused_names(run_detector("find_dependency_issues.py", root)) == []
+
+
+def test_a_package_a_tool_config_names_is_not_unused(tmp_path):
+    """Plugins, presets and parsers are loaded by the tool from the name its
+    config gives — as a string, an ESM import in a `.js` config, a `require`,
+    or (for PostCSS's object form) a key of the `plugins` object."""
+    root = write(tmp_path, {
+        "package.json": _manifest({}, {
+            "@tailwindcss/forms": "^0.5.0", "cssnano": "^7.0.0", "vue-eslint-parser": "^9.0.0",
+            "typescript-eslint": "^8.0.0", "@vue/babel-preset-app": "^5.0.0", "ts-jest": "^29.0.0",
+        }),
+        "package-lock.json": "{}",
+        "tailwind.config.js": "module.exports = { plugins: [require('@tailwindcss/forms')] };\n",
+        "postcss.config.cjs": "module.exports = { plugins: { cssnano: {}, autoprefixer: {} } };\n",
+        ".eslintrc.json": "{ \"parser\": \"vue-eslint-parser\" }\n",
+        "eslint.config.js": "import tseslint from 'typescript-eslint';\nexport default tseslint.config();\n",
+        "babel.config.json": "{ \"presets\": [\"@vue/babel-preset-app\"] }\n",
+        "jest.config.js": "module.exports = { preset: 'ts-jest' };\n",
+        "src/main.ts": "export const m = 1;\n",
+    })
+    assert _unused_names(run_detector("find_dependency_issues.py", root)) == []
+
+
+def test_a_test_environment_is_mapped_to_the_package_its_runner_loads(tmp_path):
+    """`environment: "jsdom"` makes Vitest load the `jsdom` package; Jest's
+    `testEnvironment: "jsdom"` loads `jest-environment-jsdom`; a
+    `@vitest-environment` docblock picks one per file. None is ever imported."""
+    root = write(tmp_path, {
+        "package.json": _manifest({}, {
+            "vitest": "^4.0.0", "jsdom": "^26.0.0", "happy-dom": "^15.0.0", "@edge-runtime/vm": "^5.0.0",
+            "jest": "^29.0.0", "jest-environment-jsdom": "^29.0.0",
+        }),
+        "package-lock.json": "{}",
+        "vite.config.ts": "import { defineConfig } from 'vitest/config';\n"
+                          "export default defineConfig({ test: { environment: 'jsdom' } });\n",
+        "vitest.workspace.ts": "export default [{ test: { name: 'edge', environment: 'edge-runtime' } }];\n",
+        "jest.config.js": "module.exports = { testEnvironment: 'jsdom' };\n",
+        "src/widget.test.ts": "// @vitest-environment happy-dom\nimport { it } from 'vitest';\nit('renders', () => {});\n",
+        "src/main.ts": "export const m = 1;\n",
+    })
+    assert _unused_names(run_detector("find_dependency_issues.py", root)) == []
+
+
+def test_a_provider_its_declared_tool_loads_by_name_is_not_unused(tmp_path):
+    """Vitest loads its coverage provider for `--coverage` and its UI for
+    `--ui`; `tsc --importHelpers` emits imports of `tslib`. Nothing names them
+    anywhere the scan can read — the tool that loads them is the evidence."""
+    root = write(tmp_path, {
+        "package.json": _manifest({"tslib": "^2.6.0"}, {
+            "typescript": "^5.0.0", "vitest": "^4.0.0", "@vitest/coverage-v8": "^4.0.0", "@vitest/ui": "^4.0.0",
+        }),
+        "package-lock.json": "{}",
+        "src/main.ts": "export const m = 1;\n",
+    })
+    assert _unused_names(run_detector("find_dependency_issues.py", root)) == []
+
+
+def test_a_package_referenced_nowhere_is_still_unused(tmp_path):
+    """Only a reference counts. A stylesheet, an HTML page and a config that
+    mention `left-pad` only in a comment do not use it, and a provider whose
+    tool is not declared has nothing to load it."""
+    root = write(tmp_path, {
+        "package.json": _manifest({"left-pad": "^1.0.0"}, {"@vitest/coverage-v8": "^4.0.0", "jsdom": "^26.0.0"}),
+        "package-lock.json": "{}",
+        "src/index.css": "/* @import 'left-pad'; */\nbody { background: url(img/left-pad.png); }\n",
+        "index.html": "<!-- <script type=\"module\">import 'left-pad'</script> -->\n"
+                      "<script type=\"module\" src=\"/src/main.ts\"></script>\n",
+        "vite.config.ts": "// environment: 'jsdom', plugins: ['left-pad']\n"
+                          "export default { test: { environment: 'node' } };\n",
+        "src/main.ts": "export const m = 1;\n",
+    })
+    assert _unused_names(run_detector("find_dependency_issues.py", root)) == [
+        "@vitest/coverage-v8", "jsdom", "left-pad"]

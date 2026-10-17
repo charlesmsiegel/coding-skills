@@ -96,9 +96,16 @@ different package manager, a dependency bump, or a stricter node-linker (pnpm's
 default). This is the highest-severity dependency finding for a reason.
 
 **A package you declare but do not import** is still installed, still audited,
-still in the container. Some are genuinely used without an import — a CLI, a lint
-plugin resolved by name, a type package. Check before deleting, and note the ones
-that are load-bearing so the next person does not re-litigate it.
+still in the container. Many are genuinely used without a TypeScript import, and
+`unused_dependency` already counts the common ones as used: a package a
+stylesheet `@import`s, `@use`s or `url()`s (fonts, CSS frameworks, Tailwind
+plugins), one an HTML entry point's module script imports, one a tool config
+names as a string (Vite, Vitest, Jest, Tailwind, PostCSS, ESLint, Babel,
+Prettier), the package a configured test `environment` resolves to (`jsdom`,
+`happy-dom`, `jest-environment-jsdom`), and a provider a declared tool loads by
+name (`@vitest/coverage-v8`, `tslib`). What is left still needs a look — a CLI
+run only from an npm script, a peer requirement — so check before deleting, and
+note the ones that are load-bearing so the next person does not re-litigate it.
 
 **dependencies vs devDependencies.** Anything only tests or the build use belongs
 in `devDependencies`: for a published library the distinction decides what

@@ -8,16 +8,23 @@ it, breaks on a clean install), a package declared but never used (installed,
 audited and shipped for nothing), and a runtime dependency that only test files
 import.
 
+"Used" means referenced anywhere a tool resolves package names, not only in a
+TypeScript import: a stylesheet's `@import`, an HTML entry point's module
+script, a tool config's plugin or test environment. A font package or `jsdom`
+is load-bearing even though no `.ts` file ever names it.
+
 This reads manifests, not the registry. Known advisories against the versions
 you have pinned are `npm audit`'s job — run_external_tools.py drives it.
 """
 
 import contextlib
 import json
+import re
 from collections import defaultdict
 from pathlib import Path
 
 from common import Finding, is_test_file, run_tree_detector, walk_tree
+from tsparse import TsSyntaxError, parse_source
 from tsproject import load_project
 
 # Node's own modules, which are never dependencies.
@@ -40,12 +47,163 @@ IMPLICITLY_USED = frozenset({
     "postcss", "tailwindcss", "autoprefixer", "sass", "less",
 })
 
+# Packages a declared tool loads by name with nothing in the tree to point at
+# them: Vitest loads its coverage provider for `--coverage` and its UI for
+# `--ui`, Vite loads a CSS preprocessor for a stylesheet's extension, and
+# `tsc --importHelpers` emits imports of `tslib` into the output. Each one is
+# used only while its tool is declared beside it — without the tool nothing
+# loads it, and the declaration is as dead as any other.
+LOADED_BY_TOOL = {
+    "vitest": frozenset({"@vitest/coverage-v8", "@vitest/coverage-istanbul", "@vitest/ui", "@vitest/browser"}),
+    "vite": frozenset({"sass-embedded", "stylus", "sugarss"}),
+    "typescript": frozenset({"tslib"}),
+}
+
+# Files that load packages by name without a TypeScript import. A bundler
+# follows a stylesheet's `@import` into node_modules, Vite resolves the bare
+# imports of an HTML entry point's inline module script, and a tool config
+# names the plugins, presets, parsers and test environments the tool loads.
+STYLESHEET_SUFFIXES = (".css", ".scss", ".sass", ".less")
+HTML_SUFFIXES = (".html", ".htm")
+CONFIG_STEMS = ("vite.config", "vitest.config", "vitest.workspace", "vitest.projects",
+                "tailwind.config", "postcss.config", "eslint.config", "babel.config",
+                "jest.config", "prettier.config")
+CONFIG_DOTFILES = (".eslintrc", ".babelrc", ".postcssrc", ".prettierrc")
+YAML_SUFFIXES = (".yml", ".yaml")
+
+_BLOCK_COMMENT = re.compile(r"/\*.*?\*/", re.S)
+# `//` opens a comment only at a line start or after whitespace, so the `//`
+# of `url(https://…)` survives.
+_LINE_COMMENT = re.compile(r"(?m)(?:^|(?<=\s))//.*$")
+_HTML_COMMENT = re.compile(r"<!--.*?-->", re.S)
+_HASH_COMMENT = re.compile(r"(?m)(?:^|(?<=\s))#.*$")
+# `@import "x"`, `@import url(x)`, Sass's `@use`/`@forward`, Tailwind 4's
+# `@plugin`/`@reference`, and any `url(x)`.
+_STYLESHEET_REFERENCE = re.compile(
+    r"""@(?:import|use|forward|plugin|reference)\s+(?:url\(\s*)?["']?([^"'()\s;,]+)"""
+    r"""|\burl\(\s*["']?([^"'()\s]+)""")
+_HTML_MODULE_IMPORT = re.compile(r"""\b(?:from|import)\s*\(?\s*["']([^"'\s]+)["']""")
+_NODE_MODULES_PATH = re.compile(r"node_modules/((?:@[\w.-]+/)?[\w.-]+)")
+_YAML_WORD = re.compile(r"[@\w][@\w./-]*")
+_YAML_ENVIRONMENT = re.compile(r"""\b(?:test)?[Ee]nvironment["']?\s*:\s*["']?([@\w./-]+)""")
+_ENVIRONMENT_DOCBLOCK = re.compile(r"@(?:vitest|jest)-environment\s+([@\w./-]+)")
+
 
 def _package_of(specifier: str) -> str:
     """The installable package name a bare specifier belongs to."""
     if specifier.startswith("@"):
         return "/".join(specifier.split("/")[:2])
     return specifier.split("/")[0]
+
+
+def _specifier_package(specifier: str) -> str | None:
+    """The package a bare specifier names; None for a path, a URL or a `sass:` builtin.
+
+    A leading `~` is webpack's and Sass's "resolve this from node_modules" marker.
+    """
+    specifier = specifier.strip().removeprefix("~")
+    if not specifier or specifier.startswith((".", "/", "#")) or ":" in specifier.split("/")[0]:
+        return None
+    return _package_of(specifier)
+
+
+def _environment_packages(name: str) -> set[str]:
+    """The packages a test runner loads for the environment it is configured with.
+
+    Vitest loads `jsdom` and `happy-dom` from the packages of those names,
+    `edge-runtime` from `@edge-runtime/vm`, and any other name from
+    `vitest-environment-<name>`. Jest loads `jest-environment-<name>` (where its
+    `jsdom` has lived since Jest 28) or the name itself as a package. Every
+    reading is offered because only a declared package can match one, and the
+    runner's actual choice is always among them.
+    """
+    names = {name, f"vitest-environment-{name}", f"jest-environment-{name}"}
+    if name == "edge-runtime":
+        names.add("@edge-runtime/vm")
+    return names
+
+
+def _is_tool_config(name: str) -> bool:
+    return (any(name.startswith(stem + ".") for stem in CONFIG_STEMS)
+            or any(name == dotfile or name.startswith(dotfile + ".") for dotfile in CONFIG_DOTFILES))
+
+
+def _packages_in(specifiers) -> set[str]:
+    return {package for specifier in specifiers if (package := _specifier_package(specifier))}
+
+
+def _stylesheet_references(path: Path, text: str) -> set[str]:
+    text = _BLOCK_COMMENT.sub("", text)
+    if path.suffix != ".css":  # Sass, SCSS and Less have line comments; CSS does not
+        text = _LINE_COMMENT.sub("", text)
+    return (_packages_in(first or second for first, second in _STYLESHEET_REFERENCE.findall(text))
+            | set(_NODE_MODULES_PATH.findall(text)))
+
+
+def _html_references(_path: Path, text: str) -> set[str]:
+    text = _HTML_COMMENT.sub("", text)
+    return _packages_in(_HTML_MODULE_IMPORT.findall(text)) | set(_NODE_MODULES_PATH.findall(text))
+
+
+def _config_references(path: Path, text: str) -> set[str]:
+    """Every package name a tool config hands its tool, as a string.
+
+    A JS, TS or JSON config is tokenized, so a name that appears only in a
+    comment does not count. Two shapes are read beyond the plain string: the
+    value of an `environment` / `testEnvironment` key, mapped to the package
+    the runner loads for it, and the bare keys of a PostCSS config, whose
+    object form names each plugin by its key.
+    """
+    yaml = path.suffix in YAML_SUFFIXES or (not path.suffix and not text.lstrip().startswith("{"))
+    if not yaml:
+        try:
+            tsfile = parse_source(text, path)
+        except TsSyntaxError:
+            yaml = True  # read it word by word instead, as below
+    if yaml:
+        text = _HASH_COMMENT.sub("", _LINE_COMMENT.sub("", _BLOCK_COMMENT.sub("", text)))
+        found = _packages_in(_YAML_WORD.findall(text))
+        for name in _YAML_ENVIRONMENT.findall(text):
+            found |= _environment_packages(name)
+        return found
+
+    postcss = path.name.startswith(("postcss.config.", ".postcssrc"))
+    tokens = tsfile.tokens
+    found: set[str] = set()
+    for index, token in enumerate(tokens):
+        if token.kind == "str" or (token.kind == "template" and "${" not in token.value):
+            value = token.value[1:-1]
+            if (package := _specifier_package(value)) is not None:
+                found.add(package)
+            key = tokens[index - 2] if index >= 2 and tokens[index - 1].is_op(":") else None
+            if key is not None and key.value.strip("'\"") in ("environment", "testEnvironment"):
+                found |= _environment_packages(value)
+        elif postcss and token.kind == "name" and index + 1 < len(tokens) and tokens[index + 1].is_op(":"):
+            found.add(token.value)
+    return found
+
+
+def _references_outside_typescript(root: Path, skip: list[Path]):
+    """(path, package names) for each stylesheet, HTML page and tool config under ``root``."""
+    directory = root.parent if root.is_file() else root
+    for path in walk_tree(directory):
+        if _below(path, skip):
+            continue
+        if path.suffix in STYLESHEET_SUFFIXES:
+            read = _stylesheet_references
+        elif path.suffix in HTML_SUFFIXES:
+            read = _html_references
+        elif _is_tool_config(path.name):
+            read = _config_references
+        else:
+            continue
+        try:
+            text = path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        names = read(path, text)
+        if names:
+            yield path, names
 
 
 def _manifests(root: Path) -> list[Path]:
@@ -142,21 +300,41 @@ def analyze(root: Path, ignore: set[str], _args) -> list[Finding]:
             existing = missing_sites[nearest].get(name)
             if existing is None or (existing[2] is not None and site[2] is None):
                 missing_sites[nearest][name] = site
+        # `// @vitest-environment happy-dom` picks this file's test environment,
+        # which the runner loads by name.
+        environments = {package for comment in tsfile.comments
+                        for name in _ENVIRONMENT_DOCBLOCK.findall(comment.value)
+                        for package in _environment_packages(name)}
+        for manifest in chain:
+            (tests_by_manifest if is_test else source_by_manifest)[manifest].update(environments)
+
+    # A package loaded by name from a stylesheet, an HTML entry point or a tool
+    # config is used by that file, exactly as an import from it would be. Only
+    # declared names are ever compared against these, so a word that merely
+    # looks like a package costs nothing.
+    for path, names in _references_outside_typescript(root, fixture_dirs):
+        is_test = is_test_file(path)
+        for manifest in _chain_of(path):
+            (tests_by_manifest if is_test else source_by_manifest)[manifest].update(names)
 
     declared_by_manifest = {
         manifest: _declared(package) for manifest, package in packages
     }
-    for nearest, sites in missing_sites.items():
+
+    def _visible(nearest: Path) -> dict[str, str]:
         visible: dict[str, str] = {}
         for manifest in _chain_of(nearest):  # the ancestors of the manifest's own directory
             visible.update(declared_by_manifest.get(manifest) or {})
         visible.update(declared_by_manifest.get(nearest) or {})
-        _report_missing(add, visible, sites)
+        return visible
+
+    for nearest, sites in missing_sites.items():
+        _report_missing(add, _visible(nearest), sites)
 
     for manifest, package in packages:
         runtime = dict(package.get("dependencies") or {})
         dev = dict(package.get("devDependencies") or {})
-        _report_unused(add, manifest, runtime, dev,
+        _report_unused(add, manifest, runtime, dev, _visible(manifest),
                        source_by_manifest[manifest], tests_by_manifest[manifest])
         _report_misplaced(add, manifest, runtime,
                           source_by_manifest[manifest], tests_by_manifest[manifest])
@@ -297,20 +475,24 @@ def _report_missing(add, declared, sites) -> None:
             "warning.", "high")
 
 
-def _report_unused(add, manifest, runtime, dev, used_in_source, used_in_tests) -> None:
+def _report_unused(add, manifest, runtime, dev, visible, used_in_source, used_in_tests) -> None:
     used = set(used_in_source) | set(used_in_tests)
     for name in sorted({**runtime, **dev}):
         if name in used or name in IMPLICITLY_USED:
             continue
+        if any(name in loaded and tool in visible for tool, loaded in LOADED_BY_TOOL.items()):
+            continue  # loaded by name by a tool that is itself declared
         if name.startswith("@types/"):
             continue  # consumed by the compiler, never imported by name
         if name.startswith(("eslint-", "@eslint/", "eslint@", "babel-", "@babel/", "vite-plugin-",
                             "rollup-plugin-", "postcss-", "@vitejs/", "@testing-library/")):
             continue  # configured by name in a config file, not imported
         add(manifest, _line_in_manifest(manifest, name), "unused_dependency",
-            f"`{name}` is declared but imported by no TypeScript file in this tree",
-            "Remove it, or note why it is needed (a peer requirement, a CLI, a plugin resolved by "
-            "name). Every declared package is installed, audited, and part of your supply chain.",
+            f"`{name}` is declared but no import, stylesheet, HTML entry point or tool config in "
+            "this tree references it",
+            "Remove it, or note why it is needed (a peer requirement, a CLI run from a script, a "
+            "plugin resolved by name). Every declared package is installed, audited, and part of "
+            "your supply chain.",
             "low")
 
 
