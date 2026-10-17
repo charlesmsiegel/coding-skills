@@ -80,6 +80,11 @@ review. Required unittest and Django lifecycle names are exempt from snake-case
 checks only on proven imported framework bases. Plain classes, custom camelCase
 methods and unresolved inheritance retain the normal naming checks.
 
+Declarative Django model, form and admin classes inherit behavior; proven built-in
+bases are not data-container refactoring targets. When other inherited behavior
+cannot be resolved, a data-only local declaration is a candidate without a
+dataclass replacement recommendation. Plain classes retain the normal check.
+
 ## Workflow
 
 **Cleaning up a whole poorly-written repo from cold?** The steps below assume the

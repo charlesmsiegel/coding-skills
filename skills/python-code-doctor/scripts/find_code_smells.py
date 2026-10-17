@@ -26,6 +26,8 @@ class CodeSmell:
     suggestion: str
     severity: str
     code_snippet: str = ""
+    kind: str = "finding"
+    also_caused_by: tuple[str, ...] = ()
 
 
 # Classes with these decorators/bases are data containers on purpose.
@@ -55,6 +57,23 @@ DJANGO_GENERIC_VIEWS = {
 }
 
 
+# These bases supply persistence, validation, or declarative configuration APIs;
+# replacing their subclasses with dataclasses would discard inherited behavior.
+DJANGO_DECLARATIVE_BASES = {
+    **DJANGO_GENERIC_VIEWS,
+    "django.db.models": frozenset({"Model", "Choices", "TextChoices", "IntegerChoices"}),
+    "django.db.models.base": frozenset({"Model"}),
+    "django.db.models.enums": frozenset({"Choices", "TextChoices", "IntegerChoices"}),
+    "django.forms": frozenset({"Form", "BaseForm", "ModelForm", "BaseModelForm",
+                               "BaseFormSet", "BaseModelFormSet", "BaseInlineFormSet"}),
+    "django.forms.forms": frozenset({"Form", "BaseForm"}),
+    "django.forms.models": frozenset({"ModelForm", "BaseModelForm", "BaseModelFormSet", "BaseInlineFormSet"}),
+    "django.forms.formsets": frozenset({"BaseFormSet"}),
+    "django.contrib.admin": frozenset({"ModelAdmin", "TabularInline", "StackedInline"}),
+    "django.contrib.admin.options": frozenset({"ModelAdmin", "InlineModelAdmin", "TabularInline", "StackedInline"}),
+}
+
+
 def _dotted_name(node):
     if isinstance(node, ast.Name):
         return node.id
@@ -64,7 +83,7 @@ def _dotted_name(node):
     return None
 
 
-def _stable_imports(tree):
+def _module_binding_facts(tree):
     """Only trust unconditional imports with no other bindings or mutations.
 
     Scope-insensitive invalidation deliberately favors reporting a candidate
@@ -109,10 +128,15 @@ def _stable_imports(tree):
             else:
                 imports[name] = (alias.name if alias.asname else name, node.lineno)
     # A wildcard can replace any imported identity.
-    if any(isinstance(n, ast.ImportFrom) and any(a.name == '*' for a in n.names)
-           for n in ast.walk(tree)):
-        return {}
-    return imports
+    wildcard = any(isinstance(n, ast.ImportFrom) and any(a.name == '*' for a in n.names)
+                   for n in ast.walk(tree))
+    if wildcard:
+        imports = {}
+    return imports, set(bindings) | ({"object"} if wildcard else set())
+
+
+def _stable_imports(tree):
+    return _module_binding_facts(tree)[0]
 
 
 def _constant_expression(node: ast.AST | None) -> bool:
@@ -163,10 +187,12 @@ class CodeSmellDetector(ast.NodeVisitor):
         self._hooks: frozenset = frozenset()
         self._in_assert = 0
         self._framework_imports = {}
+        self._object_is_builtin = True
 
     def visit_Module(self, node: ast.Module):
         self._hooks = framework_hook_overrides(node)
-        self._framework_imports = _stable_imports(node)
+        self._framework_imports, bound_names = _module_binding_facts(node)
+        self._object_is_builtin = "object" not in bound_names
         # A literal is only "magic" when nothing names it. Collect the node
         # ids of literals that already have a name or a self-explaining
         # position, so visit_Constant can skip them:
@@ -219,13 +245,14 @@ class CodeSmellDetector(ast.NodeVisitor):
             return self.source_lines[lineno - 1].strip()[:60]
         return ""
 
-    def _add(self, line: int, smell_type: str, desc: str, suggestion: str, severity: str = "medium"):
+    def _add(self, line: int, smell_type: str, desc: str, suggestion: str, severity: str = "medium",
+             *, kind="finding", also_caused_by=()):
         if smell_type in self.ignore:
             return
         self.issues.append(CodeSmell(
             file=self.filename, line=line, smell_type=smell_type,
             description=desc, suggestion=suggestion, severity=severity,
-            code_snippet=self._get_line(line)
+            code_snippet=self._get_line(line), kind=kind, also_caused_by=tuple(also_caused_by)
         ))
 
     def visit_FunctionDef(self, node: ast.FunctionDef):
@@ -346,7 +373,7 @@ class CodeSmellDetector(ast.NodeVisitor):
             elif isinstance(base, ast.Subscript) and isinstance(base.value, ast.Name):
                 marker_names.add(base.value.id)
         is_declared_data = bool(marker_names & DATA_CLASS_MARKERS)
-        is_generic_view = False
+        has_framework_behavior = False
         for base in node.bases:
             dotted = _dotted_name(base)
             if not dotted:
@@ -356,12 +383,22 @@ class CodeSmellDetector(ast.NodeVisitor):
             if imported and imported[1] < node.lineno:
                 resolved = f"{imported[0]}.{suffix}" if suffix else imported[0]
                 module, _, name = resolved.rpartition('.')
-                if name in DJANGO_GENERIC_VIEWS.get(module, ()):
-                    is_generic_view = True
-        if len(attributes) > 3 and len(non_dunder) == 0 and not is_declared_data and not is_generic_view:
-            self._add(node.lineno, "data_class",
-                f"Class {node.name} has only data, no behavior methods",
-                "Consider using @dataclass or namedtuple", "low")
+                if name in DJANGO_DECLARATIVE_BASES.get(module, ()):
+                    has_framework_behavior = True
+        if len(attributes) > 3 and len(non_dunder) == 0 and not is_declared_data and not has_framework_behavior:
+            inherited_behavior_unknown = any(not (isinstance(base, ast.Name) and base.id == "object"
+                                                  and self._object_is_builtin)
+                                             for base in node.bases)
+            if inherited_behavior_unknown:
+                self._add(node.lineno, "data_class",
+                    f"Class {node.name} declares data locally; check the behavior inherited from its bases",
+                    "", "low", kind="candidate",
+                    also_caused_by=("Base classes may supply validation, persistence, or other behavior.",
+                                    "Class attributes may configure an inherited framework API."))
+            else:
+                self._add(node.lineno, "data_class",
+                    f"Class {node.name} has only data, no behavior methods",
+                    "Consider using @dataclass or namedtuple", "low")
         
         self.generic_visit(node)
         self.current_class = old_class
@@ -427,7 +464,8 @@ def main():
         for issue in all_issues:
             by_type[issue.smell_type] += 1
         
-        print(f"Found {len(all_issues)} code smell(s):\n")
+        candidate_count = sum(issue.kind == "candidate" for issue in all_issues)
+        print(f"Found {len(all_issues) - candidate_count} finding(s), {candidate_count} candidate(s):\n")
         print("Summary:")
         for smell, count in sorted(by_type.items(), key=lambda x: -x[1]):
             print(f"  {smell}: {count}")
@@ -436,11 +474,16 @@ def main():
         severity_icons = SEVERITY_ICONS
         for issue in all_issues:
             icon = severity_icons[issue.severity]
-            print(f"{icon} [{issue.severity.upper()}] {issue.file}:{issue.line}")
+            marker = "? [CANDIDATE]" if issue.kind == "candidate" else f"{icon} [{issue.severity.upper()}]"
+            print(f"{marker} {issue.file}:{issue.line}")
             print(f"   {issue.smell_type}: {issue.description}")
             if issue.code_snippet:
                 print(f"   Code: {issue.code_snippet}")
-            print(f"   → {issue.suggestion}\n")
+            if issue.suggestion:
+                print(f"   → {issue.suggestion}")
+            for reason in issue.also_caused_by:
+                print(f"   ? also caused by: {reason}")
+            print()
 
 
 if __name__ == '__main__':
