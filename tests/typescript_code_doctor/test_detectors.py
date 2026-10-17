@@ -1612,7 +1612,7 @@ def test_every_member_of_a_semicolon_less_interface_is_checked(tmp_path):
     root = write(tmp_path, {"props.ts": """\
 export interface Props {
   title: string
-  open: boolean
+  flag: boolean
   isActive: boolean
 }
 
@@ -1625,7 +1625,7 @@ export interface Patch {
 """})
     naming = run_detector("find_naming_issues.py", root)
     assert [r["description"] for r in naming if r["smell_type"] == "boolean_without_predicate_name"] == [
-        "`Props.open` is a boolean but does not read as a question"]
+        "`Props.flag` is a boolean but does not read as a question"]
     # Half of Patch is required; reading only a and c made it look all-optional.
     assert _lines(run_detector("find_type_gaps.py", root), "all_optional_type") == []
 
@@ -1764,3 +1764,89 @@ def test_a_package_referenced_nowhere_is_still_unused(tmp_path):
     })
     assert _unused_names(run_detector("find_dependency_issues.py", root)) == [
         "@vitest/coverage-v8", "jsdom", "left-pad"]
+
+
+# --------------------------------------------------------------------------- #
+# A boolean whose name already states a fact is not a naming problem
+# --------------------------------------------------------------------------- #
+
+def _boolean_names(records: list[dict]) -> list[str]:
+    return sorted(r["description"].split("`")[1] for r in records
+                  if r["smell_type"] == "boolean_without_predicate_name")
+
+
+def test_a_snake_case_member_mirrors_a_wire_format_and_is_not_reported(tmp_path):
+    """A snake_case member spells a JSON payload's key: the server owns the
+    name, and the only way to "rename" it is a mapping layer."""
+    root = write(tmp_path, {"api.ts": """\
+export interface AppConfig {
+  cuda_available: boolean;
+  offload_text_encoder: boolean;
+}
+export type SettingField = { path_exists: boolean; needs_search: boolean; pipeline_dropped: boolean };
+export interface CouchDoc { _deleted: boolean }
+"""})
+    assert _boolean_names(run_detector("find_naming_issues.py", root)) == []
+
+
+def test_a_dom_or_aria_attribute_name_is_not_reported(tmp_path):
+    """`open`, `checked` and `disabled` are the platform's names. A component
+    that mirrors them is following the convention every reader already knows;
+    `isOpen` would be the surprise."""
+    root = write(tmp_path, {"Dialog.tsx": """\
+export interface DialogProps {
+  open: boolean;
+  defaultOpen?: boolean;
+  modal?: boolean;
+}
+export interface SwitchProps { checked: boolean; defaultChecked?: boolean; readOnly?: boolean; required?: boolean }
+export type ToggleProps = { pressed: boolean; expanded: boolean; selected: boolean; multiple: boolean; autoFocus: boolean };
+export interface ButtonProps { asChild?: boolean }
+"""})
+    assert _boolean_names(run_detector("find_naming_issues.py", root)) == []
+
+
+def test_an_adjective_or_participle_already_reads_as_a_statement(tmp_path):
+    """`galleryOpen`, `loading` and `editable` say which way `true` points as
+    plainly as an `is` prefix would. So do a past participle (`shadowed`), a
+    third-person verb (`pathExists`, `needsSearch`) and a prepositional phrase
+    (`atDefault`, `inProgress`)."""
+    root = write(tmp_path, {"state.ts": """\
+export interface StateData {
+  galleryOpen: boolean;
+  loading: boolean;
+  editable: boolean;
+  collapsible: boolean;
+  shadowed: boolean;
+  dataLoaded: boolean;
+  raw: boolean;
+  exists: boolean;
+  pathExists: boolean;
+  needsSearch: boolean;
+  atDefault: boolean;
+  inProgress: boolean;
+}
+"""})
+    assert _boolean_names(run_detector("find_naming_issues.py", root)) == []
+
+
+def test_a_noun_typed_boolean_is_still_reported(tmp_path):
+    """A noun does not say which way `true` points. Nor does a word that only
+    ends in the letters of an adjective or a participle: `table` is not
+    `-able`, and `embed` is not `-ed`."""
+    root = write(tmp_path, {"settings.ts": """\
+export interface Settings {
+  flag: boolean;
+  status: boolean;
+  mode: boolean;
+  data: boolean;
+  toggle: boolean;
+  value: boolean;
+  featureFlag: boolean;
+  table: boolean;
+  embed: boolean;
+}
+"""})
+    assert _boolean_names(run_detector("find_naming_issues.py", root)) == [
+        "Settings.data", "Settings.embed", "Settings.featureFlag", "Settings.flag", "Settings.mode",
+        "Settings.status", "Settings.table", "Settings.toggle", "Settings.value"]

@@ -26,6 +26,50 @@ BROWSER_GLOBALS = frozenset({
 
 BOOLEAN_PREFIXES = ("is", "has", "should", "can", "will", "did", "was", "are", "no", "allow", "enable", "disable")
 
+# The platform's boolean names — HTML boolean attributes and ARIA states, in
+# React's spelling, lower-cased for comparison. A component prop that mirrors
+# one (`open`, `checked`, `expanded`) follows a convention every reader already
+# knows; renaming it `isOpen` would be the surprise. React's uncontrolled
+# `default…` twins (`defaultOpen`, `defaultChecked`) are matched by stripping
+# the prefix, and `asChild` is Radix's composition prop, which shadcn/ui
+# components re-export under that exact name.
+DOM_BOOLEAN_ATTRIBUTES = frozenset(name.lower() for name in (
+    "allowFullScreen", "async", "autoFocus", "autoPlay", "checked", "controls", "default", "defer",
+    "disabled", "disablePictureInPicture", "disableRemotePlayback", "formNoValidate", "hidden",
+    "indeterminate", "inert", "itemScope", "loop", "multiple", "muted", "noModule", "noValidate",
+    "open", "playsInline", "readOnly", "required", "reversed", "selected",
+    "draggable", "spellCheck", "contentEditable", "suppressHydrationWarning",
+    "suppressContentEditableWarning", "asChild",
+    # ARIA states, as a prop mirrors `aria-expanded` and its kin
+    "atomic", "busy", "expanded", "grabbed", "invalid", "modal", "multiline",
+    "multiselectable", "pressed",
+))
+
+# Names that state a fact about their subject without an `is`: the final word
+# is a state adjective (`galleryOpen`, `loading`), an `-able`/`-ible` adjective
+# (`editable`), or a past participle (`shadowed`); or the first word is a
+# third-person verb (`pathExists`, `needsSearch`) or a preposition that places
+# the subject (`atDefault`, `inProgress`). Each reads as "<subject> is …" or
+# "<subject> …s …" — as plainly as a prefix would say which way `true` points.
+STATE_ADJECTIVES = frozenset({
+    "open", "closed", "visible", "hidden", "shown", "active", "inactive", "enabled", "disabled",
+    "loading", "saving", "pending", "running", "available", "dirty", "pristine", "valid",
+    "invalid", "ready", "busy", "idle", "empty", "full", "done", "complete", "raw", "live",
+    "online", "offline", "stale", "exists",
+})
+FACT_VERBS = frozenset({
+    "needs", "uses", "exists", "contains", "includes", "supports", "requires", "matches",
+    "wants", "accepts", "expects", "owns",
+})
+STATE_PREPOSITIONS = frozenset({"at", "in", "on", "within", "over", "under", "above", "below", "inside", "outside"})
+# Words that end in the letters of an adjective or a participle without being one.
+NOT_ADJECTIVES = frozenset({"enable", "disable", "variable", "timetable", "vegetable"})
+NOT_PARTICIPLES = frozenset({
+    "embed", "hundred", "shed", "sled", "seed", "need", "feed", "speed", "breed", "bleed",
+    "weed", "reed", "proceed", "succeed", "exceed", "indeed",
+})
+_CAMEL_WORD = re.compile(r"[A-Z]+(?![a-z])|[A-Z]?[a-z0-9]+")
+
 
 def _check_declaration_case(file: TsFile, report: Reporter) -> None:
     for decl in file.types:
@@ -80,12 +124,47 @@ def _check_shadowed_globals(file: TsFile, report: Reporter) -> None:
                    "diff out of context.", "medium")
 
 
+def _mirrors_a_wire_name(name: str) -> bool:
+    """A member with `_` in its name spells someone else's key.
+
+    TypeScript code names its own members in camelCase; a snake_case member of
+    an interface or type literal (`cuda_available`, CouchDB's `_deleted`)
+    mirrors a JSON payload, a database row or a config file the code does not
+    own. Renaming it breaks the contract with the other side, so the finding
+    could only be acted on by adding a mapping layer for a naming preference.
+    """
+    return "_" in name
+
+
+def _is_dom_boolean_attribute(name: str) -> bool:
+    lower = name.lower()
+    return lower in DOM_BOOLEAN_ATTRIBUTES or (
+        lower.startswith("default") and lower.removeprefix("default") in DOM_BOOLEAN_ATTRIBUTES)
+
+
+def _reads_as_a_statement(name: str) -> bool:
+    words = [word.lower() for word in _CAMEL_WORD.findall(name)]
+    if not words:
+        return False
+    first, last = words[0], words[-1]
+    if first in FACT_VERBS or (first in STATE_PREPOSITIONS and len(words) > 1):
+        return True
+    if last in STATE_ADJECTIVES:
+        return True
+    if len(last) >= 6 and last.endswith(("able", "ible")) and last not in NOT_ADJECTIVES:
+        return True  # `table` and `cable` are too short to be an `-able` adjective
+    return len(last) > 3 and last.endswith("ed") and last not in NOT_PARTICIPLES
+
+
 def _check_boolean_names(file: TsFile, report: Reporter) -> None:
     for decl in file.types:
         for member in decl.members:
             if member.type_text.strip() != "boolean" or member.name == "[index]":
                 continue
             if member.name.lower().startswith(BOOLEAN_PREFIXES):
+                continue
+            if (_mirrors_a_wire_name(member.name) or _is_dom_boolean_attribute(member.name)
+                    or _reads_as_a_statement(member.name)):
                 continue
             report.add(member.line, "boolean_without_predicate_name",
                        f"`{decl.name}.{member.name}` is a boolean but does not read as a question",
