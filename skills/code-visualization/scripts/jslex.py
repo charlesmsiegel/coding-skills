@@ -33,10 +33,10 @@ def _regex_allowed(text, i, comment_starts):
     a division."""
     j = i - 1
     while j >= 0:
-        if text[j] in " \t\r\n":
-            j -= 1
-        elif j + 1 in comment_starts:
+        if j + 1 in comment_starts:
             j = comment_starts[j + 1] - 1
+        elif text[j] in " \t\r\n":
+            j -= 1
         else:
             break
     if j < 0 or text[j] in _REGEX_AFTER:

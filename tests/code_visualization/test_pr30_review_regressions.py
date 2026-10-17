@@ -7,7 +7,8 @@ import pytest
 SCRIPTS = Path(__file__).resolve().parents[2] / "skills/code-visualization/scripts"
 
 
-@pytest.mark.parametrize("comment", ["/* explanatory comment */", "// explanatory comment\n"])
+@pytest.mark.parametrize("comment", ["/* explanatory comment */", "// explanatory comment\n",
+                                     "// explanatory comment   \n", "// explanatory comment\t\n"])
 def test_a_comment_before_a_regex_does_not_hide_the_next_import(repo, tabs, run_script, comment):
     repo.write("src/dep.ts", "export const x = 1\n")
     repo.write("src/main.ts", f"const marker = {comment} /`/;\nimport {{x}} from './dep';\n")
