@@ -165,6 +165,179 @@ def _save_commit_false_without_m2m(func):
     return commit_false
 
 
+def _has_unvalidated_form_save(func, ctx):
+    """Match a save to its constructed form within this function's scope.
+
+    Track simple aliases and rebinding in source order. This is deliberately a
+    local receiver check, not a claim that validation dominates every branch.
+    Nested functions have their own scope and are inspected separately.
+    """
+    class Usage(ast.NodeVisitor):
+        def __init__(self):
+            self.bindings = {}
+            self.validated = set()
+            self.unvalidated = False
+
+        def receiver_key(self, expr):
+            if isinstance(expr, ast.Name):
+                return (expr.id,)
+            if isinstance(expr, ast.Attribute):
+                root = self.receiver_key(expr.value)
+                if root is not None:
+                    return (*root, expr.attr)
+            return None
+
+        def receiver(self, expr):
+            if isinstance(expr, ast.Call):
+                target = call_name(expr)
+                if target and target.endswith("Form") and _is_form_or_serializer(ctx, target):
+                    return expr
+            if isinstance(expr, (ast.Name, ast.Attribute)):
+                return self.bindings.get(self.receiver_key(expr))
+            return None
+
+        def bind(self, target, form):
+            if isinstance(target, (ast.Name, ast.Attribute)):
+                key = self.receiver_key(target)
+                if key is None:
+                    return
+                # Replacing a root or intermediate attribute also replaces
+                # receivers beneath it, such as holder.form or self.box.form.
+                for existing in list(self.bindings):
+                    if existing[:len(key)] == key:
+                        del self.bindings[existing]
+                self.bindings[key] = form
+            elif isinstance(target, (ast.Tuple, ast.List)):
+                # Unpacking is unsupported: forget every target instead of
+                # retaining an instance from an earlier assignment.
+                for item in target.elts:
+                    self.bind(item, None)
+            elif isinstance(target, ast.Starred):
+                self.bind(target.value, None)
+
+        def visit_Name(self, node):
+            if isinstance(node.ctx, (ast.Store, ast.Del)):
+                self.bind(node, None)
+
+        def visit_Attribute(self, node):
+            if isinstance(node.ctx, (ast.Store, ast.Del)):
+                self.bind(node, None)
+            self.visit(node.value)
+
+        def visit_For(self, node):
+            self.visit(node.iter)
+            self.bind(node.target, None)
+            for statement in [*node.body, *node.orelse]:
+                self.visit(statement)
+
+        visit_AsyncFor = visit_For
+
+        def visit_MatchAs(self, node):
+            if node.pattern is not None:
+                self.visit(node.pattern)
+            if node.name:
+                self.bind(ast.Name(id=node.name, ctx=ast.Load()), None)
+
+        def visit_MatchStar(self, node):
+            if node.name:
+                self.bind(ast.Name(id=node.name, ctx=ast.Load()), None)
+
+        def visit_MatchMapping(self, node):
+            self.generic_visit(node)
+            if node.rest:
+                self.bind(ast.Name(id=node.rest, ctx=ast.Load()), None)
+
+        def visit_comprehension_scope(self, node):
+            # Comprehension targets live in their own scope. Preserve bindings
+            # for those roots while still visiting iterables and expressions.
+            roots = {target.id for gen in node.generators for target in ast.walk(gen.target)
+                     if isinstance(target, ast.Name)}
+            saved = {key: value for key, value in self.bindings.items() if key[0] in roots}
+            for gen in node.generators:
+                self.visit(gen.iter)
+                self.bind(gen.target, None)
+                for condition in gen.ifs:
+                    self.visit(condition)
+            if isinstance(node, ast.DictComp):
+                self.visit(node.key)
+                self.visit(node.value)
+            else:
+                self.visit(node.elt)
+            for key in list(self.bindings):
+                if key[0] in roots:
+                    del self.bindings[key]
+            self.bindings.update(saved)
+
+        visit_ListComp = visit_comprehension_scope
+        visit_SetComp = visit_comprehension_scope
+        visit_DictComp = visit_comprehension_scope
+        visit_GeneratorExp = visit_comprehension_scope
+
+        def visit_ExceptHandler(self, node):
+            if node.type is not None:
+                self.visit(node.type)
+            if node.name:
+                self.bind(ast.Name(id=node.name, ctx=ast.Load()), None)
+            for statement in node.body:
+                self.visit(statement)
+            if node.name:
+                self.bind(ast.Name(id=node.name, ctx=ast.Load()), None)
+
+        def visit_Import(self, node):
+            for alias in node.names:
+                name = alias.asname or alias.name.split(".")[0]
+                self.bind(ast.Name(id=name, ctx=ast.Load()), None)
+
+        def visit_ImportFrom(self, node):
+            for alias in node.names:
+                self.bind(ast.Name(id=alias.asname or alias.name, ctx=ast.Load()), None)
+
+        def visit_Assign(self, node):
+            self.visit(node.value)
+            form = self.receiver(node.value)
+            for target in node.targets:
+                self.bind(target, form)
+
+        def visit_AnnAssign(self, node):
+            if node.value is not None:
+                self.visit(node.value)
+                self.bind(node.target, self.receiver(node.value))
+
+        def visit_NamedExpr(self, node):
+            self.visit(node.value)
+            self.bind(node.target, self.receiver(node.value))
+
+        def visit_AugAssign(self, node):
+            self.visit(node.value)
+            self.bind(node.target, None)
+
+        def visit_Call(self, node):
+            self.generic_visit(node)
+            if not isinstance(node.func, ast.Attribute):
+                return
+            form = self.receiver(node.func.value)
+            if form is None:
+                return
+            if node.func.attr in {"is_valid", "ais_valid"}:
+                self.validated.add(form)
+            elif node.func.attr == "save" and form not in self.validated:
+                self.unvalidated = True
+
+        def visit_FunctionDef(self, node):
+            self.bind(ast.Name(id=node.name, ctx=ast.Load()), None)
+
+        visit_AsyncFunctionDef = visit_FunctionDef
+        visit_ClassDef = visit_FunctionDef
+
+        def visit_Lambda(self, node):
+            pass
+
+    usage = Usage()
+    for statement in func.body:
+        usage.visit(statement)
+    return usage.unvalidated
+
+
 def collect(ctx):
     findings = []
 
@@ -263,30 +436,22 @@ def collect(ctx):
                      "The caller may perform the deferred many-to-many save."],
                     "medium"))
 
-    # A form whose validity is never checked before use.
+    # A local form save without an explicit validation call needs review:
+    # ModelForm.save() validates through errors, and custom saves may validate too.
     for path, tree in ctx.python_trees():
         for node in ast.walk(tree):
             if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 continue
-            builds_form = False
-            for sub in ast.walk(node):
-                if isinstance(sub, ast.Call):
-                    target = call_name(sub)
-                    if target and target.endswith("Form") and _is_form_or_serializer(ctx, target):
-                        builds_form = True
-            if not builds_form:
-                continue
-            checks = any(isinstance(sub, ast.Call) and call_name(sub) in ("is_valid", "ais_valid")
-                         for sub in ast.walk(node))
-            saves = any(isinstance(sub, ast.Call) and call_name(sub) == "save"
-                        for sub in ast.walk(node))
-            if saves and not checks:
-                findings.append(finding(
+            if _has_unvalidated_form_save(node, ctx):
+                findings.append(candidate(
                     path, node.lineno, "unvalidated_form_use",
-                    "`" + node.name + "` builds a form and saves without calling is_valid(), so "
-                    "nothing runs the validators",
-                    "Guard the save: if form.is_valid(): form.save(). Without it the field "
-                    "validators, clean_<field> methods, and unique checks are all skipped.",
+                    "`" + node.name + "` saves a locally constructed form without an earlier "
+                    "explicit is_valid() call on that receiver; check its save implementation "
+                    "and whether validation is required for this operation",
+                    ["Django ModelForm.save() accesses errors, which triggers full_clean() "
+                     "when needed and rejects invalid forms.",
+                     "A custom save() may validate internally, or intentionally return an "
+                     "instance without consuming submitted data."],
                     "high"))
 
     return findings
