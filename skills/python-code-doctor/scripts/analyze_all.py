@@ -9,7 +9,8 @@ import json
 import argparse
 from pathlib import Path
 from datetime import datetime
-from common import SEVERITY_ICONS, SchemaError, configure_output, drop_aliased, validate_record
+from common import (SEVERITY_ICONS, UPSTREAM_EXEMPT_CATEGORIES, UPSTREAM_MARKER, SchemaError,
+                    configure_output, drop_aliased, find_python_files, upstream_marks, validate_record)
 from runner import default_jobs, run_detectors
 
 
@@ -67,6 +68,94 @@ def merge_aliases(results: dict) -> None:
             results[category] = [r for r in found if id(r) in kept]
 
 
+def _upstream_key(file) -> str:
+    try:
+        return str(Path(file).resolve())
+    except (OSError, ValueError):
+        return str(file)
+
+
+def withhold_upstream(results: dict, path: str) -> tuple[list, dict]:
+    """Drop, in place, records of code an author marked as copied verbatim from
+    upstream (common.UPSTREAM_MARKER), and account for every one.
+
+    Only UPSTREAM_EXEMPT_CATEGORIES are withheld — the shape of the copy;
+    correctness and security records inside it stay. A duplicate group is
+    withheld only when fewer than two of its occurrences lie outside marked
+    code. Returns the `verbatim_upstream` records — per marked file a candidate
+    counting what was not charged, and a finding for each marker that covers
+    nothing — and the per-file accounting for `meta.not_charged`.
+    """
+    marked = {}
+    for file in find_python_files(Path(path)):
+        marks = upstream_marks(_upstream_key(file))
+        if marks.ranges or marks.ignored:
+            marked[_upstream_key(file)] = (file, marks)
+    if not marked:
+        return [], {}
+
+    def covered(file, line):
+        entry = marked.get(_upstream_key(file))
+        return entry is not None and entry[1].covers(line)
+
+    withheld: dict[str, dict[str, int]] = {key: {} for key in marked}
+    for category, found in results.items():
+        if category not in UPSTREAM_EXEMPT_CATEGORIES or not isinstance(found, list):
+            continue
+        kept = []
+        for record in found:
+            if not isinstance(record, dict):
+                kept.append(record)
+                continue
+            occurrences = record.get("occurrences")
+            if isinstance(occurrences, list) and occurrences:
+                outside = [o for o in occurrences if isinstance(o, dict)
+                           and not covered(o.get("file"), o.get("line"))]
+                drop = len(outside) < 2 and len(outside) < len(occurrences)
+            else:
+                drop = covered(record.get("file"), record.get("line"))
+            if drop:
+                tally = withheld.setdefault(_upstream_key(record.get("file")), {})
+                tally[category] = tally.get(category, 0) + 1
+            else:
+                kept.append(record)
+        results[category] = kept
+
+    records, accounting = [], {}
+    for key, (file, marks) in marked.items():
+        tally = withheld.get(key, {})
+        total = sum(tally.values())
+        if marks.ranges:
+            sources = sorted({source for _, _, source in marks.ranges})
+            whole = any(start == 1 for start, _, _ in marks.ranges)
+            scope = "the whole file" if whole else "lines " + ", ".join(
+                f"{start}-{end}" for start, end, _ in marks.ranges)
+            accounting[str(file)] = {"sources": sources, "scope": scope,
+                                     "records_not_charged": total, "by_category": tally}
+            records.append({
+                "file": str(file), "line": min(start for start, _, _ in marks.ranges),
+                "smell_type": "verbatim_upstream_duplicate", "kind": "candidate",
+                "severity": "low", "suggestion": "",
+                "description": (f"{total} record(s) not charged: {scope} is marked as a verbatim "
+                                f"upstream copy of {'; '.join(sources)}"),
+                "also_caused_by": [
+                    "the marked code is copied unchanged from the named source and kept that way "
+                    "so a diff against it stays readable; simplifying it would defeat that",
+                    "correctness and security records inside it are still charged",
+                ],
+            })
+        for line, reason in marks.ignored:
+            records.append({
+                "file": str(file), "line": line, "smell_type": "upstream_annotation_ignored",
+                "severity": "low",
+                "description": f"`{UPSTREAM_MARKER}` marker exempts nothing: {reason}",
+                "suggestion": (f"Write `{UPSTREAM_MARKER} <project and path it was copied from>` on its "
+                               "own line directly above the def or class it covers, or before the "
+                               "module's first statement to cover the whole file."),
+            })
+    return records, accounting
+
+
 def generate_report(path: str, skip: set | None = None, jobs: int | None = None) -> dict:
     skip = skip or set()
     scheduled = [row for row in ANALYZERS if row[0] not in skip]
@@ -82,16 +171,23 @@ def generate_report(path: str, skip: set | None = None, jobs: int | None = None)
     # Report in the table's order, not the order the pool happened to finish in.
     results = {category: results[category] for category, _, _, _ in scheduled}
     merge_aliases(results)
+    upstream_records, not_charged = withhold_upstream(results, path)
+    if upstream_records:
+        results["verbatim_upstream"] = upstream_records
 
     report = {
         'meta': {
             'analyzed_path': path,
             'timestamp': datetime.now().isoformat(),
-            'analyzers_run': list(results.keys()),
+            'analyzers_run': [category for category, _, _, _ in scheduled],
             'analyzers_skipped': sorted(skip),
             # category -> error string for every analyzer that did not complete.
             # A zero count for one of these categories means "unknown", not "clean".
-            'analyzer_errors': {}
+            'analyzer_errors': {},
+            # file -> what a `# doctor: verbatim-upstream` marker withheld from
+            # the score there. Never absent from view: each file also carries a
+            # candidate under `verbatim_upstream` saying the same.
+            'not_charged': not_charged,
         },
         'summary': {
             'total_issues': 0,
@@ -199,6 +295,14 @@ def print_text_report(report: dict):
         if count > 0:
             print(f"  {cat}: {count}")
     print()
+
+    not_charged = meta.get('not_charged') or {}
+    if not_charged:
+        print(f"⏭  NOT CHARGED — code marked `{UPSTREAM_MARKER} <source>`:")
+        for file, entry in sorted(not_charged.items()):
+            print(f"    • {file}: {entry['records_not_charged']} record(s) not charged "
+                  f"({entry['scope']}, copied from {'; '.join(entry['sources'])})")
+        print()
 
     analyzer_errors = meta.get('analyzer_errors') or {}
     if analyzer_errors:

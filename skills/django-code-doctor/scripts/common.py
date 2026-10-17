@@ -10,8 +10,12 @@ per script; this module is the single copy.
 import ast
 import contextlib
 import functools
+import io
 import os
+import re
 import sys
+import tokenize
+import warnings
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterator
@@ -449,6 +453,100 @@ def cached_source(filepath: Path) -> str:
     the text must still see it.
     """
     return _PARSE_CACHE.source(filepath)
+
+
+# --------------------------------------------------------------------------- #
+# Code copied verbatim from another project: the author's opt-in
+# --------------------------------------------------------------------------- #
+
+# `# doctor: verbatim-upstream <source>` — on its own line before the module's
+# first statement it covers the whole file; directly above a def or class (or
+# its decorators) it covers that definition. It is for code copied unchanged
+# from another project, kept that way so a diff against the source stays
+# readable, and it must name that source. analyze_all does not charge such code
+# for its shape (UPSTREAM_EXEMPT_CATEGORIES) and reports what it withheld.
+UPSTREAM_MARKER = "# doctor: verbatim-upstream"
+_UPSTREAM_MARKER = re.compile(r"#\s*doctor:\s*verbatim-upstream\b(?P<source>.*)$")
+
+# What a verbatim copy is not charged for: its shape — complexity, design,
+# hygiene, duplication — which cannot change without breaking the diff it is
+# kept for. Correctness and security categories are absent on purpose: a bug or
+# an injection copied from upstream is still one here.
+UPSTREAM_EXEMPT_CATEGORIES = frozenset({
+    "complexity", "code_smells", "overengineering", "design_smells", "pattern_issues",
+    "dead_code", "unpythonic", "coupling", "parameter_objects", "boolean_params",
+    "return_issues", "loop_simplifications", "naming_issues", "comment_smells",
+    "outdated_idioms", "missing_docstrings", "type_gaps", "test_smells", "ai_scaffolding",
+    "local_imports", "duplicates",
+})
+
+
+@dataclass(frozen=True)
+class UpstreamMarks:
+    """What one file's verbatim-upstream markers declare.
+
+    ``ranges`` are (first line, last line, source) spans the markers cover;
+    ``ignored`` are (marker line, reason) for markers that cover nothing — one
+    that names no source, or that sits above no definition.
+    """
+
+    ranges: tuple = ()
+    ignored: tuple = ()
+
+    def covers(self, line) -> bool:
+        return isinstance(line, int) and any(start <= line <= end for start, end, _ in self.ranges)
+
+
+@functools.lru_cache(maxsize=1024)
+def upstream_marks(path: str) -> UpstreamMarks:
+    """The verbatim-upstream markers in ``path`` (see UPSTREAM_MARKER)."""
+    try:
+        source = Path(path).read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return UpstreamMarks()
+    if "verbatim-upstream" not in source:
+        return UpstreamMarks()
+    try:
+        markers = [(tok.start[0], match.group("source").strip())
+                   for tok in tokenize.generate_tokens(io.StringIO(source).readline)
+                   if tok.type == tokenize.COMMENT
+                   and (match := _UPSTREAM_MARKER.match(tok.string.strip()))]
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")  # the detectors already said what they had to
+            tree = ast.parse(source)
+    except (SyntaxError, ValueError, tokenize.TokenError):
+        return UpstreamMarks()
+    lines = source.splitlines()
+
+    def start_of(node):
+        return min([node.lineno, *(d.lineno for d in getattr(node, "decorator_list", []))])
+
+    body = tree.body
+    if (body and isinstance(body[0], ast.Expr) and isinstance(body[0].value, ast.Constant)
+            and isinstance(body[0].value.value, str)):
+        body = body[1:]
+    first_statement = start_of(body[0]) if body else len(lines) + 1
+    definitions = {start_of(node): node for node in ast.walk(tree)
+                   if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))}
+
+    ranges, ignored = [], []
+    for line, source_named in markers:
+        if not source_named:
+            ignored.append((line, "it names no source; say what project and file the code was copied from"))
+            continue
+        if line < first_statement:
+            ranges.append((1, len(lines), source_named))
+            continue
+        following = line + 1
+        while following <= len(lines) and (not lines[following - 1].strip()
+                                           or lines[following - 1].lstrip().startswith("#")):
+            following += 1
+        node = definitions.get(following)
+        if node is None:
+            ignored.append((line, "it sits above no def or class, and after the module's first statement"))
+            continue
+        ranges.append((following, node.end_lineno, source_named))
+    return UpstreamMarks(tuple(ranges), tuple(ignored))
 
 
 def sort_findings(findings: list) -> list:
