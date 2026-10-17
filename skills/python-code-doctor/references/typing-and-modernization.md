@@ -101,12 +101,14 @@ versions that float (so "works today" doesn't mean "works tomorrow").
   one unguarded import of the same name anywhere makes it required again; a bare
   `except:` or `except Exception:` does not count as a guard. A module imported only after its
   own file puts a directory on `sys.path` that the source cannot place inside the
-  repo — a checkout named on the command line, an environment variable, a path
-  outside the tree — is reported as a *candidate*: a harness run under another
-  program's interpreter imports that program's modules this way, and no manifest
-  here could declare them. Confirm which it is before adding anything. A directory
-  the source resolves inside the repo explains nothing, so imports after one stay
-  findings.
+  repo — one that resolves outside the tree, or that reads a function parameter,
+  `os.environ`/`os.getenv`, `sys.argv` or a name bound more than once — is reported
+  as a *candidate*: a harness run under another program's interpreter imports that
+  program's modules this way, and no manifest here could declare them. Confirm
+  which it is before adding anything. A directory the source resolves inside the
+  repo explains nothing, and neither does one spelled in a way the detector cannot
+  follow but with none of those run-time sources in it, so imports after either
+  stay findings.
 - **`unused_dependency` (declared, never imported).** Usually cruft from deleted
   code; remove it. But confirm by reading first — some deps are real without an
   `import`: build/runtime plugins, CLI tools, things imported via entry points or

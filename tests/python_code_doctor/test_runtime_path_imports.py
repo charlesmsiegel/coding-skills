@@ -225,3 +225,54 @@ def test_the_lead_reads_as_a_lead_in_text_and_in_the_aggregate_report(tmp_path):
     assert "records_rejected" not in report["meta"], report["meta"].get("records_rejected")
     leads = [(r["smell_type"], r["kind"]) for r in report["categories"]["dependency_issues"]["issues"]]
     assert leads == [("missing_dependency", "candidate")] * 2
+
+
+@pytest.mark.parametrize("addition", [
+    "from os.path import abspath, dirname, join\n"
+    "sys.path.insert(0, abspath(join(dirname(__file__), '..', 'lib')))",
+    "import os.path as osp\n"
+    "sys.path.insert(0, osp.join(osp.dirname(__file__), '..'))",
+    "from os import path\n"
+    "sys.path.insert(0, path.join(path.dirname(__file__), 'vendor'))",
+    "from pathlib import Path as P\n"
+    "sys.path.insert(0, str(P(__file__).parent))",
+    "sys.path.insert(0, str(Path(__file__).with_name('vendor')))",
+    "sys.path.insert(0, str(Path(__file__).with_suffix('')))",
+])
+def test_in_repo_spellings_through_imported_names_explain_nothing(tmp_path, addition):
+    """The same in-repo directory, spelled through `from os.path import join`, an
+    `osp` alias, or Path.with_name, is still inside the repository."""
+    write(tmp_path, "pyproject.toml", MANIFEST)
+    write(tmp_path, "scripts/run.py",
+          "import sys\nfrom pathlib import Path\n\n" + addition + "\n\nimport requests\n")
+
+    assert {name: r["kind"] for name, r in missing(tmp_path).items()} == {"requests": "finding"}
+
+
+def test_an_unread_path_is_opaque_only_when_the_run_decides_it(tmp_path):
+    """A path the reader cannot follow demotes the imports after it only when it
+    reads a parameter, the environment, sys.argv, or a name bound more than once.
+    One that is merely spelled in a way the reader does not know stays a finding."""
+    cases = {
+        "def vendor_dir():\n    return 'vendor'\n\nsys.path.insert(0, vendor_dir())": "finding",
+        "from settings import PLUGIN_DIR\nsys.path.insert(0, PLUGIN_DIR)": "finding",
+        "for entry in ('lib', 'vendor'):\n    sys.path.insert(0, entry)": "finding",
+        "from os import environ\nsys.path.insert(0, environ['PLUGIN_DIR'])": "candidate",
+        "from os import getenv\nsys.path.append(getenv('PLUGIN_DIR'))": "candidate",
+        "from sys import argv\nsys.path.append(argv[1])": "candidate",
+        "sys.path.insert(0, os.environ.get('PLUGIN_DIR', 'plugins'))": "candidate",
+        "def boot(arguments):\n    sys.path.insert(0, str(arguments.case_dir))": "candidate",
+        "base = Path(__file__).parent\nbase = base / 'plugins'\nsys.path.insert(0, str(base))": "candidate",
+    }
+    wrong = {}
+    for number, (addition, expected) in enumerate(cases.items()):
+        root = tmp_path / f"case{number}"
+        write(root, "pyproject.toml", MANIFEST)
+        write(root, "settings.py", "PLUGIN_DIR = 'plugins'\n")
+        write(root, "plugin.py",
+              "import os\nimport sys\nfrom pathlib import Path\n\n" + addition + "\n\n\n"
+              "def fetch():\n    import requests\n    return requests\n")
+        got = missing(root)["requests"]["kind"]
+        if got != expected:
+            wrong[addition] = got
+    assert not wrong, wrong
