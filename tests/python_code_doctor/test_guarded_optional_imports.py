@@ -205,16 +205,22 @@ def test_a_handler_that_stops_the_program_leaves_a_lead(tmp_path, stop):
     assert lead["file"].replace("\\", "/").endswith("tool.py") and lead["line"] == 5
 
 
-def test_a_shared_guard_spares_only_the_import_its_handler_replaces(tmp_path):
-    """A handler that falls back for one import says nothing about the others in the
-    same try: `requests` is a NameError waiting to happen when it is absent."""
+def test_a_shared_guard_spares_only_the_imports_its_handler_rebinds(tmp_path):
+    """Of several third-party imports under one guard, only one whose name the
+    degrading handler rebinds is optional: `x = None`, `x = fallback`, or a
+    fallback import. `requests` beside `ujson as json` is a NameError waiting to
+    happen when it is absent. Stdlib and relative imports in the same try do not
+    make it a group."""
     write(tmp_path, "pyproject.toml", MANIFEST)
     write(tmp_path, "client.py",
           "try:\n    import requests\n    import ujson as json\nexcept ImportError:\n    import json\n"
           "try:\n    import numpy, scipy\nexcept ImportError:\n    numpy = scipy = None\n"
-          "try:\n    from PIL import Image, ImageDraw\nexcept ImportError:\n    Image = ImageDraw = None\n")
+          "try:\n    from PIL import Image, ImageDraw\nexcept ImportError:\n    Image = ImageDraw = None\n"
+          "try:\n    import os\n    import yaml\nexcept ImportError:\n    yaml = None\n"
+          "try:\n    from . import _speedups\n    import cffi\nexcept ImportError:\n    _speedups = None\n"
+          "try:\n    import torch\n    import xformers\nexcept ImportError:\n    HAVE_GPU = False\n")
 
-    assert kinds(tmp_path) == {"requests": "candidate", "numpy": "candidate", "scipy": "candidate"}
+    assert kinds(tmp_path) == {"requests": "candidate", "torch": "candidate", "xformers": "candidate"}
 
 
 def test_a_guard_that_stops_stays_a_lead_however_the_module_is_guarded_elsewhere(tmp_path):
