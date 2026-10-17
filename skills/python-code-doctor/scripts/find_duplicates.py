@@ -228,6 +228,10 @@ def _group(blocks: list[dict], key: str, exact: bool) -> list[DuplicateGroup]:
     groups = []
     for hash_val, members in by_hash.items():
         if len(members) >= 2:
+            # In path order, not the walk's: rglob's order is the filesystem's,
+            # and the first occurrence is where the group is reported, which
+            # must not move between machines.
+            members.sort(key=lambda b: (b['file'], b['line']))
             groups.append(DuplicateGroup(
                 hash=hash_val,
                 occurrences=[{
