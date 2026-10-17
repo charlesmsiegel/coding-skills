@@ -2416,6 +2416,70 @@ def test_field_reset_to_none_is_temporary(tmp_path):
     )
 
 
+_CARRIED_FIELDS = (
+    "class Slot:\n"
+    "    def __init__(self):\n"
+    "        self._prompter = None\n"
+    "        self._prompter_key = None\n"
+    "\n"
+    "    def image_prompter(self, settings):\n"
+    "        key = (settings.dir, settings.device)\n"
+    "        if self._prompter is None or self._prompter_key != key:\n"
+    "            self._prompter, self._prompter_key = build(key), key\n"
+    "        return self._prompter\n"
+    "\n"
+    "class Tally:\n"
+    "    def __init__(self):\n"
+    "        self._total = None\n"
+    "\n"
+    "    def add(self, value):\n"
+    "        self._total = merge(self._total, value)\n"
+    "        log(self._total)\n"
+    "\n"
+    "class Job:\n"
+    "    def __init__(self):\n"
+    "        self.scratch = None  # fires\n"
+    "\n"
+    "    def run(self, items):\n"
+    "        self.scratch = prepare(items)\n"
+    "        log(self.scratch)\n"
+    "\n"
+    "class Guarded:\n"
+    "    def __init__(self):\n"
+    "        self.buffer = None  # fires\n"
+    "\n"
+    "    def parse(self, text):\n"
+    "        if self.buffer is not None:\n"
+    "            raise RuntimeError('re-entered')\n"
+    "        self.buffer = text.split()\n"
+    "        log(self.buffer)\n"
+    "        self.buffer = None\n"
+    "\n"
+    "class Walker:\n"
+    "    def __init__(self):\n"
+    "        self.previous = None  # fires\n"
+    "\n"
+    "    def walk(self, items):\n"
+    "        for item in items:\n"
+    "            if self.previous is not None:\n"
+    "                compare(self.previous, item)\n"
+    "            self.previous = item\n"
+)
+
+
+def test_a_field_read_before_it_is_written_carries_state_between_calls(tmp_path):
+    """`image_prompter` compares `_prompter_key` with the new key before it stores
+    it, so the read can only see what an earlier call left: the key of what is
+    cached. A field read before it is written persists by design and is not a
+    temporary field. Scratch written then read is still one, as is a field reset
+    to None after use, and a read inside a loop proves nothing (it may see the
+    same call's previous iteration)."""
+    (tmp_path / "sample.py").write_text(_CARRIED_FIELDS)
+    temporary = sorted(f["line"] for f in run_detector("find_design_smells.py", tmp_path)
+                       if f["smell_type"] == "temporary_field")
+    assert temporary == _lines_marked(_CARRIED_FIELDS)
+
+
 def test_empty_subclass_of_registering_base_is_not_lazy(tmp_path):
     (tmp_path / "sample.py").write_text(
         "class Plugin:\n"
