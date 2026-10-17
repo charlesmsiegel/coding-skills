@@ -11,6 +11,7 @@ import argparse
 from pathlib import Path
 from dataclasses import dataclass, asdict
 from collections import defaultdict
+from find_coupling_issues import _Derivation, _method_nodes
 from common import (sort_findings, SEVERITY_ICONS, configure_output, find_python_files,
                     warn_detector_error, warn_unparseable)
 
@@ -207,10 +208,19 @@ class ClassCollector(ast.NodeVisitor):
 
 
 def _self_stores(defs: list) -> set:
-    """The attributes these methods store on `self`."""
-    return {target.attr for item in defs for target in ast.walk(item)
-            if isinstance(target, ast.Attribute) and isinstance(target.ctx, ast.Store)
-            and isinstance(target.value, ast.Name) and target.value.id == 'self'}
+    """Attributes stored on each method's own receiver, including captured self.
+
+    Reuse the coupling detector's lexical resolver: a nested method's self is
+    another object, while a closure capturing this method's self owns its state.
+    """
+    stored = set()
+    for method in defs:
+        bindings = _Derivation(method, "self")
+        stored.update(target.attr for target in _method_nodes(method.body)
+                      if isinstance(target, ast.Attribute) and isinstance(target.ctx, ast.Store)
+                      and isinstance(target.value, ast.Name) and target.value.id == "self"
+                      and bindings.resolve(target.value) == bindings.receiver_key)
+    return stored
 
 
 def analyze_tree(path: Path, ignore: set) -> list:

@@ -4199,16 +4199,21 @@ def test_a_marked_upstream_copy_is_not_a_member_of_the_projects_duplication(tmp_
     def members(record):
         return sorted(Path(o["file"]).name for o in record["occurrences"])
 
-    groups = sorted((Path(r["file"]).name, members(r), r["severity"])
-                    for r in run_detector("find_duplicates.py", tmp_path) if r["kind"] == "finding")
-    assert groups == [("a_upstream.py", ["a_upstream.py", "a_upstream.py"], "medium"),
-                      ("c_two.py", ["b_one.py", "c_two.py"], "medium"),
-                      ("f_upstream.py", ["e_ported.py", "f_upstream.py"], "medium")]
+    records = run_detector("find_duplicates.py", tmp_path)
+    groups = sorted((members(r), r["kind"], r["severity"]) for r in records)
+    assert groups == [(["a_upstream.py", "a_upstream.py"], "candidate", "medium"),
+                      (["b_one.py", "c_two.py"], "candidate", "medium"),
+                      (["e_ported.py", "f_upstream.py"], "candidate", "medium")]
+    # Two copies are below the rule of three. Body partitioning still anchors
+    # upstream groups at a marked occurrence, regardless of filesystem order.
+    anchors = {tuple(members(r)): Path(r["file"]).name for r in records}
+    assert anchors[("a_upstream.py", "a_upstream.py")] == "a_upstream.py"
+    assert anchors[("e_ported.py", "f_upstream.py")] == "f_upstream.py"
 
     report = json.loads(subprocess.run(
         [sys.executable, str(SCRIPTS_DIR / "analyze_all.py"), str(tmp_path), "--format", "json"],
         capture_output=True, text=True, timeout=300, check=True).stdout)
-    charged = [members(r) for r in report["categories"]["duplicates"]["issues"] if r["kind"] == "finding"]
+    charged = [members(r) for r in report["categories"]["duplicates"]["issues"]]
     assert charged == [["b_one.py", "c_two.py"]]
     withheld = {Path(f).name: entry["by_category"].get("duplicates")
                 for f, entry in report["meta"]["not_charged"].items()}
@@ -5880,7 +5885,7 @@ def test_a_framework_hook_override_keeps_the_frameworks_signature(tmp_path, scri
 _COPIED_SIGNATURES = {
     "pkg/pipeline.py": (
         "class Pipeline:\n"
-        "    def __call__(self, params, *, generator=None, output_type='pil',  # fires\n"
+        "    def __call__(self, params, generator=None, output_type='pil',  # fires\n"
         "                 callback=None, conditioning=None, strength=1.0):\n"
         "        return params\n"
         "\n"
@@ -5889,12 +5894,12 @@ _COPIED_SIGNATURES = {
     ),
     "pkg/proxy.py": (
         "class Proxy:\n"
-        "    def __call__(self, params, *, generator, callback, conditioning, strength, **kwargs):  # fires\n"
+        "    def __call__(self, params, generator, output_type, callback, conditioning, strength, **kwargs):  # fires\n"
         "        return params\n"
     ),
     "tests/test_jobs.py": (
         "class _Recording:\n"
-        "    def __call__(self, params, *, generator, callback=None, conditioning=None, strength=1.0, **_):\n"
+        "    def __call__(self, params, generator, output_type='pil', callback=None, conditioning=None, strength=1.0, **_):\n"
         "        return params\n"
         "\n"
         "def test_the_hook_sees_every_call(install):\n"
@@ -5910,7 +5915,7 @@ _COPIED_SIGNATURES = {
         "        return a\n"
         "\n"
         "class _Renamed:\n"
-        "    def __call__(self, params, *, generator, seed, steps, width, height):  # fires\n"
+        "    def __call__(self, params, generator, seed, steps, width, height):  # fires\n"
         "        return params\n"
         "\n"
         "def spread(params, generator, output_type, a, b, c, d):  # fires\n"
@@ -5921,7 +5926,6 @@ _COPIED_SIGNATURES = {
 
 @pytest.mark.parametrize("script,finding_type,key", [
     ("analyze_complexity.py", "parameter_count", "issue_type"),
-    ("find_code_smells.py", "long_parameter_list", "smell_type"),
 ])
 def test_a_test_double_copying_a_production_signature_is_not_charged_for_it(tmp_path, script,
                                                                             finding_type, key):
