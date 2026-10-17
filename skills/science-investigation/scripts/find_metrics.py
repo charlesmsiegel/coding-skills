@@ -29,9 +29,9 @@ import argparse
 from pathlib import Path
 
 from common import (
-    CODE_SUFFIXES, CONFIG_SUFFIXES, add_common_args, candidate, configure_output, emit,
-    envelope, is_config, iter_files, mask_strings, read_source, rel, relocate, skipped_note,
-    split_comment, unpack_source,
+    CODE_SUFFIXES, CONFIG_SUFFIXES, add_common_args, bound_lines, candidate, configure_output,
+    coverage_note, emit, envelope, is_config, iter_files, looks_generated, mask_strings, read_source,
+    rel, relocate, skipped_note, split_comment, unpack_source,
 )
 
 # Tokens that make an identifier a measure on their own.
@@ -44,6 +44,13 @@ STRONG_TOKENS = frozenset({
     "rating", "eval", "benchmark", "kappa", "agreement", "regret", "mean",
     "average", "avg", "median", "delta", "lift", "uplift", "pvalue", "baseline",
 })
+# Tokens that are a measure only in a metric's shape. "map" is mean average
+# precision and also every mapping in the language: `source_map`, `identity_map`
+# and `const map = new Map()` were 40 rows in one real repository. It counts
+# beside a cutoff (`map_at_10`, `mapAt5`, `MAP_AT_K`), or alone holding a number
+# (`"map": 0.42`, `map >= 0.5`).
+SHAPED_TOKENS = frozenset({"map"})
+_CUTOFF_RE = re.compile(r"^(?:at\d*|k|\d+)$")
 # Plurals on their own are usually a container (`scores = [...]`), not a measure.
 # They still count next to a strong token: `metric_scores` matches on `metric`.
 # "rate" is only a measure next to one of these; learning_rate and sample_rate are not.
@@ -103,7 +110,12 @@ _LITERAL_END = r"[fFdDlLuU]?(?![\w.])"
 # optional call the decision site was inventoried nowhere.
 _CALL = r"(?:\([^()]*\))?"
 _OPS = r"(>=|<=|==|!=|>|<)"
-_COMPARE_RE = re.compile(r"([A-Za-z_][\w.]*)" + _CALL + r"\s*" + _OPS + r"\s*("
+# A name starts where its run starts, or just after the dot that follows a call or
+# a subscript (`scores[k].precision`, `evaluate(rows).accuracy`). Matching from
+# inside an identifier made a long one cost quadratic time, and changes no match:
+# any end reachable from inside a run is reachable from its start.
+_NAME_START = r"(?:(?<![\w.])|(?<=[^\w.]\.)|(?<=^\.))"
+_COMPARE_RE = re.compile(_NAME_START + r"([A-Za-z_][\w.]*)" + _CALL + r"\s*" + _OPS + r"\s*("
                          + _NUMBER + r")" + _LITERAL_END)
 _COMPARE_MIRRORED_RE = re.compile(r"(?<![\w.])(" + _NUMBER + r")" + _LITERAL_END
                                   + r"\s*" + _OPS + r"\s*([A-Za-z_][\w.]*)")
@@ -125,7 +137,8 @@ _AGGREGATE_RE = re.compile(
     r"|\.(?:mean|sum|average|agg)\s*\("
 )
 # `0.4 * relevance + 0.2 * latency`
-_WEIGHTED_SUM_RE = re.compile(r"(?:" + _NUMBER + r"\s*\*\s*[A-Za-z_]|[A-Za-z_][\w.]*\s*\*\s*" + _NUMBER + r")")
+_WEIGHTED_SUM_RE = re.compile(r"(?:(?<![\w.])" + _NUMBER + r"\s*\*\s*[A-Za-z_]"
+                              r"|" + _NAME_START + r"[A-Za-z_][\w.]*\s*\*\s*" + _NUMBER + r")")
 # `return 0.0`, `except ...: return 0`, `.get("accuracy", 0)`, `or 0.0`
 # The trailing `;` is not optional decoration: without it every JS/Java/C/C#
 # `return 0;` in a metric path went unreported.
@@ -135,6 +148,21 @@ _ZERO_DEFAULT_RE = re.compile(
     r"|\bor\s+(?:0|0\.0+)(?![\d.])"
     r"|(?:\?\?|\|\|)\s*(?:0|0\.0+)(?![\d.])"          # JS: result.accuracy ?? 0
 )
+
+# A command's `return 0` is its exit status, not a score: one real repository's
+# CLI subcommands were 20 of its 42 zero-default rows. Only the bare integer, and
+# only in a function that is evidently a command — named `main`, handed argv or
+# an argparse namespace, passed to sys.exit, or printing its output and
+# returning nothing but integer literals. A metric that prints and still returns
+# a computed value is not one.
+_BARE_ZERO_RETURN_RE = re.compile(r"^\s*return\s+0\s*;?\s*$")
+_FUNC_RE = re.compile(r"^(\s*)(?:(?:export|public|private|protected|static|async)\s+)*"
+                      r"(?:def|function|func|fn|int)\s+([A-Za-z_]\w*)\s*\(")
+_RETURN_RE = re.compile(r"^\s*return\b")
+_INT_RETURN_RE = re.compile(r"^\s*return\s+(?:\d+|\d+\s+if\s+.+\s+else\s+\d+)\s*;?\s*$")
+_PRINTS_RE = re.compile(r"\bprint\(|\bsys\.std(?:out|err)\b|\bconsole\.(?:log|error)\(|\bputs\b"
+                        r"|\bfmt\.F?[Pp]rint")
+_CLI_PARAM_RE = re.compile(r"\bargv\b|\bargparse\.Namespace\b")
 
 CONFIRM = {
     "metric_definition": "read the formula and its inputs; then find who consumes the number",
@@ -156,9 +184,22 @@ def tokens_of(name: str) -> frozenset:
     return frozenset(t.lower() for t in _SPLIT_RE.findall(name))
 
 
-def is_metric_name(name: str) -> bool:
+def names_a_strong_measure(toks: frozenset, value=None) -> bool:
+    """Whether the tokens hold a measure word, a shaped one only in its shape."""
+    strong = toks & STRONG_TOKENS
+    if strong - SHAPED_TOKENS:
+        return True
+    if not strong:
+        return False
+    if any(_CUTOFF_RE.match(token) for token in toks):
+        return True
+    return toks == strong and value is not None and looks_numeric(value)
+
+
+def is_metric_name(name: str, value=None) -> bool:
+    """`value`, when given, is what the name holds or is compared against."""
     toks = tokens_of(name)
-    if toks & STRONG_TOKENS:
+    if names_a_strong_measure(toks, value):
         return True
     return "rate" in toks and bool(toks & RATE_PARTNERS)
 
@@ -169,7 +210,8 @@ def is_threshold_name(name: str) -> bool:
         return False
     # `max_retries` is a limit, not a measurement threshold; require a measure or a
     # bare threshold word ("THRESHOLD = 0.8") to keep this out of retry config.
-    return bool(toks & STRONG_TOKENS) or bool(toks & {"threshold", "cutoff", "slo", "sla", "gate", "bar"})
+    return (names_a_strong_measure(toks)
+            or bool(toks & {"threshold", "cutoff", "slo", "sla", "gate", "bar"}))
 
 
 def looks_numeric(value: str) -> bool:
@@ -205,18 +247,19 @@ def named_on(line: str, stripped: str) -> list:
     return deduped
 
 
-def comparable(line: str, is_config_file: bool) -> str:
+def comparable(line: str, is_config_file: bool, unquoted=None) -> str:
     """The part of a line a comparison may legitimately be read from.
 
     Message text is masked in source files: `message = "quality_score > 0.8"` gates
     nothing, and reporting it as a threshold invents a decision site. Config files
-    are left alone, because there the quoted text *is* the value.
+    are left alone, because there the quoted text *is* the value. `unquoted` is
+    the masked, comment-free line when the caller already has it.
     """
     if is_config_file:
         return line
     # Comments go too: `result = run()  # legacy: quality_score > 0.8` documents an
     # old gate, it does not gate anything now.
-    return split_comment(mask_strings(line))[0]
+    return split_comment(mask_strings(line))[0] if unquoted is None else unquoted
 
 
 def name_candidates(line: str, stripped: str, path_display: str, lineno: int, defined: dict) -> list:
@@ -231,7 +274,7 @@ def name_candidates(line: str, stripped: str, path_display: str, lineno: int, de
                 name + " = " + value.strip().rstrip(",;") + " — a constant that turns a number into a decision",
                 CONFIRM["threshold"], stripped,
             ))
-        if not is_metric_name(name):
+        if not is_metric_name(name, value):
             continue
         # Only module-level definitions are eligible for the dead-measurement check:
         # a local inside a function is a step in a computation, and "this local is
@@ -258,7 +301,8 @@ def scan_line(line: str, path_display: str, lineno: int, defined: dict, window: 
 
     out = name_candidates(line, stripped, path_display, lineno, defined)
 
-    scannable = comparable(line, is_config_file)
+    unquoted = split_comment(mask_strings(line))[0]
+    scannable = comparable(line, is_config_file, unquoted)
     comparisons = [(left, op, number) for left, op, number in _COMPARE_RE.findall(scannable)]
     # Normalized so `0.75 <= score` reads as `score >= 0.75`: the same gate, and an
     # auditor should not have to notice which way round the author wrote it.
@@ -270,20 +314,26 @@ def scan_line(line: str, path_display: str, lineno: int, defined: dict, window: 
         if (leaf, op, number) in seen_comparisons:
             continue
         seen_comparisons.add((leaf, op, number))
-        if is_metric_name(leaf) or is_threshold_name(leaf):
+        if is_metric_name(leaf, number) or is_threshold_name(leaf):
             out.append(candidate(
                 "threshold", path_display, lineno,
                 leaf + " " + op + " " + number + " — a measure gates control flow here",
                 CONFIRM["threshold"], stripped,
             ))
 
-    if len(_WEIGHTED_SUM_RE.findall(line)) >= 2 and "+" in line:
+    # Weights are read with string bodies masked in every file, config included:
+    # arithmetic inside a string — a Lean proof in a JSON value, a polynomial a
+    # test expects — weighs nothing, and was every composite row in one real
+    # repository. A config's unquoted value (`composite: 0.4 * a + 0.6 * b`) and a
+    # key's number (`"relevance_weight": 0.4`) are outside the quotes and still read.
+    terms = len(_WEIGHTED_SUM_RE.findall(unquoted))
+    if terms >= 2 and "+" in unquoted:
         out.append(candidate(
             "composite_weight", path_display, lineno,
-            "a weighted sum of " + str(len(_WEIGHTED_SUM_RE.findall(line))) + " terms",
+            "a weighted sum of " + str(terms) + " terms",
             CONFIRM["composite_weight"], stripped,
         ))
-    elif "weight" in stripped.lower() and re.search(r"0\.\d+", stripped):
+    elif "weight" in stripped.lower() and re.search(r"0\.\d+", unquoted):
         out.append(candidate(
             "composite_weight", path_display, lineno,
             "hand-written weights",
@@ -307,29 +357,94 @@ def scan_line(line: str, path_display: str, lineno: int, defined: dict, window: 
     return out
 
 
+def enclosing_function(lines: list, index: int):
+    """(name, signature, body) of the function holding `lines[index]`, or None.
+
+    By indentation, which every language here is written with in practice: walk
+    up past each enclosing block to the first header indented less than them.
+    """
+    threshold = len(lines[index]) - len(lines[index].lstrip())
+    for start in range(index - 1, -1, -1):
+        text = lines[start]
+        if not text.strip():
+            continue
+        lead = len(text) - len(text.lstrip())
+        # `) -> int:` closing a multi-line signature, or a bracket closing a call,
+        # is a continuation line, not an enclosing block.
+        if lead >= threshold or text.lstrip().startswith((")", "]", "}")):
+            continue
+        header = _FUNC_RE.match(text)
+        if header is None:
+            if lead == 0:
+                return None
+            threshold = lead
+            continue
+        # The signature runs until its parentheses close, possibly over lines.
+        end, depth = start, 0
+        while end < len(lines) and end < start + 12:
+            depth += lines[end].count("(") - lines[end].count(")")
+            if depth <= 0:
+                break
+            end += 1
+        body = []
+        for text in lines[end + 1:]:
+            if text.strip() and len(text) - len(text.lstrip()) <= lead:
+                break
+            body.append(text)
+        return header.group(2), "\n".join(lines[start:end + 1]), body
+    return None
+
+
+def exit_status(lines: list, index: int, text: str) -> bool:
+    """Whether the `return 0` at `lines[index]` is a command's exit status."""
+    found = enclosing_function(lines, index)
+    if found is None:
+        return False
+    name, signature, body = found
+    if name == "main" or _CLI_PARAM_RE.search(signature):
+        return True
+    if re.search(r"\b(?:sys\.exit|SystemExit|process\.exit)\(\s*" + re.escape(name) + r"\(", text):
+        return True
+    returns = [line for line in body if _RETURN_RE.match(line)]
+    return bool(_PRINTS_RE.search("\n".join(body))) and all(_INT_RETURN_RE.match(r) for r in returns)
+
+
 def scan(root: Path) -> tuple:
-    """(candidates, defined-name -> sites, corpus, files skipped unread)."""
+    """(candidates, defined-name -> sites, corpus, files skipped unread, notebook
+    locations, generated files not mined -> their lines, lines cut)."""
     files = iter_files(root, CODE_SUFFIXES | CONFIG_SUFFIXES)
     found = []
     defined: dict = {}
     corpus = {}
     skipped = []
     notebooks: dict = {}
+    generated: dict = {}
+    truncated = 0
     for path in files:
         lines, reason, locations = unpack_source(read_source(path))
         display = rel(path, root)
         if reason:
             skipped.append((display, reason))
             continue
+        if looks_generated(path, lines):
+            # Not mined, but kept as a place a metric can be read: a bundle may be
+            # the only committed consumer of a number, and a name it reads is not dead.
+            generated[display] = lines
+            continue
         corpus[display] = lines
         if locations:
             notebooks[display] = locations
-        for lineno, line in enumerate(lines, 1):
+        scanned, cut = bound_lines(lines)
+        truncated += cut
+        text = "\n".join(scanned)
+        for lineno, line in enumerate(scanned, 1):
             # A few lines of context, because the aggregate that makes a dropped-None
             # list a composite usually sits on the next line, not this one.
-            window = "\n".join(lines[max(0, lineno - 2):lineno + 3])
-            found += scan_line(line, display, lineno, defined, window, is_config(path))
-    return found, defined, corpus, skipped, notebooks
+            window = "\n".join(scanned[max(0, lineno - 2):lineno + 3])
+            found += [row for row in scan_line(line, display, lineno, defined, window, is_config(path))
+                      if not (row["kind"] == "zero_default" and _BARE_ZERO_RETURN_RE.match(line)
+                              and exit_status(scanned, lineno - 1, text))]
+    return found, defined, corpus, skipped, notebooks, generated, truncated
 
 
 def dead_metrics(defined: dict, corpus: dict) -> list:
@@ -465,7 +580,10 @@ CAVEAT = (
     "C-family signature; a bare class method (`qualityScore(rows) {`) is NOT matched, because it is "
     "textually identical to a call and matching it would report every call site as a definition. "
     "Consumer counts are literal text matches, so a metric read through a key built at runtime "
-    "reads as unused, and a name matched inside a comment reads as used. Confirm every row by reading."
+    "reads as unused, and a name matched inside a comment reads as used. Confirm every row by reading. "
+    "\"map\" counts only beside a cutoff or holding a number, weights are read outside string literals, "
+    "and a bare `return 0` in an evident command (main, argv, an argparse namespace, sys.exit, or "
+    "printing and returning only integers) is read as an exit status rather than a score."
 )
 
 
@@ -480,19 +598,22 @@ def main() -> int:
         print("error: no such path: " + str(root), file=sys.stderr)
         return 2
 
-    rows, defined, corpus, skipped, notebooks = scan(root)
-    rows += dead_metrics(defined, corpus)
+    rows, defined, corpus, skipped, notebooks, generated, truncated = scan(root)
+    rows += dead_metrics(defined, {**corpus, **generated})
     rows = relocate(scope_zero_defaults(rows), notebooks)
     shown = dedupe(rows, args.limit)
     counts = {
         "files_scanned": len(corpus),
         "files_skipped_unread": len(skipped),
+        "files_skipped_generated": len(generated),
+        "lines_truncated": truncated,
         "metric_names": len(defined),
         "candidates_total": len(rows),
         "candidates_shown": len(shown),
     }
     headline = headline_for(rows, defined, len(corpus)) + skipped_note(skipped)
-    emit(envelope("find_metrics", root, headline, CAVEAT, counts, shown), args.format)
+    caveat = CAVEAT + coverage_note(sorted(generated), truncated)
+    emit(envelope("find_metrics", root, headline, caveat, counts, shown), args.format)
     return 0
 
 
