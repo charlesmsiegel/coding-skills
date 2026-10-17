@@ -182,39 +182,35 @@ class ClassCollector(ast.NodeVisitor):
         self.generic_visit(node)
 
     def _check_thin_wrapper(self, node: ast.ClassDef):
-        init_method = None
-        for item in node.body:
-            if isinstance(item, ast.FunctionDef) and item.name == '__init__':
-                init_method = item
-                break
-        
+        """A class whose only state is the one object it stores in __init__, and
+        whose methods mostly reach through to it.
+
+        Every attribute the class stores on self counts, in any method and by
+        any form of assignment (`self.x = `, `self.x: T = `, `self.a, self.b = `,
+        `self.n += `). A class that also keeps a key, a cache or a counter of its
+        own owns state the wrapped object does not, so it is not a thin wrapper.
+        """
+        defs = [item for item in node.body if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef))]
+        init_method = next((item for item in defs if item.name == '__init__'), None)
         if not init_method:
             return
-        
-        stored_attrs = []
-        for stmt in ast.walk(init_method):
-            if isinstance(stmt, ast.Assign):
-                for target in stmt.targets:
-                    if isinstance(target, ast.Attribute):
-                        if isinstance(target.value, ast.Name) and target.value.id == 'self':
-                            stored_attrs.append(target.attr)
-        
-        if len(stored_attrs) == 1:
-            wrapped_attr = stored_attrs[0]
-            methods = [n for n in node.body if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and n.name != '__init__']
-            
-            if methods:
-                delegate_count = 0
-                for method in methods:
-                    for stmt in ast.walk(method):
-                        if isinstance(stmt, ast.Attribute):
-                            if isinstance(stmt.value, ast.Attribute):
-                                if stmt.value.attr == wrapped_attr:
-                                    delegate_count += 1
-                                    break
-                
-                if delegate_count >= len(methods) * 0.7 and len(methods) > 1:
-                    self.analyzer.thin_wrappers.append((node.name, self.filename, node.lineno, wrapped_attr))
+        stored = _self_stores(defs)
+        if len(stored) != 1 or stored != _self_stores([init_method]):
+            return
+        (wrapped_attr,) = stored
+        methods = [item for item in defs if item.name != '__init__']
+        delegate_count = sum(1 for method in methods if any(
+            isinstance(inner, ast.Attribute) and isinstance(inner.value, ast.Attribute)
+            and inner.value.attr == wrapped_attr for inner in ast.walk(method)))
+        if delegate_count >= len(methods) * 0.7 and len(methods) > 1:
+            self.analyzer.thin_wrappers.append((node.name, self.filename, node.lineno, wrapped_attr))
+
+
+def _self_stores(defs: list) -> set:
+    """The attributes these methods store on `self`."""
+    return {target.attr for item in defs for target in ast.walk(item)
+            if isinstance(target, ast.Attribute) and isinstance(target.ctx, ast.Store)
+            and isinstance(target.value, ast.Name) and target.value.id == 'self'}
 
 
 def analyze_tree(path: Path, ignore: set) -> list:

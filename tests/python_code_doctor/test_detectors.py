@@ -3724,6 +3724,76 @@ def test_abstraction_with_two_implementations_is_earned(tmp_path):
     assert run_detector("find_overengineering.py", tmp_path) == []
 
 
+_WRAPPERS = (
+    "class Prompter:\n"
+    "    def __init__(self, encoder):\n"
+    "        self.encoder = encoder\n"
+    "        self._key: tuple | None = None\n"
+    "        self._loaded: object | None = None\n"
+    "\n"
+    "    def adapter(self, path):\n"
+    "        if self._key != path:\n"
+    "            self._key, self._loaded = path, load(path)\n"
+    "        return self._loaded\n"
+    "\n"
+    "    def conditioning(self, images):\n"
+    "        return self.encoder.encode(images)\n"
+    "\n"
+    "    def nulls(self):\n"
+    "        return self.encoder.encode([gray()])\n"
+    "\n"
+    "    def release(self):\n"
+    "        self._key, self._loaded = None, None\n"
+    "        self.encoder.release()\n"
+    "\n"
+    "class Remembering:\n"
+    "    def __init__(self, client):\n"
+    "        self.client = client\n"
+    "\n"
+    "    def get(self, key):\n"
+    "        self.last = key\n"
+    "        return self.client.get(key)\n"
+    "\n"
+    "    def put(self, key, value):\n"
+    "        return self.client.put(key, value)\n"
+    "\n"
+    "    def delete(self, key):\n"
+    "        return self.client.delete(key)\n"
+    "\n"
+    "class Wrapper:  # fires\n"
+    "    def __init__(self, client):\n"
+    "        self.client = client\n"
+    "\n"
+    "    def get(self, key):\n"
+    "        return self.client.get(key)\n"
+    "\n"
+    "    def put(self, key, value):\n"
+    "        return self.client.put(key, value)\n"
+    "\n"
+    "class AnnotatedWrapper:  # fires\n"
+    "    def __init__(self, client):\n"
+    "        self.client: Client = client\n"
+    "\n"
+    "    def get(self, key):\n"
+    "        return self.client.get(key)\n"
+    "\n"
+    "    def put(self, key, value):\n"
+    "        return self.client.put(key, value)\n"
+)
+
+
+def test_a_class_with_state_of_its_own_is_not_a_thin_wrapper(tmp_path):
+    """anima-ui's `ImagePrompter` stores its encoder plus the key and the adapter
+    it caches; the annotated `self._key: ... = None` was invisible, so it read as
+    a wrapper of `encoder`. Every store on self counts, in any method and any
+    assignment form, and a class keeping state of its own is not a thin wrapper.
+    A class whose only state is the object it forwards to still is."""
+    (tmp_path / "sample.py").write_text(_WRAPPERS)
+    wrappers = sorted(r["line"] for r in run_detector("find_overengineering.py", tmp_path)
+                      if r["issue_type"] == "thin_wrapper")
+    assert wrappers == _lines_marked(_WRAPPERS)
+
+
 # ---- find_parameter_objects ----------------------------------------------- #
 
 
