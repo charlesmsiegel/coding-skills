@@ -183,7 +183,7 @@ export class Badge {
 # Comments are located by character offset
 # --------------------------------------------------------------------------- #
 
-def test_an_explained_empty_catch_is_low_and_a_silent_one_high(tmp_path):
+def test_an_explained_empty_catch_is_omitted_and_a_silent_one_high(tmp_path):
     root = project(tmp_path, {"src/a.ts": """\
 export function f(g: () => void): void {
   try { g(); } catch { /* best effort: the cache is rebuilt on the next read */ }
@@ -191,7 +191,7 @@ export function f(g: () => void): void {
 }
 """})
     found = records("find_exception_issues.py", root, "empty_catch")
-    assert sorted((r["line"], r["severity"]) for r in found) == [(2, "low"), (3, "high")]
+    assert sorted((r["line"], r["severity"]) for r in found) == [(3, "high")]
 
 
 def test_an_explained_empty_function_is_not_reported(tmp_path):

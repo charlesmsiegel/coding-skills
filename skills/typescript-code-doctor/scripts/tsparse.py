@@ -23,7 +23,7 @@ __all__ = [
     "TypeDecl", "TypeMember", "Import", "Export", "RESERVED",
     "parse_file", "parse_source", "callee_of", "iter_calls", "enclosing_call", "argument_spans",
     "callback_target", "body_indices", "names_in", "statement_start", "statement_end", "line_indent",
-    "is_definite_assignment",
+    "is_definite_assignment", "imported_identity", "name_is_shadowed",
 ]
 
 
@@ -281,3 +281,66 @@ def is_definite_assignment(file: TsFile, bang: int) -> bool:
     # A class field in code without semicolons starts its own line after the
     # previous member's last token, which is not an operator.
     return name.line > lead.line and not continues_line(file, bang - 2)
+
+
+def name_is_shadowed(file: TsFile, name: str, index: int, definition: Func | None = None) -> bool:
+    """Refuse a binding proof when an enclosing scope can replace the name.
+
+    This is deliberately conservative about block scope, while writes in sibling
+    functions cannot invalidate a binding at this use site.
+    """
+    active = [func for func in file.functions if func.has_body and func.body_open < index < func.body_close]
+    scopes = {None, *(id(func) for func in active)}
+    if any(param.name == name for func in active for param in func.params):
+        return True
+    allowed = statement_start(file, definition.start) if definition is not None else -1
+    for func in file.functions:
+        parent = file.enclosing_function(func.start)
+        if func.owner is None and func.name == name and func is not definition \
+                and (id(parent) if parent is not None else None) in scopes:
+            return True
+    for probe, token in enumerate(file.tokens):
+        parent = file.enclosing_function(probe)
+        if (id(parent) if parent is not None else None) not in scopes:
+            continue
+        if token.is_name("const", "let", "var"):
+            if statement_start(file, probe) == allowed:
+                continue
+            end = statement_end(file, probe)
+            equals = file.find_op("=", probe + 1, end)
+            if any(file.tokens[i].is_name(name) for i in range(probe + 1, equals if equals >= 0 else end)):
+                return True
+        if not token.is_name(name) or file.is_jsx_attribute(probe):
+            continue
+        previous = file.tok(probe - 1)
+        if previous is not None and previous.is_op(".", "?."):
+            continue
+        if definition is not None and probe < definition.params_open and statement_start(file, probe) == allowed:
+            continue
+        after = probe + 1
+        while after + 1 < len(file) and file.tokens[after].is_op(".", "?."):
+            after += 2
+        following = file.tok(after)
+        if following is not None and following.is_op("=", "+=", "-=", "++", "--", "||=", "&&=", "??="):
+            return True
+        if previous is not None and previous.is_name("class"):
+            return True
+    return False
+
+
+def imported_identity(file: TsFile, callee: str, index: int) -> str:
+    """Canonical imported name at a use site; empty when its binding is uncertain."""
+    root, separator, rest = callee.partition(".")
+    identities = []
+    for record in file.imports:
+        if record.kind != "import" or record.is_type_only or record.line > file.tokens[index].line:
+            continue
+        if root in record.type_names:
+            continue
+        if root in record.bindings:
+            identities.append(record.module + "." + record.bindings[root])
+        elif root in (record.default_name, record.namespace_name) and root:
+            identities.append(record.module)
+    if len(identities) != 1 or name_is_shadowed(file, root, index):
+        return ""
+    return identities[0] + (separator + rest if separator else "")

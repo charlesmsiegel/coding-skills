@@ -38,7 +38,7 @@ def analyze(root: Path, ignore: set[str], _args) -> list[Finding]:
             findings.append(Finding(file=str(path), line=line, smell_type=smell,
                                     description=description, suggestion=suggestion, severity=severity))
 
-    sources = [p for p in project.sources if not is_declaration_file(p)]
+    sources = [p for p in project.sources if not is_declaration_file(p) and not _is_build_config(p)]
     tests = project.tests
     if not sources:
         return findings
@@ -61,7 +61,6 @@ def analyze(root: Path, ignore: set[str], _args) -> list[Finding]:
                 covered.add(target)
                 frontier.append(target)
 
-    sources = [p for p in sources if not _is_build_config(p)]
     untested = [p for p in sources if p not in covered]
     for path in sorted(untested):
         tsfile = project.files[path]

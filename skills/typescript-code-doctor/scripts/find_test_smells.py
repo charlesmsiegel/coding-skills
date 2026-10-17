@@ -10,7 +10,7 @@ the slot where a real one would go and report the code as covered.
 
 from common import SUITE_DEFINERS, Reporter, is_test_file, run_file_detector
 from tsparse import (
-    TsFile, argument_spans, body_indices, iter_calls, statement_end, statement_start,
+    TsFile, argument_spans, body_indices, iter_calls, name_is_shadowed, statement_end, statement_start,
 )
 
 TEST_DEFINERS = frozenset({"it", "test", "specify", "bench"})
@@ -117,8 +117,21 @@ def _helpers_called(file: TsFile, func, helpers: dict[str, list]) -> list:
     body = body_indices(func)
     if not body:
         return []
-    return [helper for _, callee in iter_calls(file, body.start, body.stop)
-            for helper in helpers.get(callee, ()) if helper is not func]
+    called = []
+    for paren, callee in iter_calls(file, body.start, body.stop):
+        visible = []
+        for helper in helpers.get(callee, ()):
+            parent = file.enclosing_function(helper.start)
+            if parent is None or parent.body_open < paren < parent.body_close:
+                visible.append((parent.body_open if parent is not None else -1, helper))
+        if not visible:
+            continue
+        nearest = max(depth for depth, _ in visible)
+        targets = [helper for depth, helper in visible if depth == nearest]
+        if len(targets) == 1 and targets[0] is not func \
+                and not name_is_shadowed(file, callee, paren, targets[0]):
+            called.append(targets[0])
+    return called
 
 
 class _Assertions:

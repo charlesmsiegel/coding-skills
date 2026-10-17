@@ -51,15 +51,15 @@ _NOT_IN_TYPE_ARGUMENTS = frozenset({
 _STATEMENT_KEYWORDS = frozenset({"const", "let", "var", "function", "class", "return", "if", "for", "while"})
 
 
-def angle_group_end(file: TsFile, index: int, stop: int) -> int:
+def angle_group_end(file: TsFile, index: int, stop: int, assignment_boundary: bool = False) -> int:
     """Index just past the `>` closing the `<` at ``index``; -1 if it is no type-argument list.
 
     `<` and `>` are not bracket-matched — they are comparisons too — so this
     counts them, stepping over bracket groups, and gives up at a token that
     cannot sit inside a list of types. The lexer reads `>>` and `>>>` as one
     token, which is how `Map<string, Array<number>>` ends, so those close two
-    and three levels at once. `Array<T>= x` (no space) lexes `>=` as one token
-    and is treated as no list; formatted code never writes it.
+    and three levels at once. At an annotation/default boundary the lexer can
+    fuse the closing angles and `=`; only that type context accepts the token.
     """
     depth = 0
     cursor = index
@@ -69,6 +69,8 @@ def angle_group_end(file: TsFile, index: int, stop: int) -> int:
             if token.value in OPENERS:
                 cursor = file.skip_group(cursor)
                 continue
+            if assignment_boundary and token.value in {">=", ">>=", ">>>="}:
+                return cursor + 1 if depth == len(token.value) - 1 else -1
             if token.value in _NOT_IN_TYPE_ARGUMENTS:
                 return -1
             if token.value == "<":
@@ -122,8 +124,11 @@ def read_type_after_colon(file: TsFile, colon: int, stop: int) -> tuple[str, int
             if token.value == "<":
                 # In a type every `<` opens type arguments, and their commas
                 # are not the end of the type: `Record<string, X>` is one type.
-                end = angle_group_end(file, cursor, stop)
+                end = angle_group_end(file, cursor, stop, assignment_boundary=True)
                 if end > 0:
+                    if file.tokens[end - 1].is_op(">=", ">>=", ">>>="):
+                        cursor = end - 1
+                        break
                     cursor = after_arguments = end
                     continue
             if token.value == "{":
@@ -142,14 +147,19 @@ def read_type_after_colon(file: TsFile, colon: int, stop: int) -> tuple[str, int
         # A newline followed by something that cannot continue a type ends it.
         # The `>` closing type arguments ends a type rather than continuing it.
         previous = file.tokens[cursor - 1]
-        continued = continues_line(file, cursor - 1) and cursor != after_arguments
+        # `void` is a complete type here, even though it needs an operand
+        # as a value operator in statement scanning.
+        continued = continues_line(file, cursor - 1) and not previous.is_name("void") and cursor != after_arguments
         if cursor > start and token.line > previous.line and not continued \
                 and token.value not in CONTINUATIONS and token.kind == "name":
             break
         cursor += 1
     if cursor > start:
         file.type_spans.append((start, cursor - 1))
-    return file.slice(start, cursor).strip(), cursor
+    text = file.slice(start, cursor)
+    if cursor < stop and file.tokens[cursor].is_op(">=", ">>=", ">>>="):
+        text += file.tokens[cursor].value[:-1]  # closing angles belong to the type, `=` does not
+    return text.strip(), cursor
 
 
 def _parse_params(file: TsFile, open_index: int, close_index: int) -> list[Param]:
@@ -188,10 +198,11 @@ def _parameter_end(file: TsFile, start: int, stop: int) -> int:
             elif token.value == "=":
                 defaulted = True
             elif token.value == "<":
-                end = angle_group_end(file, cursor, stop)
+                end = angle_group_end(file, cursor, stop, assignment_boundary=annotated and not defaulted)
                 generic_call = defaulted and 0 < end < stop and file.tokens[end].is_op("(") \
                     and file.tokens[cursor - 1].kind == "name"
                 if end > 0 and ((annotated and not defaulted) or generic_call):
+                    defaulted = defaulted or file.tokens[end - 1].is_op(">=", ">>=", ">>>=")
                     cursor = end
                     continue
         cursor += 1
@@ -243,7 +254,7 @@ def _parse_one_param(file: TsFile, start: int, stop: int) -> Param | None:
     type_text = ""
     if cursor < stop and file.tokens[cursor].is_op(":"):
         type_text, cursor = read_type_after_colon(file, cursor, stop)
-    has_default = cursor < stop and file.tokens[cursor].is_op("=")
+    has_default = cursor < stop and file.tokens[cursor].is_op("=", ">=", ">>=", ">>>=")
     return Param(
         name=name, type_text=type_text, line=file.tokens[start].line, optional=optional,
         has_default=has_default, is_rest=is_rest, is_destructured=destructured,
@@ -594,7 +605,7 @@ def _parse_class_body(file: TsFile, klass: Class) -> None:
         )
         if cursor < klass.body_close and tokens[cursor].is_op(":"):
             prop.type_text, cursor = read_type_after_colon(file, cursor, klass.body_close)
-        if cursor < klass.body_close and tokens[cursor].is_op("="):
+        if cursor < klass.body_close and tokens[cursor].is_op("=", ">=", ">>=", ">>>="):
             prop.has_initializer = True
             init_start = cursor + 1
             cursor = skip_to_statement_end(file, cursor + 1, klass.body_close)

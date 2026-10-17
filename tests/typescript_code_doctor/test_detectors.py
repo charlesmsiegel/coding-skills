@@ -1624,8 +1624,9 @@ export interface Patch {
 }
 """})
     naming = run_detector("find_naming_issues.py", root)
-    assert [r["description"] for r in naming if r["smell_type"] == "boolean_without_predicate_name"] == [
-        "`Props.flag` is a boolean but does not read as a question"]
+    names = [r for r in naming if r["smell_type"] == "boolean_without_predicate_name"]
+    assert [r["description"].split("`", 2)[1] for r in names] == ["Props.flag"]
+    assert names[0]["kind"] == "candidate" and not names[0]["suggestion"]
     # Half of Patch is required; reading only a and c made it look all-optional.
     assert _lines(run_detector("find_type_gaps.py", root), "all_optional_type") == []
 
