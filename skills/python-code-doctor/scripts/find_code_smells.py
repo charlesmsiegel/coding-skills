@@ -74,6 +74,14 @@ DJANGO_DECLARATIVE_BASES = {
 }
 
 
+# ModelBase and ModelFormMetaclass consume these immediate inner Meta classes.
+# BaseModelForm alone does not install ModelFormMetaclass.
+DJANGO_META_CONSUMERS = frozenset({
+    "django.db.models.Model", "django.db.models.base.Model",
+    "django.forms.ModelForm", "django.forms.models.ModelForm",
+})
+
+
 def _dotted_name(node):
     if isinstance(node, ast.Name):
         return node.id
@@ -188,6 +196,7 @@ class CodeSmellDetector(ast.NodeVisitor):
         self._in_assert = 0
         self._framework_imports = {}
         self._object_is_builtin = True
+        self._framework_meta_nodes = set()
 
     def visit_Module(self, node: ast.Module):
         self._hooks = framework_hook_overrides(node)
@@ -374,6 +383,7 @@ class CodeSmellDetector(ast.NodeVisitor):
                 marker_names.add(base.value.id)
         is_declared_data = bool(marker_names & DATA_CLASS_MARKERS)
         has_framework_behavior = False
+        consumes_meta = False
         for base in node.bases:
             dotted = _dotted_name(base)
             if not dotted:
@@ -385,7 +395,15 @@ class CodeSmellDetector(ast.NodeVisitor):
                 module, _, name = resolved.rpartition('.')
                 if name in DJANGO_DECLARATIVE_BASES.get(module, ()):
                     has_framework_behavior = True
-        if len(attributes) > 3 and len(non_dunder) == 0 and not is_declared_data and not has_framework_behavior:
+                if resolved in DJANGO_META_CONSUMERS:
+                    consumes_meta = True
+        if consumes_meta:
+            # AST identities tie the exemption to immediate class-body members;
+            # sibling classes and classes inside methods receive no contract.
+            self._framework_meta_nodes.update(child for child in node.body
+                                              if isinstance(child, ast.ClassDef) and child.name == "Meta")
+        if (len(attributes) > 3 and len(non_dunder) == 0 and not is_declared_data
+                and not has_framework_behavior and node not in self._framework_meta_nodes):
             inherited_behavior_unknown = any(not (isinstance(base, ast.Name) and base.id == "object"
                                                   and self._object_is_builtin)
                                              for base in node.bases)
