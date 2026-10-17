@@ -108,7 +108,12 @@ versions that float (so "works today" doesn't mean "works tomorrow").
   which it is before adding anything. A directory the source resolves inside the
   repo explains nothing, and neither does one spelled in a way the detector cannot
   follow but with none of those run-time sources in it, so imports after either
-  stay findings.
+  stay findings. Know the scope before trusting a clean report: one such addition
+  turns *every* undeclared module imported only after it in that file into a
+  candidate, not just the ones the added directory provides. A production module
+  that loads plugins from `$PLUGIN_DIR` and then imports `requests`, or a lazy
+  import in any function below a `def add_dir(d): sys.path.append(d)` helper,
+  becomes a candidate too — which is why it is a candidate and not silence.
 - **`unused_dependency` (declared, never imported).** Usually cruft from deleted
   code; remove it. But confirm by reading first — some deps are real without an
   `import`: build/runtime plugins, CLI tools, things imported via entry points or

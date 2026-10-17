@@ -41,6 +41,12 @@ Reported as a candidate, not a finding:
     follow but with none of those run-time sources in it, and a module-level
     import is not served by an addition inside a function, which cannot have
     run yet when the module loads.
+    Scope, stated plainly: one such addition demotes EVERY undeclared module
+    whose imports all come after it in that file, not only the modules the added
+    directory provides. That covers a production module that loads plugins from
+    $PLUGIN_DIR and then imports `requests`, and an ordinary lazy import in any
+    function below a `def add_dir(d): sys.path.append(d)` helper. The source
+    cannot say which names the directory serves, so all of them are leads.
 """
 
 import ast
