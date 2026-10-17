@@ -271,12 +271,30 @@ def _sole_assignment(stmts: list, name: str) -> tuple[int, ast.expr | None]:
     return binds, (values[0] if binds == 1 and len(values) == 1 else None)
 
 
+def _unpacked_from(stmts: list, name: str) -> ast.expr | None:
+    """What one scope unpacks `name` from (`args, rest = parser.parse_known_args()`):
+    the matching item of a tuple display, or the whole value."""
+    for node in walk_same_scope(stmts):
+        if not (isinstance(node, ast.Assign) and len(node.targets) == 1
+                and isinstance(node.targets[0], (ast.Tuple, ast.List))):
+            continue
+        items = node.targets[0].elts
+        for index, item in enumerate(items):
+            if isinstance(item, ast.Name) and item.id == name:
+                value = node.value
+                same_shape = isinstance(value, (ast.Tuple, ast.List)) and len(value.elts) == len(items)
+                return value.elts[index] if same_shape else value
+    return None
+
+
 # Calls that hand back where their one argument points.
 _SAME_PATH = frozenset({"Path", "PurePath", "pathlib.Path", "pathlib.PurePath", "str", "os.fspath",
                         "os.path.abspath", "os.path.realpath", "os.path.normpath"})
 _RENAMES = frozenset({"with_name", "with_stem", "with_suffix"})
 # What only the run decides: a directory read from one of these is opaque.
 _RUN_TIME_SOURCES = ("os.environ", "os.getenv", "sys.argv")
+# The command line, read through argparse: `args.comfy` from `parser.parse_args()`.
+_RUN_TIME_CALLS = frozenset({"parse_args", "parse_known_args"})
 _MAX_PATH_DEPTH = 12
 
 
@@ -312,11 +330,13 @@ class _PathReader:
         return not any(PurePath(os.path.normpath(a)).is_relative_to(self.root) for a in anchors)
 
     def decided_at_run_time(self, node, scopes: tuple, seen: set) -> bool:
-        """`node` reads a function parameter, the environment, sys.argv, or a name
-        bound more than once — directly or through names bound once."""
+        """`node` reads a function parameter, the environment, sys.argv, an argparse
+        result, or a name bound more than once — directly or through names bound once."""
         for child in ast.walk(node):
             dotted = _canonical(self.aliases, _dotted(child)) if isinstance(child, (ast.Name, ast.Attribute)) else ""
             if any(dotted == source or dotted.startswith(source + ".") for source in _RUN_TIME_SOURCES):
+                return True
+            if isinstance(child, ast.Call) and getattr(child.func, "attr", "") in _RUN_TIME_CALLS:
                 return True
             if isinstance(child, ast.Name) and self._name_decided_at_run_time(child.id, scopes, seen):
                 return True
@@ -327,10 +347,13 @@ class _PathReader:
             scope = scopes[depth - 1]
             if name in _parameters(scope):
                 return True
-            binds, value = _sole_assignment(scope.body, name) if not isinstance(scope, ast.Lambda) else (0, None)
+            body = scope.body if not isinstance(scope, ast.Lambda) else []
+            binds, value = _sole_assignment(body, name)
             if binds:
+                value = value if value is not None else _unpacked_from(body, name)
                 return self._binding_decided(binds, value, (id(scope), name), scopes[:depth], seen)
         binds, value = _sole_assignment(self.module.body, name)
+        value = value if value is not None or binds != 1 else _unpacked_from(self.module.body, name)
         return self._binding_decided(binds, value, (id(self.module), name), (), seen)
 
     def _binding_decided(self, binds: int, value, key: tuple, scopes: tuple, seen: set) -> bool:

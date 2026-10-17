@@ -112,7 +112,8 @@ versions that float (so "works today" doesn't mean "works tomorrow").
   `sys.path.insert(0, os.path.abspath('..'))` in `docs/conf.py`, is read from both the
   repo root and the file's own directory, and is inside if either is), or that
   reads a function parameter,
-  `os.environ`/`os.getenv`, `sys.argv` or a name bound more than once — is reported
+  `os.environ`/`os.getenv`, `sys.argv`, an argparse result (`args.x` from
+  `parse_args()`) or a name bound more than once — is reported
   as a *candidate*: a harness run under another program's interpreter imports that
   program's modules this way, and no manifest here could declare them. Confirm
   which it is before adding anything. A directory the source resolves inside the
