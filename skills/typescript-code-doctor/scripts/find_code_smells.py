@@ -14,7 +14,7 @@ already proves it exhaustive, where it is not reported at all.
 from common import Reporter, is_test_file, run_file_detector
 from find_tsconfig_issues import compiler_options, strict_null_checks
 from tsparse import (
-    RESERVED, TsFile, argument_spans, body_indices, callee_of, callback_target, iter_calls,
+    RESERVED, TsFile, argument_spans, body_indices, callee_of, callback_target, imported_identity, iter_calls,
 )
 
 # Values so conventional a name would add nothing — including the unit
@@ -415,7 +415,7 @@ def _is_effect_callback(file: TsFile, func) -> bool:
     value, so mixing the two is not an inconsistency.
     """
     callee, position = callback_target(file, func)
-    return position == 0 and callee.rsplit(".", 1)[-1] in EFFECT_HOOKS
+    return position == 0 and imported_identity(file, callee, func.start) in {"react." + hook for hook in EFFECT_HOOKS}
 
 
 def _check_returns(file: TsFile, report: Reporter) -> None:

@@ -155,9 +155,37 @@ def _chain_has_two_argument_then(file: TsFile, start: int, stop: int) -> bool:
     for index in range(start, min(stop + 1, len(file))):
         if file.tokens[index].is_name("then") and file.tokens[index - 1].is_op(".", "?.") \
                 and index + 1 < len(file) and file.tokens[index + 1].is_op("("):
-            if len(argument_spans(file, index + 1)) >= 2:
+            spans = argument_spans(file, index + 1)
+            if len(spans) >= 2 and _rejection_handler(file, *spans[1]):
                 return True
     return False
+
+
+def _rejection_handler(file: TsFile, start: int, stop: int, seen=frozenset()) -> bool:
+    """A second argument handles rejection only when it can be a callable."""
+    while start < stop and file.tokens[start].is_op("(") and file.closer(start) == stop - 1:
+        start, stop = start + 1, stop - 1
+    if start >= stop:
+        return False
+    token = file.tokens[start]
+    if token.kind in {"num", "str", "template", "regex"} or token.is_op("{", "[", "+", "-", "!", "~") \
+            or token.is_name("undefined", "null", "true", "false", "void", "NaN", "Infinity"):
+        return False
+    if stop == start + 1 and token.kind == "name":
+        if token.value in seen:
+            return False
+        # Follow visible simple assignments so `const onErr = undefined` is
+        # not mistaken for a handler merely because it has a name.
+        for index in range(start):
+            if file.tokens[index].is_name(token.value) and file.value(index + 1) == "=":
+                owner = file.enclosing_function(index)
+                if owner is None or owner.body_open < start < owner.body_close:
+                    end = statement_end(file, index + 2)
+                    if end > index + 2 and file.tokens[end - 1].is_op(";"):
+                        end -= 1
+                    if not _rejection_handler(file, index + 2, end, seen | {token.value}):
+                        return False
+    return True
 
 
 # Tokens that, at the head of a statement, put its value somewhere.

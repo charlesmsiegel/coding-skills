@@ -34,7 +34,6 @@ DOM_STATE_WORDS = frozenset({
 })
 # A participle or adjective ending already says which way `true` points:
 # `truncated`, `pending`, `available`, `visible`, `active`.
-STATE_SUFFIXES = ("ed", "ing", "able", "ible", "ive")
 _WORDS = re.compile(r"[A-Z]?[a-z0-9]+|[A-Z]+(?![a-z])")
 
 # The platform's boolean names — HTML boolean attributes and ARIA states, in
@@ -171,8 +170,11 @@ def _reads_as_state(name: str) -> bool:
     """True for a name whose last word is a platform state or a participle/adjective."""
     words = _WORDS.findall(name)
     last = words[-1].lower() if words else name.lower()
+    suffix = (len(last) >= 6 and last.endswith(("able", "ible"))
+              or len(last) > 3 and last.endswith("ed")
+              or len(last) > 4 and last.endswith(("ing", "ive")))
     return last not in NOT_ADJECTIVES | NOT_PARTICIPLES and (
-        name.lower() in DOM_STATE_WORDS or last in DOM_STATE_WORDS or last.endswith(STATE_SUFFIXES))
+        name.lower() in DOM_STATE_WORDS or last in DOM_STATE_WORDS or suffix)
 
 
 def _check_boolean_names(file: TsFile, report: Reporter) -> None:

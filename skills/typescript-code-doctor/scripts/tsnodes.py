@@ -128,6 +128,8 @@ class Import:
     # Names bound by an inline `type` specifier: `B` in `import { a, type B }`.
     # Each is already erased from the emitted import, like `import type`.
     type_names: list[str] = field(default_factory=list)
+    # Local binding -> original export, before an `as` alias.
+    bindings: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass(slots=True)

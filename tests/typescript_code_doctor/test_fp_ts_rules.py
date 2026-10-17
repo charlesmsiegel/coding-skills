@@ -321,6 +321,7 @@ def test_a_throw_guard_and_a_finally_restore_are_not_logic_in_a_test(tmp_path):
 # --------------------------------------------------------------------------- #
 
 EFFECTS = """\
+import React, { useEffect } from "react";
 export function Ticker({ live }: { live: boolean }) {
   useEffect(() => {
     if (!live) return;
@@ -347,7 +348,7 @@ export function pick(live: boolean) {
 
 def test_an_effect_callback_may_return_a_cleanup_on_some_paths(tmp_path):
     found = records("find_code_smells.py", tmp_path, {"ticker.tsx": EFFECTS}, "inconsistent_returns")
-    assert lines_of(found) == [19], "only `pick` really returns a value on one path and nothing on another"
+    assert lines_of(found) == [20], "only `pick` really returns a value on one path and nothing on another"
 
 
 TERNARIES = """\

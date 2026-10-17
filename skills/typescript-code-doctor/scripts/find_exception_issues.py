@@ -71,8 +71,9 @@ def _records_the_failure(file: TsFile, binding: str, body_open: int, body_close:
     these is the failure disappearing — that is a catch whose writes, if any,
     nothing ever reads.
     """
-    if binding and _mentions(file, body_open + 1, body_close, binding):
-        return True
+    if binding and any(_mentions(file, paren + 1, file.closer(paren), binding)
+                       for paren, _ in iter_calls(file, body_open + 1, body_close)):
+        return True  # passing the error to a consumer, rather than a bare/void read
     owner = file.enclosing_function(body_open)
     scope_end = owner.body_close if owner is not None else len(file)
     for index in range(body_open + 1, body_close):
@@ -151,7 +152,9 @@ def _check_catch_bodies(file: TsFile, report: Reporter) -> None:
                        "`console.log` is not error handling. Re-throw (with context), return a "
                        "typed failure the caller must handle, or report to the error channel that "
                        "is actually watched.", "medium")
-        elif not rethrows and not returns and not reports and len(body) <= 4 \
+        elif not rethrows and not returns and not reports \
+                and (len(body) <= 4 or (binding and all(file.tokens[i].value in
+                     {binding, "void", "(", ")", ";"} for i in body))) \
                 and not _records_the_failure(file, binding, body_open, body_close):
             report.add(line, "swallowed_error",
                        "`catch` neither re-throws, returns, nor reports — the failure disappears",
