@@ -458,7 +458,11 @@ class MutationHazardDetector(ast.NodeVisitor):
                 return (isinstance(expr, ast.Attribute) and expr.attr == name
                         and isinstance(expr.value, ast.Name) and expr.value.id == receiver)
 
-            for child in _same_scope_nodes(method.body, stop_types=(ast.ClassDef,)):
+            # The walker skips child scopes; definitions passed as roots must
+            # also be excluded before their unrelated receivers can be visited.
+            method_body = (statement for statement in method.body
+                           if not isinstance(statement, _SCOPE_BOUNDARIES + (ast.ClassDef,)))
+            for child in _same_scope_nodes(method_body, stop_types=(ast.ClassDef,)):
                 if isinstance(child, ast.Name) and child.id == receiver and isinstance(child.ctx, ast.Store):
                     return None
                 # Assignment/deletion of the attribute itself changes lookup.

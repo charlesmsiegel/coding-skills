@@ -4,6 +4,7 @@ import json
 import subprocess
 import sys
 from pathlib import Path
+from textwrap import indent
 
 import pytest
 
@@ -52,3 +53,27 @@ def test_candidate_text_has_benign_explanations_without_fix_arrow(tmp_path):
     assert '[CANDIDATE]' in result.stdout
     assert 'also caused by:' in result.stdout
     assert '→' not in result.stdout
+
+
+@pytest.mark.parametrize('nested_definition', [
+    'def helper(self):\n    self.items.append(1)\nreturn helper\n',
+    'async def helper(self):\n    self.items.append(1)\nreturn helper\n',
+    'class Helper:\n    def add(self):\n        self.items.append(1)\nreturn Helper\n',
+    'helper = lambda self: self.items.append(1)\nreturn helper\n',
+])
+@pytest.mark.parametrize(('direct_mutation', 'expected_kind'), [
+    ('', 'candidate'),
+    ('self.items.append(value)\n', 'finding'),
+])
+def test_nested_receivers_do_not_establish_or_hide_shared_mutation(
+        tmp_path, nested_definition, direct_mutation, expected_kind):
+    source = ('class Example:\n    items = []\n    def inspect(self, value):\n'
+              + indent(direct_mutation + nested_definition, '        '))
+    record, = scan(tmp_path, source)
+    assert record['kind'] == expected_kind
+    if expected_kind == 'candidate':
+        assert not record['suggestion']
+        assert record['also_caused_by']
+    else:
+        assert record['suggestion']
+        assert not record['also_caused_by']
