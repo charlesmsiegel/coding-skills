@@ -105,7 +105,10 @@ versions that float (so "works today" doesn't mean "works tomorrow").
   `except:` or `except Exception:` does not count as a guard, and neither does an
   `except ImportError:` written after one, which never runs. A module imported only after its
   own file puts a directory on `sys.path` that the source cannot place inside the
-  repo — one that resolves outside the tree, or that reads a function parameter,
+  repo — one that resolves outside the tree (a relative entry, such as Sphinx's
+  `sys.path.insert(0, os.path.abspath('..'))` in `docs/conf.py`, is read from both the
+  repo root and the file's own directory, and is inside if either is), or that
+  reads a function parameter,
   `os.environ`/`os.getenv`, `sys.argv` or a name bound more than once — is reported
   as a *candidate*: a harness run under another program's interpreter imports that
   program's modules this way, and no manifest here could declare them. Confirm

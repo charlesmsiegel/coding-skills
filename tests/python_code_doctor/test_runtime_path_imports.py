@@ -306,3 +306,27 @@ def test_a_path_built_from_itself_or_a_wide_chain_is_read_quickly(tmp_path, bind
     kinds = {r["description"].split("'")[1]: r["kind"] for r in json.loads(result.stdout)
              if r["smell_type"] == "missing_dependency"}
     assert kinds["requests"] == "finding", "a path that reads nothing the run decides explains nothing"
+
+
+def test_a_relative_entry_counts_from_the_root_and_from_its_own_directory(tmp_path):
+    """A relative sys.path entry is relative to the working directory, and the two
+    that occur are the project root and the file's own directory: Sphinx runs
+    docs/conf.py from docs/, so its `abspath('..')` is the repository root."""
+    cases = {
+        ("docs/conf.py", "sys.path.insert(0, os.path.abspath('..'))"): "finding",
+        ("docs/conf.py", "sys.path.insert(0, os.path.abspath('../src'))"): "finding",
+        ("tests/conftest.py", "sys.path.append('..')"): "finding",
+        ("scripts/x.py", "sys.path.insert(0, str(Path('..').resolve()))"): "finding",
+        ("scripts/x.py", "sys.path.insert(0, os.path.dirname(os.path.abspath('.')))"): "finding",
+        ("docs/conf.py", "sys.path.insert(0, os.path.abspath('../../ComfyUI'))"): "candidate",
+    }
+    wrong = {}
+    for number, ((rel, addition), expected) in enumerate(cases.items()):
+        root = tmp_path / f"case{number}"
+        write(root, "pyproject.toml", MANIFEST)
+        write(root, rel, "import os\nimport sys\nfrom pathlib import Path\n\n" + addition
+              + "\n\nimport sphinx_rtd_theme\n")
+        got = missing(root)["sphinx_rtd_theme"]["kind"]
+        if got != expected:
+            wrong[(rel, addition)] = got
+    assert not wrong, wrong
