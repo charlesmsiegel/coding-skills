@@ -35,8 +35,9 @@ import json
 import argparse
 from pathlib import Path
 from dataclasses import dataclass, asdict
-from typing import Iterator
 from collections import defaultdict
+from ast_scopes import (body_kind, decorator_names, is_dotted_name, is_dunder, local_bindings,
+                        walk_loop_level, walk_same_scope)
 from common import (is_test_file, sort_findings, cached_parse, SEVERITY_ICONS, configure_output, find_python_files,
                     warn_detector_error, warn_unparseable)
 
@@ -94,110 +95,6 @@ PROPERTY_DECORATORS = frozenset({"property", "cached_property"})
 # often the clearest form, and conservatism keeps the output trustworthy.
 MIN_EQ_BRANCHES = 4
 MIN_ISINSTANCE_BRANCHES = 4
-
-
-def _is_dunder(name: str) -> bool:
-    return name.startswith("__") and name.endswith("__")
-
-
-def _walk_same_scope(stmts: list[ast.stmt]) -> Iterator[ast.AST]:
-    """Walk statements without descending into nested scopes (defs, classes,
-    lambdas) — a name assigned there is a different variable."""
-    stack: list[ast.AST] = list(stmts)
-    while stack:
-        node = stack.pop()
-        yield node
-        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda)):
-            stack.extend(ast.iter_child_nodes(node))
-
-
-def _walk_loop_level(stmts: list[ast.stmt]) -> Iterator[ast.AST]:
-    """Walk statements without descending into nested scopes OR nested loops —
-    a flag assigned inside an inner loop cannot be replaced by a `break` of
-    the outer one."""
-    stack: list[ast.AST] = list(stmts)
-    while stack:
-        node = stack.pop()
-        yield node
-        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef,
-                                 ast.Lambda, ast.While, ast.For, ast.AsyncFor)):
-            stack.extend(ast.iter_child_nodes(node))
-
-
-def _strip_docstring(body: list[ast.stmt]) -> list[ast.stmt]:
-    if body and isinstance(body[0], ast.Expr) and isinstance(body[0].value, ast.Constant) \
-            and isinstance(body[0].value.value, str):
-        return body[1:]
-    return body
-
-
-def _body_kind(body: list[ast.stmt]) -> str | None:
-    """Classify a trivial body: 'noop' (pass/.../docstring only), 'raise_nie', or None."""
-    rest = _strip_docstring(body)
-    if not rest or all(
-        isinstance(s, ast.Pass)
-        or (isinstance(s, ast.Expr) and isinstance(s.value, ast.Constant) and s.value.value is Ellipsis)
-        for s in rest
-    ):
-        return "noop"
-    if len(rest) == 1 and isinstance(rest[0], ast.Raise):
-        exc = rest[0].exc
-        if isinstance(exc, ast.Call):
-            exc = exc.func
-        if isinstance(exc, ast.Name) and exc.id == "NotImplementedError":
-            return "raise_nie"
-    return None
-
-
-def _local_bindings(node: ast.FunctionDef | ast.AsyncFunctionDef) -> tuple[frozenset[str], frozenset[str]]:
-    """(shadows, local_imports) for the function's own scope. Shadows are names
-    bound by parameters/assignments/loop targets — they hide a module-level
-    name; local imports are module-internal receivers within this scope only."""
-    a = node.args
-    shadows = {p.arg for p in (*a.posonlyargs, *a.args, *a.kwonlyargs)}
-    if a.vararg:
-        shadows.add(a.vararg.arg)
-    if a.kwarg:
-        shadows.add(a.kwarg.arg)
-    imports = set()
-    for inner in _walk_same_scope(node.body):
-        if isinstance(inner, (ast.Import, ast.ImportFrom)):
-            for alias in inner.names:
-                imports.add(alias.asname or alias.name.split(".")[0])
-            continue
-        if isinstance(inner, ast.Assign):
-            targets = inner.targets
-        elif isinstance(inner, (ast.AnnAssign, ast.AugAssign, ast.NamedExpr)):
-            targets = [inner.target]
-        elif isinstance(inner, (ast.For, ast.AsyncFor)):
-            targets = [inner.target]
-        elif isinstance(inner, ast.withitem) and inner.optional_vars is not None:
-            targets = [inner.optional_vars]
-        else:
-            continue
-        for target in targets:
-            for name_node in ast.walk(target):
-                if isinstance(name_node, ast.Name):
-                    shadows.add(name_node.id)
-    return frozenset(shadows), frozenset(imports)
-
-
-def _is_dotted_name(expr: ast.expr) -> bool:
-    """True for attribute chains rooted at a bare name (Kind.CREATE, mod.Kind.CREATE)."""
-    while isinstance(expr, ast.Attribute):
-        expr = expr.value
-    return isinstance(expr, ast.Name)
-
-
-def _decorator_names(node: ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef) -> set[str]:
-    names = set()
-    for dec in node.decorator_list:
-        target = dec.func if isinstance(dec, ast.Call) else dec
-        if isinstance(target, ast.Name):
-            names.add(target.id)
-        elif isinstance(target, ast.Attribute):
-            names.add(target.attr)
-    return names
 
 
 class DesignSmellDetector(ast.NodeVisitor):
@@ -387,7 +284,7 @@ class DesignSmellDetector(ast.NodeVisitor):
                 self.visit(arg.annotation)
         if node.returns is not None:
             self.visit(node.returns)
-        shadows, local_imports = _local_bindings(node)
+        shadows, local_imports = local_bindings(node)
         self._func_stack.append((node.name, shadows, local_imports))
         for stmt in node.body:
             self.visit(stmt)
@@ -476,7 +373,7 @@ class DesignSmellDetector(ast.NodeVisitor):
             for subject, case in ((test.left, test.comparators[0]), (test.comparators[0], test.left)):
                 if isinstance(subject, (ast.Name, ast.Attribute)) and (
                         isinstance(case, ast.Constant)
-                        or (isinstance(case, ast.Attribute) and _is_dotted_name(case))):
+                        or (isinstance(case, ast.Attribute) and is_dotted_name(case))):
                     out.append((subject, "eq"))
         elif (isinstance(test, ast.Call) and isinstance(test.func, ast.Name)
                 and test.func.id == "isinstance" and len(test.args) == 2
@@ -584,7 +481,7 @@ class DesignSmellDetector(ast.NodeVisitor):
         # since then the terminating value may never reach the loop boundary.
         assigned_values = [
             inner.value.value
-            for inner in _walk_loop_level(node.body)
+            for inner in walk_loop_level(node.body)
             if any(isinstance(t, ast.Name) and t.id == flag for t in
                    (inner.targets if isinstance(inner, ast.Assign)
                     else [inner.target] if isinstance(inner, ast.AnnAssign) and inner.value is not None
@@ -630,7 +527,7 @@ class DesignSmellDetector(ast.NodeVisitor):
         saw_call = False
         while isinstance(root, (ast.Attribute, ast.Subscript, ast.Call)):
             if isinstance(root, ast.Attribute):
-                if root.attr.startswith("_") and not _is_dunder(root.attr):
+                if root.attr.startswith("_") and not is_dunder(root.attr):
                     return None  # already navigating private structure; the inner access is the finding
                 root = root.value
             elif isinstance(root, ast.Subscript):
@@ -658,9 +555,9 @@ class DesignSmellDetector(ast.NodeVisitor):
 
     def visit_Attribute(self, node: ast.Attribute):
         enclosing = self._innermost_function_name()
-        in_dunder = bool(enclosing) and _is_dunder(enclosing)
+        in_dunder = bool(enclosing) and is_dunder(enclosing)
         attr = node.attr
-        private = attr.startswith("_") and not _is_dunder(attr)
+        private = attr.startswith("_") and not is_dunder(attr)
         # Inside a class body, `other.__secret` is name-mangled to this class —
         # by construction a same-class access, not intimacy. At module level it
         # reaches into another class's deliberately private state.
@@ -741,7 +638,7 @@ class DesignSmellDetector(ast.NodeVisitor):
         # Discovery stays in __init__'s own scope: an assignment inside a nested
         # callback does not run during construction. Disqualification stays
         # broad (any read, any non-None write) — broader means quieter.
-        for inner in _walk_same_scope(init.body):
+        for inner in walk_same_scope(init.body):
             targets, value = [], None
             if isinstance(inner, ast.Assign):
                 targets, value = inner.targets, inner.value
@@ -780,12 +677,12 @@ class DesignSmellDetector(ast.NodeVisitor):
             # Identity-keyed: same-named classes in different containers must
             # not collapse into one method.
             qualname = (id(klass), f"{klass.name}.{method.name}")
-            decorators = _decorator_names(method)
+            decorators = decorator_names(method)
             if decorators & PROPERTY_DECORATORS or {"setter", "getter", "deleter"} & decorators:
                 accessor_like.add(qualname)
             # Same-scope only: a deferred callback's accesses are not the
             # method's own — it may run long after the method returns.
-            for inner in _walk_same_scope(method.body):
+            for inner in walk_same_scope(method.body):
                 if isinstance(inner, ast.Attribute) and isinstance(inner.value, ast.Name) \
                         and inner.value.id == "self" and inner.attr in none_fields:
                     usage[inner.attr].add(qualname)
@@ -895,18 +792,18 @@ class DesignSmellDetector(ast.NodeVisitor):
         inherited: dict[str, bool] = {}
         for klass in mro[1:]:
             for method in self._methods(klass):
-                if method.name not in inherited and "overload" not in _decorator_names(method):
-                    inherited[method.name] = ("abstractmethod" not in _decorator_names(method)
-                                              and _body_kind(method.body) is None)
+                if method.name not in inherited and "overload" not in decorator_names(method):
+                    inherited[method.name] = ("abstractmethod" not in decorator_names(method)
+                                              and body_kind(method.body) is None)
         if not inherited:
             return
         for method in self._methods(node):
-            decorators = _decorator_names(method)
+            decorators = decorator_names(method)
             # @overload declarations are intentionally `...`-bodied signatures
             # preceding the real implementation, not refusals.
-            if _is_dunder(method.name) or {"abstractmethod", "overload"} & decorators:
+            if is_dunder(method.name) or {"abstractmethod", "overload"} & decorators:
                 continue
-            kind = _body_kind(method.body)
+            kind = body_kind(method.body)
             if kind and inherited.get(method.name) is True:
                 action = "raises NotImplementedError on" if kind == "raise_nie" else "no-ops"
                 self._add(method.lineno, "refused_bequest",
@@ -946,7 +843,7 @@ class DesignSmellDetector(ast.NodeVisitor):
         # deleting it would unregister the plugin.
         if self._hierarchy_defines(node, base, "__init_subclass__"):
             return
-        if _body_kind(node.body) == "noop":
+        if body_kind(node.body) == "noop":
             self._add(node.lineno, "lazy_class",
                 f"Class '{node.name}' adds nothing over '{base.id}'",
                 f"Use '{base.id}' directly and delete this class (Inline Class / Collapse "
