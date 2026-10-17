@@ -5388,3 +5388,55 @@ def test_one_methods_implementations_are_a_contract_not_a_data_clump(tmp_path):
                     for r in run_detector("find_parameter_objects.py", tmp_path))
     assert clumps == ["Parameters ['backoff', 'retries', 'url']",
                       "Parameters ['host', 'port', 'timeout']"]
+
+
+_FRAMEWORK_HOOKS = (
+    "import torch.nn as nn\n"
+    "from pydantic_settings import BaseSettings\n"
+    "\n"
+    "SOURCES = 'settings_cls, init_settings, env_settings, dotenv_settings, file_secret_settings'\n"
+    "\n"
+    "class Settings(BaseSettings):\n"
+    "    @classmethod\n"
+    "    def settings_customise_sources(cls, settings_cls, init_settings, env_settings,\n"
+    "                                   dotenv_settings, file_secret_settings):\n"
+    "        return (init_settings,)\n"
+    "\n"
+    "    def reload(self, a, b, c, d, e, f):  # fires\n"
+    "        return a\n"
+    "\n"
+    "class Other(BaseSettings):\n"
+    "    def settings_customise_sources(self, a, b, c, d, e, f):  # fires\n"
+    "        return a\n"
+    "\n"
+    "class Local:\n"
+    "    pass\n"
+    "\n"
+    "class Mine(Local):\n"
+    "    def settings_customise_sources(cls, settings_cls, init_settings, env_settings, dotenv_settings, file_secret_settings):  # fires: count\n"
+    "        return ()\n"
+    "\n"
+    "def settings_customise_sources(cls, settings_cls, init_settings, env_settings, dotenv_settings, file_secret_settings):  # fires: count\n"
+    "    return ()\n"
+    "\n"
+    "class Block(nn.Module):\n"
+    "    def forward(self, x, mask, context, scale, shift, gate):  # fires\n"
+    "        return x\n"
+)
+
+
+@pytest.mark.parametrize("script,finding_type,key", [
+    ("analyze_complexity.py", "parameter_count", "issue_type"),
+    ("find_code_smells.py", "long_parameter_list", "smell_type"),
+])
+def test_a_framework_hook_override_keeps_the_frameworks_signature(tmp_path, script,
+                                                                  finding_type, key):
+    """pydantic-settings calls `settings_customise_sources` with exactly these five
+    sources. A forward() on an nn.Module is the author's own signature, so it fires.
+    (`# fires: count` marks six-parameter defs, under long_parameter_list's limit.)"""
+    (tmp_path / "config.py").write_text(_FRAMEWORK_HOOKS)
+    lines = sorted(f["line"] for f in run_detector(script, tmp_path) if f.get(key) == finding_type)
+    expected = _lines_marked(_FRAMEWORK_HOOKS)
+    if finding_type == "parameter_count":
+        expected = sorted(expected + _lines_marked(_FRAMEWORK_HOOKS, "# fires: count"))
+    assert lines == expected

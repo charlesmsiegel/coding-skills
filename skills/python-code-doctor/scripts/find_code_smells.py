@@ -11,7 +11,7 @@ import argparse
 from pathlib import Path
 from dataclasses import dataclass, asdict
 from collections import defaultdict
-from common import count_parameters, is_test_file, parameter_severity, signature_is_a_contract, sort_findings, cached_parse, SEVERITY_ICONS, configure_output, find_python_files, warn_detector_error, warn_unparseable
+from common import count_parameters, framework_hook_overrides, is_test_file, parameter_severity, signature_is_a_contract, sort_findings, cached_parse, SEVERITY_ICONS, configure_output, find_python_files, warn_detector_error, warn_unparseable
 
 
 @dataclass
@@ -60,8 +60,10 @@ class CodeSmellDetector(ast.NodeVisitor):
         self.current_class = None
         self.class_info: dict[str, dict] = {}
         self._named_constants: set[int] = set()
+        self._hooks: frozenset = frozenset()
 
     def visit_Module(self, node: ast.Module):
+        self._hooks = framework_hook_overrides(node)
         # A literal is only "magic" when nothing names it. Collect the node
         # ids of literals that already have a name or a self-explaining
         # position, so visit_Constant can skip them:
@@ -141,7 +143,7 @@ class CodeSmellDetector(ast.NodeVisitor):
         # Long parameter list — counted and graded as analyze_complexity's
         # parameter_count is, which analyze_all keeps in its place when both fire.
         total_params = count_parameters(node)
-        if total_params > 6 and not signature_is_a_contract(node):
+        if total_params > 6 and not signature_is_a_contract(node, self._hooks):
             self._add(node.lineno, "long_parameter_list",
                 f"{node.name} has {total_params} parameters",
                 "Group into dataclass or config object", parameter_severity(total_params))
