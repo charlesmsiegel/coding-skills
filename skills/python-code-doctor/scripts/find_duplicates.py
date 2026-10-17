@@ -31,7 +31,7 @@ import argparse
 from pathlib import Path
 from dataclasses import dataclass
 from collections import defaultdict
-from common import configure_output, find_python_files, warn_detector_error, warn_unparseable
+from common import configure_output, find_python_files, upstream_marks, warn_detector_error, warn_unparseable
 
 
 # Shortest block worth reporting as a duplicate, in executable lines. Shared
@@ -265,6 +265,28 @@ def _collapse_nested(groups: list[DuplicateGroup]) -> list[DuplicateGroup]:
     return kept
 
 
+def _marked(occurrence: dict) -> bool:
+    """Whether the occurrence lies in code marked `# doctor: verbatim-upstream`."""
+    return upstream_marks(str(Path(occurrence['file']).resolve())).covers(occurrence['line'])
+
+
+def _split_by_body(group: DuplicateGroup) -> list[DuplicateGroup]:
+    """The group as each body of code's own duplication.
+
+    A marked verbatim copy keeps upstream's code, so it never counts toward
+    the project's duplication: two project copies are a group of two whatever
+    upstream copies sit beside them, and marked copies of each other are a
+    group of their own. A group that takes a project copy and a marked one to
+    make is kept whole, anchored at the marked copy, so analyze_all withholds
+    it and counts it as not charged.
+    """
+    marked = [o for o in group.occurrences if _marked(o)]
+    unmarked = [o for o in group.occurrences if not _marked(o)]
+    parts = [part for part in (unmarked, marked) if len(part) >= 2] or [marked + unmarked]
+    return [DuplicateGroup(hash=group.hash, occurrences=part, lines=group.lines, exact=group.exact)
+            for part in parts]
+
+
 def find_duplicates(path: Path, min_lines: int) -> list[DuplicateGroup]:
     all_blocks = []
     for filepath in find_python_files(path):
@@ -277,7 +299,7 @@ def find_duplicates(path: Path, min_lines: int) -> list[DuplicateGroup]:
     loose = [g for g in _group(all_blocks, 'shape_hash', exact=False)
              if _members(g) not in exact_members]
 
-    duplicates = _collapse_nested(exact + loose)
+    duplicates = [part for group in _collapse_nested(exact + loose) for part in _split_by_body(group)]
     duplicates.sort(key=lambda x: (not x.is_finding, not x.exact, -len(x.occurrences), -x.lines))
     return duplicates
 

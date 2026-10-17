@@ -240,7 +240,9 @@ that definition. **It is only for code copied verbatim from another project,
 and it must name that source** — never a way to quiet the doctor on code
 written here. `analyze_all.py` then does not charge the marked code for
 complexity, design, hygiene or duplication; correctness and security detectors
-still report inside it. Nothing is hidden. Each marked file gets a
+still report inside it. Marked code also never counts toward a duplicate group
+or a data clump charged to unmarked code: those are judged on the project's
+own copies and signatures. Nothing is hidden. Each marked file gets a
 `verbatim_upstream` candidate counting the records not charged, the same count
 is in `meta.not_charged`, and a marker that names no source, or sits above no
 definition, exempts nothing and is reported as a finding.

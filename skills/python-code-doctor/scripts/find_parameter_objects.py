@@ -22,6 +22,13 @@ on a Protocol and implemented by three solvers (or mirrored by a fake) is one
 signature, a contract, not four functions passing the same loose values.
 Initializers are the exception — unrelated classes built from the same three
 values are exactly the clump this looks for.
+
+A clump is one body of code's design, so its members are counted within one
+body. Code marked `# doctor: verbatim-upstream` keeps upstream's signatures and
+is a body of its own: it never makes up the numbers for a clump charged to the
+project's code. A clump wholly inside it, or one that takes marked code to
+reach the threshold, is reported at a marked member, where analyze_all
+withholds it and counts it as not charged.
 """
 
 import ast
@@ -31,7 +38,7 @@ from pathlib import Path
 from dataclasses import dataclass, asdict, field
 from itertools import combinations
 from collections import defaultdict
-from common import configure_output, find_python_files, is_test_file, warn_detector_error, warn_unparseable, is_route_handler
+from common import configure_output, find_python_files, is_test_file, upstream_marks, warn_detector_error, warn_unparseable, looks_like_test, is_route_handler
 
 
 @dataclass
@@ -97,11 +104,12 @@ def _requests_fixtures(node) -> bool:
 
 
 def _collect(path: Path):
-    """Return list of (frozenset_of_params, file, line, funcname, identity).
+    """Return list of (frozenset_of_params, file, line, funcname, identity, body).
 
     ``identity`` is what makes two definitions the same function for counting:
     a method's name (all methods named `advance` are one contract), and the
-    definition's own location for anything else.
+    definition's own location for anything else. ``body`` is the code it is
+    counted with: "upstream" for code marked as a verbatim copy, else "project".
     """
     out = []
     for filepath in find_python_files(path):
@@ -117,6 +125,7 @@ def _collect(path: Path):
             continue
         methods = {id(item) for node in ast.walk(tree) if isinstance(node, ast.ClassDef)
                    for item in node.body if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef))}
+        marks = upstream_marks(str(filepath.resolve()))
         for node in ast.walk(tree):
             if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 if _framework_called(node, in_tests):
@@ -126,8 +135,26 @@ def _collect(path: Path):
                     identity = (("method", node.name)
                                 if id(node) in methods and node.name not in _INITIALIZERS
                                 else ("def", str(filepath), node.lineno))
-                    out.append((frozenset(names), str(filepath), node.lineno, node.name, identity))
+                    body = "upstream" if marks.covers(node.lineno) else "project"
+                    out.append((frozenset(names), str(filepath), node.lineno, node.name, identity, body))
     return out
+
+
+def _clumps(bodies: dict, identities: dict) -> list[dict]:
+    """The clumps one group of names makes, as {locs, identities, body, marked}.
+
+    Each body whose own functions reach MIN_FUNCS makes a clump of its members.
+    When none does but marked code is among them and all of them together do,
+    the clump needs the marked code: it is kept whole, as body "mixed", and
+    anchored at a marked member (``marked``).
+    """
+    found = [{"locs": bodies[body], "identities": identities[body], "body": body, "marked": []}
+             for body in bodies if len(identities[body]) >= MIN_FUNCS]
+    everyone = set().union(*identities.values())
+    if not found and "upstream" in bodies and len(everyone) >= MIN_FUNCS:
+        found.append({"locs": [loc for locs in bodies.values() for loc in locs], "identities": everyone,
+                      "body": "mixed", "marked": bodies["upstream"]})
+    return found
 
 
 def _families(clumps: list[dict]) -> list[dict]:
@@ -137,7 +164,8 @@ def _families(clumps: list[dict]) -> list[dict]:
     some of which drop `name` and some `imports`, yields three overlapping
     clumps with three different supports — and one refactoring (a single
     parameter object) answers all of them. Two clumps are one family when
-    they share at least MIN_GROUP - 1 names and at least one function.
+    they belong to the same body of code and share at least MIN_GROUP - 1
+    names and at least one function.
     """
     parent = list(range(len(clumps)))
 
@@ -150,15 +178,17 @@ def _families(clumps: list[dict]) -> list[dict]:
     for i, first in enumerate(clumps):
         for j in range(i + 1, len(clumps)):
             second = clumps[j]
-            if len(first["names"] & second["names"]) >= MIN_GROUP - 1 \
+            if first["body"] == second["body"] \
+                    and len(first["names"] & second["names"]) >= MIN_GROUP - 1 \
                     and set(first["locs"]) & set(second["locs"]):
                 parent[root(j)] = root(i)
     joined: dict[int, dict] = {}
     for i, clump in enumerate(clumps):
-        family = joined.setdefault(root(i), {"names": set(), "locs": set(), "identities": set()})
+        family = joined.setdefault(root(i), {"names": set(), "locs": set(), "identities": set(), "marked": set()})
         family["names"] |= clump["names"]
         family["locs"] |= set(clump["locs"])
         family["identities"] |= clump["identities"]
+        family["marked"] |= set(clump["marked"])
     for family in joined.values():
         family["functions"] = len(family["identities"])
     return list(joined.values())
@@ -169,30 +199,30 @@ def detect(path: Path, ignore: set):
         return []
     functions = _collect(path)
 
-    # Count every MIN_GROUP-sized subset of params, tracking where it occurs.
-    triple_locs = defaultdict(list)   # frozenset(3 names) -> [(file, line, name)]
-    identities = defaultdict(set)     # frozenset(3 names) -> distinct functions
-    for names, f, ln, fn, identity in functions:
+    # Count every MIN_GROUP-sized subset of params, by the body of code each
+    # member belongs to, tracking where it occurs.
+    members = defaultdict(lambda: defaultdict(list))      # 3 names -> body -> [(file, line, name)]
+    identities = defaultdict(lambda: defaultdict(set))   # 3 names -> body -> distinct functions
+    for names, f, ln, fn, identity, body in functions:
         for combo in combinations(sorted(names), MIN_GROUP):
-            triple_locs[frozenset(combo)].append((f, ln, fn))
-            identities[frozenset(combo)].add(identity)
-
-    qualifying = {t: locs for t, locs in triple_locs.items() if len(identities[t]) >= MIN_FUNCS}
+            members[frozenset(combo)][body].append((f, ln, fn))
+            identities[frozenset(combo)][body].add(identity)
 
     # Merge triples that share the exact same support into one (maximal) clump,
     # so a recurring 4-name group is reported once rather than as 4 triples.
-    by_support = defaultdict(lambda: {"names": set(), "locs": None, "identities": set()})
-    for t, locs in qualifying.items():
-        key = frozenset(locs)
-        by_support[key]["names"].update(t)
-        by_support[key]["locs"] = locs
-        by_support[key]["identities"].update(identities[t])
+    by_support = {}
+    for triple, bodies in members.items():
+        for clump in _clumps(bodies, identities[triple]):
+            data = by_support.setdefault((clump["body"], frozenset(clump["locs"])),
+                                         {**clump, "names": set(), "identities": set()})
+            data["names"].update(triple)
+            data["identities"] |= clump["identities"]
 
     issues = []
     for data in _families(list(by_support.values())):
         names = sorted(data["names"])
         locs = data["locs"]
-        f0, ln0, _ = sorted(locs)[0]
+        f0, ln0, _ = min(data["marked"] or locs)
         where = ", ".join(f"{Path(f).name}:{ln} {fn}()" for f, ln, fn in sorted(locs)[:5])
         more = "" if len(locs) <= 5 else f" (+{len(locs) - 5} more)"
         issues.append(CodeSmell(

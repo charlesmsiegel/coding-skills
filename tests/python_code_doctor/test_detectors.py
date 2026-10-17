@@ -4083,6 +4083,68 @@ def test_a_block_nested_inside_a_duplicate_is_not_a_second_duplicate(tmp_path):
     assert findings[0]["occurrences"][0]["type"] == "function"
 
 
+_SUMMED = (
+    "    total = 0\n"
+    "    for item in items:\n"
+    "        if item.ok:\n"
+    "            total += item.weight * scale\n"
+    "        else:\n"
+    "            total -= item.weight\n"
+    "    return total * factor + offset\n"
+)
+
+
+def test_a_marked_upstream_copy_is_not_a_member_of_the_projects_duplication(tmp_path):
+    """Two project functions with the same body are one duplicate of two copies;
+    two upstream originals marked verbatim beside them do not make it four (and
+    `high`): they are a group of their own. A group that takes a project copy and
+    a marked one to make is kept whole and anchored at the marked copy, so
+    analyze_all withholds it and counts it as not charged."""
+    (tmp_path / "pkg").mkdir()
+    (tmp_path / "pkg" / "a_upstream.py").write_text(
+        "# doctor: verbatim-upstream lib/weights.py\n"
+        "def upstream_sum(items, scale, factor, offset):\n" + _SUMMED
+        + "\ndef upstream_mean(values, scale, factor, offset):\n"
+        + _SUMMED.replace("items", "values").replace("total", "acc"))
+    (tmp_path / "pkg" / "b_one.py").write_text("def weigh(items, scale, factor, offset):\n" + _SUMMED)
+    (tmp_path / "pkg" / "c_two.py").write_text("def measure(items, scale, factor, offset):\n" + _SUMMED)
+    (tmp_path / "pkg" / "d_three.py").write_text(
+        "def tally(values, scale, factor, offset):\n"
+        + _SUMMED.replace("items", "values").replace("total", "acc").replace("item.ok", "item.live"))
+
+    clamped = (
+        "    out = []\n"
+        "    for row in rows:\n"
+        "        value = max(low, min(high, row))\n"
+        "        if value % step:\n"
+        "            value -= value % step\n"
+        "        out.append(value)\n"
+        "    return out\n"
+    )
+    (tmp_path / "pkg" / "e_ported.py").write_text("def clamp_all(rows, low, high, step):\n" + clamped)
+    (tmp_path / "pkg" / "f_upstream.py").write_text(
+        "# doctor: verbatim-upstream lib/clamp.py\n"
+        "def upstream_clamp(rows, low, high, step):\n" + clamped)
+
+    def members(record):
+        return sorted(Path(o["file"]).name for o in record["occurrences"])
+
+    groups = sorted((Path(r["file"]).name, members(r), r["severity"])
+                    for r in run_detector("find_duplicates.py", tmp_path) if r["kind"] == "finding")
+    assert groups == [("a_upstream.py", ["a_upstream.py", "a_upstream.py"], "medium"),
+                      ("c_two.py", ["b_one.py", "c_two.py"], "medium"),
+                      ("f_upstream.py", ["e_ported.py", "f_upstream.py"], "medium")]
+
+    report = json.loads(subprocess.run(
+        [sys.executable, str(SCRIPTS_DIR / "analyze_all.py"), str(tmp_path), "--format", "json"],
+        capture_output=True, text=True, timeout=300, check=True).stdout)
+    charged = [members(r) for r in report["categories"]["duplicates"]["issues"] if r["kind"] == "finding"]
+    assert charged == [["b_one.py", "c_two.py"]]
+    withheld = {Path(f).name: entry["by_category"].get("duplicates")
+                for f, entry in report["meta"]["not_charged"].items()}
+    assert withheld == {"a_upstream.py": 1, "f_upstream.py": 1}
+
+
 def test_docstrings_do_not_count_toward_duplicate_size(tmp_path):
     """A one-expression body under a long docstring is not a 9-line duplicate."""
     doc = '    """One line.\n\n    Two.\n\n    Three.\n\n    Four.\n    """\n'
@@ -5577,6 +5639,63 @@ def test_one_methods_implementations_are_a_contract_not_a_data_clump(tmp_path):
                     for r in run_detector("find_parameter_objects.py", tmp_path))
     assert clumps == ["Parameters ['backoff', 'retries', 'url']",
                       "Parameters ['host', 'port', 'timeout']"]
+
+
+def test_code_marked_verbatim_upstream_is_not_a_member_of_the_projects_clumps(tmp_path):
+    """A marked copy keeps upstream's signatures, so it cannot make up the numbers
+    for a clump charged to the project's code: two project functions and one
+    upstream FinalLayer are not three, and that clump is reported at the marked
+    member, where analyze_all withholds and counts it. A clump that stands on the
+    project's own functions is reported without the marked one, and a clump
+    wholly inside marked code is reported there."""
+    (tmp_path / "pkg").mkdir()
+    (tmp_path / "tests").mkdir()
+    (tmp_path / "pkg" / "model.py").write_text(
+        "def project(x, emb, adaln, scale):\n    return x\n"
+        "\n"
+        "def modulate(x, emb, adaln, shift):\n    return x\n"
+    )
+    (tmp_path / "pkg" / "net.py").write_text(
+        "def connect(host, port, timeout):\n    return host\n"
+        "\n"
+        "def ping(host, port, timeout):\n    return port\n"
+        "\n"
+        "def close_conn(host, port, timeout):\n    return timeout\n"
+        "\n"
+        "# doctor: verbatim-upstream urllib3 connection.py\n"
+        "def upstream_connect(host, port, timeout):\n    return host\n"
+    )
+    (tmp_path / "tests" / "test_reference.py").write_text(
+        "# doctor: verbatim-upstream ComfyUI comfy/ldm/cosmos/predict2.py (FinalLayer)\n"
+        "class UpstreamFinalLayer:\n"
+        "    def forward(self, x, emb, adaln):\n"
+        "        return x\n"
+    )
+    (tmp_path / "tests" / "attention_reference.py").write_text(
+        "# doctor: verbatim-upstream ComfyUI comfy/ldm/modules/attention.py\n"
+        "def attention_basic(q, k, v):\n    return q\n"
+        "\n"
+        "def attention_split(q, k, v):\n    return k\n"
+        "\n"
+        "def attention_sub_quad(q, k, v):\n    return v\n"
+    )
+    clumps = sorted((Path(r["file"]).relative_to(tmp_path).as_posix(), r["description"].split(":")[0])
+                    for r in run_detector("find_parameter_objects.py", tmp_path))
+    assert clumps == [
+        ("pkg/net.py", "Parameters ['host', 'port', 'timeout'] appear together in 3 functions"),
+        ("tests/attention_reference.py", "Parameters ['k', 'q', 'v'] appear together in 3 functions"),
+        ("tests/test_reference.py", "Parameters ['adaln', 'emb', 'x'] appear together in 3 functions"),
+    ]
+
+    report = json.loads(subprocess.run(
+        [sys.executable, str(SCRIPTS_DIR / "analyze_all.py"), str(tmp_path),
+         "--format", "json", "--skip-duplicates"],
+        capture_output=True, text=True, timeout=300, check=True).stdout)
+    charged = [Path(r["file"]).name for r in report["categories"]["parameter_objects"]["issues"]]
+    assert charged == ["net.py"]
+    withheld = {Path(f).name: entry["by_category"] for f, entry in report["meta"]["not_charged"].items()}
+    assert withheld["attention_reference.py"].get("parameter_objects") == 1
+    assert withheld["test_reference.py"].get("parameter_objects") == 1
 
 
 _FRAMEWORK_HOOKS = (
