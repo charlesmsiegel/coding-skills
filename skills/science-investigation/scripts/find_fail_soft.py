@@ -30,9 +30,9 @@ import argparse
 from pathlib import Path
 
 from common import (
-    CODE_SUFFIXES, CONFIG_SUFFIXES, add_common_args, candidate, configure_output, emit,
-    envelope, iter_files, mask_strings, read_source, rel, relocate, skipped_note,
-    split_comment, unpack_source,
+    CODE_SUFFIXES, CONFIG_SUFFIXES, add_common_args, bound_lines, candidate, configure_output,
+    coverage_note, emit, envelope, iter_files, looks_generated, mask_strings, read_source, rel,
+    relocate, skipped_note, split_comment, unpack_source,
 )
 
 KIND_ORDER = ["error_becomes_zero", "swallowed_error", "default_off_flag",
@@ -69,12 +69,52 @@ _ZERO_BODY_RE = re.compile(r"\breturn\s+" + _ZERO
 _EMPTY_BODY_RE = re.compile(r"^\s*(?:pass|continue|break|return(?:\s+(?:None|null|nil))?|\}|;)\s*;?\s*$")
 _SURFACED_RE = re.compile(r"\braise\b|\bthrow\b|\brethrow\b")
 _CONDITIONAL_RE = re.compile(r"^(?:if|elif|else\b|when|case|unless)\b|^\}?\s*else\b")
-# `# cannot rethrow here` must not count as re-raising, or the `pass` under it
-# never surfaces. Comments are stripped before the check — and so are string
-# bodies, because `log("cannot rethrow")` above a `return 0.0` was reading as a
-# re-raise and producing a clean headline over the exact shape this tool exists
-# to find. The quotes are kept so `return ""` still matches _ZERO_BODY_RE.
-_STRING_BODY_RE = re.compile(r"(['\"])(?:\\.|(?!\1).)*\1")
+
+
+def strip_string_bodies(line: str) -> str:
+    """Every complete quoted literal on one line cut to its quotes: `log("x")` -> `log("")`.
+
+    The same answer as `(['"])(?:\\.|(?!\1)[^\\])*\1`, computed by a loop, because
+    no regex for it was safe. The original used `.` where `[^\\]` stands, so a
+    backslash could be read as an escape or as a character: an unterminated quote
+    before a run of backslashes backtracked exponentially, and one committed bundle
+    held the scan for minutes. Without the ambiguity it was still quadratic, since
+    every escaped quote in a run restarted the match (8s at 32K characters).
+
+    Linear because once a quote of one kind fails to close, every later quote of
+    that kind fails too: the scan from the first read each later one as escaped,
+    and continues past it in exactly the state the later one would start in. So
+    each kind is read to the end of the line at most once. An unterminated quote
+    is left as it is, as the regex left it.
+    """
+    out, index, dead, size = [], 0, set(), len(line)
+    while index < size:
+        char = line[index]
+        if char in "'\"" and char not in dead:
+            end = index + 1
+            while end < size and line[end] != char:
+                end += 2 if line[end] == "\\" else 1
+            if end < size:
+                out.append(char + char)
+                index = end + 1
+                continue
+            dead.add(char)
+        out.append(char)
+        index += 1
+    return "".join(out)
+
+
+def surfaces(code: str) -> bool:
+    """Whether `code` re-raises, read with its string bodies stripped.
+
+    `# cannot rethrow here` must not count as re-raising, or the `pass` under it
+    never surfaces. Comments are stripped before the check — and so are string
+    bodies, because `log("cannot rethrow")` above a `return 0.0` was reading as a
+    re-raise and producing a clean headline over the exact shape this tool exists
+    to find.
+    """
+    return bool(_SURFACED_RE.search("\n".join(strip_string_bodies(line) for line in code.split("\n"))))
+
 
 # `judge(row).catch(() => 0)` — a promise rejection handler, which is fail-soft in
 # exactly the same way as a catch block and never opened one.
@@ -82,25 +122,27 @@ _PROMISE_CATCH_RE = re.compile(r"\.catch\s*\(\s*(?:\([^)]*\)|[A-Za-z_$][\w$]*)?\
 _ARROW_ZERO_RE = re.compile(r"^\s*(?:0(?:\.0*)?(?![\d.])|\"\"|'')")
 _ARROW_EMPTY_RE = re.compile(r"^\s*(?:\{\s*\}|null|undefined|void\s+0)")
 
-# The flag word may open the name (`enable_reranker`) or sit inside it
-# (`rag.use_reranker`), so the prefix is optional. `on` alone matches half the
-# words in English, which is what _ENABLE_TOKEN_RE below exists to filter back out.
-_FLAG_NAME = r"[\w.-]*(?:enable|enabled|use|using|with|allow|feature|flag|active|on)[\w-]*"
+# The whole name, from the start of its run: the flag word may open it
+# (`enable_reranker`) or sit inside it (`rag.use_reranker`), and is_flag_name
+# reads its tokens afterwards. Anchoring at the run's start is what keeps this
+# linear — `\b` let the match restart at every dot of `a.b.c...`, and a long
+# dotted run cost seconds per line. Possessive (3.11+), so a run that is not
+# followed by `=` or `:` is given up at once rather than backtracked through.
+_NAME = r"(?<![\w.-])([\w.-]++)"
 # An optional type annotation may sit between the name and the value:
 # `ENABLE_RERANKER: bool = False`, `const useReranker: boolean = false`.
 # The optional `["']` carries JSON's `{"use_reranker": false}`, where the closing
 # key quote sits between the name and the delimiter.
 _ANNOTATED = r"[\"']?\s*(?::\s*[A-Za-z_][\w.\[\]<>| ]*)?\s*[:=]\s*"
 _DEFAULT_OFF_RE = re.compile(
-    r"\b(" + _FLAG_NAME + r")" + _ANNOTATED + r"(?:false\b|0(?![\d.]))"
-    r"|\b(" + _FLAG_NAME + r")" + _ANNOTATED + r"[\"'](?:false|off|0|no)[\"']",
+    _NAME + _ANNOTATED + r"(?:false\b|0(?![\d.]))"
+    r"|" + _NAME + _ANNOTATED + r"[\"'](?:false|off|0|no)[\"']",
     re.IGNORECASE,
 )
 # `disable_reranker: true` is the same configuration written the other way round.
-_DISABLE_NAME = r"[\w.-]*(?:disable|disabled|skip|off|bypass|ignore)[\w-]*"
 _DISABLE_ON_RE = re.compile(
-    r"\b(" + _DISABLE_NAME + r")" + _ANNOTATED + r"(?:true\b|1(?![\d.]))"
-    r"|\b(" + _DISABLE_NAME + r")" + _ANNOTATED + r"[\"'](?:true|on|1|yes)[\"']",
+    _NAME + _ANNOTATED + r"(?:true\b|1(?![\d.]))"
+    r"|" + _NAME + _ANNOTATED + r"[\"'](?:true|on|1|yes)[\"']",
     re.IGNORECASE,
 )
 DISABLE_TOKENS = frozenset({"disable", "disabled", "skip", "off", "bypass", "ignore"})
@@ -110,11 +152,20 @@ DISABLE_TOKENS = frozenset({"disable", "disabled", "skip", "off", "bypass", "ign
 _TOKEN_RE = re.compile(r"[A-Z]+(?![a-z])|[A-Z][a-z0-9]*|[a-z0-9]+")
 FLAG_TOKENS = frozenset({"enable", "enabled", "disable", "use", "using", "with",
                          "allow", "feature", "flag", "active", "on", "toggle"})
+# What a call tolerates rather than which method it runs: json's `allow_nan`,
+# pydantic's `allow_inf_nan`, shutil's `ignore_errors`, requests'
+# `allow_redirects`. Passed as a keyword argument, such a switch configures one
+# library call, and no better method sits behind it waiting to be measured.
+TOLERANCE_TOKENS = frozenset({"nan", "inf", "error", "errors", "warning", "warnings",
+                              "unicode", "redirects"})
 
 
+# rows[:100] — read from code with string bodies masked, so a slice inside an
+# f-string (`f"{digest[:12]}"`) is display text, and then only when the thing
+# sliced is not evidently a string (see slices_text).
+_SLICE_CAP_RE = re.compile(r"\[\s*:\s*\d{1,6}\s*\]")
 _CAP_RE = re.compile(
-    r"\[\s*:\s*\d{1,6}\s*\]"                             # rows[:100]
-    r"|\.head\(\s*\d+"                                     # df.head(50)
+    r"\.head\(\s*\d+"                                      # df.head(50)
     r"|\bislice\(\s*[^,]+,\s*\d+"                          # islice(rows, 50)
     r"|\blimit[\"']?\s*[=:(]\s*\d+"                        # limit=100, "limit": 100
     r"|\blimit\s+\d+"                                      # SQL LIMIT 100
@@ -129,21 +180,186 @@ _NONDET_RE = re.compile(
     r"|\bdo_sample[\"']?\s*[=:]\s*true",
     re.IGNORECASE,
 )
+_FAMILY = r"(?:gpt|claude|gemini|llama|mistral|mixtral|command|titan|sonnet|opus|haiku|o[134]|text-embedding)"
 # Quoted in code, bare in config: `model="gpt-4o"`, `MODEL=gpt-4`, `model: gpt-4`.
 # Requiring quotes meant the .env and YAML forms were scanned and never reported.
+# A quoted id is the whole literal: `"claude cli"` and `"o1 = x + y"` are text
+# that happens to open with a family word.
 _MODEL_RE = re.compile(
-    r"(?:[\"']|[=:]\s*)"
-    r"((?:gpt|claude|gemini|llama|mistral|mixtral|command|titan|sonnet|opus|haiku|o[134]|text-embedding)"
-    r"[A-Za-z0-9._-]*)"
-    r"(?=[\"']|\s|,|$)"
+    r"([\"'])(" + _FAMILY + r"[A-Za-z0-9._-]*)\1"
+    r"|[=:]\s*(" + _FAMILY + r"[A-Za-z0-9._-]*)(?=\s|,|$)"
 )
+# A family word is a model id only when something says so. Its own shape can: a
+# version or a tier after it (`gpt-4o`, `claude-sonnet`, `command-r`, `llama3`,
+# `o3-mini`). Or the key it is assigned to can: `model="claude"`. Without
+# either, "command" is a word and "claude" is a backend name or an event kind —
+# 83 and 174 of one real repository's 489 rows.
+_MODEL_SHAPE_RE = re.compile(r"(?:o[134](?:-|$)|(?:gpt|claude|gemini|llama|mistral|mixtral|command|titan)\d)")
+MODEL_TIERS = frozenset({
+    "sonnet", "opus", "haiku", "instant", "turbo", "mini", "nano", "pro", "flash", "ultra",
+    "large", "medium", "small", "tiny", "light", "lite", "nightly", "latest", "preview",
+    "r", "plus", "embed", "instruct", "chat", "vision",
+})
+MODEL_KEYS = frozenset({"model", "models", "engine"})
+# A model option names the value beside it: `add_argument("--judge-model",
+# default="claude")`, and the argv list `["prove", "--model", "claude"]`.
+_MODEL_OPTION = r"[\"']--?(?:\w+[-_])*model[\"']"
+_MODEL_OPTION_RE = re.compile(_MODEL_OPTION)
+_MODEL_ARGV_RE = re.compile(_MODEL_OPTION + r"\s*,\s*$")
 # A full date, a compact date, a four-digit provider snapshot (gpt-4-0613,
 # gpt-4-1106-preview), an explicit -v2, or an @-pinned tag.
 _PINNED_RE = re.compile(r"\d{4}-\d{2}-\d{2}|\d{6,8}|-\d{4}(?!\d)|-v\d+|@\d")
 
 
+def looks_like_model_id(text: str) -> bool:
+    """`gpt-4o`, `claude-sonnet`, `command-r-plus`, `llama3`; not `claude.result`."""
+    if _MODEL_SHAPE_RE.match(text):
+        return True
+    rest = text[re.match(_FAMILY, text).end():]
+    if not rest.startswith("-"):
+        return False
+    return any(any(c.isdigit() for c in segment) or segment.lower() in MODEL_TIERS
+               for segment in re.split(r"[-.]", rest[1:]))
+
+
+def model_keyed(line: str, start: int) -> bool:
+    """Whether the value at `start` is assigned to a model-ish key: `model=`,
+    `"judge_model": `, `HARDY_MODEL = `, `--model `."""
+    if _MODEL_ARGV_RE.search(line[max(0, start - 80):start]):
+        return True
+    prefix = re.split(r"[,;({\[]", line[max(0, start - 80):start])[-1]
+    words = {t.lower() for t in _TOKEN_RE.findall(prefix)}
+    if words & MODEL_KEYS:
+        return True
+    return "default" in words and bool(_MODEL_OPTION_RE.search(line[:start]))
+
+
+def model_ids(line: str) -> list:
+    """Every evident model id on a line, quoted or bare."""
+    found = []
+    for match in _MODEL_RE.finditer(line):
+        text = match.group(2) or match.group(3)
+        if looks_like_model_id(text) or model_keyed(line, match.start()):
+            found.append(text)
+    return found
+
+
+# A slice of text caps nothing that is evaluated: `hexdigest()[:12]` is an id,
+# `text[:200]` is a log line, `msc[0][:2]` is a code's prefix — at least 95 of one
+# real repository's 291 cap rows. A silent cap slices a collection of examples,
+# so a slice is set aside only on evidence that what it slices is a string: a
+# string-named value, a call that returns text, or one element of a collection.
+STRING_NAME_TOKENS = frozenset({
+    "sha", "sha1", "sha256", "sha512", "md5", "digest", "hexdigest", "hash", "hex",
+    "checksum", "fingerprint", "uuid", "id", "revision", "commit",
+    "text", "detail", "details", "message", "msg", "title", "label", "line", "url",
+    "uri", "path", "stdout", "stderr", "description", "summary", "reason", "note",
+    "slug", "stem", "prefix", "suffix", "name", "code", "version", "error",
+})
+STRING_CALLS = frozenset({
+    "str", "repr", "ascii", "format", "join", "strip", "lstrip", "rstrip", "lower",
+    "upper", "casefold", "title", "replace", "decode", "hexdigest", "isoformat",
+    "getvalue", "read", "read_text",
+})
+# An element of one of these is itself a set of examples, so slicing it is a cap.
+EXAMPLE_GROUP_TOKENS = frozenset({
+    "split", "splits", "batch", "batches", "fold", "folds", "shard", "shards",
+    "chunk", "chunks", "dataset", "datasets", "partition", "partitions",
+})
+
+
+# Longer than this, a sliced expression is not evidently anything, and its slice
+# is reported. The bound also keeps the backward read linear in the line.
+MAX_RECEIVER = 200
+
+
+def _opening(text: str, end: int, floor: int = 0) -> int:
+    """Index of the bracket matching the `)` or `]` at `text[end - 1]`, or -1."""
+    depth = 0
+    for index in range(end - 1, floor - 1, -1):
+        if text[index] in ")]":
+            depth += 1
+        elif text[index] in "([":
+            depth -= 1
+            if depth == 0:
+                return index
+    return -1
+
+
+def subscripted(code: str, index: int) -> str:
+    """The expression the `[` at `index` subscripts, read backwards: `a.b(c)[0]`.
+
+    '' when it runs past MAX_RECEIVER characters.
+    """
+    start, floor = index, max(0, index - MAX_RECEIVER)
+    while start > 0:
+        if start <= floor:
+            return ""
+        char = code[start - 1]
+        if char in ")]":
+            opening = _opening(code, start, floor)
+            if opening < 0:
+                return ""
+            start = opening
+        elif char.isalnum() or char in "_.":
+            start -= 1
+        else:
+            break
+    return code[start:index]
+
+
+def _last_token(name: str) -> str:
+    tokens = _TOKEN_RE.findall(name)
+    return tokens[-1].lower() if tokens else ""
+
+
+def slices_text(receiver: str) -> bool:
+    """Whether a sliced expression is evidently a string, not a collection of examples."""
+    element = re.search(r"\[\s*-?\d+\s*\]$", receiver)
+    if element:
+        container = receiver[:element.start()]
+        while container.endswith((")", "]")) and _opening(container, len(container)) > 0:
+            container = container[:_opening(container, len(container))]
+        words = {t.lower() for t in _TOKEN_RE.findall(container.split(".")[-1])}
+        return not words & EXAMPLE_GROUP_TOKENS
+    if receiver.endswith(")"):
+        opening = _opening(receiver, len(receiver))
+        callee = receiver[:opening] if opening > 0 else ""
+        if not callee or not (callee[-1].isalnum() or callee[-1] == "_"):
+            return False      # `(a if b else c)[:5]`: nothing says what it is
+        name = callee.split(".")[-1]
+        return name in STRING_CALLS or _last_token(name) in STRING_NAME_TOKENS
+    return bool(receiver) and _last_token(receiver.split(".")[-1]) in STRING_NAME_TOKENS
+
+
+def caps_a_collection(code: str) -> bool:
+    return any(not slices_text(subscripted(code, match.start()))
+               for match in _SLICE_CAP_RE.finditer(code))
+
+
 def is_flag_name(name: str, tokens=FLAG_TOKENS) -> bool:
     return bool({t.lower() for t in _TOKEN_RE.findall(name)} & tokens)
+
+
+def tolerance_argument(line: str, match) -> bool:
+    """Whether a flag match is a library call's strictness keyword (`allow_nan=False`).
+
+    Deliberately narrow: only a keyword argument, and only one whose subject is
+    nothing but what the call tolerates. `ignore_errors: true` as a key in an eval
+    config is the project's own setting and is still reported, as is
+    `allow_reranker=False`, which names a component.
+    """
+    group = 1 if match.group(1) else 2
+    words = {t.lower() for t in _TOKEN_RE.findall(match.group(group))}
+    subject = words - FLAG_TOKENS - DISABLE_TOKENS
+    if not subject or not subject <= TOLERANCE_TOKENS:
+        return False
+    if not re.match(r"\s*=(?!=)", line[match.end(group):]):
+        return False
+    before = line[:match.start(group)].rstrip()
+    after = line[match.end():].lstrip()
+    # `f(x, allow_nan=False)`, or one argument per line inside a call.
+    return before.endswith(("(", ",")) or (not before and after[:1] in (",", ")"))
 
 
 def handler_body(lines: list, index: int, max_lines: int = 8) -> list:
@@ -189,7 +405,7 @@ def always_raises(code: list) -> bool:
     if not code:
         return False
     base = min(len(b) - len(b.lstrip()) for b in code)
-    raises = [b for b in code if _SURFACED_RE.search(_STRING_BODY_RE.sub(r"\1\1", b))]
+    raises = [b for b in code if surfaces(b)]
     # Indentation alone is not enough: `if isinstance(exc, Fatal): raise` sits at
     # the base indent and still runs only for one class, so the paths below it are
     # still scored. A raise with a conditional in front of it is conditional.
@@ -202,7 +418,7 @@ def classify_handler(body: list) -> tuple:
     code = [split_comment(b)[0].rstrip() for b in body]
     code = [b for b in code if b.strip()]
     joined = "\n".join(code)
-    surfaced = _SURFACED_RE.search(_STRING_BODY_RE.sub(r"\1\1", joined))
+    surfaced = surfaces(joined)
     zeroed = _ZERO_BODY_RE.search(joined)
 
     if surfaced and always_raises(code):
@@ -210,7 +426,7 @@ def classify_handler(body: list) -> tuple:
     if surfaced and not zeroed:
         # The paths that do not raise still have to record something. `if fatal:
         # raise` followed by `return None` loses every non-fatal example silently.
-        remainder = [b for b in code if not _SURFACED_RE.search(_STRING_BODY_RE.sub(r"\1\1", b))
+        remainder = [b for b in code if not surfaces(b)
                      and not _CONDITIONAL_RE.match(b.strip())]
         if remainder and all(_EMPTY_BODY_RE.match(b) for b in remainder):
             return ("swallowed_error",
@@ -250,7 +466,7 @@ def scan_promise_catches(line: str, display: str, lineno: int) -> list:
     if not match:
         return []
     body = match.group(1)
-    if _SURFACED_RE.search(_STRING_BODY_RE.sub(r"\1\1", body)):
+    if surfaces(body):
         return []
     if _ARROW_ZERO_RE.match(body) or _ZERO_BODY_RE.search(body):
         return [candidate(
@@ -294,8 +510,10 @@ def sampling_disabled(line: str) -> bool:
 
 
 def scan_line(line: str, display: str, lineno: int, sampling_off: bool = False,
-              switched_off_elsewhere: bool = False) -> list:
+              switched_off_elsewhere: bool = False, code=None) -> list:
     out = []
+    if code is None:
+        code = split_comment(mask_strings(line))[0]
     stripped = line.strip()
     if not stripped or stripped.startswith(("#", "//", "*", "<!--")):
         return out
@@ -306,13 +524,15 @@ def scan_line(line: str, display: str, lineno: int, sampling_off: bool = False,
     # minified line the first hit is often a near-miss (`onboarding` contains
     # "on") that token validation rejects — and stopping there missed the real
     # `enable-reranker` switch beside it.
-    if any(is_flag_name(m.group(1) or m.group(2) or "") for m in _DEFAULT_OFF_RE.finditer(line)):
+    if any(is_flag_name(m.group(1) or m.group(2) or "") and not tolerance_argument(line, m)
+           for m in _DEFAULT_OFF_RE.finditer(line)):
         out.append(candidate(
             "default_off_flag", display, lineno,
             "a component defaults to off here",
             CONFIRM["default_off_flag"], stripped,
         ))
     elif any(is_flag_name(m.group(1) or m.group(2) or "", DISABLE_TOKENS)
+             and not tolerance_argument(line, m)
              for m in _DISABLE_ON_RE.finditer(line)):
         out.append(candidate(
             "default_off_flag", display, lineno,
@@ -320,7 +540,7 @@ def scan_line(line: str, display: str, lineno: int, sampling_off: bool = False,
             CONFIRM["default_off_flag"], stripped,
         ))
 
-    if _CAP_RE.search(line):
+    if _CAP_RE.search(line) or caps_a_collection(code):
         out.append(candidate(
             "silent_cap", display, lineno,
             "a cap or sample is applied here",
@@ -347,7 +567,7 @@ def scan_line(line: str, display: str, lineno: int, sampling_off: bool = False,
                 ))
                 break
 
-    for model in _MODEL_RE.findall(line):
+    for model in model_ids(line):
         if not _PINNED_RE.search(model):
             out.append(candidate(
                 "unpinned_model", display, lineno,
@@ -358,8 +578,9 @@ def scan_line(line: str, display: str, lineno: int, sampling_off: bool = False,
 
 
 def scan(root: Path) -> tuple:
+    """(rows, files read, files skipped unread, generated files not mined, lines cut)."""
     files = iter_files(root, CODE_SUFFIXES | CONFIG_SUFFIXES)
-    rows, skipped, read = [], [], 0
+    rows, skipped, generated, read, truncated = [], [], [], 0, 0
     notebooks: dict = {}
     for path in files:
         lines, reason, locations = unpack_source(read_source(path))
@@ -367,19 +588,23 @@ def scan(root: Path) -> tuple:
         if reason:
             skipped.append((display, reason))
             continue
+        if looks_generated(path, lines):
+            generated.append(display)
+            continue
         read += 1
+        lines, cut = bound_lines(lines)
+        truncated += cut
         if locations:
             notebooks[display] = locations
         handled = scan_handlers(lines, display)
         rows += handled
         seen_handlers = {(r["kind"], r["line"]) for r in handled}
-        text = "\n".join(split_comment(mask_strings(b))[0] for b in lines)
-        switched_off = bool(_SAMPLING_OFF_RE.search(text))
-        for lineno, line in enumerate(lines, 1):
-            code = split_comment(mask_strings(line))[0]
-            rows += [r for r in scan_line(line, display, lineno, sampling_disabled(code), switched_off)
+        codes = [split_comment(mask_strings(line))[0] for line in lines]
+        switched_off = bool(_SAMPLING_OFF_RE.search("\n".join(codes)))
+        for lineno, (line, code) in enumerate(zip(lines, codes), 1):
+            rows += [r for r in scan_line(line, display, lineno, sampling_disabled(code), switched_off, code)
                      if (r["kind"], r["line"]) not in seen_handlers]
-    return relocate(rows, notebooks), read, skipped
+    return relocate(rows, notebooks), read, skipped, generated, truncated
 
 
 def headline_for(rows: list, files: int) -> str:
@@ -423,7 +648,10 @@ CAVEAT = (
     "Textual and context-free. It cannot tell a cap in an eval loop (the finding) from a cap in a CLI "
     "flag or a UI page size (fine), nor a default-off feature flag from a default-off debug switch. "
     "Handler bodies are read by indentation and brace heuristics, so an unusual layout may be "
-    "misclassified. Errors swallowed inside a library you call, or in a service, are invisible here."
+    "misclassified. Errors swallowed inside a library you call, or in a service, are invisible here. "
+    "A slice is not reported when what it slices is evidently text (a digest, a message, one element), "
+    "and a model family word counts only when shaped like an id or assigned to a model key — so a cap "
+    "on a string-named collection, or a model alias held under an unrelated name, is missed."
 )
 
 
@@ -439,7 +667,7 @@ def main() -> int:
         print("error: no such path: " + str(root), file=sys.stderr)
         return 2
 
-    rows, files, skipped = scan(root)
+    rows, files, skipped, generated, truncated = scan(root)
     headline = headline_for(rows, files) + skipped_note(skipped)
     if args.kind:
         # The headline still describes the whole tree — suppressing a more serious
@@ -452,12 +680,15 @@ def main() -> int:
         rows = shown
     rows.sort(key=lambda r: (KIND_ORDER.index(r["kind"]) if r["kind"] in KIND_ORDER else 99, r["file"], r["line"]))
 
-    counts = {"files_scanned": files, "files_skipped_unread": len(skipped), "candidates_total": len(rows)}
+    counts = {"files_scanned": files, "files_skipped_unread": len(skipped),
+              "files_skipped_generated": len(generated), "lines_truncated": truncated,
+              "candidates_total": len(rows)}
     for kind in KIND_ORDER:
         found = sum(1 for r in rows if r["kind"] == kind)
         if found:
             counts[kind] = found
-    emit(envelope("find_fail_soft", root, headline, CAVEAT, counts, rows[:args.limit]), args.format)
+    caveat = CAVEAT + coverage_note(generated, truncated)
+    emit(envelope("find_fail_soft", root, headline, caveat, counts, rows[:args.limit]), args.format)
     return 0
 
 
