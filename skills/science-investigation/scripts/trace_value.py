@@ -32,7 +32,7 @@ if str(Path(__file__).resolve().parent) not in sys.path:
     sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from common import (
-    CODE_SUFFIXES, CONFIG_SUFFIXES, DOC_SUFFIXES, add_common_args, candidate, configure_output,
+    CODE_SUFFIXES, CONFIG_SUFFIXES, DOC_SUFFIXES, add_common_args, bound_lines, candidate, configure_output,
     coverage_note, emit, envelope, is_config, iter_files, looks_generated, mask_strings,
     read_source, rel, relocate, skipped_note, split_comment, unpack_source,
 )
@@ -136,7 +136,7 @@ def classify(line: str, display: str, path: Path, span: tuple, numeric: bool = T
     absolute path carries the checkout's own directory names, and a repo cloned
     under ~/tests/ would otherwise report every site as a test.
     """
-    lowered = display.lower()
+    lowered = display.lower().replace('\\', "/")
     if re.search(r"(?:^|[/_.-])(?:tests?|spec|specs|__tests__)(?:[/_.-]|$)", lowered):
         return "test"
     # Docs first: `# Release threshold 0.7` is a Markdown heading, and reading its
@@ -179,7 +179,7 @@ def classify(line: str, display: str, path: Path, span: tuple, numeric: bool = T
 
 
 def scan(root: Path, pattern: re.Pattern, numeric: bool = True) -> tuple:
-    """(rows, files skipped unread).
+    """(rows, unread files, scanned count, generated files, truncated line count).
 
     Every occurrence on a line is classified, not just the first — `score > 0.7 and
     backup > 0.7` is two consumers, and minified config puts many on one line. Rows
@@ -188,7 +188,7 @@ def scan(root: Path, pattern: re.Pattern, numeric: bool = True) -> tuple:
     """
     rows, skipped, generated, seen = [], [], [], set()
     notebooks: dict = {}
-    scanned = 0
+    scanned, truncated = 0, 0
     for path in iter_files(root, CODE_SUFFIXES | CONFIG_SUFFIXES | DOC_SUFFIXES):
         display = rel(path, root)
         lines, reason, locations = unpack_source(read_source(path))
@@ -201,6 +201,8 @@ def scan(root: Path, pattern: re.Pattern, numeric: bool = True) -> tuple:
             # minutes. Named in the caveat rather than dropped silently.
             generated.append(display)
             continue
+        lines, cut = bound_lines(lines)
+        truncated += cut
         scanned += 1
         if locations:
             notebooks[display] = locations
@@ -215,7 +217,7 @@ def scan(root: Path, pattern: re.Pattern, numeric: bool = True) -> tuple:
                     continue
                 seen.add((display, lineno, kind))
                 rows.append(candidate(kind, display, lineno, kind + " site", CONFIRM[kind], line.strip()))
-    return relocate(rows, notebooks), skipped, scanned, generated
+    return relocate(rows, notebooks), skipped, scanned, generated, truncated
 
 
 def headline_for(needle: str, rows: list, files: int = 1) -> str:
@@ -297,18 +299,18 @@ def main() -> int:
         print("error: bad regular expression: " + str(exc), file=sys.stderr)
         return 2
 
-    rows, skipped, scanned, generated = scan(root, pattern, bool(_NUMERIC_RE.match(args.needle)) and not args.regex)
+    rows, skipped, scanned, generated, truncated = scan(root, pattern, bool(_NUMERIC_RE.match(args.needle)) and not args.regex)
     order = ["definition", "declaration", "comparison", "config", "doc", "test", "comment", "text", "other"]
     rows.sort(key=lambda r: (order.index(r["kind"]) if r["kind"] in order else 99, r["file"], r["line"]))
     counts = {"needle": args.needle, "sites": len(rows), "files": len({r["file"] for r in rows}),
               "files_scanned": scanned, "files_skipped_unread": len(skipped),
-              "files_skipped_generated": len(generated)}
+              "files_skipped_generated": len(generated), "lines_truncated": truncated}
     for kind in order:
         found = sum(1 for r in rows if r["kind"] == kind)
         if found:
             counts[kind] = found
     headline = headline_for(args.needle, rows, scanned) + skipped_note(skipped)
-    caveat = CAVEAT + coverage_note(generated)
+    caveat = CAVEAT + coverage_note(generated, truncated)
     emit(envelope("trace_value", root, headline, caveat, counts, rows[:args.limit]), args.format)
     return 0
 

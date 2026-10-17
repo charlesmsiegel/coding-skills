@@ -401,7 +401,8 @@ def enclosing_function(lines: list, index: int):
 
 
 def exit_status(lines: list, index: int, text: str) -> bool:
-    """Whether the `return 0` at `lines[index]` is a command's exit status."""
+    """Whether the `return 0` is an exit status; printing alone cannot prove
+    that for a function whose name explicitly identifies a measure."""
     found = enclosing_function(lines, index)
     if found is None:
         return False
@@ -410,6 +411,8 @@ def exit_status(lines: list, index: int, text: str) -> bool:
         return True
     if re.search(r"\b(?:sys\.exit|SystemExit|process\.exit)\(\s*" + re.escape(name) + r"\(", text):
         return True
+    if is_metric_name(name):
+        return False  # printing does not turn a named measure into an exit code
     returns = [line for line in body if _RETURN_RE.match(line)]
     return bool(_PRINTS_RE.search("\n".join(body))) and all(_INT_RETURN_RE.match(r) for r in returns)
 

@@ -249,11 +249,9 @@ def model_ids(line: str) -> list:
     return found
 
 
-# A slice of text caps nothing that is evaluated: `hexdigest()[:12]` is an id,
-# `text[:200]` is a log line, `msc[0][:2]` is a code's prefix — at least 95 of one
-# real repository's 291 cap rows. A silent cap slices a collection of examples,
-# so a slice is set aside only on evidence that what it slices is a string: a
-# string-named value, a call that returns text, or one element of a collection.
+# A slice of text caps nothing that is evaluated: hexdigest()[:12] is an id,
+# and text[:200] is a log line. An indexed value needs the same text evidence;
+# its index alone cannot distinguish a string from a collection of examples.
 STRING_NAME_TOKENS = frozenset({
     "sha", "sha1", "sha256", "sha512", "md5", "digest", "hexdigest", "hash", "hex",
     "checksum", "fingerprint", "uuid", "id", "revision", "commit",
@@ -266,13 +264,6 @@ STRING_CALLS = frozenset({
     "upper", "casefold", "title", "replace", "decode", "hexdigest", "isoformat",
     "getvalue", "read", "read_text",
 })
-# An element of one of these is itself a set of examples, so slicing it is a cap.
-EXAMPLE_GROUP_TOKENS = frozenset({
-    "split", "splits", "batch", "batches", "fold", "folds", "shard", "shards",
-    "chunk", "chunks", "dataset", "datasets", "partition", "partitions",
-})
-
-
 # Longer than this, a sliced expression is not evidently anything, and its slice
 # is reported. The bound also keeps the backward read linear in the line.
 MAX_RECEIVER = 200
@@ -322,11 +313,10 @@ def slices_text(receiver: str) -> bool:
     """Whether a sliced expression is evidently a string, not a collection of examples."""
     element = re.search(r"\[\s*-?\d+\s*\]$", receiver)
     if element:
-        container = receiver[:element.start()]
-        while container.endswith((")", "]")) and _opening(container, len(container)) > 0:
-            container = container[:_opening(container, len(container))]
-        words = {t.lower() for t in _TOKEN_RE.findall(container.split(".")[-1])}
-        return not words & EXAMPLE_GROUP_TOKENS
+        # Indexing says nothing about the element's type: rows[0] may itself be
+        # an entire collection. Retain the lead unless its container has the
+        # same text evidence required of an ordinary slice receiver.
+        return slices_text(receiver[:element.start()])
     if receiver.endswith(")"):
         opening = _opening(receiver, len(receiver))
         callee = receiver[:opening] if opening > 0 else ""
