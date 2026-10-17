@@ -37,7 +37,7 @@ sequenceDiagram
 
 Mermaid caveats: escape `<` and `>` in labels or avoid them; `stateDiagram-v2` transition labels break on colons/parentheses — use `flowchart LR` with quoted edge labels (`|"label"|`) when labels need punctuation. Keep each diagram under ~15 participants/nodes; split large flows into several diagrams.
 
-For quantitative structure, the template ships two data-driven renderers. Each is a `<div class="viz" data-render="...">` whose **immediately following sibling** is a `<script type="application/json">` data block; a `style="height:...px"` on the `.viz` div sizes the canvas (set one — the box collapses without it). Both get tooltips, and the force graph gets pan/zoom and node drag, for free.
+For quantitative structure, the atlas ships two data-driven renderers (`assets/renderers.js`, which `assemble.py` inlines into the page). Each is a `<div class="viz" data-render="...">` whose **immediately following sibling** is a `<script type="application/json">` data block; a `style="height:...px"` on the `.viz` div sizes the canvas (set one — the box collapses without it). Both get tooltips, and the force graph gets pan/zoom and node drag, for free.
 
 Treemap — `value` drives area, `metric` drives heat color (`metricMax` pins the color scale; it defaults to the max metric present):
 

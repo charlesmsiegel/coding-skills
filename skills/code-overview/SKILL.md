@@ -155,7 +155,9 @@ that is the correct output.
 
 Pass `--template "$SKILL/assets/template.html"` to `code-visualization`'s
 `assemble.py` too. That one flag is what makes the five documents read as one
-artifact instead of three tools' output.
+artifact instead of three tools' output. It changes the look only: `assemble.py`
+inlines code-visualization's own renderers (graphs, treemaps, Mermaid, sortable
+tables) into whichever shell it is given.
 
 **The grade.** Pass the merged envelope from step 2; `build_health.py` partitions
 its findings and candidates by path, so each package's page carries only
