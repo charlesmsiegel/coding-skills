@@ -326,12 +326,15 @@ def _anchor(path: Path) -> Path | None:
     lone file with neither, None.
     """
     resolved = Path(path).resolve()
+    root = _ANALYSIS.root
+    bounded = root is not None and (resolved == root or root in resolved.parents)
     for directory in resolved.parents:
         if _has_marker(directory):
             return directory
-    root = _ANALYSIS.root
+        if bounded and directory == root and root.name.lower() not in {"test", "tests"}:
+            break
     if root is not None and (resolved == root or root in resolved.parents):
-        return root
+        return root.parent if root.name.lower() in {"test", "tests"} else root
     return None
 
 

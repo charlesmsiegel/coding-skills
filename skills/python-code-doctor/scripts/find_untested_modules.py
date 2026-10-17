@@ -412,13 +412,20 @@ def _string_value(node: ast.expr) -> str | None:
 
 
 def _collect_request_strings(nodes: list) -> Set[str]:
-    """Every string in a test that could be a request path: it contains a `/`."""
+    """Literal paths passed to HTTP-shaped calls, rather than incidental prose."""
     found: Set[str] = set()
     for node in nodes:
-        if isinstance(node, (ast.Constant, ast.JoinedStr, ast.BinOp)):
-            value = _string_value(node)
-            if value and "/" in value:
-                found.add(value.split("://", 1)[-1])
+        if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                and node.func.attr in {"get", "post", "put", "patch", "delete", "head",
+                                       "options", "request", "open"}):
+            continue
+        argument = next((kw.value for kw in node.keywords if kw.arg in {"url", "path"}), None)
+        if argument is None:
+            index = 1 if node.func.attr == "request" else 0
+            argument = node.args[index] if len(node.args) > index else None
+        value = _string_value(argument)
+        if value and "/" in value:
+            found.add(value.split("://", 1)[-1])
     return found
 
 

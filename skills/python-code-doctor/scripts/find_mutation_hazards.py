@@ -373,16 +373,6 @@ class ClassFamilyResolver:
         for base in node.bases:
             binding = self._binding_at(base)
             if binding is None:
-                scope = self.parents.get(node)
-                while scope is not None and not isinstance(scope, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Module)):
-                    scope = self.parents.get(scope)
-                if isinstance(scope, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                    imported = {a.asname or a.name for stmt in scope.body if isinstance(stmt, ast.Import)
-                                for a in stmt.names if a.name == "ctypes"}
-                    dotted = _dotted_name(base) or ""
-                    head, _, leaf = dotted.rpartition(".")
-                    if head in imported and leaf in _CTYPES_BASES:
-                        families.add("ctypes")
                 continue
             kind, value = binding
             if kind == "class" and isinstance(value, ast.ClassDef):

@@ -279,7 +279,7 @@ def detect(tree, filename, lines, ignore):
         visible = candidate_names - local
         if not visible:
             continue
-        for n, held in _guarded_nodes(fn.body, locks):
+        for n, held in _guarded_nodes(fn.body, locks - local):
             m = _mutates_name(n, visible)
             if m:
                 guarded[m].append(held)

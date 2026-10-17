@@ -202,12 +202,11 @@ at a time and the evidence is elsewhere:
 |---|---|
 | `unused_function` / `unused_class` on a public name | any other module may import it |
 | `unused_parameter` on a method or a nested callback | the base class or the caller that receives it dictates the signature |
-| `sql_injection` on a `PRAGMA` statement | PRAGMA accepts no bound parameters, so a dynamic identifier has no parameterized spelling |
 | `assert_for_validation` on `assert x is not None` / `assert isinstance(...)` | that shape usually narrows a type for the checker and records an invariant the caller guarantees |
 | `local_import` of a slow-to-import package (torch, transformers, ...) or inside a CLI command | deferral to keep startup and `--help` fast is the usual reason, and only the author knows |
 | `unused_parameter` on a method, a nested callback, or a function some module hands out as a value | the base class or the caller that receives it dictates the signature |
 | `unused_import` of an absolute import in a package's `__init__.py` | the import makes the name a package attribute another module may read (a relative import there is never reported) |
-| `sql_injection` on DDL or a `PRAGMA`, on quoted identifiers only, or in a test | a bound parameter cannot fill an identifier position, so interpolation is the only spelling, and a test builds its SQL from its own values; whether a name is attacker-controlled shows only at the call sites |
+| `sql_injection` in a schema identifier position or `PRAGMA`, on proven quoted constant identifiers, or in a test | identifiers cannot be bound; test code may construct its own values. Confirm the origin and interpolation position. CREATE data queries containing SELECT or VALUES keep the ordinary data-interpolation finding |
 | `swallowed_exception` / `catches_baseexception` under a reasoned `# noqa: BLE001 -- why` | the repo's own lint gate adjudicated the line; the reason is what to check, and a bare noqa stays a finding |
 | `global_rebind` under a reasoned `# noqa: PLW0603 -- why` | an at-fork or install-once hook has no caller to return a value to |
 | `mutable_class_attribute` that nothing in the module mutates | a read-only table shared on purpose looks the same; only another module's code can show a mutation |

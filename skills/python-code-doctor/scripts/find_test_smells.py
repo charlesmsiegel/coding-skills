@@ -34,7 +34,7 @@ import argparse
 from pathlib import Path
 from dataclasses import dataclass, asdict
 from collections import defaultdict
-from common import (sort_findings, cached_parse, SEVERITY_ICONS, configure_output, find_python_files,
+from common import (is_test_file, sort_findings, cached_parse, SEVERITY_ICONS, configure_output, find_python_files,
                     warn_detector_error, warn_unparseable)
 
 
@@ -50,12 +50,7 @@ class CodeSmell:
 
 
 def _is_test_file(filepath: Path) -> bool:
-    """Return True if this file should be analysed as a test file."""
-    name = filepath.name
-    if name.startswith("test_") or name.endswith("_test.py"):
-        return True
-    parts = filepath.parts
-    return "tests" in parts or "test" in parts
+    return is_test_file(filepath)
 
 
 def _get_line(lines: list[str], lineno: int) -> str:
@@ -216,6 +211,8 @@ def _reaches_assertion(func_node: ast.FunctionDef | ast.AsyncFunctionDef,
     One level only: the helper's own assertions count, not its helpers'.
     """
     own = list(_scope_nodes(func_node.body))
+    parents = {id(child): parent for parent in ast.walk(func_node)
+               for child in ast.iter_child_nodes(parent)}
 
     # Nested definitions, checked only when the rest of the test refers to them.
     loads: dict[str, int] = defaultdict(int)
@@ -233,6 +230,20 @@ def _reaches_assertion(func_node: ast.FunctionDef | ast.AsyncFunctionDef,
             if any(_collect_assertions(body) for body in bodies):
                 return True
         elif isinstance(node, ast.Lambda):
+            holder = parents.get(id(node))
+            while holder is not None and not isinstance(holder, (ast.Assign, ast.AnnAssign, ast.Call)):
+                holder = parents.get(id(holder))
+            if isinstance(holder, (ast.Assign, ast.AnnAssign)):
+                targets = holder.targets if isinstance(holder, ast.Assign) else [holder.target]
+                names = {n.id for target in targets for n in ast.walk(target) if isinstance(n, ast.Name)}
+                inside = defaultdict(int)
+                for inner in ast.walk(node.body):
+                    if isinstance(inner, ast.Name) and isinstance(inner.ctx, ast.Load):
+                        inside[inner.id] += 1
+                if not any(loads[name] > inside[name] for name in names):
+                    continue
+            elif not isinstance(holder, ast.Call):
+                continue
             if any(isinstance(n, ast.Call) and _is_assert_call(n) for n in ast.walk(node.body)):
                 return True
 
@@ -698,6 +709,8 @@ def _is_guard(node: ast.If) -> bool:
     if node.orelse or not node.body:
         return False
     *lead, last = node.body
+    if isinstance(last, ast.Return) and last.value is None and lead and _is_exit_call(lead[-1]):
+        last = lead.pop()
     if any(isinstance(stmt, _COMPOUND) for stmt in lead):
         return False
     return isinstance(last, ast.Raise) or _is_exit_call(last)

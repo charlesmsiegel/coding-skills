@@ -299,18 +299,28 @@ def _names_passed_by_reference(tree) -> set:
 
 
 def _methods_of_derived_classes(tree) -> set:
-    """ids of methods defined directly in a class that inherits from something.
-
-    Such a method may override a base's or implement a protocol, whose
-    signature it has to accept whether or not it uses every argument.
+    """Methods with an unresolved base contract; visible local overrides are
+    handled separately by _build_override_map, so new local methods still count.
     """
-    result = set()
+    classes = defaultdict(list)
     for node in ast.walk(tree):
-        if isinstance(node, ast.ClassDef) and any(
-                not (isinstance(base, ast.Name) and base.id == "object") for base in node.bases):
-            result.update(id(item) for item in node.body
-                          if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef)))
-    return result
+        if isinstance(node, ast.ClassDef):
+            classes[node.name].append(node)
+
+    def unresolved(node, seen):
+        if id(node) in seen:
+            return False
+        seen = seen | {id(node)}
+        for base in node.bases:
+            if isinstance(base, ast.Name) and base.id == "object":
+                continue
+            local = classes.get(base.id, []) if isinstance(base, ast.Name) else []
+            if len(local) != 1 or unresolved(local[0], seen):
+                return True
+        return False
+
+    return {id(item) for nodes in classes.values() for node in nodes if unresolved(node, set())
+            for item in node.body if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef))}
 
 
 def _kwargs_owned_by_the_signature(func_node, by_reference, derived_methods, used) -> bool:

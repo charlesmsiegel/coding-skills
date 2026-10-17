@@ -4396,9 +4396,9 @@ def test_a_type_narrowing_assert_is_a_candidate_not_a_validation_finding(tmp_pat
                if r["smell_type"] == "assert_for_validation"}
 
     assert {line: r["kind"] for line, r in records.items()} == {
-        3: "candidate", 4: "candidate", 5: "finding", 6: "finding"}
+        3: "candidate", 4: "candidate", 5: "candidate", 6: "candidate"}
     assert records[3]["also_caused_by"] and not records[3]["suggestion"]
-    assert records[5]["suggestion"] and not records[5].get("also_caused_by")
+    assert records[5]["also_caused_by"] and not records[5]["suggestion"]
 
     output = run_detector_text("find_exception_issues.py", tmp_path)
     assert "[CANDIDATE]" in output and "? also caused by:" in output
@@ -4459,7 +4459,7 @@ class Child(Base):
 
 
 class Remote(remote.Base):
-    def call(self, **kwargs):  # fires
+    def call(self, **kwargs):  # unresolved external signature contract
         return 1
 
 
@@ -4470,7 +4470,7 @@ def plain(a, **kwargs):  # fires
 
 def test_unused_kwargs_spares_deliberate_and_inherited_catch_alls(tmp_path):
     """`**_kwargs` says "unused on purpose"; an override must keep its base's
-    signature. A base this file cannot see proves nothing, so that one stays."""
+    signature. An unresolved external base also leaves the signature a contract."""
     (tmp_path / "sample.py").write_text(_KWARGS)
     lines = sorted(f["line"] for f in run_detector("find_ai_scaffolding.py", tmp_path)
                    if f["smell_type"] == "unused_kwargs")
@@ -4718,7 +4718,6 @@ _REGISTERED_CONFIG = (
 
 @pytest.mark.parametrize("script,finding_type,key", [
     ("analyze_complexity.py", "parameter_count", "issue_type"),
-    ("find_code_smells.py", "long_parameter_list", "smell_type"),
 ])
 def test_a_register_to_config_init_keeps_its_flat_keyword_arguments(tmp_path, script,
                                                                     finding_type, key):
@@ -4778,7 +4777,6 @@ _CLI_COMMANDS = (
 
 @pytest.mark.parametrize("script,finding_type,key", [
     ("analyze_complexity.py", "parameter_count", "issue_type"),
-    ("find_code_smells.py", "long_parameter_list", "smell_type"),
 ])
 def test_a_cli_commands_parameters_are_its_flags(tmp_path, script, finding_type, key):
     """A typer/click command declares one parameter per command-line option; the
@@ -5218,15 +5216,15 @@ _SIGNATURES = (
 )
 
 
-def test_the_two_parameter_count_detectors_agree_on_severity(tmp_path):
-    """Same count, same grade: what one calls a medium, so does the other."""
+def test_canonical_parameter_count_owns_signature_severity(tmp_path):
+    """Only the canonical rule counts positional and named parameter thresholds."""
     (tmp_path / "sigs.py").write_text(_SIGNATURES)
     complexity = {r["line"]: r["severity"] for r in run_detector("analyze_complexity.py", tmp_path)
                   if r["issue_type"] == "parameter_count"}
     smells = {r["line"]: r["severity"] for r in run_detector("find_code_smells.py", tmp_path)
               if r["smell_type"] == "long_parameter_list"}
     assert complexity == {1: "low", 4: "medium", 7: "high"}
-    assert smells == complexity
+    assert smells == {}
 
 
 def test_one_too_long_signature_is_one_finding_in_the_report(tmp_path):
@@ -5245,9 +5243,7 @@ def test_one_too_long_signature_is_one_finding_in_the_report(tmp_path):
 
     assert records() == [(1, "parameter_count", "low"), (4, "parameter_count", "medium"),
                          (7, "parameter_count", "high")]
-    assert records("--skip", "complexity") == [
-        (1, "long_parameter_list", "low"), (4, "long_parameter_list", "medium"),
-        (7, "long_parameter_list", "high")], "with no parameter_count, the alias is the report"
+    assert records("--skip", "complexity") == [], "skipping the canonical owner skips its rule"
 
 
 def test_the_diff_lens_lists_one_too_long_signature_once(tmp_path):
@@ -5422,7 +5418,7 @@ _FRAMEWORK_HOOKS = (
     "    pass\n"
     "\n"
     "class Mine(Local):\n"
-    "    def settings_customise_sources(cls, settings_cls, init_settings, env_settings, dotenv_settings, file_secret_settings):  # fires: count\n"
+    "    def settings_customise_sources(cls, settings_cls, init_settings, env_settings, dotenv_settings, file_secret_settings, extra_source):  # fires: count\n"
     "        return ()\n"
     "\n"
     "def settings_customise_sources(cls, settings_cls, init_settings, env_settings, dotenv_settings, file_secret_settings):  # fires: count\n"
@@ -5436,7 +5432,6 @@ _FRAMEWORK_HOOKS = (
 
 @pytest.mark.parametrize("script,finding_type,key", [
     ("analyze_complexity.py", "parameter_count", "issue_type"),
-    ("find_code_smells.py", "long_parameter_list", "smell_type"),
 ])
 def test_a_framework_hook_override_keeps_the_frameworks_signature(tmp_path, script,
                                                                   finding_type, key):
@@ -5514,7 +5509,7 @@ _LOCATED_PROJECT = {
     ),
     "tests/test_misc.py": (
         "def test_numbers():\n"
-        "    for value in (17, 33):\n"
+        "    for value in provided_values():\n"
         "        assert value * 3\n"
     ),
 }

@@ -22,7 +22,7 @@ import argparse
 from pathlib import Path
 from dataclasses import dataclass, asdict
 from collections import defaultdict
-from common import count_parameters, framework_hook_overrides, is_test_file, parameter_severity, signature_is_a_contract, sort_findings, cached_parse, SEVERITY_ICONS, configure_output, find_python_files, warn_detector_error, warn_unparseable, looks_like_test
+from common import framework_hook_overrides, is_test_file, sort_findings, cached_parse, SEVERITY_ICONS, configure_output, find_python_files, warn_detector_error, warn_unparseable, looks_like_test
 
 
 # Callables whose first positional argument is an HTTP status code.

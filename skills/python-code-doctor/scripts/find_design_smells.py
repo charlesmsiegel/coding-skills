@@ -22,8 +22,9 @@ smell is complexity and repetition. One short ladder in one place "is often the
 clearest form", so it is a candidate.
 
 inappropriate_intimacy is cross-module reaching. A private name some class in
-this module defines (`self._x = ...`, `def _x`) is read as same-module access,
-which the catalog calls conventional. A private name of a module this file
+this module defines (`self._x = ...`, `def _x`) may be same-module access,
+which the catalog calls conventional: an untyped receiver remains a candidate,
+while a receiver annotated with an imported type is still foreign. A private name of a module this file
 imports relatively (`from . import overlay; overlay._ledger`) is a candidate:
 it is a sibling module's internals unless the package spells package-internal
 with an underscore, which one file cannot tell. Absolute imports stay exempt:
@@ -63,6 +64,10 @@ _SHORT_SWITCH_REASONS = (
 _SIBLING_PRIVATE_REASONS = (
     "the package uses a leading underscore for package-internal rather than "
     "module-internal names, and sibling modules share these helpers by design",
+)
+_LOCAL_PRIVATE_REASONS = (
+    "a class in this module defines the same private member, and an untyped receiver "
+    "may be one of its instances; confirm the receiver's owner before changing it",
 )
 # A ladder this long is a finding even when it is the only one on its subject.
 LONG_SWITCH_BRANCHES = 6
@@ -123,9 +128,14 @@ class DesignSmellDetector(ast.NodeVisitor):
         # Qualifying type switches, held until the whole module is read: whether
         # one is a finding depends on whether its subject is switched elsewhere.
         self._switches: list[tuple[ast.If, str, str, int]] = []
-        # Private members some class in this module defines. Reading one is
-        # same-module access, whatever the receiver is called.
+        # A matching private name is evidence of a possible local owner, not
+        # proof of ownership for every receiver with that spelling.
         self.module_privates: set[str] = self._collect_module_privates(tree)
+        self._parents = {id(child): parent for parent in ast.walk(tree)
+                         for child in ast.iter_child_nodes(parent)}
+        self._import_names = {alias.asname or alias.name.split(".")[0]
+                              for stmt in tree.body if isinstance(stmt, (ast.Import, ast.ImportFrom))
+                              for alias in stmt.names}
         # Names a relative import binds: sibling modules of this package.
         self.relative_imports: set[str] = {
             alias.asname or alias.name.split(".")[0]
@@ -553,6 +563,31 @@ class DesignSmellDetector(ast.NodeVisitor):
                 return name
         return None
 
+    def _has_imported_receiver_type(self, value: ast.expr) -> bool:
+        """Whether an un-rebound parameter is annotated with an imported type."""
+        if not isinstance(value, ast.Name):
+            return False
+        current = self._parents.get(id(value))
+        while current is not None:
+            if isinstance(current, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                args = current.args
+                parameters = [*args.posonlyargs, *args.args, *args.kwonlyargs]
+                parameter = next((arg for arg in parameters if arg.arg == value.id), None)
+                shadowed = any(isinstance(n, ast.Name) and n.id == value.id
+                               and isinstance(n.ctx, (ast.Store, ast.Del))
+                               for n in walk_same_scope(current.body))
+                if shadowed:
+                    return False
+                if parameter is not None:
+                    annotation = parameter.annotation
+                    while isinstance(annotation, (ast.Attribute, ast.Subscript)):
+                        annotation = annotation.value
+                    local_classes = {klass.name for klass in self._all_classes}
+                    return (isinstance(annotation, ast.Name) and annotation.id in self._import_names
+                            and annotation.id not in local_classes)
+            current = self._parents.get(id(current))
+        return False
+
     def visit_Attribute(self, node: ast.Attribute):
         enclosing = self._innermost_function_name()
         in_dunder = bool(enclosing) and is_dunder(enclosing)
@@ -564,8 +599,9 @@ class DesignSmellDetector(ast.NodeVisitor):
         if attr.startswith("__") and self._class_depth > 0:
             private = False
         if (not self.is_test_file and not in_dunder and private
-                and attr not in NAMEDTUPLE_API and attr not in self.module_privates):
+                and attr not in NAMEDTUPLE_API):
             receiver = self._foreign_receiver(node.value)
+            key = (node.lineno, f"{receiver or ast.unparse(node.value)}.{attr}")
             if (receiver is not None and attr == "_meta" and self._django_context
                     and id(node) in self._metadata_operations):
                 if "inappropriate_intimacy" not in self.ignore:
@@ -581,11 +617,20 @@ class DesignSmellDetector(ast.NodeVisitor):
                             "is a Django model. Verify its type before treating this as private coupling.",),
                     ))
             elif receiver is not None:
-                self._add(node.lineno, "inappropriate_intimacy",
-                    f"Reaching into '{receiver}.{node.attr}' — another object's private internals",
-                    "Move Method to where the data lives, or expose an intentional API "
-                    "(Hide Delegate); classes should know as little about each other as possible",
-                    "medium")
+                self._reported.add(key)
+                if attr in self.module_privates and not self._has_imported_receiver_type(node.value):
+                    if "inappropriate_intimacy" not in self.ignore:
+                        self.issues.append(DesignSmell(
+                            self.filename, node.lineno, "inappropriate_intimacy",
+                            f"Reaching into '{receiver}.{attr}' — its owner is not established",
+                            "", "low", self._get_line(node.lineno),
+                            kind="candidate", also_caused_by=_LOCAL_PRIVATE_REASONS))
+                else:
+                    self._add(node.lineno, "inappropriate_intimacy",
+                        f"Reaching into '{receiver}.{node.attr}' — another object's private internals",
+                        "Move Method to where the data lives, or expose an intentional API "
+                        "(Hide Delegate); classes should know as little about each other as possible",
+                        "medium")
             elif self._reaches_sibling_module(node.value) and "inappropriate_intimacy" not in self.ignore:
                 self._reported.add(key)
                 self.issues.append(DesignSmell(

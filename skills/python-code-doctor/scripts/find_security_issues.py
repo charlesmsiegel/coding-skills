@@ -189,17 +189,16 @@ def _unbindable_keyword(node) -> str | None:
     prefix = _leading_sql_literal(node)
     match = _LEADING_WORD.match(prefix or "")
     if match and match.group(1).lower() in _UNBINDABLE_KEYWORDS:
+        if match.group(1).lower() == "create":
+            parts = _sql_parts(node)
+            text = "".join(piece if kind == "text" else "\0" for kind, piece in parts or [])
+            # CREATE data queries can bind values, including AS WITH, commented
+            # SELECT and AS VALUES forms. Keep these visible without trying to
+            # parse a complete SQL grammar from the leading keyword.
+            if re.search(r"\b(?:SELECT|VALUES)\b", text, re.IGNORECASE):
+                return None
         return match.group(1).upper()
     return None
-
-
-def _is_quoting_call(node) -> bool:
-    """`_quote_table(name)`, `quote_ident(x)`: a value made an identifier on purpose."""
-    if not isinstance(node, ast.Call):
-        return False
-    func = node.func
-    name = func.id if isinstance(func, ast.Name) else (func.attr if isinstance(func, ast.Attribute) else "")
-    return "quote" in name.lower()
 
 
 def _sql_parts(node):
@@ -256,36 +255,6 @@ def _sql_parts(node):
     if isinstance(node, ast.Constant) and isinstance(node.value, str):
         return [("text", node.value)]
     return [("value", node)]
-
-
-def _interpolates_only_identifiers(node) -> bool:
-    """True when every interpolated value is an identifier, not data.
-
-    An identifier position is one a bound parameter cannot fill, so
-    interpolation there is the only spelling: a value passed through a quoting
-    function, or one written inside a double-quoted SQL identifier
-    (`UPDATE t SET "{column}"=?`). A value inside a single-quoted string
-    literal is data, and the classic injection — it never qualifies.
-    """
-    parts = _sql_parts(node)
-    if not parts or not any(kind == "value" for kind, _ in parts):
-        return False
-    state = None                      # None, or the quote character we are inside
-    for kind, piece in parts:
-        if kind == "text":
-            for char in piece:
-                if state is None and char in "'\"":
-                    state = char
-                elif char == state:
-                    state = None      # a doubled quote closes and reopens: net no change
-            continue
-        values = piece.elts if isinstance(piece, ast.Tuple) else [piece]
-        if state == '"':
-            continue
-        if state is None and all(_is_quoting_call(v) for v in values):
-            continue
-        return False
-    return True
 
 
 # --------------------------------------------------------------------------- #
@@ -710,8 +679,8 @@ def detect(tree, filename, lines, ignore):
                     # DDL and PRAGMA take no bound parameters, so a dynamic
                     # name there must be interpolated.
                     reasons += [
-                        f"{keyword} accepts no bound parameters, so a dynamic identifier can "
-                        "only be interpolated — this is the only spelling",
+                        f"a schema identifier in {keyword} cannot be supplied as a bound "
+                        "parameter; confirm that the interpolated value occupies that position",
                         "the interpolated value is validated against a known set of table "
                         "names before it reaches the statement",
                     ]
