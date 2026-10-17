@@ -357,3 +357,35 @@ def test_a_checkout_named_on_the_command_line_through_argparse_is_run_time(tmp_p
         if got != expected:
             wrong[addition] = got
     assert not wrong, wrong
+
+
+def test_a_long_chain_of_names_is_cut_off_rather_than_crashing(tmp_path):
+    """Hundreds of names each bound to the next used to exhaust the interpreter's
+    recursion limit in the run-time check, and the whole tree's report with it."""
+    chain = "".join(f"N{i} = N{i + 1}\n" for i in range(400)) + "N400 = sys.argv[1]\n"
+    write(tmp_path, "pyproject.toml", MANIFEST)
+    write(tmp_path, "plugin.py", "import sys\n\n" + chain + "sys.path.insert(0, N0)\n\nimport requests\n")
+    write(tmp_path, "other.py", "import yaml\n")
+
+    kinds = {name: r["kind"] for name, r in missing(tmp_path).items()}
+    assert kinds == {"requests": "finding", "yaml": "finding"}, "past the reader's depth, the finding stays"
+
+
+def test_one_file_that_breaks_the_reader_does_not_take_down_the_report(tmp_path, load_module, monkeypatch, capsys):
+    detector = load_module(SCRIPTS_DIR, "find_dependency_issues")
+    write(tmp_path, "pyproject.toml", MANIFEST)
+    write(tmp_path, "bad.py", "import yaml\n")
+    write(tmp_path, "good.py", "import requests\n")
+    real = detector.import_sites
+
+    def breaking(tree, filepath, root):
+        if filepath.name == "bad.py":
+            raise RecursionError("maximum recursion depth exceeded")
+        return real(tree, filepath, root)
+
+    monkeypatch.setattr(detector, "import_sites", breaking)
+    names = {i.description.split("'")[1] for i in detector.analyze(tmp_path, set())
+             if i.smell_type == "missing_dependency"}
+
+    assert names == {"requests"}
+    assert "bad.py" in capsys.readouterr().err, "the skipped file is named, not reported clean"

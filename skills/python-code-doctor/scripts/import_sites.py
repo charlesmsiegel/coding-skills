@@ -329,40 +329,44 @@ class _PathReader:
         anchors = [path] if path.is_absolute() else [PurePath(self.root, path), PurePath(self.filepath.parent, path)]
         return not any(PurePath(os.path.normpath(a)).is_relative_to(self.root) for a in anchors)
 
-    def decided_at_run_time(self, node, scopes: tuple, seen: set) -> bool:
+    def decided_at_run_time(self, node, scopes: tuple, seen: set, depth: int = 0) -> bool:
         """`node` reads a function parameter, the environment, sys.argv, an argparse
-        result, or a name bound more than once — directly or through names bound once."""
+        result, or a name bound more than once — directly or through names bound
+        once, followed no further than the path reader follows them. Past that
+        depth the answer is no, which keeps the finding."""
+        if depth > _MAX_PATH_DEPTH:
+            return False
         for child in ast.walk(node):
             dotted = _canonical(self.aliases, _dotted(child)) if isinstance(child, (ast.Name, ast.Attribute)) else ""
             if any(dotted == source or dotted.startswith(source + ".") for source in _RUN_TIME_SOURCES):
                 return True
             if isinstance(child, ast.Call) and getattr(child.func, "attr", "") in _RUN_TIME_CALLS:
                 return True
-            if isinstance(child, ast.Name) and self._name_decided_at_run_time(child.id, scopes, seen):
+            if isinstance(child, ast.Name) and self._name_decided_at_run_time(child.id, scopes, seen, depth):
                 return True
         return False
 
-    def _name_decided_at_run_time(self, name: str, scopes: tuple, seen: set) -> bool:
-        for depth in range(len(scopes), 0, -1):
-            scope = scopes[depth - 1]
+    def _name_decided_at_run_time(self, name: str, scopes: tuple, seen: set, depth: int) -> bool:
+        for level in range(len(scopes), 0, -1):
+            scope = scopes[level - 1]
             if name in _parameters(scope):
                 return True
             body = scope.body if not isinstance(scope, ast.Lambda) else []
             binds, value = _sole_assignment(body, name)
             if binds:
                 value = value if value is not None else _unpacked_from(body, name)
-                return self._binding_decided(binds, value, (id(scope), name), scopes[:depth], seen)
+                return self._binding_decided(binds, value, (id(scope), name), scopes[:level], seen, depth)
         binds, value = _sole_assignment(self.module.body, name)
         value = value if value is not None or binds != 1 else _unpacked_from(self.module.body, name)
-        return self._binding_decided(binds, value, (id(self.module), name), (), seen)
+        return self._binding_decided(binds, value, (id(self.module), name), (), seen, depth)
 
-    def _binding_decided(self, binds: int, value, key: tuple, scopes: tuple, seen: set) -> bool:
+    def _binding_decided(self, binds: int, value, key: tuple, scopes: tuple, seen: set, depth: int) -> bool:
         if binds > 1:
             return True
         if value is None or key in seen:
             return False
         seen.add(key)
-        return self.decided_at_run_time(value, scopes, seen)
+        return self.decided_at_run_time(value, scopes, seen, depth + 1)
 
     def _binding(self, name: str, scopes: tuple):
         """The expression `name` holds where it is read, the scopes to read it in,
