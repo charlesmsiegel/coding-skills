@@ -108,7 +108,11 @@ def withhold_upstream(results: dict, path: str) -> tuple[list, dict]:
                 kept.append(record)
                 continue
             occurrences = record.get("occurrences")
-            if isinstance(occurrences, list) and occurrences:
+            # Duplicate locations are structured records. Parameter clumps also
+            # have occurrences, but those are display strings; their anchor is
+            # chosen by the detector to represent the body's upstream status.
+            if (isinstance(occurrences, list) and occurrences
+                    and all(isinstance(o, dict) for o in occurrences)):
                 outside = [o for o in occurrences if isinstance(o, dict)
                            and not covered(o.get("file"), o.get("line"))]
                 drop = len(outside) < 2 and len(outside) < len(occurrences)

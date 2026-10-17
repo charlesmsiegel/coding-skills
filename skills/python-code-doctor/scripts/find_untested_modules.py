@@ -468,7 +468,9 @@ def _record_import(found: _Bindings, stmt: ast.ImportFrom) -> None:
         if alias.name == "*":
             found.stars.append((stmt.module, stmt.level))
         else:
-            found.imported[alias.asname or alias.name] = (stmt.module, stmt.level, alias.name)
+            name = alias.asname or alias.name
+            found.defined.discard(name)
+            found.imported[name] = (stmt.module, stmt.level, alias.name)
 
 
 def _record_assignment(found: _Bindings, stmt: ast.Assign | ast.AnnAssign | ast.AugAssign) -> None:
@@ -476,6 +478,8 @@ def _record_assignment(found: _Bindings, stmt: ast.Assign | ast.AnnAssign | ast.
     names = {node.id for target in targets for node in ast.walk(target)
              if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store)}
     found.defined |= names
+    for name in names:
+        found.imported.pop(name, None)
     if "__all__" not in names or stmt.value is None:
         return
     listed = _literal_names(stmt.value)
@@ -489,6 +493,7 @@ def _bindings(tree: ast.Module) -> _Bindings:
     for stmt in _top_level(tree.body):
         if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
             found.defined.add(stmt.name)
+            found.imported.pop(stmt.name, None)
         elif isinstance(stmt, ast.ImportFrom):
             _record_import(found, stmt)
         elif isinstance(stmt, (ast.Assign, ast.AnnAssign, ast.AugAssign)):
