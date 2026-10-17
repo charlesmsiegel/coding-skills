@@ -272,24 +272,32 @@ def _python_files(path: Path) -> Iterator[Path]:
 # Files whose presence marks the top of a project.
 _PROJECT_MARKERS = (".git", "pyproject.toml", "setup.py", "setup.cfg")
 
-# The directory this run analyses, resolved; None for a single file. A per-file
-# detector is handed one path and nothing else, so this is how it learns which
-# part of that path is the project and which is merely where the project was
-# checked out. find_python_files() records it, and the runner passes it to every
-# worker as a parameter rather than trusting fork to copy a global.
-_ANALYSIS_ROOT: Path | None = None
+class _Analysis:
+    """The directory this run analyses, resolved; None for a single file.
+
+    A per-file detector is handed one path and nothing else, so this is how it
+    learns which part of that path is the project and which is merely where the
+    project was checked out. find_python_files() records it, and the runner
+    passes it to every worker as a parameter rather than trusting fork to copy
+    process state. One instance, mutated in place: the state belongs to the run,
+    and no caller rebinds the module's name for it.
+    """
+
+    root: Path | None = None
+
+
+_ANALYSIS = _Analysis()
 
 
 def set_analysis_root(path) -> None:
     """Record what this run analyses: a directory, or None for a single file."""
-    global _ANALYSIS_ROOT
     candidate = Path(path) if path is not None else None
-    _ANALYSIS_ROOT = candidate.resolve() if candidate is not None and candidate.is_dir() else None
+    _ANALYSIS.root = candidate.resolve() if candidate is not None and candidate.is_dir() else None
 
 
 def analysis_root() -> Path | None:
     """The directory this run analyses, or None (a single file, or nothing yet)."""
-    return _ANALYSIS_ROOT
+    return _ANALYSIS.root
 
 
 @functools.lru_cache(maxsize=4096)
@@ -309,7 +317,7 @@ def _anchor(path: Path) -> Path | None:
     for directory in resolved.parents:
         if _has_marker(directory):
             return directory
-    root = _ANALYSIS_ROOT
+    root = _ANALYSIS.root
     if root is not None and (resolved == root or root in resolved.parents):
         return root
     return None
