@@ -44,7 +44,8 @@ Reported as a candidate, not a finding:
     one that resolves outside the repository (a relative entry is read from the
     project root and from the file's own directory, the two working
     directories that occur, and is inside if either is), or one that reads a function
-    parameter, os.environ/os.getenv, sys.argv, or a name bound more than once.
+    parameter, os.environ/os.getenv, sys.argv, an argparse result (`args.x`
+    from parse_args() or parse_known_args()), or a name bound more than once.
     A harness run under another program's interpreter imports that program's
     modules this way, and no manifest here could declare them. A directory the
     source does resolve inside the project explains nothing (every module there
@@ -103,7 +104,7 @@ _RUNTIME_PATH_REASONS = (
     "the file runs inside another program's checkout or interpreter (a test harness, a plugin "
     "host, a script driving a vendored tree) and imports that program's own modules from the "
     "directory it puts on sys.path, which no manifest of this project could declare",
-    "the directory comes from a function argument, the environment, sys.argv or a name rebound as "
+    "the directory comes from a function argument, the environment, the command line or a name rebound as "
     "the program runs, or resolves outside this repository, so only the machine the code runs on "
     "shows what it provides",
 )

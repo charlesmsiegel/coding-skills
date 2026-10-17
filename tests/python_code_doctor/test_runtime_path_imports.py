@@ -330,3 +330,30 @@ def test_a_relative_entry_counts_from_the_root_and_from_its_own_directory(tmp_pa
         if got != expected:
             wrong[(rel, addition)] = got
     assert not wrong, wrong
+
+
+def test_a_checkout_named_on_the_command_line_through_argparse_is_run_time(tmp_path):
+    """`args.comfy` from parse_args() is the command line, as sys.argv is. The cwd,
+    `~` and input() stay findings: they are not what this rule is about."""
+    cases = {
+        "parser = argparse.ArgumentParser()\nparser.add_argument('--comfy')\n"
+        "args = parser.parse_args()\nsys.path.insert(0, args.comfy)": "candidate",
+        "parser = argparse.ArgumentParser()\nargs, _ = parser.parse_known_args()\n"
+        "sys.path.insert(0, str(Path(args.comfy)))": "candidate",
+        "def main():\n    parser = argparse.ArgumentParser()\n    options = parser.parse_args()\n"
+        "    sys.path.insert(0, options.comfy)": "candidate",
+        "sys.path.insert(0, input('ComfyUI checkout? '))": "finding",
+        "sys.path.insert(0, str(Path.cwd() / 'ComfyUI'))": "finding",
+        "sys.path.insert(0, os.path.expanduser('~/ComfyUI'))": "finding",
+    }
+    wrong = {}
+    for number, (addition, expected) in enumerate(cases.items()):
+        root = tmp_path / f"case{number}"
+        write(root, "pyproject.toml", MANIFEST)
+        write(root, "harness.py",
+              "import argparse\nimport os\nimport sys\nfrom pathlib import Path\n\n" + addition + "\n\n\n"
+              "def render():\n    import comfy\n    return comfy\n")
+        got = missing(root)["comfy"]["kind"]
+        if got != expected:
+            wrong[addition] = got
+    assert not wrong, wrong
