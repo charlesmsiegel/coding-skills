@@ -5566,3 +5566,91 @@ def test_the_aggregate_report_is_the_same_wherever_the_project_is_checked_out(tm
         "a real tests/ directory inside the project is still test code"
     assert categories(_write_project(tmp_path / "tests" / "app")) == neutral
     assert categories(_write_project(tmp_path / "scripts" / "app")) == neutral
+
+
+# --------------------------------------------------------------------------- #
+# Round five: code copied verbatim from upstream, test doubles, exact-type
+# assertions, and imports that are slow because of what they import.
+# --------------------------------------------------------------------------- #
+
+_PORTED = (
+    "import pickle\n"
+    "\n"
+    "# doctor: verbatim-upstream ComfyUI comfy/utils.py\n"
+    "def upstream_resize(image, width, height, crop, method, antialias, mode):\n"
+    "    return image * 37\n"
+    "\n"
+    "def own(image, width, height, crop, method, antialias, mode):  # charged\n"
+    "    return image * 41\n"
+    "\n"
+    "# doctor: verbatim-upstream\n"
+    "def unsourced(a, b, c, d, e, f, g):  # charged\n"
+    "    return a * 43\n"
+    "\n"
+    "class Wrapper:\n"
+    "    # doctor: verbatim-upstream ComfyUI comfy/ldm/modules/attention.py\n"
+    "    def forward(self, x, transformer_options={}):\n"
+    "        return pickle.loads(x)  # charged: security still runs\n"
+)
+
+_REFERENCE = (
+    '"""ComfyUI\'s LLLite, reconstructed statement for statement."""\n'
+    "# doctor: verbatim-upstream ComfyUI comfy/ldm/anima/lllite.py\n"
+    "import os\n"
+    "\n"
+    "def forward(x, a, b, c, d, e, f):\n"
+    "    return x * 99\n"
+    "\n"
+    "def run(cmd):\n"
+    "    os.system(cmd)  # charged: security still runs\n"
+)
+
+
+def test_code_marked_verbatim_upstream_is_not_charged_but_is_accounted_for(tmp_path):
+    """Parity tests rebuild upstream code unchanged so a diff against it stays
+    readable; simplifying it would defeat that. The author opts in per file or per
+    definition, names the source, and every record not charged is counted."""
+    (tmp_path / "pkg").mkdir()
+    (tmp_path / "pkg" / "ported.py").write_text(_PORTED)
+    (tmp_path / "pkg" / "reference.py").write_text(_REFERENCE)
+
+    report = json.loads(subprocess.run(
+        [sys.executable, str(SCRIPTS_DIR / "analyze_all.py"), str(tmp_path),
+         "--format", "json", "--skip-duplicates"],
+        capture_output=True, text=True, timeout=300, check=True).stdout)
+    assert "records_rejected" not in report["meta"], report["meta"].get("records_rejected")
+
+    def rows(name):
+        return {(category, r["line"], r.get("smell_type") or r.get("issue_type") or r.get("pattern_type"))
+                for category, v in report["categories"].items() if category != "verbatim_upstream"
+                for r in v["issues"] if Path(r["file"]).name == name}
+
+    still_charged = {"security", "untested_modules", "exception_issues", "mutation_hazards",
+                     "resource_leaks", "global_state", "import_cycles", "debug_leftovers",
+                     "dependency_issues", "duplicate_definitions", "unawaited_coroutines"}
+    ported = rows("ported.py")
+    marked = set(range(4, 6)) | set(range(16, 18))  # upstream_resize and Wrapper.forward
+    assert not {r for r in ported if r[1] in marked and r[0] not in still_charged}, ported
+    assert ("complexity", 7, "parameter_count") in ported, "unmarked code is still charged"
+    assert ("complexity", 11, "parameter_count") in ported, "a marker naming no source exempts nothing"
+    assert ("security", 17, "unsafe_deserialization") in ported, "security runs inside marked code"
+
+    reference = rows("reference.py")
+    assert {category for category, _, _ in reference} <= still_charged, reference
+    assert ("security", 9, "shell_injection") in reference
+
+    upstream = {(Path(r["file"]).name, r["kind"], r["smell_type"]): r
+                for r in report["categories"]["verbatim_upstream"]["issues"]}
+    for name, source in (("ported.py", "comfy/utils.py"), ("reference.py", "lllite.py")):
+        lead = upstream[(name, "candidate", "verbatim_upstream_duplicate")]
+        assert "not charged" in lead["description"] and source in lead["description"]
+        assert lead["also_caused_by"] and not lead["suggestion"]
+    ignored = upstream[("ported.py", "finding", "upstream_annotation_ignored")]
+    assert ignored["line"] == _lines_marked(_PORTED, "# doctor: verbatim-upstream")[0]
+    assert set(report["meta"]["not_charged"]) == {
+        str(tmp_path / "pkg" / "ported.py"), str(tmp_path / "pkg" / "reference.py")}
+
+    text = subprocess.run(
+        [sys.executable, str(SCRIPTS_DIR / "analyze_all.py"), str(tmp_path), "--skip-duplicates"],
+        capture_output=True, text=True, timeout=300, check=True).stdout
+    assert "not charged" in text
