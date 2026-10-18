@@ -8,7 +8,7 @@ for. See TsFile.in_type_position.
 """
 
 from tsnodes import Class, Func, Param, Prop, TsFile
-from tslex import MEMBER_MODIFIERS, RESERVED, CLOSERS, CONTROL_KEYWORDS, OPENERS
+from tslex import MEMBER_MODIFIERS, RESERVED, CLOSERS, OPENERS
 
 
 # --------------------------------------------------------------------------- #
@@ -695,7 +695,10 @@ def extract_object_methods(file: TsFile) -> None:
         if after >= len(tokens) or not tokens[after].is_op("{"):
             continue
         previous = tokens[index - 1] if index else None
-        if previous is not None and (previous.is_op(".", "?.", "=", "new") or previous.is_name(*CONTROL_KEYWORDS)):
+        # A member starts after a property boundary or a method modifier.
+        # A ternary call followed by a separate block can otherwise look like
+        # `name(args): ReturnType { ... }`, even with deferred type spans.
+        if previous is not None and not (previous.is_op("{", ",", "*") or previous.is_name("async", "get", "set")):
             continue
         # `condition ? call(value) : {}` also has a colon after parentheses.
         # A rejected method probe must not publish its value branch as a type.
