@@ -229,6 +229,8 @@ at a time and the evidence is elsewhere:
 | `raise_without_from` on an `HTTPException` | the framework renders it as a response and never prints the chain |
 | `assert_for_validation` outside a public function's argument check | an invariant or type narrowing holds under `-O` too; only the call sites show whether input reaches it |
 | `feature_envy`, `try_finally_close` | whether the receiver is a strategy's context, or a context manager, is decided where its class is defined |
+| `thin_wrapper` when methods access one stored object but do more than transparently forward | that object can hold state whose aggregation, validation, or transformation is the class's own policy; the record names the method bodies to inspect |
+| `temporary_field` on a public field populated and read in one method without a visible reset | a result or status may remain meaningful to external consumers after the writer returns; private scratch and explicit reset lifecycles stay findings |
 
 Others are candidates because the file states a reason the detector cannot
 weigh — a reasoned `# noqa: E402`, a docstring documenting an import order, two

@@ -266,13 +266,14 @@ class DesignSmellDetector(ast.NodeVisitor):
             return self.source_lines[lineno - 1].strip()[:60]
         return ""
 
-    def _add(self, line: int, smell_type: str, desc: str, suggestion: str, severity: str = "medium"):
+    def _add(self, line: int, smell_type: str, desc: str, suggestion: str, severity: str = "medium",
+             *, kind: str = "finding", also_caused_by: tuple[str, ...] = ()):
         if smell_type in self.ignore:
             return
         self.issues.append(DesignSmell(
             file=self.filename, line=line, smell_type=smell_type,
             description=desc, suggestion=suggestion, severity=severity,
-            code_snippet=self._get_line(line)
+            code_snippet=self._get_line(line), kind=kind, also_caused_by=also_caused_by,
         ))
 
     # ----------------------------------------------------------------- #
@@ -443,13 +444,9 @@ class DesignSmellDetector(ast.NodeVisitor):
                     "Replace Conditional with Polymorphism, a dispatch dict, or match — "
                     "adding a case should mean adding an entry, not editing a ladder",
                     "high" if branches >= LONG_SWITCH_BRANCHES else "medium")
-            elif "type_switch" not in self.ignore:
-                self.issues.append(DesignSmell(
-                    file=self.filename, line=node.lineno, smell_type="type_switch",
-                    description=description, suggestion="", severity="low",
-                    code_snippet=self._get_line(node.lineno),
-                    kind="candidate", also_caused_by=_SHORT_SWITCH_REASONS,
-                ))
+            else:
+                self._add(node.lineno, "type_switch", description, "", "low",
+                          kind="candidate", also_caused_by=_SHORT_SWITCH_REASONS)
 
     def _check_duplicate_fragments(self, node: ast.If, bodies: list[list[ast.stmt]], final_else: bool):
         if not final_else or len(bodies) < 2 or any(not b for b in bodies):
@@ -634,13 +631,9 @@ class DesignSmellDetector(ast.NodeVisitor):
                         "medium")
             elif self._reaches_sibling_module(node.value) and "inappropriate_intimacy" not in self.ignore:
                 self._reported.add(key)
-                self.issues.append(DesignSmell(
-                    file=self.filename, line=node.lineno, smell_type="inappropriate_intimacy",
-                    description=f"Reaching into '{ast.unparse(node.value)}.{attr}' — a sibling "
-                                "module's private name",
-                    suggestion="", severity="low", code_snippet=self._get_line(node.lineno),
-                    kind="candidate", also_caused_by=_SIBLING_PRIVATE_REASONS,
-                ))
+                self._add(node.lineno, "inappropriate_intimacy",
+                          f"Reaching into '{ast.unparse(node.value)}.{attr}' — a sibling module's private name",
+                          "", "low", kind="candidate", also_caused_by=_SIBLING_PRIVATE_REASONS)
         self.generic_visit(node)
 
     def _reaches_sibling_module(self, value: ast.expr) -> bool:
@@ -779,6 +772,17 @@ class DesignSmellDetector(ast.NodeVisitor):
                     and not _reads_before_writing(bodies[only_key], attr)))
             if is_temporary:
                 only = only_key[1]
+                # A public field without a reset can be a result published to
+                # callers. One visible writer/read-back does not establish its
+                # lifetime outside that method. Keep the observation for review.
+                if not attr.startswith("_") and only_key not in reset_in.get(attr, set()):
+                    self._add(line, "temporary_field",
+                        f"Public field 'self.{attr}' starts as None and is populated and read only "
+                        f"in '{only}' within this hierarchy; no reset is visible", "", "low",
+                        kind="candidate", also_caused_by=(
+                            "The field may publish a completed result or status for callers to read after "
+                            "this method returns; inspect external consumers before replacing it with local scratch.",))
+                    continue
                 self._add(line, "temporary_field",
                     f"Field 'self.{attr}' is None except inside '{only}' — a temporary field",
                     f"Pass the value through parameters or extract '{only}' and its data into "
