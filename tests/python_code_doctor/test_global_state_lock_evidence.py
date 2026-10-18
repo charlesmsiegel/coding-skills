@@ -784,7 +784,7 @@ def test_bound_mutex_operations_keep_their_receiver_identity(detector, scope, me
     ("def helper(lock):\n    helper(lock)", "_guard"),
     ("def helper(lock):\n    pass", "*(_guard,)"),
     ("def helper(lock):\n    pass", '**{"lock": _guard}'),
-    ("def helper(*locks):\n    pass", "_guard"),
+    ("def helper(*locks):\n    opaque(locks)", "_guard"),
 ])
 def test_unsupported_visible_callables_do_not_certify_mutex_retention(detector, definition, arguments):
     found = mutations(detector, "from threading import Lock\n_guard = Lock()\nregistry = {}\n" + definition +
@@ -804,3 +804,67 @@ def test_a_named_expression_context_still_proves_its_known_mutex(detector):
     found = mutations(detector, "from threading import Lock\n_guard = Lock()\nregistry = {}\n"
                       "def put(key):\n    with (alias := _guard):\n        registry[key] = 1\n")
     assert len(found) == 1 and found[0].kind == "candidate"
+
+
+@pytest.mark.parametrize("statement, expected", [
+    ("alias, = (_guard,)", "finding"),
+    ("[alias] = [_guard]", "finding"),
+    ("other, (alias,) = (None, (_guard,))", "finding"),
+    ("alias, = (fake_guard,)", "candidate"),
+])
+def test_literal_destructuring_preserves_element_origins(detector, statement, expected):
+    found = mutations(detector, "from threading import Lock\n_guard = Lock()\nregistry = {}\n"
+                      f"def put(key):\n    {statement}\n    with _guard:\n        alias.release()\n        registry[key] = 1\n")
+    assert len(found) == 1 and found[0].kind == expected
+
+
+@pytest.mark.parametrize("factory, expected", [("Lock", "finding"), ("RLock", "candidate")])
+@pytest.mark.parametrize("arguments", ["", "False", "timeout=0.01"])
+def test_a_prior_manual_acquisition_cannot_certify_plain_lock_entry(detector, factory, expected, arguments):
+    found = mutations(detector, f"from threading import {factory}\n_guard = {factory}()\nregistry = {{}}\n"
+                      f"def put(key):\n    _guard.acquire({arguments})\n    with _guard:\n        registry[key] = 1\n")
+    assert len(found) == 1 and found[0].kind == expected
+
+
+@pytest.mark.parametrize("initial, body, followup, expected", [
+    ("_guard", "alias.release()", "None", "finding"),
+    ("fake_guard", "alias.release()", "None", "candidate"),
+    ("fake_guard", "alias = _guard", "alias.release()", "finding"),
+])
+def test_visible_helper_nonlocals_retain_and_update_the_captured_cell(detector, initial, body, followup, expected):
+    found = mutations(detector, "from threading import Lock\n_guard = Lock()\nregistry = {}\n"
+                      f"def put(key):\n    alias = {initial}\n    def helper():\n        nonlocal alias\n        {body}\n"
+                      f"    with _guard:\n        helper()\n        {followup}\n        registry[key] = 1\n")
+    assert len(found) == 1 and found[0].kind == expected
+
+
+@pytest.mark.parametrize("consumer", ["list(values)", "tuple(values)", "for value in values:\n    pass"])
+@pytest.mark.parametrize("protected", [False, True])
+def test_known_synchronous_consumers_execute_generator_mutations(detector, consumer, protected):
+    indent = "        " if protected else "    "
+    statement = "\n".join(indent + line for line in consumer.splitlines())
+    found = mutations(detector, "from threading import Lock\n_guard = Lock()\nregistry = {}\n"
+                      "def put(key):\n    values = (registry.pop(key) for key in keys)\n"
+                      "    with _guard:\n        registry[key] = 1\n" + statement + "\n")
+    assert len(found) == 1 and found[0].kind == ("candidate" if protected else "finding")
+
+
+def test_a_known_shadow_consumer_can_leave_the_generator_unconsumed(detector):
+    found = mutations(detector, "from threading import Lock\n_guard = Lock()\nregistry = {}\n"
+                      "def list(values):\n    return None\n"
+                      "def put(key):\n    with _guard:\n        registry[key] = 1\n"
+                      "    list(registry.pop(key) for key in keys)\n")
+    assert len(found) == 1 and found[0].kind == "candidate"
+
+
+def test_consuming_a_deferred_helper_cannot_certify_retention_without_expansion(detector):
+    found = mutations(detector, "from threading import Lock\n_guard = Lock()\nregistry = {}\n"
+                      "def helper(lock):\n    lock.release()\n    yield None\n"
+                      "def put(key):\n    with _guard:\n        list(helper(_guard))\n        registry[key] = 1\n")
+    assert len(found) == 1 and found[0].kind == "finding"
+
+def test_uncertain_deferred_consumption_before_entry_also_declines_the_proof(detector):
+    found = mutations(detector, "from threading import Lock\n_guard = Lock()\nregistry = {}\n"
+                      "def helper(lock):\n    lock.release()\n    yield None\n"
+                      "def put(key):\n    list(helper(_guard))\n    with _guard:\n        registry[key] = 1\n")
+    assert len(found) == 1 and found[0].kind == "finding"
