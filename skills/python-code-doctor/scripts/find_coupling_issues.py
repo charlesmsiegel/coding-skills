@@ -23,6 +23,7 @@ import argparse
 from pathlib import Path
 from dataclasses import dataclass, asdict, field
 from collections import Counter, defaultdict
+from ast_scopes import walk_same_scope
 from common import first_party_modules, is_test_file, project_root, sort_findings, cached_parse, SEVERITY_ICONS, configure_output, find_python_files, warn_detector_error, warn_unparseable
 from find_mutation_hazards import ClassFamilyResolver
 
@@ -330,6 +331,12 @@ class _ExternalTypes:
         self.filename = filename
         self._first_party = None
         self.imports: dict[str, str | None] = {}  # local name -> top-level module (None: relative)
+        self.module_imports = {
+            alias.asname or alias.name.split(".")[0]
+            for node in walk_same_scope(getattr(tree, "body", []))
+            if isinstance(node, (ast.Import, ast.ImportFrom))
+            for alias in node.names
+        }
         self.defined: set = set()
         self.module_values: dict[str, list] = defaultdict(list)
         for node in ast.walk(tree):
@@ -569,7 +576,7 @@ def _read_method(func, module_names: set, types: "_ExternalTypes | None" = None)
                                      func.args.vararg, func.args.kwarg] if a is not None}
     method.constructs = _constructs(func, receiver)
     method.validates = _is_validator(func)
-    shadowed = (types.imports.keys() | types.defined | types.module_values.keys()) if types else set()
+    shadowed = (types.module_imports | types.defined | types.module_values.keys()) if types else set()
     called = {id(node.func) for node in _method_nodes(func.body) if isinstance(node, ast.Call)}
     for node in _method_nodes(func.body):
         if (receiver is not None and isinstance(node, ast.Call)
@@ -719,7 +726,12 @@ def _analyze_class(node: ast.ClassDef, filename: str, module_names: set,
     # Low cohesion (LCOM4)
     interface = any(_name_of(base) in _INTERFACE_BASES for base in node.bases) or any(
         kw.arg == "metaclass" and _name_of(kw.value) == "ABCMeta" for kw in node.keywords)
-    groups = [] if in_tests or interface else _groups(methods, _declared_fields(node, classes))
+    cohesion_methods = methods
+    # With no explicit base, object.__str__ delegates to this class's __repr__.
+    # A custom base can override __str__, so its fallback is not established.
+    if not node.bases and "__str__" not in methods and "__repr__" in methods:
+        cohesion_methods = {**methods, "__str__": methods["__repr__"]}
+    groups = [] if in_tests or interface else _groups(cohesion_methods, _declared_fields(node, classes))
     inherited = any(_name_of(base) not in _NEUTRAL_BASES for base in node.bases)
     if len(groups) >= 2:
         issues.append(CouplingIssue(
