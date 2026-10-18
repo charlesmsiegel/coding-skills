@@ -12,6 +12,8 @@ from contextlib import contextmanager
 
 
 _FALLBACK = object()
+_TYPING_ORIGINS = {module + suffix for module in ("typing", "typing_extensions")
+                   for suffix in ("", ".cast", ".Literal", ".Annotated")}
 
 def dotted_name(node) -> str | None:
     if isinstance(node, ast.Name):
@@ -60,7 +62,79 @@ class ImportReferences(ast.NodeVisitor):
         self._quoted_depth = 0
         self._finishing_references = False
         self._reference_only = False
-        self._loop_breaks = []
+        self._continuing = True
+        self._abrupt = []
+        self._prefix_collectors = []
+
+    def _visit_block(self, statements, before=None):
+        """Transfer one block; only normal outcomes reach its next statement."""
+        previous = self._continuing, self._abrupt
+        self._continuing, self._abrupt = True, []
+        if before is not None:
+            self._restore_origins(before)
+        try:
+            for statement in statements:
+                if not self._continuing:
+                    break
+                possible_exception = self._may_raise(statement)
+                if possible_exception:
+                    self._capture_prefix()
+                self.visit(statement)
+                if possible_exception:
+                    self._capture_prefix()
+            return self._abrupt + ([("normal", self._origin_state())] if self._continuing else [])
+        finally:
+            self._continuing, self._abrupt = previous
+
+    @staticmethod
+    def _may_raise(node):
+        # Pure control transfers do not create a suppressed-exception path.
+        # Dynamic expressions may fail; nested bodies record their own prefixes.
+        if isinstance(node, (ast.If, ast.While)):
+            node = node.test
+        elif isinstance(node, (ast.For, ast.AsyncFor)):
+            node = node.iter
+        elif isinstance(node, (ast.Try, ast.TryStar)):
+            return False
+        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            return True  # Definition inputs/class execution can fail.
+        return any(isinstance(part, (ast.Call, ast.Attribute, ast.Subscript, ast.BinOp, ast.UnaryOp,
+                                     ast.Compare, ast.Import, ast.ImportFrom, ast.Raise, ast.Await))
+                   or isinstance(part, ast.Name) and isinstance(part.ctx, (ast.Load, ast.Del))
+                   for part in ast.walk(node))
+
+    def _capture_prefix(self):
+        for depth, partial in self._prefix_collectors:
+            partial.append(self._origin_state()[:depth])
+
+    def _block_prefixes(self, statements, before=None):
+        partial = []
+        self._prefix_collectors.append((len(self._annotation_scopes), partial))
+        try:
+            return self._visit_block(statements, before), partial
+        finally:
+            self._prefix_collectors.pop()
+
+    def _accept_paths(self, paths):
+        normal = [state for kind, state in paths if kind == "normal"]
+        self._abrupt.extend((kind, state) for kind, state in paths if kind != "normal")
+        self._continuing = bool(normal)
+        if normal:
+            self._restore_origins(self._joined_origins(normal))
+
+    def _exit(self, kind, node):
+        self.generic_visit(node)
+        self._abrupt.append((kind, self._origin_state()))
+        self._continuing = False
+
+    def visit_Return(self, node):
+        self._exit("return", node)
+
+    def visit_Raise(self, node):
+        self._exit("raise", node)
+
+    def visit_Continue(self, node):
+        self._exit("continue", node)
 
     def visit_Assign(self, node: ast.Assign):
         # Python evaluates the value with the old binding, then stores each
@@ -110,8 +184,7 @@ class ImportReferences(ast.NodeVisitor):
         self._visit_loop(node, [node.target, *node.body])
 
     def visit_While(self, node: ast.While):
-        self.visit(node.test)
-        self._visit_loop(node, node.body)
+        self._visit_loop(node, [node.test, *node.body])
 
     @staticmethod
     def _loop_entry(node):
@@ -126,27 +199,31 @@ class ImportReferences(ast.NodeVisitor):
         return None
 
     def _visit_loop(self, node, body):
-        # A break skips else and belongs to its nearest loop. Preserve its
-        # bindings independently from normal exhaustion, including zero trips.
+        # Origins are finite helper/nonhelper alternatives. Iteration joins
+        # loop-carried paths to a fixed point; break alone skips the loop else.
         enters = self._loop_entry(node)
-        breaks = []
-        self._loop_breaks.append(breaks)
-        try:
-            if enters is not False:
-                self._join_branches((body,) if enters is True else ([], body))
-        finally:
-            self._loop_breaks.pop()
+        before = self._origin_state()
+        exhausted = [before] if enters is not True else []
+        exits, entry = [], before
+        if enters is not False:
+            while True:
+                paths = self._visit_block(body, entry)
+                carried = [state for kind, state in paths if kind in {"normal", "continue"}]
+                exits.extend(("normal" if kind == "break" else kind, state)
+                             for kind, state in paths if kind not in {"normal", "continue"})
+                exhausted.extend(carried)
+                joined = self._joined_origins([before, *carried])
+                if not carried or joined == entry:
+                    break
+                entry = joined
         if isinstance(node, ast.While) and enters is True:
-            if breaks:
-                self._restore_origins(self._joined_origins(breaks))
-            return  # A constant-true loop cannot exhaust into else.
-        for statement in node.orelse:
-            self.visit(statement)
-        self._restore_origins(self._joined_origins([self._origin_state(), *breaks]))
+            exhausted = []
+        if exhausted:
+            exits.extend(self._visit_block(node.orelse, self._joined_origins(exhausted)))
+        self._accept_paths(exits)
 
     def visit_Break(self, node):
-        if self._loop_breaks:
-            self._loop_breaks[-1].append(self._origin_state())
+        self._exit("break", node)
 
     def visit_Match(self, node: ast.Match):
         self.visit(node.subject)
@@ -161,17 +238,21 @@ class ImportReferences(ast.NodeVisitor):
             if case.guard is not None:
                 self.visit(case.guard)
             captured = self._origin_state()
-            catches_all = isinstance(case.pattern, ast.MatchAs) and case.pattern.pattern is None
+            catches_all = self._exhaustive_pattern(case.pattern)
             guard = (bool(case.guard.value) if isinstance(case.guard, ast.Constant)
                      else True if case.guard is None else None)
             unmatched = [] if catches_all else [incoming, captured]
             if guard is not True:
                 unmatched.append(captured)
             if guard is not False:
-                for statement in case.body:
-                    self.visit(statement)
-                completed.append(self._origin_state())
-        self._restore_origins(self._joined_origins([*completed, *unmatched]))
+                completed.extend(self._visit_block(case.body))
+        self._accept_paths([*completed, *(("normal", state) for state in unmatched)])
+
+    @staticmethod
+    def _exhaustive_pattern(pattern):
+        if isinstance(pattern, ast.MatchAs):
+            return pattern.pattern is None or ImportReferences._exhaustive_pattern(pattern.pattern)
+        return isinstance(pattern, ast.MatchOr) and any(ImportReferences._exhaustive_pattern(item) for item in pattern.patterns)
 
     def visit_MatchAs(self, node: ast.MatchAs):
         self.generic_visit(node)
@@ -197,8 +278,7 @@ class ImportReferences(ast.NodeVisitor):
         # import's progressive origin, in any scope.
         self.visit(test)
         if isinstance(test, ast.Constant):
-            for statement in body if test.value else otherwise:
-                self.visit(statement)
+            self._accept_paths(self._visit_block(body if test.value else otherwise))
         else:
             self._join_branches((body, otherwise))
 
@@ -207,16 +287,14 @@ class ImportReferences(ast.NodeVisitor):
         # branch visited is not evidence that the other was skipped. Restore
         # maps in place: queued deferred bodies retain these namespace objects.
         before = self._origin_state()
-        branches = []
+        paths = []
         for statements in alternatives:
-            self._restore_origins(before)
-            for statement in statements:
-                self.visit(statement)
-            branches.append(self._origin_state())
-        self._restore_origins(self._joined_origins(branches))
+            paths.extend(self._visit_block(statements, before))
+        self._accept_paths(paths)
 
     def _origin_state(self):
-        return [origins.copy() for _kind, origins, _globals in self._annotation_scopes]
+        return [(origins.maps[0] if isinstance(origins, ChainMap) else origins).copy()
+                for _kind, origins, _globals in self._annotation_scopes]
 
     def _restore_origins(self, state):
         for (_kind, origins, _globals), original in zip(self._annotation_scopes, state):
@@ -235,69 +313,90 @@ class ImportReferences(ast.NodeVisitor):
         return joined
 
     def visit_Try(self, node):
-        # An exception can leave after any prefix of the body. Handlers begin
-        # from those possible bindings, not from the last handler we traversed.
-        partial = [self._origin_state()]
-        for statement in node.body:
-            self.visit(statement)
-            partial.append(self._origin_state())
-        handler_entry = self._joined_origins(partial)
-        for statement in node.orelse:
-            self.visit(statement)
-            partial.append(self._origin_state())
-        continuing = [self._origin_state()]
+        before = self._origin_state()
+        body, partial = self._block_prefixes(node.body)
+        normal = [state for kind, state in body if kind == "normal"]
+        paths = [(kind, state) for kind, state in body if kind != "normal"]
+        if normal:
+            otherwise, prefixes = self._block_prefixes(node.orelse, self._joined_origins(normal))
+            paths.extend(otherwise)
+            partial.extend(prefixes)
+        handler_entry = self._joined_origins(partial or [before])
         for handler in node.handlers:
             self._restore_origins(handler_entry)
-            self._visit_exception_handler(handler, partial)
-            continuing.append(self._origin_state())
+            handled, prefixes = self._visit_exception_handler(handler)
+            paths.extend(handled)
+            partial.extend(prefixes)
             if isinstance(node, ast.TryStar):
-                # Several except* handlers can run in order; an ordinary except
-                # chooses only one. The next group may also skip earlier ones.
-                handler_entry = self._joined_origins([handler_entry, continuing[-1]])
-        normal = self._joined_origins(continuing)
-        self._restore_origins(normal)
-        if not node.finalbody:
-            return
-        self._visit_cleanup(node.finalbody, partial, normal)
+                continuing = [state for kind, state in handled if kind == "normal"]
+                handler_entry = self._joined_origins([handler_entry, *continuing])
+        # Unknown exceptions may escape. Their finally references count, while
+        # these paths cannot supply origins to statements after the try.
+        paths.extend(("raise", state) for state in partial)
+        self._accept_paths(self._cleanup_paths(node.finalbody, paths) if node.finalbody else paths)
 
     visit_TryStar = visit_Try
 
-    def _visit_exception_handler(self, handler, partial):
+    def _visit_exception_handler(self, handler):
         if handler.type is not None:
             self.visit(handler.type)
         if handler.name:
             self._store_origins({handler.name: None})
-        for statement in handler.body:
-            self.visit(statement)
-            partial.append(self._origin_state())
+        paths, partial = self._block_prefixes(handler.body)
         if handler.name:
             # Python deletes the exception target at handler exit; a class can
             # then fall back to an enclosing binding, unlike a function local.
-            kind, origins = self._binding_namespace(handler.name)
-            if kind in {"module", "class"}:
-                origins.pop(handler.name, None)
-            else:
-                origins[handler.name] = None
+            cleaned = []
+            for outcome, state in paths:
+                self._restore_origins(state)
+                kind, origins = self._binding_namespace(handler.name)
+                if kind in {"module", "class"}:
+                    origins.pop(handler.name, None)
+                else:
+                    origins[handler.name] = None
+                cleaned.append((outcome, self._origin_state()))
+            paths = cleaned
+        return paths, partial
 
-    def _visit_cleanup(self, statements, partial, normal):
+    def _cleanup_paths(self, statements, paths):
+        if not paths:
+            return []
         if self._reference_only:
-            self._restore_origins(self._joined_origins([*partial, normal]))
-        for statement in statements:
-            self.visit(statement)
-        after = self._origin_state()
-        if not self._reference_only:
-            # Finally also runs while an uncaught exception escapes. Its uses
-            # count, but that path cannot supply bindings to later statements.
-            # Reference-only nested cleanups are walked once, avoiding an
-            # exponential second walk for deeply nested try/finally statements.
+            cleanup = self._visit_block(statements, self._joined_origins([state for _kind, state in paths]))
+            return [(incoming if outcome == "normal" else outcome, state)
+                    for incoming in {kind for kind, _state in paths} for outcome, state in cleanup]
+        normal = [state for kind, state in paths if kind == "normal"]
+        result = self._visit_block(statements, self._joined_origins(normal)) if normal else []
+        abrupt = [(kind, state) for kind, state in paths if kind != "normal"]
+        if abrupt:
+            # A second, reference-only walk covers escaping paths. Nested
+            # cleanups stay single-pass here, bounding deeply nested finally.
             self._reference_only = True
-            self._restore_origins(self._joined_origins([*partial, normal]))
             try:
-                for statement in statements:
-                    self.visit(statement)
+                cleanup = self._visit_block(statements, self._joined_origins([state for _kind, state in abrupt]))
+                result.extend((incoming if outcome == "normal" else outcome, state)
+                              for incoming in {kind for kind, _state in abrupt} for outcome, state in cleanup)
             finally:
                 self._reference_only = False
-                self._restore_origins(after)
+        return result
+
+    def visit_With(self, node):
+        partial = []
+        for index, item in enumerate(node.items):
+            if index:
+                partial.append(self._origin_state())
+            self.visit(item.context_expr)
+            if item.optional_vars is not None:
+                self.visit(item.optional_vars)
+        paths, prefixes = self._block_prefixes(node.body)
+        partial.extend(prefixes)
+        if len(node.items) > 1:
+            partial.extend(state for _kind, state in paths)
+        # An unknown __exit__ may suppress an exception after any dynamic body
+        # prefix. Return/break/continue themselves remain abrupt outcomes.
+        self._accept_paths([*paths, *(("normal", state) for state in partial)])
+
+    visit_AsyncWith = visit_With
 
     def visit_BoolOp(self, node: ast.BoolOp):
         self.visit(node.values[0])
@@ -315,6 +414,15 @@ class ImportReferences(ast.NodeVisitor):
     @staticmethod
     def _origin_options(value):
         return value if isinstance(value, frozenset) else frozenset((value,))
+
+    def _mapping_options(self, origins, name):
+        if not isinstance(origins, ChainMap):
+            return self._origin_options(origins.get(name, _FALLBACK))
+        if len(origins.maps) == 1:
+            return self._mapping_options(origins.maps[0], name)
+        options = self._origin_options(origins.maps[0].get(name, _FALLBACK))
+        return ((options - {_FALLBACK}) | self._mapping_options(origins.parents, name)
+                if _FALLBACK in options else options)
 
     def _remember_annotation_imports(self, node):
         origins = self._annotation_scopes[-1][1]
@@ -344,9 +452,9 @@ class ImportReferences(ast.NodeVisitor):
         for index, (kind, origins, globals_) in enumerate(self._annotation_scopes):
             if kind != "class" or index == len(self._annotation_scopes) - 1:
                 for name in globals_:
-                    out[name] = self._origin_options(self._annotation_scopes[0][1].get(name, _FALLBACK))
+                    out[name] = self._mapping_options(self._annotation_scopes[0][1], name)
                 for name, value in origins.items():
-                    options = self._origin_options(value)
+                    options = self._mapping_options(origins, name)
                     if _FALLBACK in options:
                         # A class branch may leave its local name absent. That
                         # path falls back to the enclosing namespace.
@@ -356,7 +464,8 @@ class ImportReferences(ast.NodeVisitor):
 
     @contextmanager
     def _preserve_annotation_bindings(self, enabled=True):
-        saved = [(origins, origins.copy()) for _kind, origins, _globals in self._annotation_scopes] if enabled else []
+        saved = [(origins, (origins.maps[0] if isinstance(origins, ChainMap) else origins).copy())
+                 for _kind, origins, _globals in self._annotation_scopes] if enabled else []
         try:
             yield
         finally:
@@ -415,7 +524,7 @@ class ImportReferences(ast.NodeVisitor):
             self._annotation_scopes.pop()
 
     def visit_Module(self, node: ast.Module):
-        self.generic_visit(node)
+        self._accept_paths(self._visit_block(node.body))
         # This is a file-local use analysis, not a simulation of call order.
         # Revisit only unresolved type-bearing calls, retaining earlier proven
         # uses as well as those the completed enclosing namespaces establish.
@@ -443,10 +552,14 @@ class ImportReferences(ast.NodeVisitor):
         first, separator, rest = dotted.partition(".")
         # Keep an unknown/non-import branch as an explicit alternative. A
         # possible custom generic still gives its strings type semantics.
-        return {imported + (separator + rest if separator else "")
-                if isinstance(imported, str) and imported else ""
-                for imported in self._origin_options(origins.get(first, _FALLBACK))
-                if imported is not _FALLBACK and imported != ""}
+        names = {imported + (separator + rest if separator else "")
+                 if isinstance(imported, str) and imported else ""
+                 for imported in self._origin_options(origins.get(first, _FALLBACK))
+                 if imported is not _FALLBACK and imported != ""}
+        # Only typing helper identity affects string semantics. Collapsing
+        # other origins prevents attribute reassignment loops growing strings
+        # forever while preserving their ordinary/custom-generic distinction.
+        return {name if name in _TYPING_ORIGINS else "" for name in names}
 
     def visit_Attribute(self, node: ast.Attribute):
         if isinstance(node.value, ast.Name):
@@ -468,7 +581,7 @@ class ImportReferences(ast.NodeVisitor):
             return
         if isinstance(node, ast.Constant) and isinstance(node.value, str):
             try:
-                expression = ast.parse(node.value, mode="eval").body
+                expression = ast.parse(node.value.strip(), mode="eval").body
             except (SyntaxError, ValueError):
                 return
             # Quoted expressions need the same parent relationships as the
@@ -597,11 +710,16 @@ class ImportReferences(ast.NodeVisitor):
             return False
         first = dotted.partition(".")[0]
         origins = self._annotation_origins()
+        module = self._annotation_scopes[0][1]
+        if first in self._annotation_scopes[-1][2] and isinstance(module, ChainMap) and first in module.maps[0]:
+            return False  # This invocation already replaced its own global.
         deferred = [local for kind, local, _globals in self._annotation_scopes if kind in {"function", "generator"}]
         if deferred and first in deferred[-1]:
             # A later import in this very function is an unbound local at the
             # current call. Only an enclosing namespace may complete later.
             return False
+        if deferred:
+            return True  # A known enclosing origin may also be rebound later.
         return first not in origins or bool({"", _FALLBACK} & self._origin_options(origins[first]))
 
     def _typing_cast_references(self, node: ast.Call) -> bool:
@@ -653,8 +771,14 @@ class ImportReferences(ast.NodeVisitor):
         # A function body is deferred. Its global stores are visible within
         # that body (and nested readers), not evidence that it already ran.
         with self._preserve_annotation_bindings(), self._deferred_module_namespace(), self._annotation_scope(node):
-            for statement in node.body:
-                self.visit(statement)
+            previous = self._prefix_collectors
+            self._prefix_collectors = []  # Defining this body does not run it.
+            try:
+                paths = self._visit_block(node.body)
+                if paths:
+                    self._restore_origins(self._joined_origins([state for _kind, state in paths]))
+            finally:
+                self._prefix_collectors = previous
 
     visit_FunctionDef = visit_AsyncFunctionDef = _visit_function
 
@@ -664,6 +788,7 @@ class ImportReferences(ast.NodeVisitor):
                            *getattr(node, "type_params", ())):
             self.visit(expression)
         with self._annotation_scope(node):
-            for statement in node.body:
-                self.visit(statement)
-        self._store_origins({node.name: None})
+            paths = self._visit_block(node.body)
+        self._accept_paths(paths)
+        if self._continuing:
+            self._store_origins({node.name: None})
