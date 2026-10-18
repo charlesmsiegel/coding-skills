@@ -268,6 +268,14 @@ class _ExternalTypes:
             (isinstance(value, ast.AST) and module._scope_of(value) is self.module_scope)
             or self._namespace_write(value, name, module) for value in values)
 
+    def _module_write_values(self, name):
+        """Actual canonical writes from the already indexed global owners."""
+        values = []
+        for scope in self.global_scopes.get(name, ()):
+            writer = self._inventory(scope)
+            values.extend(writer.bindings.get((writer.global_scope, name), []))
+        return values
+
     def _lexical_binding(self, expression, name):
         """Nearest possible values, or None for an unbound/builtin name.
 
@@ -282,6 +290,10 @@ class _ExternalTypes:
             if isinstance(current, _SCOPES):
                 inventory = self._inventory(current)
                 key = (id(current), name)
+                if isinstance(current, ast.Module):
+                    # Class bodies and sibling functions are not ancestors,
+                    # but their actual global writes reach this namespace too.
+                    module_writes.extend(self._module_write_values(name))
                 if not module_only or isinstance(current, ast.Module):
                     if key in inventory.globals:
                         if isinstance(current, ast.Module):

@@ -1082,3 +1082,65 @@ def test_namespace_overwrite_respects_statement_end_before_the_read(detector, tm
     late = binding == "late_assignment"
     assert namespace["Entry"]().save() == (6 if late else math.pi + math.e + math.tau)
     assert [row.metric_value for row in findings(detector, tmp_path, source, "feature_envy")] == ([3] if late else [])
+
+
+@pytest.mark.parametrize("binding", ["class_rebound", "method_rebound", "readonly", "external", "local", "enclosing"])
+def test_pattern_module_lookup_includes_indexed_global_writers_but_keeps_nearer_cells(detector, tmp_path, binding):
+    class_write = ("Kind = Payload" if binding in {"class_rebound", "local", "enclosing"}
+                   else "from fractions import Fraction as Kind" if binding == "external" else "pass")
+    source = textwrap.dedent(f"""
+        from fractions import Fraction as Kind
+        class Payload:
+            numerator = 1
+            denominator = 2
+            real = 3
+        class Configure:
+            global Kind
+            {class_write}
+    """)
+    if binding == "method_rebound":
+        source += "    @staticmethod\n    def configure():\n        global Kind\n        Kind = Payload\n"
+    entry = textwrap.dedent(f"""
+        class Entry:
+            def measure(self):
+                return self.metrics
+            def save(self, value):
+                {"from fractions import Fraction as Kind" if binding == "local" else "pass"}
+                {"Configure.configure()" if binding == "method_rebound" else "pass"}
+                match value:
+                    case Kind() as item:
+                        return item.numerator + item.denominator + item.real
+    """)
+    if binding == "enclosing":
+        entry = ("def make():\n    from fractions import Fraction as Kind\n" + textwrap.indent(entry, "    ")
+                 + "    return Entry\nEntry = make()\n")
+    source += entry
+    namespace = {}
+    exec(source, namespace)
+    rebound = binding in {"class_rebound", "method_rebound"}
+    value = namespace["Payload"]() if rebound else Fraction(3, 2)
+    assert namespace["Entry"]().save(value) == (6 if rebound else 6.5)
+    assert [row.metric_value for row in findings(detector, tmp_path, source, "feature_envy")] == ([3] if rebound else [])
+
+
+@pytest.mark.parametrize("rebound", [False, True])
+def test_representation_module_lookup_includes_class_writes_without_inventing_declaration_values(
+        detector, tmp_path, rebound):
+    source = textwrap.dedent(f"""
+        class Configure:
+            global str
+            {"str = lambda value: 'converted'" if rebound else "pass"}
+        class Entry:
+            def measure(self):
+                return self.metrics
+            def save(self):
+                return str(self)
+            def __str__(self):
+                return self.payload
+    """)
+    namespace = {}
+    exec(source, namespace)
+    entry = namespace["Entry"]()
+    entry.payload = "original"
+    assert entry.save() == ("converted" if rebound else "original")
+    assert [row.metric_value for row in findings(detector, tmp_path, source, "low_cohesion")] == ([] if rebound else [2])
