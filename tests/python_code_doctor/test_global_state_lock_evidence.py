@@ -24,6 +24,122 @@ def mutations(detector, source):
             if r.smell_type == "mutated_global"]
 
 
+@pytest.mark.parametrize("statement, expected", [
+    ("first[key] = registry[key] = 1", "finding"),
+    ("del first[key], registry[key]", "finding"),
+    ("first[key], registry[key] = (1, 2)", "finding"),
+    ("first[registry[key]] = 1", "candidate"),
+    ("registry[key]: int", "candidate"),
+    ("registry[key]: int = 1", "finding"),
+])
+def test_every_direct_write_target_counts_but_index_reads_do_not(detector, statement, expected):
+    found = mutations(detector, "from threading import Lock\n_guard = Lock()\nfirst = {}\nregistry = {}\n"
+                      "def put(key):\n    with _guard:\n        registry[key] = 1\n    " + statement + "\n")
+    registry = next(result for result in found if result.line == 4)
+    assert registry.kind == expected
+
+
+@pytest.mark.parametrize("setup, namespace, expected", [
+    ("", "vars(threading)", "finding"),
+    ("from builtins import vars as namespace_of\n", "namespace_of(threading)", "finding"),
+    ("import builtins as helpers\n", "helpers.vars(threading)", "finding"),
+    ("vars = lambda value: {}\n", "vars(threading)", "candidate"),
+    ("", "vars(fake_module)", "candidate"),
+])
+def test_builtin_vars_preserves_only_the_actual_module_namespace(detector, setup, namespace, expected):
+    found = mutations(detector, "import threading\n" + setup + namespace + '["Lock"] = make_guard\n'
+                      "_guard = threading.Lock()\nregistry = {}\ndef put(key):\n    with _guard:\n        registry[key] = 1\n")
+    assert len(found) == 1 and found[0].kind == expected
+
+
+@pytest.mark.parametrize("namespace", ["vars(threading)", "threading.__dict__"])
+@pytest.mark.parametrize("key, expected", [("name", "finding"), ('"other"', "candidate")])
+def test_namespace_item_writes_decline_unknown_keys_and_preserve_unrelated_literals(detector, namespace, key, expected):
+    found = mutations(detector, "import threading\n" + namespace + f"[{key}] = make_guard\n"
+                      "_guard = threading.Lock()\nregistry = {}\ndef put(key):\n    with _guard:\n        registry[key] = 1\n")
+    assert len(found) == 1 and found[0].kind == expected
+
+
+@pytest.mark.parametrize("factory", ["map", "filter"])
+@pytest.mark.parametrize("consumer, expected", [("list(values)", "finding"), ("pass", "candidate")])
+def test_lazy_callback_writes_execute_only_when_consumed(detector, factory, consumer, expected):
+    found = mutations(detector, "from threading import Lock\n_guard = Lock()\nregistry = {}\n"
+                      f"def put(key):\n    values = {factory}(lambda item: registry.pop(item), keys)\n"
+                      "    with _guard:\n        registry[key] = 1\n    " + consumer + "\n")
+    assert len(found) == 1 and found[0].kind == expected
+
+
+@pytest.mark.parametrize("factory", ["map", "filter"])
+@pytest.mark.parametrize("argument, expected", [("_guard", "finding"), ("fake_guard", "candidate")])
+def test_consumed_callbacks_bind_actual_literal_elements(detector, factory, argument, expected):
+    found = mutations(detector, "from threading import Lock\n_guard = Lock()\nregistry = {}\n"
+                      f"def put(key):\n    with _guard:\n        list({factory}(lambda lock: lock.release(), ({argument},)))\n"
+                      "        registry[key] = 1\n")
+    assert len(found) == 1 and found[0].kind == expected
+
+
+@pytest.mark.parametrize("factory", ["map", "filter"])
+def test_a_callback_parameter_named_like_the_module_registry_remains_private(detector, factory):
+    found = mutations(detector, "from threading import Lock\n_guard = Lock()\nregistry = {}\n"
+                      f"def put(key):\n    with _guard:\n        registry[key] = 1\n    list({factory}(lambda registry: registry.clear(), ({{}},)))\n")
+    assert len(found) == 1 and found[0].kind == "candidate"
+
+
+@pytest.mark.parametrize("consumer", ["list(values)", "for value in values:\n            pass"])
+def test_a_callback_write_consumed_under_the_common_mutex_is_still_a_candidate(detector, consumer):
+    found = mutations(detector, "from threading import Lock\n_guard = Lock()\nregistry = {}\n"
+                      "def put(key):\n    values = map(lambda item: registry.pop(item), keys)\n"
+                      "    with _guard:\n        " + consumer + "\n")
+    assert len(found) == 1 and found[0].kind == "candidate"
+
+
+@pytest.mark.parametrize("setup, expression, expected", [
+    ("from builtins import map as lazy\n", "list(lazy(lambda key: registry.pop(key), keys))", "finding"),
+    ("import builtins as helpers\n", "list(helpers.filter(lambda key: registry.pop(key), keys))", "finding"),
+    ("map = lambda callback, values: values\n", "list(map(lambda key: registry.pop(key), keys))", "candidate"),
+    ("", "list(map(lambda item: item, map(lambda key: registry.pop(key), keys)))", "finding"),
+])
+def test_callback_iteration_uses_builtin_origins_and_consumes_nested_inputs(detector, setup, expression, expected):
+    found = mutations(detector, "from threading import Lock\n_guard = Lock()\nregistry = {}\n" + setup +
+                      "def put(key):\n    with _guard:\n        registry[key] = 1\n    " + expression + "\n")
+    assert len(found) == 1 and found[0].kind == expected
+
+
+def test_cyclic_visible_callback_iterators_decline_proof_without_unbounded_expansion(detector):
+    found = mutations(detector, "from threading import Lock\n_guard = Lock()\nregistry = {}\n"
+                      "def put(key):\n    values = keys\n    while key:\n        values = map(lambda item: item, values)\n"
+                      "    with _guard:\n        list(values)\n        registry[key] = 1\n")
+    assert len(found) == 1 and found[0].kind == "finding"
+
+
+@pytest.mark.parametrize("definition", ["def helper():\n            pass", "class Helper:\n            pass"])
+@pytest.mark.parametrize("decorator, expected", [
+    ("lambda value: (_guard.release(), value)[1]", "finding"),
+    ("lambda value: (registry.clear(), value)[1]", "finding"),
+    ("lambda value: value", "candidate"),
+])
+def test_visible_decorators_execute_when_the_definition_is_created(detector, definition, decorator, expected):
+    found = mutations(detector, "from threading import Lock\n_guard = Lock()\nregistry = {}\n"
+                      f"decorate = {decorator}\ndef put(key):\n    with _guard:\n        registry[key] = 1\n"
+                      "    @decorate\n    " + definition.replace("            ", "        ") + "\n")
+    assert len(found) == 1 and found[0].kind == expected
+
+
+def test_guarded_decorator_application_cannot_erase_its_independent_unguarded_write(detector):
+    found = mutations(detector, "from threading import Lock\n_guard = Lock()\nregistry = {}\n"
+                      "def decorate(fn):\n    registry.clear()\n    return fn\n"
+                      "def put(key):\n    with _guard:\n        registry[key] = 1\n"
+                      "        @decorate\n        def helper():\n            pass\n")
+    assert len(found) == 1 and found[0].kind == "finding"
+
+
+def test_stacked_visible_decorators_do_not_invent_the_transformed_argument_value(detector):
+    found = mutations(detector, "from threading import Lock\n_guard = Lock()\nregistry = {}\n"
+                      "def put(key):\n    with _guard:\n        @ (lambda lock: lock.release())\n"
+                      "        @ (lambda fn: _guard)\n        def helper():\n            pass\n        registry[key] = 1\n")
+    assert len(found) == 1 and found[0].kind == "finding"
+
+
 @pytest.mark.parametrize("setup", [
     "import threading\n_guard = threading.Lock()\n",
     "import threading as threads\n_guard = threads.RLock()\n",
@@ -991,4 +1107,41 @@ def test_other_conditional_evaluations_do_not_overwrite_the_skipped_origin(detec
     found = mutations(detector, "from threading import Lock\n_guard = Lock()\nregistry = {}\n"
                       f"def put(key):\n    alias = {initial}\n    {expression}\n"
                       "    with _guard:\n        alias.release()\n        registry[key] = 1\n")
+    assert len(found) == 1 and found[0].kind == expected
+
+@pytest.mark.parametrize("statement, expected", [
+    ('threading.__dict__.pop("Lock")', "finding"),
+    ('threading.__dict__.clear()', "finding"),
+    ('threading.__dict__.popitem()', "finding"),
+    ('threading.__dict__.__setitem__("Lock", make_guard)', "finding"),
+    ('threading.__dict__.__delitem__("Lock")', "finding"),
+    ('threading.__dict__.__ior__({"Lock": make_guard})', "finding"),
+    ('threading.__dict__.__init__({"Lock": make_guard})', "finding"),
+    ('namespace = threading.__dict__\nremove = namespace.pop\nremove("Lock")', "finding"),
+    ('namespace = threading.__dict__\nnamespace |= {"Lock": make_guard}', "finding"),
+    ('namespace = threading.__dict__\nnamespace |= {"other": value}\nnamespace.pop("Lock")', "finding"),
+    ('threading.__dict__.pop("other", None)', "candidate"),
+    ('threading.__dict__.setdefault("Lock", make_guard)', "candidate"),
+    ('threading.__dict__.items()', "candidate"),
+])
+def test_namespace_operation_family_declines_mutations_and_preserves_known_readers(detector, statement, expected):
+    found = mutations(detector, "import threading\n" + statement + "\n_guard = threading.Lock()\nregistry = {}\n"
+                      "def put(key):\n    with _guard:\n        registry[key] = 1\n")
+    assert len(found) == 1 and found[0].kind == expected
+
+
+def test_a_factory_captured_before_namespace_removal_keeps_its_object(detector):
+    found = mutations(detector, "from threading import Lock\nimport threading\n"
+                      'threading.__dict__.pop("Lock")\n_guard = Lock()\nregistry = {}\n'
+                      "def put(key):\n    with _guard:\n        registry[key] = 1\n")
+    assert len(found) == 1 and found[0].kind == "candidate"
+
+@pytest.mark.parametrize("capture_first, expected", [(True, "candidate"), (False, "finding")])
+def test_namespace_helper_effects_follow_call_order_for_saved_factories(detector, capture_first, expected):
+    capture = "from threading import Lock\n"
+    call = "alter(threading.__dict__)\n"
+    sequence = capture + call if capture_first else call + capture
+    found = mutations(detector, "import threading\ndef alter(namespace):\n    namespace.pop(\"Lock\")\n" + sequence +
+                      "_guard = Lock()\nregistry = {}\n"
+                      "def put(key):\n    with _guard:\n        registry[key] = 1\n")
     assert len(found) == 1 and found[0].kind == expected
