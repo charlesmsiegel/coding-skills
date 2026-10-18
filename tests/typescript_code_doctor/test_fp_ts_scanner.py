@@ -428,6 +428,7 @@ def test_missing_import_type_skips_an_inline_type_specifier(tmp_path):
     "const row = <Row {...(ready ? props(value) : {})} />;",
     "const result = ready ? load() : Promise.resolve(fixture<Awaited<ReturnType<typeof api.getX>>>({meta:{}}));",
     "const x = ready ? value : {};",
+    "class C { run() { return ready ? convert(value) : {}; } }",
 ])
 def test_rejected_method_probes_do_not_mark_ternary_values_as_types(ts, tmp_path, source):
     file = parse(ts, source, "sample.tsx")
@@ -445,6 +446,8 @@ def test_rejected_method_probes_do_not_mark_ternary_values_as_types(ts, tmp_path
     ("function accept(value: {}): {} { return {}; }", 2),
     ("const methods = { make(): {} { return {}; } };", 1),
     ("const methods = { make<T>(): Promise<{}> { return load(); } };", 1),
+    ("class C { run() { const methods = { make(): {} { return {}; } }; } }", 1),
+    ("class C { run() { const methods = { make<T>(): Promise<{}> { return load(); } }; } }", 1),
 ])
 def test_confirmed_empty_object_types_keep_their_scored_findings(ts, tmp_path, source, expected):
     file = parse(ts, source)

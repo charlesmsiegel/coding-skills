@@ -697,12 +697,12 @@ def extract_object_methods(file: TsFile) -> None:
         previous = tokens[index - 1] if index else None
         if previous is not None and (previous.is_op(".", "?.", "=", "new") or previous.is_name(*CONTROL_KEYWORDS)):
             continue
-        if file.enclosing_class(index) is not None:
-            continue
         # `condition ? call(value) : {}` also has a colon after parentheses.
         # A rejected method probe must not publish its value branch as a type.
         if type_colon >= 0 and after > type_colon + 1:
             file.type_spans.append((type_colon + 1, after - 1))
+        if file.enclosing_class(index) is not None:
+            continue
         is_async = bool(previous is not None and previous.is_name("async"))
         func = Func(
             name=token.value, kind="method", line=token.line,
