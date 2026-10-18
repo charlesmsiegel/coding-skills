@@ -96,6 +96,8 @@ def _declared_fields(node: ast.ClassDef, classes: ClassFamilyResolver | None = N
         return set()
     return {item.target.id for item in node.body
             if isinstance(item, ast.AnnAssign) and isinstance(item.target, ast.Name)
+            # Pydantic private attributes are not validated model fields.
+            and (not inherited_model or not item.target.id.startswith('_'))
             and "ClassVar" not in ast.unparse(item.annotation)}
 
 

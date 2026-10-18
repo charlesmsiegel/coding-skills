@@ -65,6 +65,39 @@ def test_plain_local_base_retains_disconnected_state_evidence(run_script, tmp_pa
     assert any(record['issue_type'] == 'low_cohesion' for record in records)
 
 
+@pytest.mark.parametrize('local_base', [False, True])
+def test_pydantic_private_state_keeps_cohesion_evidence(run_script, tmp_path, local_base):
+    (tmp_path / 'models.py').write_text(
+        'from pydantic import BaseModel\nclass FrozenModel(BaseModel): pass\n', encoding='utf-8')
+    imports = ('from models import FrozenModel\nclass Entry(FrozenModel):\n' if local_base
+               else 'from pydantic import BaseModel\nclass Entry(BaseModel):\n')
+    records = detect(run_script, tmp_path, 'find_coupling_issues.py', imports
+                     + '    _first: int = 1\n    _second: int = 2\n'
+                     '    def one(self): return self._first\n'
+                     '    def two(self): return self._second\n')
+    assert any(record['issue_type'] == 'low_cohesion' for record in records)
+
+
+def test_pydantic_private_cache_stays_separate_from_public_fields(run_script, tmp_path):
+    records = detect(run_script, tmp_path, 'find_coupling_issues.py',
+                     'from pydantic import BaseModel\nclass Entry(BaseModel):\n'
+                     '    first: int\n    second: int\n    _cache: dict = {}\n'
+                     '    def one(self): return self.first\n'
+                     '    def two(self): return self.second\n'
+                     '    def cached(self): return self._cache\n')
+    [cohesion] = [record for record in records if record['issue_type'] == 'low_cohesion']
+    assert cohesion['metric_value'] == 2
+
+
+def test_dataclass_underscore_fields_remain_one_record(run_script, tmp_path):
+    records = detect(run_script, tmp_path, 'find_coupling_issues.py',
+                     'from dataclasses import dataclass\n@dataclass\nclass Entry:\n'
+                     '    _first: int\n    _second: int\n'
+                     '    def one(self): return self._first\n'
+                     '    def two(self): return self._second\n')
+    assert not any(record['issue_type'] == 'low_cohesion' for record in records)
+
+
 @pytest.mark.parametrize('method', ['__enter__', '__exit__', '__aenter__', '__iter__',
                                     '__next__', '__call__', '_claim'])
 def test_protocol_and_private_methods_are_behavior(run_script, tmp_path, method):
