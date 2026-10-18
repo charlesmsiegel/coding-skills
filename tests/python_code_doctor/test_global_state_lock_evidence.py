@@ -68,6 +68,78 @@ def test_implicit_iterator_consumers_preserve_direct_write_evidence(detector, co
     assert len(found) == 1 and found[0].kind == expected
 
 
+@pytest.mark.parametrize("factory, method, argument", [("Counter", "subtract", "{key: 1}"), ("OrderedDict", "move_to_end", "key")])
+@pytest.mark.parametrize("protected", [False, True])
+def test_counter_and_ordered_dict_public_mutators_contribute_write_evidence(detector, factory, method, argument, protected):
+    indent = "        " if protected else "    "
+    found = mutations(detector, f"from collections import {factory}\nfrom threading import Lock\n_guard = Lock()\nregistry = {factory}()\n"
+                      "def put(key):\n    with _guard:\n        registry.update({key: 1})\n" + indent + f"registry.{method}({argument})\n")
+    assert len(found) == 1 and found[0].kind == ("candidate" if protected else "finding")
+
+
+@pytest.mark.parametrize("mutation, expected", [
+    ("builtins.__import__ = fake_import", "finding"),
+    ('setattr(builtins, "__import__", fake_import)', "finding"),
+    ('builtins.__dict__["__import__"] = fake_import', "finding"),
+    ('vars(builtins).update(__import__=fake_import)', "finding"),
+    ('builtins.__dict__["other"] = value', "candidate"),
+])
+@pytest.mark.parametrize("capture_first", [False, True])
+def test_visible_builtin_import_replacement_obeys_original_import_capture(detector, mutation, expected, capture_first):
+    capture = "from threading import Lock\n"
+    sequence = capture + mutation + "\n" if capture_first else mutation + "\n" + capture
+    found = mutations(detector, "import builtins\n" + sequence + "_guard = Lock()\nregistry = {}\n"
+                      "def put(key):\n    with _guard:\n        registry[key] = 1\n")
+    assert len(found) == 1 and found[0].kind == ("candidate" if capture_first else expected)
+
+
+@pytest.mark.parametrize("definition, expression, expected", [
+    ("def get_operation():\n    return _guard.release\n", "get_operation()", "finding"),
+    ("get_operation = lambda: _guard.release\n", "get_operation()", "finding"),
+    ("def get_operation(value):\n    return value.release\n", "get_operation(_guard)", "finding"),
+    ("def get_operation():\n    return fake_guard.release\n", "get_operation()", "candidate"),
+])
+def test_visible_returned_mutex_operations_keep_possible_canonical_receivers(detector, definition, expression, expected):
+    found = mutations(detector, "from threading import Lock\n_guard = Lock()\nregistry = {}\n" + definition +
+                      f"def put(key):\n    operation = {expression}\n    with _guard:\n        operation()\n        registry[key] = 1\n")
+    assert len(found) == 1 and found[0].kind == expected
+
+
+@pytest.mark.parametrize("subject, pattern, expected", [
+    ("[_guard]", "[alias]", "finding"),
+    ("(None, (_guard,))", "[other, [alias]]", "finding"),
+    ('{"guard": _guard}', '{"guard": alias}', "finding"),
+    ("[fake_guard]", "[alias]", "candidate"),
+    ('{"guard": fake_guard}', '{"guard": alias}', "candidate"),
+])
+def test_literal_match_destructuring_keeps_capture_origins(detector, subject, pattern, expected):
+    found = mutations(detector, "from threading import Lock\n_guard = Lock()\nregistry = {}\n"
+                      f"def put(key):\n    with _guard:\n        match {subject}:\n            case {pattern}:\n                alias.release()\n"
+                      "        registry[key] = 1\n")
+    assert len(found) == 1 and found[0].kind == expected
+
+
+@pytest.mark.parametrize("consumer", ["sorted", "min", "max"])
+@pytest.mark.parametrize("callback, expected", [("lambda item: _guard.release()", "finding"), ("lambda item: item", "candidate"), ("None", "candidate")])
+def test_known_eager_key_callbacks_execute_at_the_consumer(detector, consumer, callback, expected):
+    found = mutations(detector, "from threading import Lock\n_guard = Lock()\nregistry = {}\n"
+                      f"def put(key):\n    with _guard:\n        {consumer}([0], key={callback})\n        registry[key] = 1\n")
+    assert len(found) == 1 and found[0].kind == expected
+
+
+@pytest.mark.parametrize("mutation, expected", [
+    ('globals()["_guard"] = fake_guard', "finding"),
+    ('globals().update(_guard=fake_guard)', "finding"),
+    ('namespace = globals()\nnamespace[name] = fake_guard', "finding"),
+    ('globals()["other"] = value', "candidate"),
+    ('globals = lambda: {}\nglobals()["_guard"] = fake_guard', "candidate"),
+])
+def test_builtin_globals_writes_cannot_retain_a_replaced_guard_identity(detector, mutation, expected):
+    found = mutations(detector, "from threading import Lock\n_guard = Lock()\n" + mutation + "\nregistry = {}\n"
+                      "def put(key):\n    with _guard:\n        registry[key] = 1\n")
+    assert len(found) == 1 and found[0].kind == expected
+
+
 @pytest.mark.parametrize("expression, expected", [
     ("(_guard,)[0]", "finding"),
     ("[_guard][0]", "finding"),
