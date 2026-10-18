@@ -227,7 +227,7 @@ class _Derivation:
             child, current = current, self.parent.get(id(current))
         return None
 
-    def binding_identity(self, expr, origin) -> bool:
+    def binding_identity(self, expr, origin, global_namespace=None) -> bool:
         """A name alias grounded in one binding, never merely its data.
 
         The caller checks every write to the origin separately. Cycles among
@@ -247,6 +247,9 @@ class _Derivation:
             key = self.resolve(value)
             if key is None or key in self.unpacked:
                 return False
+            if (global_namespace is not None and key[0] == self.global_scope
+                    and not global_namespace(self, value, key)):
+                return False
             if key == origin or key in proven:
                 continue
             if leaving:
@@ -263,18 +266,18 @@ class _Derivation:
             pending.extend((binding, False) for binding in values)
         return True
 
-    def module_namespace(self, expr, imported_namespace=None) -> bool:
+    def module_namespace(self, expr, imported_namespace=None, global_namespace=None) -> bool:
         """A module alias stays exempt only while every origin write is safe.
 
         Import writes ground the same iterative identity proof as the receiver.
         A possible foreign replacement in that binding or any alias still wins;
         merely encountering one import cannot certify the other writes.
         """
-        return any(self.binding_identity(expr, origin) and all(
+        return any(self.binding_identity(expr, origin, global_namespace) and all(
             isinstance(value, ast.Import)
             or (isinstance(value, ast.ImportFrom) and imported_namespace is not None
                 and imported_namespace(value, origin[1])) or self.derived(value)
-            or self.binding_identity(value, origin) for value in self.bindings[origin])
+            or self.binding_identity(value, origin, global_namespace) for value in self.bindings[origin])
             for origin in self.module_keys)
 
     def derived(self, expr) -> bool:

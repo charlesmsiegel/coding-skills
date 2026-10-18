@@ -177,7 +177,9 @@ class _ExternalTypes:
         self.defined: set = set()
         self.module_values: dict[str, list] = defaultdict(list)
         self.parents = {child: parent for parent in ast.walk(tree) for child in ast.iter_child_nodes(parent)}
+        self.module_scope = tree
         self.scope_inventories = {tree: _Derivation(tree, None)}
+        self.global_scopes: dict[str, set] = defaultdict(set)
         for node in ast.walk(tree):
             if isinstance(node, ast.Import):
                 for alias in node.names:
@@ -186,6 +188,13 @@ class _ExternalTypes:
                 top = None if node.level else (node.module or "").split(".")[0]
                 for alias in node.names:
                     self.imports[alias.asname or alias.name] = top
+            elif isinstance(node, ast.Global):
+                scope = self.parents.get(node)
+                while scope is not None and not isinstance(scope, _SCOPES + (ast.ClassDef,)):
+                    scope = self.parents.get(scope)
+                if scope is not None and not isinstance(scope, ast.Module):
+                    for name in node.names:
+                        self.global_scopes[name].add(scope)
         for node in getattr(tree, "body", []):
             if isinstance(node, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
                 self.defined.add(node.name)
@@ -210,6 +219,55 @@ class _ExternalTypes:
             return self._external_module(self.imports[name])
         return name not in self.defined and name not in self.module_values and name in _BUILTIN_TYPES
 
+    def _inventory(self, scope):
+        if scope not in self.scope_inventories:
+            # A class body's explicit globals need write evidence too. Reuse
+            # the collector without making its namespace a method's closure.
+            tree = ast.Module(body=scope.body, type_ignores=[]) if isinstance(scope, ast.ClassDef) else scope
+            self.scope_inventories[scope] = _Derivation(tree, None)
+        return self.scope_inventories[scope]
+
+    def _namespace_write(self, value, name, inventory):
+        """Ground this writer locally; another global needs its own proof."""
+        return (isinstance(value, ast.Import)
+                or (isinstance(value, ast.ImportFrom) and self.imported_namespace(value, name))
+                or inventory.module_namespace(value, self.imported_namespace,
+                    lambda _inventory, _expression, key: key[1] == name))
+
+    @staticmethod
+    def _unconditional_write(inventory, expression, key):
+        """A direct earlier statement runs whenever this same-scope read does."""
+        scope = inventory._scope_of(expression)
+        for value in inventory.bindings.get(key, []):
+            statement = value if isinstance(value, (ast.Import, ast.ImportFrom)) else inventory.parent.get(id(value))
+            if (isinstance(statement, (ast.Import, ast.ImportFrom, ast.Assign, ast.AnnAssign))
+                    and inventory.parent.get(id(statement)) is scope
+                    and (statement.end_lineno, statement.end_col_offset) < (expression.lineno, expression.col_offset)):
+                return True
+        return False
+
+    def global_namespace(self, inventory, expression, key):
+        """A method's global aliases also inherit writes outside that method.
+
+        The module inventory skips classes. Consult the same cached owner
+        inventories for visible global writers, including class bodies/methods.
+        A straight-line overwrite can supersede initializers, never another
+        possible writer; unknown cross-global dependencies stay conservative.
+        """
+        name = key[1]
+        for scope in self.global_scopes.get(name, ()):
+            writer = self._inventory(scope)
+            if not all(self._namespace_write(value, name, writer)
+                       for value in writer.bindings.get((writer.global_scope, name), [])):
+                return False
+        module = self._inventory(self.module_scope)
+        values = module.bindings.get((id(self.module_scope), name), [])
+        if all(self._namespace_write(value, name, module) for value in values):
+            return True
+        return self._unconditional_write(inventory, expression, key) and all(
+            (isinstance(value, ast.AST) and module._scope_of(value) is self.module_scope)
+            or self._namespace_write(value, name, module) for value in values)
+
     def _lexical_binding(self, expression, name):
         """Nearest possible values, or None for an unbound/builtin name.
 
@@ -222,9 +280,7 @@ class _ExternalTypes:
         module_writes = []
         while current is not None:
             if isinstance(current, _SCOPES):
-                if current not in self.scope_inventories:
-                    self.scope_inventories[current] = _Derivation(current, None)
-                inventory = self.scope_inventories[current]
+                inventory = self._inventory(current)
                 key = (id(current), name)
                 if not module_only or isinstance(current, ast.Module):
                     if key in inventory.globals:
@@ -389,6 +445,8 @@ class _ExternalTypes:
 
     def _pattern_type(self, pattern) -> bool:
         """The whole matched instance, not fields taken from that instance."""
+        if isinstance(pattern, ast.MatchSingleton):
+            return True  # True/False/None match by identity, not overloaded equality.
         if isinstance(pattern, ast.MatchClass):
             # The lexical root proof already checks the actual external import.
             # The general callee reader treats method-local imports as unknown,
@@ -398,6 +456,8 @@ class _ExternalTypes:
             return self._pattern_type(pattern.pattern)
         if isinstance(pattern, ast.MatchOr):
             return all(self._pattern_type(branch) for branch in pattern.patterns)
+        # MatchValue uses equality: a custom first-party object can match a
+        # numeric/string literal while the capture still holds that object.
         return False
 
     def _pattern_value(self, capture, derivation, seen) -> bool:
@@ -458,6 +518,8 @@ class _ExternalTypes:
             return self._indexed_value(expr.value, derivation, index)
         if isinstance(expr, ast.MatchAs):
             return self._pattern_value(expr, derivation, seen)
+        if isinstance(expr, (ast.MatchStar, ast.MatchMapping)):
+            return True  # *rest and **rest are fresh builtin list/dict objects.
         if isinstance(expr, ast.Name):
             return self.name(expr, derivation, seen)
         return False
@@ -600,7 +662,8 @@ def _read_method(func, module_names: set, types: "_ExternalTypes | None" = None)
             key = derivation.resolve(base)
             if key is not None and key == derivation.receiver_key:
                 method.self_names.append(node.attr)
-            elif key is not None and derivation.module_namespace(base, types.imported_namespace if types else None):
+            elif key is not None and derivation.module_namespace(
+                    base, types.imported_namespace if types else None, types.global_namespace if types else None):
                 pass  # module/owned-data reads are safe only when every write proves it
             elif key is not None and derivation.state.get(key):
                 method.derived_reads.add(f"{base.id}.{node.attr}")

@@ -890,3 +890,195 @@ def test_conditional_global_import_keeps_sibling_writes_until_the_module(detecto
     assert namespace["Entry"]().save(value) == (6 if rebound else 6.5)
     found = findings(detector, tmp_path, source, "feature_envy")
     assert [row.metric_value for row in found] == ([3] if rebound else [])
+
+
+@pytest.mark.parametrize("kind", ["star", "mapping"])
+@pytest.mark.parametrize("binding", ["fresh", "alias", "rebound", "conditional"])
+def test_rest_capture_creates_a_builtin_container_until_rebound(detector, tmp_path, kind, binding):
+    pattern = "[head, *rest]" if kind == "star" else '{"key": selected, **rest}'
+    attributes = "append, extend, clear" if kind == "star" else "keys, values, items"
+    declarations = "\n".join(f"    {name} = {index}" for index, name in enumerate(attributes.split(", "), 1))
+    assignment = {"fresh": "pass", "alias": "item = rest", "rebound": "rest = replacement",
+                  "conditional": "if should_rebind:\n    rest = replacement"}[binding]
+    name = "item" if binding == "alias" else "rest"
+    reads = ", ".join(f"{name}.{attribute}" for attribute in attributes.split(", "))
+    source = f"class Payload:\n{declarations}\nlist = dict = Payload\n" + textwrap.dedent(f"""
+        class Entry:
+            def measure(self):
+                return self.metrics
+            def save(self, value, replacement, should_rebind):
+                match value:
+                    case {pattern}:
+                        BINDING
+                        return {name}, ({reads})
+    """).replace("                BINDING", textwrap.indent(assignment, "                "))
+    namespace = {}
+    exec(source, namespace)
+    replacement = namespace["Payload"]()
+    value = [0, 1] if kind == "star" else {"key": 0, "tail": 1}
+    rest, reads = namespace["Entry"]().save(value, replacement, True)
+    rebound = binding in {"rebound", "conditional"}
+    assert (rest is replacement) if rebound else (type(rest) is (list if kind == "star" else dict))
+    assert reads == (1, 2, 3) if rebound else all(method.__self__ is rest for method in reads)
+    assert [row.metric_value for row in findings(detector, tmp_path, source, "feature_envy")] == ([3] if rebound else [])
+
+
+@pytest.mark.parametrize("pattern,value", [("True", True), ("False", False), ("None", None), ("True | False", True)])
+@pytest.mark.parametrize("rebound", [False, True])
+def test_singleton_capture_proves_identity_until_rebound(detector, tmp_path, pattern, value, rebound):
+    attributes = ("__class__", "__repr__", "__str__") if value is None else ("numerator", "denominator", "real")
+    reads = ", ".join(f"item.{attribute}" for attribute in attributes)
+    source = textwrap.dedent(f"""
+        class Payload:
+            numerator = 1
+            denominator = 2
+            real = 3
+        class Entry:
+            def measure(self):
+                return self.metrics
+            def save(self, value, replacement):
+                match value:
+                    case {pattern} as item:
+                        {"item = replacement" if rebound else "pass"}
+                        return item, ({reads})
+    """)
+    namespace = {}
+    exec(source, namespace)
+    replacement = namespace["Payload"]()
+    item, reads = namespace["Entry"]().save(value, replacement)
+    assert item is (replacement if rebound else value)
+    assert len(reads) == 3
+    assert [row.metric_value for row in findings(detector, tmp_path, source, "feature_envy")] == ([3] if rebound else [])
+
+
+@pytest.mark.parametrize("literal", ["1", '"Realm"'])
+def test_literal_equality_capture_keeps_the_original_first_party_instance(detector, tmp_path, literal):
+    source = textwrap.dedent(f"""
+        class Payload:
+            numerator = 1
+            denominator = 2
+            real = 3
+            def __eq__(self, other):
+                return other == {literal}
+        class Entry:
+            def measure(self):
+                return self.metrics
+            def save(self, value):
+                match value:
+                    case {literal} as item:
+                        return item, item.numerator + item.denominator + item.real
+    """)
+    namespace = {}
+    exec(source, namespace)
+    value = namespace["Payload"]()
+    item, total = namespace["Entry"]().save(value)
+    assert item is value and total == 6
+    assert [row.metric_value for row in findings(detector, tmp_path, source, "feature_envy")] == [3]
+
+
+@pytest.mark.parametrize("initial,binding,writer,local_alias,expected", [
+    ("payload", "conditional_alias", "none", False, 3),
+    ("payload", "conditional_import", "none", False, 3),
+    ("payload", "direct_import", "none", False, None),
+    ("payload", "direct_alias", "none", False, None),
+    ("module", "conditional_alias", "none", False, None),
+    ("module", "conditional_import", "none", False, None),
+    ("module", "conditional_alias", "top", False, 3),
+    ("module", "direct_import", "top", False, 3),
+    ("module", "conditional_import", "class", False, 3),
+    ("module", "direct_import", "class", False, 3),
+    ("payload", "conditional_alias", "none", True, 3),
+])
+def test_global_namespace_proof_includes_ambient_writes(
+        detector, tmp_path, initial, binding, writer, local_alias, expected):
+    assignment = {
+        "conditional_alias": "if flag:\n    alias = imported_module",
+        "conditional_import": "if flag:\n    import math as alias",
+        "direct_import": "import math as alias",
+        "direct_alias": "alias = imported_module",
+    }[binding]
+    source = textwrap.dedent("""
+        class Payload:
+            pi = 1
+            e = 2
+            tau = 3
+        INITIAL
+        WRITER
+        class Entry:
+            CLASS_WRITER
+            def measure(self):
+                return self.metrics
+            def save(self, flag):
+                global alias
+                import math as imported_module
+                ASSIGNMENT
+                CALL_WRITER
+                LOCAL_ALIAS
+                return READ.pi + READ.e + READ.tau
+    """).replace("INITIAL", "alias = Payload()" if initial == "payload" else "import math as alias")
+    declaration = "def configure():\n    global alias\n    alias = Payload()"
+    source = source.replace("WRITER\n", declaration + "\n", 1) if writer == "top" else source.replace("WRITER\n", "\n", 1)
+    source = source.replace("    CLASS_WRITER", textwrap.indent("@staticmethod\n" + declaration, "    ")
+                            if writer == "class" else "")
+    source = source.replace("        ASSIGNMENT", textwrap.indent(assignment, "        "))
+    source = source.replace("CALL_WRITER", "configure()" if writer == "top" else "Entry.configure()" if writer == "class" else "pass")
+    source = source.replace("LOCAL_ALIAS", "local_alias = alias" if local_alias else "pass")
+    source = source.replace("READ", "local_alias" if local_alias else "alias")
+    namespace = {}
+    exec(source, namespace)
+    assert namespace["Entry"]().save(False) == (6 if expected else math.pi + math.e + math.tau)
+    assert [row.metric_value for row in findings(detector, tmp_path, source, "feature_envy")] == ([] if expected is None else [expected])
+
+
+@pytest.mark.parametrize("body,expected", [("pass", None), ("import math as alias", None), ("alias = Payload()", 3)])
+def test_class_body_global_ownership_preserves_actual_write_evidence(detector, tmp_path, body, expected):
+    source = textwrap.dedent(f"""
+        import math as alias
+        class Payload:
+            pi = 1
+            e = 2
+            tau = 3
+        class Configure:
+            global alias
+            {body}
+        class Entry:
+            def measure(self):
+                return self.metrics
+            def save(self, flag):
+                global alias
+                if flag:
+                    import math as alias
+                return alias.pi + alias.e + alias.tau
+    """)
+    namespace = {}
+    exec(source, namespace)
+    assert namespace["Entry"]().save(False) == (6 if expected else math.pi + math.e + math.tau)
+    assert [row.metric_value for row in findings(detector, tmp_path, source, "feature_envy")] == ([] if expected is None else [expected])
+
+
+@pytest.mark.parametrize("binding", ["import", "assignment", "late_assignment"])
+def test_namespace_overwrite_respects_statement_end_before_the_read(detector, tmp_path, binding):
+    statements = {
+        "import": "import math as alias; return alias.pi + alias.e + alias.tau",
+        "assignment": "alias = imported_module; return alias.pi + alias.e + alias.tau",
+        "late_assignment": "local_alias = alias; alias = imported_module; return local_alias.pi + local_alias.e + local_alias.tau",
+    }
+    source = textwrap.dedent(f"""
+        class Payload:
+            pi = 1
+            e = 2
+            tau = 3
+        alias = Payload()
+        class Entry:
+            def measure(self):
+                return self.metrics
+            def save(self):
+                global alias
+                import math as imported_module
+                {statements[binding]}
+    """)
+    namespace = {}
+    exec(source, namespace)
+    late = binding == "late_assignment"
+    assert namespace["Entry"]().save() == (6 if late else math.pi + math.e + math.tau)
+    assert [row.metric_value for row in findings(detector, tmp_path, source, "feature_envy")] == ([3] if late else [])
