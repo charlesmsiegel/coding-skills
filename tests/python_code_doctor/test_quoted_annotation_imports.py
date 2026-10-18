@@ -585,3 +585,49 @@ def test_a_generators_first_iterable_cannot_use_a_later_local_import(tmp_path):
               '    rows = (value for value in cast("unused.Type", values))\n'
               '    from typing import cast\n    return list(rows)\n')
     assert "unused" in unused_imports(tmp_path, source)
+
+
+@pytest.mark.parametrize("guarded", [
+    'try:\n    may_fail()\nexcept Exception:\n    cast = converter\n',
+    'try:\n    may_fail()\nexcept ValueError:\n    cast = converter\n'
+    'except Exception:\n    pass\n',
+    'try:\n    may_fail()\n    cast = converter\nexcept Exception:\n    pass\n',
+])
+def test_exception_paths_keep_the_possible_typing_origin(tmp_path, guarded):
+    source = ('import used\nfrom typing import cast\n' + guarded
+              + 'def run(value):\n    return cast("used.Type", value)\n')
+    assert "used" not in unused_imports(tmp_path, source)
+
+
+@pytest.mark.parametrize("guarded", [
+    'try:\n    may_fail()\nexcept Exception:\n    cast = converter\n'
+    'else:\n    cast = other_converter\n',
+    'try:\n    may_fail()\nexcept Exception:\n    pass\n'
+    'finally:\n    cast = converter\n',
+])
+def test_every_continuing_exception_path_can_replace_the_typing_origin(tmp_path, guarded):
+    source = ('import unused\nfrom typing import cast\n' + guarded
+              + 'value = cast("unused.Type", None)\n')
+    assert "unused" in unused_imports(tmp_path, source)
+
+
+def test_finally_sees_bindings_from_an_escaping_partial_try_body(tmp_path):
+    source = ('import used\nfrom typing import cast\n'
+              'try:\n    may_fail()\n    cast = converter\n'
+              'finally:\n    value = cast("used.Type", None)\n')
+    assert "used" not in unused_imports(tmp_path, source)
+
+
+def test_a_finally_import_replaces_every_incoming_origin(tmp_path):
+    source = ('import used\nfrom converter import cast\n'
+              'try:\n    may_fail()\nexcept Exception:\n    cast = other_converter\n'
+              'finally:\n    from typing import cast\n'
+              'value = cast("used.Type", None)\n')
+    assert "used" not in unused_imports(tmp_path, source)
+
+
+def test_later_exception_group_handlers_see_earlier_handler_imports(tmp_path):
+    source = ('import used\nfrom converter import cast\n'
+              'try:\n    may_fail()\nexcept* ValueError:\n    from typing import cast\n'
+              'except* TypeError:\n    value = cast("used.Type", None)\n')
+    assert "used" not in unused_imports(tmp_path, source)
