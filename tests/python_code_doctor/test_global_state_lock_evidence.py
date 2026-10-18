@@ -466,3 +466,160 @@ def test_each_iteration_can_reestablish_a_known_class_guard(detector, loop, rese
                       f"def put(key):\n    class Other:\n        {loop}:\n" + reset +
                       "            with _guard:\n                registry[key] = 1\n            _guard = fake_guard\n")
     assert len(found) == 1 and found[0].kind == "candidate"
+
+
+@pytest.mark.parametrize("definition", [
+    "def inner(value=registry.pop(key)):\n    pass",
+    "async def inner(value=registry.pop(key)):\n    pass",
+    "@decorate(registry.pop(key))\ndef inner():\n    pass",
+    "inner = lambda value=registry.pop(key): None",
+])
+@pytest.mark.parametrize("protected", [False, True])
+def test_definition_inputs_execute_with_the_enclosing_guard_state(detector, definition, protected):
+    indent = "        " if protected else "    "
+    tail = "\n".join(indent + line for line in definition.splitlines())
+    found = mutations(detector, "from threading import Lock\n_guard = Lock()\nregistry = {}\n"
+                      "def put(key):\n    with _guard:\n        registry[key] = 1\n" + tail + "\n")
+    assert len(found) == 1 and found[0].kind == ("candidate" if protected else "finding")
+
+
+@pytest.mark.parametrize("expression, expected", [
+    ("_guard if key else _guard", "finding"),
+    ("_guard if key else fake_guard", "finding"),
+    ("fake_guard if key else other_fake", "candidate"),
+])
+def test_conditional_expression_aliases_keep_their_possible_origins(detector, expression, expected):
+    found = mutations(detector, "from threading import Lock\n_guard = Lock()\nregistry = {}\n"
+                      f"def put(key):\n    alias = {expression}\n    with _guard:\n"
+                      "        alias.release()\n        registry[key] = 1\n")
+    assert len(found) == 1 and found[0].kind == expected
+
+
+@pytest.mark.parametrize("body, expected", [
+    ("threading = fake_module\n    del threading\n    threading.Lock = make_guard", "finding"),
+    ("_guard = fake_guard\n    del _guard\n    _guard.release()", "finding"),
+])
+def test_class_deletion_restores_outer_object_lookup(detector, body, expected):
+    found = mutations(detector, "import threading\n_guard = threading.Lock()\nregistry = {}\n"
+                      f"class Other:\n    {body}\n"
+                      "def put(key):\n    with _guard:\n        registry[key] = 1\n")
+    assert len(found) == 1 and found[0].kind == expected
+
+
+@pytest.mark.parametrize("factory", ["Lock", "RLock"])
+@pytest.mark.parametrize("arguments, blocking", [("", True), ("True", True), ("False", False), ("timeout=0", False)])
+def test_only_blocking_plain_lock_reacquisition_defeats_the_guard(detector, factory, arguments, blocking):
+    found = mutations(detector, f"from threading import {factory}\n_guard = {factory}()\nregistry = {{}}\n"
+                      f"def put(key):\n    with _guard:\n        _guard.acquire({arguments})\n        registry[key] = 1\n")
+    expected = "finding" if factory == "Lock" and blocking else "candidate"
+    assert len(found) == 1 and found[0].kind == expected
+
+
+@pytest.mark.parametrize("setup", [
+    'from builtins import setattr as replace\nreplace(threading, "Lock", make_guard)',
+    'import builtins\nbuiltins.setattr(threading, "Lock", make_guard)',
+    'import builtins as core\nother = core\nother.setattr(threading, "Lock", make_guard)',
+])
+def test_explicit_builtin_origins_cannot_hide_factory_replacement(detector, setup):
+    found = mutations(detector, "import threading\n" + setup + "\n_guard = threading.Lock()\nregistry = {}\n"
+                      "def put(key):\n    with _guard:\n        registry[key] = 1\n")
+    assert len(found) == 1 and found[0].kind == "finding"
+
+
+@pytest.mark.parametrize("constructor, expected", [
+    ("Lock(1)", "finding"), ("Lock(flag=True)", "finding"),
+    ("threading.Lock(1)", "finding"), ("threading.Lock(flag=True)", "finding"),
+    ("Lock(*())", "candidate"), ("Lock(**{})", "candidate"),
+    ("RLock(1)", "candidate"), ("RLock(flag=True)", "candidate"),
+])
+def test_lock_constructor_arguments_must_be_valid_for_the_factory(detector, constructor, expected):
+    found = mutations(detector, "import threading\nfrom threading import Lock, RLock\n"
+                      f"_guard = {constructor}\nregistry = {{}}\n"
+                      "def put(key):\n    with _guard:\n        registry[key] = 1\n")
+    assert len(found) == 1 and found[0].kind == expected
+
+
+@pytest.mark.parametrize("expression, protected, expected", [
+    ("(lambda: registry.pop(key))()", False, "finding"),
+    ("(lambda: registry.pop(key))()", True, "candidate"),
+    ("(lambda registry: registry.pop(key))(fake_registry)", False, "candidate"),
+    ("(lambda: registry.pop(key))", False, "candidate"),
+])
+def test_immediate_lambda_mutations_use_invocation_scope_and_guard_state(detector, expression, protected, expected):
+    indent = "        " if protected else "    "
+    found = mutations(detector, "from threading import Lock\n_guard = Lock()\nregistry = {}\n"
+                      "def put(key):\n    with _guard:\n        registry[key] = 1\n" + indent + expression + "\n")
+    assert len(found) == 1 and found[0].kind == expected
+
+
+@pytest.mark.parametrize("expression, expected", [
+    ("(lambda: (yield registry.pop(key)))()", "candidate"),
+    ("(lambda: (registry.pop(key) for value in values))()", "candidate"),
+    ("(lambda: (value for value in registry.pop(key)))()", "finding"),
+])
+def test_generator_creation_defers_its_body_but_evaluates_the_outer_iterable(detector, expression, expected):
+    found = mutations(detector, "from threading import Lock\n_guard = Lock()\nregistry = {}\n"
+                      "def put(key):\n    with _guard:\n        registry[key] = 1\n    " + expression + "\n")
+    assert len(found) == 1 and found[0].kind == expected
+
+
+@pytest.mark.parametrize("expression, expected", [
+    ("(lambda alias: alias.acquire())(_guard)", "finding"),
+    ("(lambda alias: alias.acquire())(fake_guard)", "candidate"),
+    ("_guard.acquire(timeout=0.01)", "candidate"),
+])
+def test_acquisition_evidence_uses_receiver_origins_and_a_finite_timeout(detector, expression, expected):
+    found = mutations(detector, "from threading import Lock\n_guard = Lock()\nregistry = {}\n"
+                      f"def put(key):\n    with _guard:\n        {expression}\n        registry[key] = 1\n")
+    assert len(found) == 1 and found[0].kind == expected
+
+
+def test_deleting_a_class_local_guard_restores_the_module_guard_for_mutations(detector):
+    found = mutations(detector, "from threading import Lock\n_guard = Lock()\nregistry = {}\n"
+                      "def put(key):\n    class Other:\n        _guard = fake_guard\n        del _guard\n"
+                      "        with _guard:\n            registry[key] = 1\n")
+    assert len(found) == 1 and found[0].kind == "candidate"
+
+
+def test_eager_class_definition_inputs_do_not_charge_a_class_local_registry(detector):
+    found = mutations(detector, "from threading import Lock\n_guard = Lock()\nregistry = {}\n"
+                      "def put(key):\n    with _guard:\n        registry[key] = 1\n"
+                      "    class Other:\n        registry = {}\n"
+                      "        def inner(value=registry.pop(key, None)):\n            pass\n")
+    assert len(found) == 1 and found[0].kind == "candidate"
+
+
+def test_immediate_lambda_comprehension_targets_do_not_shadow_the_module_object(detector):
+    found = mutations(detector, "from threading import Lock\n_guard = Lock()\nregistry = {}\n"
+                      "def put(key):\n    with _guard:\n        registry[key] = 1\n"
+                      "    (lambda: [registry.pop(key) for registry in fake_registries])()\n")
+    assert len(found) == 1 and found[0].kind == "candidate"
+
+
+def test_a_global_registry_rebound_inside_a_function_is_still_module_owned(detector):
+    found = mutations(detector, "registry = {}\n"
+                      "def put(key):\n    global registry\n    registry = {}\n    registry[key] = 1\n")
+    assert len(found) == 1 and found[0].kind == "finding"
+
+
+@pytest.mark.parametrize("statement", [
+    "(_guard if key else _guard).release()",
+    'setattr(threading if key else threading, "Lock", make_guard)',
+])
+def test_calls_evaluate_conditional_receiver_and_argument_origins_first(detector, statement):
+    found = mutations(detector, "import threading\n_guard = threading.Lock()\nregistry = {}\n"
+                      f"def put(key):\n    with _guard:\n        {statement}\n        registry[key] = 1\n")
+    assert len(found) == 1 and found[0].kind == "finding"
+
+
+def test_a_conditional_context_can_prove_one_identical_mutex(detector):
+    found = mutations(detector, "from threading import Lock\n_guard = Lock()\nregistry = {}\n"
+                      "def put(key):\n    with (_guard if key else _guard):\n        registry[key] = 1\n")
+    assert len(found) == 1 and found[0].kind == "candidate"
+
+
+def test_a_conditional_local_binding_never_becomes_a_module_registry(detector):
+    found = mutations(detector, "from threading import Lock\n_guard = Lock()\nregistry = {}\n"
+                      "def put(key):\n    with _guard:\n        registry[key] = 1\n"
+                      "def local(key):\n    if key:\n        registry = {}\n    registry[key] = 1\n")
+    assert len(found) == 1 and found[0].kind == "candidate"
