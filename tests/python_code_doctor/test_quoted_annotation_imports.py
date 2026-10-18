@@ -321,7 +321,7 @@ def test_an_async_loop_reads_its_iterable_before_binding_its_target(tmp_path):
 
 
 @pytest.mark.parametrize("module", ["typing", "typing_extensions"])
-@pytest.mark.parametrize("binding", ["", "cast = converter\n", "from converter import *\n"])
+@pytest.mark.parametrize("binding", ["", "cast = converter\n", "from converter import cast\n"])
 def test_typing_wildcard_records_cast_until_a_later_binding(tmp_path, module, binding):
     source = f"import used\nfrom {module} import *\n{binding}value = cast('used.Type', None)\n"
     assert ("used" in unused_imports(tmp_path, source)) == bool(binding)
@@ -675,3 +675,100 @@ def test_direct_aliases_keep_the_known_origin_without_inventing_type_semantics(t
     if "Choice" in expression:
         source = 'import used\n' + bindings + f'def run() -> {expression}: pass\n'
     assert ("used" not in unused_imports(tmp_path, source)) is used
+
+
+@pytest.mark.parametrize("loop,used", [
+    ('while flag:\n    cast = converter.cast\n', True),
+    ('while False:\n    cast = converter.cast\n', True),
+    ('while True:\n    cast = converter.cast\n    break\n', False),
+    ('for item in values:\n    break\nelse:\n    cast = converter.cast\n', True),
+    ('for item in values:\n    cast = converter.cast\n    break\nelse:\n    cast = converter.cast\n', False),
+    ('for item in []:\n    break\nelse:\n    cast = converter.cast\n', False),
+    ('for item in values:\n    for inner in values:\n        break\nelse:\n    cast = converter.cast\n', False),
+    ('while flag:\n    break\nelse:\n    cast = converter.cast\n', True),
+])
+def test_loop_entry_and_break_exits_keep_only_possible_typing_origins(tmp_path, loop, used):
+    source = 'import used\nfrom typing import cast\n' + loop + 'value = cast("used.Type", value)\n'
+    assert ("used" not in unused_imports(tmp_path, source)) is used
+
+
+@pytest.mark.parametrize("cases,used", [
+    ('    case 1:\n        cast = converter.cast\n    case _:\n        pass\n', True),
+    ('    case 1:\n        cast = converter.cast\n', True),
+    ('    case 1:\n        cast = converter.cast\n    case _:\n        cast = converter.cast\n', False),
+    ('    case cast:\n        pass\n', False),
+    ('    case _ if False:\n        cast = converter.cast\n    case _:\n        pass\n', True),
+])
+def test_match_cases_join_origins_and_bind_capture_names(tmp_path, cases, used):
+    source = ('import used\nfrom typing import cast\nmatch choice:\n' + cases
+              + 'value = cast("used.Type", value)\n')
+    assert ("used" not in unused_imports(tmp_path, source)) is used
+
+
+@pytest.mark.parametrize("imports,expression,used", [
+    ('from typing import cast\nfrom helpers import *\n', 'cast("used.Type", value)', True),
+    ('from converter import cast\nfrom typing import *\n', 'cast("used.Type", value)', True),
+    ('from converter import cast\nfrom helpers import *\n', 'cast("used.Type", value)', False),
+])
+def test_unknown_star_exports_do_not_erase_known_typing_alternatives(tmp_path, imports, expression, used):
+    source = 'import used\n' + imports + f'value = {expression}\n'
+    assert ("used" not in unused_imports(tmp_path, source)) is used
+
+
+@pytest.mark.parametrize("module,outer,inner,used", [
+    ('typing', 'converter', '', True),
+    ('converter', 'typing', '', False),
+    ('typing', 'converter', '        cast = converter.cast\n', False),
+])
+def test_explicit_global_uses_the_module_not_an_enclosing_local(tmp_path, module, outer, inner, used):
+    source = (f'import used\nimport typing\nimport converter\nfrom {module} import cast\n'
+              f'def outer():\n    cast = {outer}.cast\n    def inner(value):\n'
+              '        global cast\n' + inner + '        return cast("used.Type", value)\n'
+              '    return inner\n')
+    assert ("used" not in unused_imports(tmp_path, source)) is used
+
+
+def test_an_enclosing_global_store_is_visible_to_a_nested_global_read(tmp_path):
+    source = ('import unused\nimport converter\nfrom typing import cast\n'
+              'def outer():\n    global cast\n    cast = converter.cast\n'
+              '    def inner(value):\n        global cast\n'
+              '        return cast("unused.Type", value)\n    return inner\n')
+    assert "unused" in unused_imports(tmp_path, source)
+
+
+def test_an_uninvoked_function_does_not_replace_the_modules_binding(tmp_path):
+    source = ('import used\nimport converter\nfrom typing import cast\n'
+              'def replace():\n    global cast\n    cast = converter.cast\n'
+              'value = cast("used.Type", value)\n')
+    assert "used" not in unused_imports(tmp_path, source)
+
+
+def test_a_nested_global_read_can_use_its_enclosing_functions_later_import(tmp_path):
+    source = ('import used\ndef outer():\n    global cast\n'
+              '    def inner(value):\n        global cast\n'
+              '        return cast("used.Type", value)\n'
+              '    from typing import cast\n    return inner\n')
+    assert "used" not in unused_imports(tmp_path, source)
+
+
+def test_a_calls_own_later_global_import_does_not_bind_its_earlier_call(tmp_path):
+    source = ('import unused\ndef run(value):\n    global cast\n'
+              '    result = cast("unused.Type", value)\n'
+              '    from typing import cast\n    return result\n')
+    assert "unused" in unused_imports(tmp_path, source)
+
+
+@pytest.mark.parametrize("assignment", ['(convert := typing.cast)', 'convert: object = typing.cast'])
+def test_alias_assignment_expressions_share_direct_assignment_origins(tmp_path, assignment):
+    source = ('import used\nimport typing\n' + assignment
+              + '\nvalue = convert("used.Type", value)\n')
+    assert "used" not in unused_imports(tmp_path, source)
+
+
+@pytest.mark.skipif(sys.version_info < (3, 12), reason="PEP 695 requires Python 3.12")
+@pytest.mark.parametrize("declaration,used", [
+    ('type Alias = "used.Type"\n', True),
+    ('type Alias = Literal["used"]\nfrom typing import Literal\n', False),
+])
+def test_type_alias_values_are_deferred_type_positions(tmp_path, declaration, used):
+    assert ("used" not in unused_imports(tmp_path, 'import used\n' + declaration)) is used
