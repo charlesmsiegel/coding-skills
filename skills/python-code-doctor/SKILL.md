@@ -91,7 +91,8 @@ Protocol methods such as context-manager and iterator hooks, and ordinary privat
 methods, count as behavior when checking for data-only classes. Initializers alone
 still leave a data-container finding. Cohesion groups declared fields through
 resolved first-party Pydantic ancestry; unresolved or unrelated bases retain their
-normal evidence.
+normal evidence. Pydantic private attributes stay separate from validated model
+fields; underscore-prefixed dataclass fields remain part of their record.
 
 An `__import__` call whose arguments are all source literals keeps a
 `literal_import` design finding about its hidden dependency. Unresolved arguments,
