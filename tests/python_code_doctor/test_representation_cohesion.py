@@ -152,3 +152,92 @@ def test_representation_still_participates_in_other_coupling_checks(detector, tm
     """)
     found = detector.coupling_issues(ast.parse(source), str(tmp_path / "app.py"))
     assert any(record.issue_type == "message_chain" for record in found)
+
+
+@pytest.mark.parametrize("presentation", ["__repr__", "__str__"])
+def test_behavior_reaching_separate_state_through_presentation_still_counts(
+        detector, tmp_path, presentation):
+    source = textwrap.dedent(f"""
+        class Split:
+            def measure(self):
+                return len(self.metrics)
+
+            def save(self):
+                return self.{presentation}()
+
+            def {presentation}(self):
+                return self.payload
+    """)
+    [record] = cohesion(detector, tmp_path, source)
+    assert record.metric_value == 2
+    assert "{measure} and {save}" in record.description
+
+
+@pytest.mark.parametrize("presentation", ["__repr__", "__str__"])
+def test_behavior_reaching_shared_state_through_presentation_stays_connected(
+        detector, tmp_path, presentation):
+    source = textwrap.dedent(f"""
+        class Entry:
+            def measure(self):
+                return len(self.payload)
+
+            def save(self):
+                return self.{presentation}()
+
+            def {presentation}(self):
+                return self.payload
+    """)
+    assert cohesion(detector, tmp_path, source) == []
+
+
+def test_stateless_presentation_does_not_make_its_caller_stateful(detector, tmp_path):
+    source = textwrap.dedent("""
+        class Entry:
+            def measure(self):
+                return len(self.payload)
+
+            def label(self):
+                return self.__str__()
+
+            def __str__(self):
+                return 'Entry'
+    """)
+    assert cohesion(detector, tmp_path, source) == []
+
+
+def test_presentation_cycle_preserves_its_callers_reachable_state(detector, tmp_path):
+    source = textwrap.dedent("""
+        class Split:
+            def measure(self):
+                return len(self.metrics)
+
+            def save(self):
+                return self.__str__()
+
+            def __str__(self):
+                return self.__repr__()
+
+            def __repr__(self):
+                return self.payload + self.__str__()
+    """)
+    [record] = cohesion(detector, tmp_path, source)
+    assert record.metric_value == 2
+    assert "{measure} and {save}" in record.description
+
+
+def test_behavior_coordinating_groups_through_a_representation_can_join_them(detector, tmp_path):
+    source = textwrap.dedent("""
+        class Entry:
+            def left(self):
+                return self.left_value
+
+            def right(self):
+                return self.right_value
+
+            def save(self):
+                return self.__repr__()
+
+            def __repr__(self):
+                return str((self.left(), self.right()))
+    """)
+    assert cohesion(detector, tmp_path, source) == []
