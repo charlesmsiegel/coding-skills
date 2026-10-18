@@ -210,3 +210,31 @@ def function_scopes(tree):
             else:
                 yield from visit(child, enclosing)
     yield from visit(tree, frozenset())
+
+
+def independent_function_scopes(tree):
+    """Entry points whose bodies need a walk independent of visible calls.
+
+    A nested synchronous helper can use only its real invocation edges when
+    its single local binding has exclusively direct calls in the owning body.
+    Aliases, returned values, decorators and references in another deferred
+    body retain the independent-entry walk: their callers are not established.
+    """
+    parents = {child: node for node in ast.walk(tree) for child in ast.iter_child_nodes(node)}
+    for fn, enclosing in function_scopes(tree):
+        owner = parents[fn]
+        while not isinstance(owner, (ast.Module, ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
+            owner = parents[owner]
+        if isinstance(owner, (ast.FunctionDef, ast.AsyncFunctionDef)) and not fn.decorator_list and not callable_is_deferred(fn):
+            body = ast.Module(body=owner.body, type_ignores=[])
+            deferred = {node for node in ast.walk(body) if isinstance(node, ast.GeneratorExp)}
+            immediate = set(module_scope_nodes(body, skipped=deferred))
+            references = [node for node in ast.walk(body) if isinstance(node, ast.Name)
+                          and node.id == fn.name and isinstance(node.ctx, ast.Load)]
+            external_binding = any(isinstance(node, (ast.Global, ast.Nonlocal)) and fn.name in node.names
+                                   for node in immediate)
+            if (references and module_bindings(body)[fn.name] == 1 and not external_binding
+                    and all(node in immediate and isinstance(parents[node], ast.Call)
+                            and parents[node].func is node for node in references)):
+                continue
+        yield fn, enclosing

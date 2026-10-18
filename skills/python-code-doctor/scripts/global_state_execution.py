@@ -41,6 +41,7 @@ def _eager_children(node, contexts=None):
         if kind == "consume":
             children.append(value.elt)
             for index, generator in enumerate(value.generators):
+                children.append(generator.target)
                 children.extend(generator.ifs)
                 if index:
                     children.append(generator.iter)
@@ -62,16 +63,16 @@ def _module_name(value, names, contexts):
             and ("global", value.id) in contexts.get(value, ()))
 
 def mutated_names(node, names, contexts):
-    if isinstance(node, ast.AnnAssign) and node.value is None:
-        return set()
     if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
         if node.func.attr in _MUTATING_METHODS and _module_name(node.func.value, names, contexts):
             return {node.func.value.id}
-    targets = (node.targets if isinstance(node, (ast.Assign, ast.Delete)) else
-               [node.target] if isinstance(node, (ast.AugAssign, ast.AnnAssign)) else [])
-    return {part.value.id for target in targets for part in ast.walk(target)
-            if isinstance(part, ast.Subscript) and isinstance(part.ctx, (ast.Store, ast.Del))
-            and _module_name(part.value, names, contexts)}
+    # Store nodes execute under their actual enclosing mutex state. Reading
+    # them here also covers loop/comprehension and attribute targets without
+    # incorrectly assigning all descendants the statement's entry state.
+    if (isinstance(node, (ast.Subscript, ast.Attribute)) and isinstance(node.ctx, (ast.Store, ast.Del))
+            and _module_name(node.value, names, contexts)):
+        return {node.value.id}
+    return set()
 
 def _context_mutex(expression, locks, contexts):
     origins = {origin for origin in contexts.get(expression, ()) if origin[0] != "global"}
