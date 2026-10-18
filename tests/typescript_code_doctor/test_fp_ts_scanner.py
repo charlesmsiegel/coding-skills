@@ -420,3 +420,38 @@ def test_missing_import_type_skips_an_inline_type_specifier(tmp_path):
     })
     found = records("find_module_issues.py", root, "missing_import_type")
     assert [r["description"] for r in found] == ["`Row` from './client' is only used as a type"]
+
+
+@pytest.mark.parametrize("source", [
+    "const x = ready ? convert(value) : {};",
+    "const [counts] = useState<Record<string, number>>(() => (seed ? stored(seed) : {}));",
+    "const row = <Row {...(ready ? props(value) : {})} />;",
+    "const result = ready ? load() : Promise.resolve(fixture<Awaited<ReturnType<typeof api.getX>>>({meta:{}}));",
+    "const x = ready ? value : {};",
+])
+def test_rejected_method_probes_do_not_mark_ternary_values_as_types(ts, tmp_path, source):
+    file = parse(ts, source, "sample.tsx")
+    empty_objects = [i for i, token in enumerate(file.tokens)
+                     if token.is_op("{") and file.closer(i) == i + 1]
+    assert empty_objects
+    assert not any(file.in_type_position(i) for i in empty_objects)
+    root = project(tmp_path, {"src/sample.tsx": source})
+    assert records("find_type_gaps.py", root, "empty_object_type") == []
+
+
+@pytest.mark.parametrize("source, expected", [
+    ("type Empty = {};", 1),
+    ("const value: {} = {};", 1),
+    ("function accept(value: {}): {} { return {}; }", 2),
+    ("const methods = { make(): {} { return {}; } };", 1),
+    ("const methods = { make<T>(): Promise<{}> { return load(); } };", 1),
+])
+def test_confirmed_empty_object_types_keep_their_scored_findings(ts, tmp_path, source, expected):
+    file = parse(ts, source)
+    empty_types = [i for i, token in enumerate(file.tokens)
+                   if token.is_op("{") and file.closer(i) == i + 1 and file.in_type_position(i)]
+    assert len(empty_types) == expected
+    root = project(tmp_path, {"src/sample.ts": source})
+    found = records("find_type_gaps.py", root, "empty_object_type")
+    assert len(found) == expected
+    assert all(r["kind"] == "finding" and r["suggestion"] for r in found)
