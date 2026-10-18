@@ -127,7 +127,7 @@ def _mutates_name(node, names):
 
 
 def _context_mutex(expression, locks, contexts):
-    if not isinstance(expression, ast.Name) or expression.id not in locks:
+    if not isinstance(expression, ast.Name):
         return None
     origins = contexts.get(expression, ())
     if not origins or any(kind != "guard" or name not in locks for kind, name in origins):
@@ -249,6 +249,7 @@ def _module_bindings(tree) -> Counter:
 
 
 _UNKNOWN_ORIGINS = frozenset({("unknown", "")})
+_SETATTR_ORIGINS = frozenset({("builtin", "setattr")})
 
 
 def _merged_origins(*paths):
@@ -265,7 +266,7 @@ class _LockInterference(ast.NodeVisitor):
     """
 
     def __init__(self, bindings, replaced, released, contexts, *, module=False, class_outer=None):
-        self.bindings = {} if module else dict(bindings)
+        self.bindings = {"setattr": _SETATTR_ORIGINS} if module else dict(bindings)
         self.replaced, self.released = replaced, released
         self.module_seeds = dict(bindings) if module else {}
         self.class_outer = class_outer
@@ -359,6 +360,11 @@ class _LockInterference(ast.NodeVisitor):
             return
         if isinstance(node.func, ast.Attribute) and node.func.attr in {"release", "__exit__"}:
             self.released.update(name for kind, name in self._origins(node.func.value) if kind == "guard")
+        if ("builtin", "setattr") in self._origins(node.func) and len(node.args) == 3:
+            target, attribute, _ = node.args
+            if ("module", "threading") in self._origins(target) and isinstance(attribute, ast.Constant):
+                if isinstance(attribute.value, str) and attribute.value in _LOCK_FACTORIES:
+                    self.replaced.add((attribute.value, (node.lineno, node.col_offset)))
         self.generic_visit(node)
 
     def visit_If(self, node):
@@ -366,11 +372,24 @@ class _LockInterference(ast.NodeVisitor):
         self._alternatives([node.body, node.orelse])
 
     def visit_While(self, node):
-        self.visit(node.test)
         self._loop(node, dict(self.bindings))
 
     def _loop(self, node, before):
-        possible = self._body_origins(node.body)
+        # Every origin is one of this file's finite seeds or unknown. Joining
+        # carried bindings therefore reaches a fixed point without a cutoff,
+        # and contexts in later iterations cannot reuse first-iteration proof.
+        entry = dict(self.bindings)
+        while True:
+            self.bindings = dict(entry)
+            if isinstance(node, ast.While):
+                self.visit(node.test)
+            else:
+                self._bind(node.target)
+            possible = self._body_origins(node.body)
+            carried = _merged_origins(entry, possible, self.bindings)
+            if carried == entry:
+                break
+            entry = carried
         self._body(node.orelse)
         self.bindings = _merged_origins(before, possible, self.bindings)
 
@@ -427,7 +446,7 @@ class _LockInterference(ast.NodeVisitor):
                     self._set(pattern.name, _UNKNOWN_ORIGINS)
                 elif isinstance(pattern, ast.MatchMapping) and pattern.rest:
                     self._set(pattern.rest, _UNKNOWN_ORIGINS)
-            if isinstance(case.pattern, ast.MatchAs) and case.pattern.pattern is None and case.pattern.name:
+            if isinstance(case.pattern, ast.MatchAs) and case.pattern.name:
                 self._set(case.pattern.name, subject)
             if case.guard:
                 self.visit(case.guard)
@@ -500,6 +519,9 @@ def _lock_interference(tree, threading_modules, lock_names, contexts):
     known.update((name, frozenset({("guard", name)})) for name in lock_names)
     replaced, released = set(), set()
     _LockInterference(known, replaced, released, contexts, module=True)._body(tree.body)
+    if ("setattr" not in _module_bindings(tree)
+            and not any(isinstance(node, ast.Global) and "setattr" in node.names for node in ast.walk(tree))):
+        known["setattr"] = _SETATTR_ORIGINS
     for fn, enclosing in _function_scopes(tree):
         global_names = {name for node in _same_scope_nodes(fn.body)
                         if isinstance(node, ast.Global) for name in node.names}

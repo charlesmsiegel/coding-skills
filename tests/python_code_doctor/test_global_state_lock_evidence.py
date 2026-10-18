@@ -399,3 +399,70 @@ def test_immediate_lambda_calls_use_their_own_parameter_scope(detector, expressi
     found = mutations(detector, "from threading import Lock\n_guard = Lock()\nregistry = {}\n"
                       f"def put(key):\n    with _guard:\n        {expression}\n        registry[key] = 1\n")
     assert len(found) == 1 and found[0].kind == expected
+
+
+@pytest.mark.parametrize("factory, expected", [("Lock", "finding"), ("RLock", "candidate")])
+@pytest.mark.parametrize("contexts", ["_guard, alias", "_guard:\n        with alias"])
+def test_local_alias_acquisition_uses_the_recorded_mutex_identity(detector, factory, expected, contexts):
+    indent = "        " if "," in contexts else "            "
+    found = mutations(detector, f"from threading import {factory}\n_guard = {factory}()\nregistry = {{}}\n"
+                      f"def put(key):\n    alias = _guard\n    with {contexts}:\n{indent}registry[key] = 1\n")
+    assert len(found) == 1 and found[0].kind == expected
+
+
+@pytest.mark.parametrize("factory", ["Lock", "RLock"])
+@pytest.mark.parametrize("replacement", [
+    'setattr(threading, "{factory}", make_guard)',
+    'threads = threading\nsetattr(threads, "{factory}", make_guard)',
+    'def configure():\n    threads = threading\n    setattr(threads, "{factory}", make_guard)\nconfigure()',
+])
+def test_literal_setattr_replacements_cannot_establish_a_mutex(detector, factory, replacement):
+    found = mutations(detector, "import threading\n" + replacement.format(factory=factory) +
+                      f"\n_guard = threading.{factory}()\nregistry = {{}}\n"
+                      "def put(key):\n    with _guard:\n        registry[key] = 1\n")
+    assert len(found) == 1 and found[0].kind == "finding"
+
+
+@pytest.mark.parametrize("setup", [
+    'def other(setattr):\n    setattr(threading, "Lock", make_guard)\n',
+    'setattr = lambda obj, name, value: None\nsetattr(threading, "Lock", make_guard)\n',
+])
+def test_shadowed_setattr_does_not_prove_a_builtin_replacement(detector, setup):
+    found = mutations(detector, "import threading\n" + setup +
+                      "_guard = threading.Lock()\nregistry = {}\n"
+                      "def put(key):\n    with _guard:\n        registry[key] = 1\n")
+    assert len(found) == 1 and found[0].kind == "candidate"
+
+
+@pytest.mark.parametrize("loop", ["for index in range(2)", "while ready"])
+def test_later_iterations_cannot_reuse_an_earlier_class_guard_binding(detector, loop):
+    found = mutations(detector, "from threading import Lock\n_guard = Lock()\nregistry = {}\n"
+                      f"def put(key):\n    class Other:\n        {loop}:\n"
+                      "            with _guard:\n                registry[key] = 1\n            _guard = fake_guard\n")
+    assert len(found) == 1 and found[0].kind == "finding"
+
+
+def test_each_for_iteration_rebinds_its_target_before_the_body(detector):
+    found = mutations(detector, "from threading import Lock\n_guard = Lock()\nregistry = {}\n"
+                      "def put(key):\n    with _guard:\n        for alias in fake_guards:\n"
+                      "            alias.release()\n            alias = _guard\n        registry[key] = 1\n")
+    assert len(found) == 1 and found[0].kind == "candidate"
+
+
+@pytest.mark.parametrize("pattern", ["_ as alias", "object() as alias"])
+def test_top_level_as_patterns_capture_the_whole_match_subject(detector, pattern):
+    found = mutations(detector, "from threading import Lock\n_guard = Lock()\nregistry = {}\n"
+                      f"def put(key):\n    with _guard:\n        match _guard:\n            case {pattern}:\n"
+                      "                alias.release()\n        registry[key] = 1\n")
+    assert len(found) == 1 and found[0].kind == "finding"
+
+
+@pytest.mark.parametrize("loop, reset", [
+    ("for index in range(2)", "            _guard = _other\n"),
+    ("while (_guard := _other) and ready", ""),
+])
+def test_each_iteration_can_reestablish_a_known_class_guard(detector, loop, reset):
+    found = mutations(detector, "from threading import Lock\n_guard = Lock()\n_other = Lock()\nregistry = {}\n"
+                      f"def put(key):\n    class Other:\n        {loop}:\n" + reset +
+                      "            with _guard:\n                registry[key] = 1\n            _guard = fake_guard\n")
+    assert len(found) == 1 and found[0].kind == "candidate"
