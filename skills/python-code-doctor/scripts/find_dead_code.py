@@ -164,6 +164,14 @@ _CANDIDATE_REASONS = {
 
 
 class ScopeTracker(ast.NodeVisitor):
+    """Record uses in lexical namespaces, distinguishing immediate expressions
+    from deferred bodies. Defaults and definition headers read the enclosing
+    namespace; lambda/comprehension bindings stay local, and bodies do not
+    close over class namespaces. Unresolved body casts get a second reading
+    after enclosing bindings are known, without retracting earlier proven
+    uses or pretending to simulate arbitrary call order.
+    """
+
     def __init__(
         self,
         filename: str,
@@ -184,6 +192,10 @@ class ScopeTracker(ast.NodeVisitor):
         self.comments = comments
         self.import_origins: dict[str, str] = {}
         self._annotation_scopes = [("module", {})]
+        # Unresolved calls in deferred bodies may use an import below their
+        # definition. Keep their lexical namespaces alive until the module has
+        # been read; an earlier proven use still stands if a name is rebound.
+        self._deferred_casts: list[tuple[ast.Call, tuple]] = []
         self.current_app_config_names: set[str] = set()
         self.django_app_config_classes: set[ast.ClassDef] = set()
         self.function_stack: list[ast.FunctionDef | ast.AsyncFunctionDef] = []
@@ -271,26 +283,46 @@ class ScopeTracker(ast.NodeVisitor):
             elif node.level == 0 and node.module:
                 origins[local] = f"{node.module}.{alias.name}"
             else:
-                origins.pop(local, None)
+                origins[local] = None
+
+    def _annotation_origins(self) -> dict:
+        """Visible import origins, with explicit local shadows. A function or
+        comprehension does not close over a class's namespace; a class body
+        itself can see the names it has already bound."""
+        out = {}
+        for index, (kind, origins) in enumerate(self._annotation_scopes):
+            if kind != "class" or index == len(self._annotation_scopes) - 1:
+                out.update(origins)
+        return out
 
     @contextmanager
     def _annotation_scope(self, node):
         is_class = isinstance(node, ast.ClassDef)
-        # A method body does not close over its class namespace.
-        parent = self._annotation_scopes[-1][1] if is_class else next(
-            origins for kind, origins in reversed(self._annotation_scopes) if kind != "class"
-        )
-        origins = dict(parent)
-        if not is_class:
-            for arg in (*node.args.posonlyargs, *node.args.args, *node.args.kwonlyargs,
-                        node.args.vararg, node.args.kwarg):
+        origins = {}
+        args = getattr(node, "args", None)
+        if args is not None:
+            for arg in (*args.posonlyargs, *args.args, *args.kwonlyargs, args.vararg, args.kwarg):
                 if arg is not None:
-                    origins.pop(arg.arg, None)
-        self._annotation_scopes.append(("class" if is_class else "function", origins))
+                    origins[arg.arg] = None
+        kind = ("class" if is_class else "function" if args is not None else "comprehension")
+        self._annotation_scopes.append((kind, origins))
         try:
             yield
         finally:
             self._annotation_scopes.pop()
+
+    def visit_Module(self, node: ast.Module):
+        self.generic_visit(node)
+        # This is a file-local use analysis, not a simulation of call order.
+        # Revisit only unresolved type-bearing calls, retaining earlier proven
+        # uses as well as those the completed enclosing namespaces establish.
+        for call, enclosing in tuple(self._deferred_casts):
+            previous = self._annotation_scopes
+            self._annotation_scopes = list(enclosing)
+            try:
+                self._typing_cast_references(call)
+            finally:
+                self._annotation_scopes = previous
 
     def _remember_imports(self, node: ast.Import | ast.ImportFrom) -> None:
         self._remember_annotation_imports(node)
@@ -405,7 +437,7 @@ class ScopeTracker(ast.NodeVisitor):
 
     def visit_Name(self, node: ast.Name):
         if isinstance(node.ctx, (ast.Store, ast.Del)):
-            self._annotation_scopes[-1][1].pop(node.id, None)
+            self._annotation_scopes[-1][1][node.id] = None
         if isinstance(node.ctx, ast.Load):
             self.used_names.add(node.id)
             parent = self.parents.get(node)
@@ -428,15 +460,7 @@ class ScopeTracker(ast.NodeVisitor):
         Literal enum members and Annotated metadata still need their imports,
         without interpreting a string argument as another forward reference.
         """
-        nodes = list(ast.walk(node))
-        callees = {child.func for child in nodes if isinstance(child, ast.Call)}
-        for child in nodes:
-            if isinstance(child, ast.Name) and isinstance(child.ctx, ast.Load):
-                self.used_names.add(child.id)
-                if child not in callees:
-                    self.value_references.add(child.id)
-            elif isinstance(child, ast.Call):
-                self._call_references(child)
+        self.visit(node)
 
     def _annotation_references(self, node: ast.AST | None) -> None:
         """Read forward references only in annotation type positions."""
@@ -447,6 +471,10 @@ class ScopeTracker(ast.NodeVisitor):
                 expression = ast.parse(node.value, mode="eval").body
             except (SyntaxError, ValueError):
                 return
+            # Quoted expressions need the same parent relationships as the
+            # file's AST: a callee is called, not handed out as a callback.
+            self.parents.update((child, parent) for parent in ast.walk(expression)
+                                for child in ast.iter_child_nodes(parent))
             self._annotation_references(expression)
             return
         if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load):
@@ -454,7 +482,7 @@ class ScopeTracker(ast.NodeVisitor):
             self.used_names.add(node.id)
             self.value_references.add(node.id)
         if isinstance(node, ast.Subscript):
-            name = self._canonical_name(node.value, self._annotation_scopes[-1][1])
+            name = self._canonical_name(node.value, self._annotation_origins())
             self._annotation_references(node.value)
             if name in {"typing.Literal", "typing_extensions.Literal"}:
                 self._expression_references(node.slice)
@@ -467,6 +495,8 @@ class ScopeTracker(ast.NodeVisitor):
                 return  # Remaining arguments are metadata.
             self._annotation_references(node.slice)
             return
+        if isinstance(node, ast.Call):
+            self._call_references(node)
         for child in ast.iter_child_nodes(node):
             self._annotation_references(child)
 
@@ -481,39 +511,56 @@ class ScopeTracker(ast.NodeVisitor):
         self._annotation_references(node.annotation)
         self.generic_visit(node)
 
-    def visit_FunctionDef(self, node: ast.FunctionDef):
+    def _visit_function(self, node: ast.FunctionDef | ast.AsyncFunctionDef):
+        # These expressions execute before the function's parameters bind.
+        for expression in (*node.decorator_list, *node.args.defaults,
+                           *(default for default in node.args.kw_defaults if default is not None)):
+            self.visit(expression)
+        for parameter in getattr(node, "type_params", ()):
+            self.visit(parameter)
         self._signature_references(node)
         if node.col_offset == 0:
             self.functions[node.name] = node
         self._check_unreachable(node)
         self._check_unused_params(node)
-        self.function_stack.append(node)
-        try:
-            with self._annotation_scope(node):
-                self.generic_visit(node)
-        finally:
-            self.function_stack.pop()
-        self._annotation_scopes[-1][1].pop(node.name, None)
+        self._annotation_scopes[-1][1][node.name] = None
         if self._at_module_scope(node):
             self.import_origins.pop(node.name, None)
             self.current_app_config_names.discard(node.name)
+        self.function_stack.append(node)
+        try:
+            with self._annotation_scope(node):
+                for statement in node.body:
+                    self.visit(statement)
+        finally:
+            self.function_stack.pop()
 
-    def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef):
-        self._signature_references(node)
-        if node.col_offset == 0:
-            self.functions[node.name] = node
-        self._check_unreachable(node)
-        self._check_unused_params(node)
-        self.function_stack.append(node)
-        try:
-            with self._annotation_scope(node):
-                self.generic_visit(node)
-        finally:
-            self.function_stack.pop()
-        self._annotation_scopes[-1][1].pop(node.name, None)
-        if self._at_module_scope(node):
-            self.import_origins.pop(node.name, None)
-            self.current_app_config_names.discard(node.name)
+    visit_FunctionDef = visit_AsyncFunctionDef = _visit_function
+
+    def visit_Lambda(self, node: ast.Lambda):
+        for default in (*node.args.defaults, *(d for d in node.args.kw_defaults if d is not None)):
+            self.visit(default)
+        with self._annotation_scope(node):
+            self.visit(node.body)
+
+    def _visit_comprehension(self, node):
+        # Only the first iterable executes outside the comprehension's scope.
+        # Later iterables/filters see preceding targets, and no target leaks
+        # into the enclosing annotation or expression.
+        self.visit(node.generators[0].iter)
+        with self._annotation_scope(node):
+            for index, generator in enumerate(node.generators):
+                if index:
+                    self.visit(generator.iter)
+                self.visit(generator.target)
+                for condition in generator.ifs:
+                    self.visit(condition)
+            for field in ("elt", "key", "value"):
+                expression = getattr(node, field, None)
+                if expression is not None:
+                    self.visit(expression)
+
+    visit_ListComp = visit_SetComp = visit_DictComp = visit_GeneratorExp = _visit_comprehension
 
     def visit_ClassDef(self, node: ast.ClassDef):
         if node.col_offset == 0:
@@ -525,9 +572,15 @@ class ScopeTracker(ast.NodeVisitor):
         )
         if is_app_config:
             self.django_app_config_classes.add(node)
+        # A nested class's header still reads the enclosing class namespace;
+        # only its body starts a new namespace, and its methods skip that one.
+        for expression in (*node.decorator_list, *node.bases, *node.keywords,
+                           *getattr(node, "type_params", ())):
+            self.visit(expression)
         with self._annotation_scope(node):
-            self.generic_visit(node)
-        self._annotation_scopes[-1][1].pop(node.name, None)
+            for statement in node.body:
+                self.visit(statement)
+        self._annotation_scopes[-1][1][node.name] = None
         if self._at_module_scope(node):
             self.import_origins.pop(node.name, None)
             if is_app_config:
@@ -541,12 +594,19 @@ class ScopeTracker(ast.NodeVisitor):
             self.instantiated_classes.add(node.func.id)
         elif isinstance(node.func, ast.Attribute):
             self.called_functions.add(node.func.attr)
+        if not self._typing_cast_references(node) and any(
+                kind == "function" for kind, _origins in self._annotation_scopes):
+            self._deferred_casts.append((node, tuple(self._annotation_scopes)))
+
+    def _typing_cast_references(self, node: ast.Call) -> bool:
         # Only typing's cast gives its first argument type semantics. An
         # unrelated converter.cast("Model", value) receives ordinary data,
         # including when it appears inside quoted Annotated metadata.
-        callee = self._canonical_name(node.func, self._annotation_scopes[-1][1])
+        callee = self._canonical_name(node.func, self._annotation_origins())
         if callee in {"typing.cast", "typing_extensions.cast"} and node.args:
             self._annotation_references(node.args[0])
+            return True
+        return False
 
     def visit_Call(self, node: ast.Call):
         self._call_references(node)

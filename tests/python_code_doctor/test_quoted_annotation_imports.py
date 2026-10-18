@@ -191,3 +191,110 @@ def test_typing_cast_type_reader_preserves_literal_string_data(tmp_path):
     source = ("import unused\nfrom typing import Annotated, Literal, cast\n"
               "value: \"Annotated[int, cast(\\\"Literal['unused.Type']\\\", 1)]\"\n")
     assert "unused" in unused_imports(tmp_path, source)
+
+
+@pytest.mark.parametrize("declaration", [
+    "def result(cast=cast('used.Type', None)):\n    return cast",
+    "async def result(*, cast=cast('used.Type', None)):\n    return cast",
+    "@cast('used.Type', lambda function: function)\ndef result(cast):\n    return cast",
+    "result = lambda cast=cast('used.Type', None): cast",
+])
+def test_definition_expressions_resolve_cast_in_the_enclosing_scope(tmp_path, declaration):
+    source = f"import used\nfrom typing import cast\n{declaration}\n"
+    assert "used" not in unused_imports(tmp_path, source)
+
+
+def test_a_default_using_an_enclosing_parameter_does_not_become_a_typing_cast(tmp_path):
+    source = ("import unused\nfrom typing import cast\n"
+              "def outer(cast):\n"
+              "    def inner(cast=cast('unused.Type', None)):\n        return cast\n"
+              "    return inner\n")
+    assert "unused" in unused_imports(tmp_path, source)
+
+
+@pytest.mark.parametrize("metadata", [
+    "(lambda cast: cast('unused.Type', 1))(object())",
+    "[cast('unused.Type', 1) for cast in converters]",
+    "{cast('unused.Type', 1) for cast in converters}",
+    "{key: cast('unused.Type', 1) for key, cast in converters}",
+    "tuple(cast('unused.Type', 1) for cast in converters)",
+    "[value for cast in converters for value in cast('unused.Type', [])]",
+])
+@pytest.mark.parametrize("quoted", [False, True])
+def test_expression_local_cast_bindings_keep_type_like_strings_as_data(tmp_path, metadata, quoted):
+    annotation = f"Annotated[int, {metadata}]"
+    expression = repr(annotation) if quoted else annotation
+    source = ("import unused\nfrom typing import Annotated, cast\n"
+              f"value: {expression}\n")
+    assert "unused" in unused_imports(tmp_path, source)
+
+
+@pytest.mark.parametrize("metadata", [
+    "(lambda cast=cast('used.Type', 1): cast)()",
+    "[cast for cast in cast('used.Type', [])]",
+    "[cast('used.Type', value) for value in values]",
+])
+def test_nested_metadata_keeps_enclosing_typing_casts(tmp_path, metadata):
+    annotation = f"Annotated[int, {metadata}]"
+    source = f"import used\nfrom typing import Annotated, cast\nvalue: {annotation!r}\n"
+    assert "used" not in unused_imports(tmp_path, source)
+
+
+@pytest.mark.parametrize("metadata", [
+    "(lambda cast: cast('unused.Type', 1))(object())",
+    "[cast('unused.Type', 1) for cast in converters]",
+])
+def test_metadata_expression_bindings_do_not_leak_to_the_next_argument(tmp_path, metadata):
+    annotation = f"Annotated[int, {metadata}, cast('used.Type', 1)]"
+    source = f"import used\nimport unused\nfrom typing import Annotated, cast\nvalue: {annotation!r}\n"
+    assert "used" not in unused_imports(tmp_path, source)
+    assert "unused" in unused_imports(tmp_path, source)
+
+
+@pytest.mark.parametrize("imports,callee", [
+    ("from typing import cast", "cast"),
+    ("from typing_extensions import cast as convert", "convert"),
+    ("import typing as types", "types.cast"),
+])
+def test_a_function_body_resolves_module_imports_bound_after_its_definition(tmp_path, imports, callee):
+    source = (f"import used\ndef result(value):\n    return {callee}('used.Type', value)\n"
+              f"{imports}\n")
+    assert "used" not in unused_imports(tmp_path, source)
+
+
+@pytest.mark.parametrize("binding", [
+    "from converter import cast",
+    "from typing import cast\ncast = converter",
+])
+def test_a_deferred_body_does_not_assume_a_later_cast_is_typing(tmp_path, binding):
+    source = ("import unused\ndef result(value):\n    return cast('unused.Type', value)\n"
+              f"{binding}\n")
+    assert "unused" in unused_imports(tmp_path, source)
+
+
+def test_a_method_body_does_not_close_over_class_cast_bindings(tmp_path):
+    source = ("import used\nclass Container:\n    cast = converter\n"
+              "    def result(self, value):\n        return cast('used.Type', value)\n"
+              "from typing import cast\n")
+    assert "used" not in unused_imports(tmp_path, source)
+
+
+def test_a_nested_body_sees_its_enclosing_functions_later_import(tmp_path):
+    source = ("import used\ndef outer():\n"
+              "    def inner(value):\n        return cast('used.Type', value)\n"
+              "    from typing import cast\n    return inner\n")
+    assert "used" not in unused_imports(tmp_path, source)
+
+
+@pytest.mark.parametrize("rebind", ["cast = converter", "from converter import cast"])
+def test_a_cast_used_before_later_rebinding_keeps_its_type_import(tmp_path, rebind):
+    source = ("import used\nfrom typing import cast\ndef result(value):\n"
+              "    return cast('used.Type', value)\n"
+              f"value = result(1)\n{rebind}\n")
+    assert "used" not in unused_imports(tmp_path, source)
+
+
+def test_a_nested_class_header_uses_its_enclosing_class_namespace(tmp_path):
+    source = ("import used\nclass Container:\n    from typing import cast as convert\n"
+              "    @convert('used.Type', lambda cls: cls)\n    class Nested:\n        pass\n")
+    assert "used" not in unused_imports(tmp_path, source)
