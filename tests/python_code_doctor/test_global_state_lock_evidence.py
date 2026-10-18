@@ -254,3 +254,102 @@ def test_stable_module_and_factory_aliases_preserve_a_known_constructor(detector
     found = mutations(detector, setup + "registry = {}\n"
                       "def put(key):\n    with guard:\n        registry[key] = 1\n")
     assert len(found) == 1 and found[0].kind == "candidate"
+
+
+@pytest.mark.parametrize("assignment", ["threads = threading", "first = threading; threads = first"])
+def test_local_module_aliases_cannot_hide_factory_replacement(detector, assignment):
+    found = mutations(detector, "import threading\n"
+                      f"def configure():\n    {assignment}\n    threads.Lock = make_guard\n"
+                      "configure()\n_guard = threading.Lock()\nregistry = {}\n"
+                      "def put(key):\n    with _guard:\n        registry[key] = 1\n")
+    assert len(found) == 1 and found[0].kind == "finding"
+
+
+@pytest.mark.parametrize("assignment", ["alias = _guard", "first = _guard; alias = first"])
+@pytest.mark.parametrize("release", ["release()", "__exit__(None, None, None)"])
+def test_local_guard_aliases_cannot_hide_manual_release(detector, assignment, release):
+    found = mutations(detector, "from threading import Lock\n_guard = Lock()\nregistry = {}\n"
+                      f"def put(key):\n    {assignment}\n    with _guard:\n        alias.{release}\n"
+                      "        registry[key] = 1\n")
+    assert len(found) == 1 and found[0].kind == "finding"
+
+
+@pytest.mark.parametrize("assignment", ["threading.Lock = make_guard", "threads = threading; threads.Lock = make_guard"])
+def test_patched_constructor_imports_cannot_establish_a_mutex(detector, assignment):
+    found = mutations(detector, "import threading\n" + assignment + "\nfrom threading import Lock\n"
+                      "_guard = Lock()\nregistry = {}\n"
+                      "def put(key):\n    with _guard:\n        registry[key] = 1\n")
+    assert len(found) == 1 and found[0].kind == "finding"
+
+
+@pytest.mark.parametrize("body", [
+    "threading = fake_module\n    threading.Lock = make_guard",
+    "_guard = fake_guard\n    _guard.release()",
+])
+def test_class_local_objects_do_not_interfere_with_module_mutexes(detector, body):
+    found = mutations(detector, "import threading\n_guard = threading.Lock()\nregistry = {}\n"
+                      f"class Other:\n    {body}\n"
+                      "def put(key):\n    with _guard:\n        registry[key] = 1\n")
+    assert len(found) == 1 and found[0].kind == "candidate"
+
+
+@pytest.mark.parametrize("setup", [
+    "from app_guards import *; from threading import Lock; _guard = Lock()\n",
+    "from app_guards import *; import threading; _guard = threading.Lock()\n",
+])
+def test_same_line_explicit_bindings_after_a_wildcard_restore_the_proof(detector, setup):
+    found = mutations(detector, setup + "registry = {}\n"
+                      "def put(key):\n    with _guard:\n        registry[key] = 1\n")
+    assert len(found) == 1 and found[0].kind == "candidate"
+
+
+@pytest.mark.parametrize("body, expected", [
+    ("alias = fake_guard\n        alias.release()", "candidate"),
+    ("alias = _guard\n        alias = fake_guard\n        alias.release()", "candidate"),
+    ("if key:\n            alias = _guard\n        else:\n            alias = fake_guard\n        alias.release()", "finding"),
+])
+def test_local_aliases_follow_bindings_and_keep_uncertain_branches_conservative(detector, body, expected):
+    found = mutations(detector, "from threading import Lock\n_guard = Lock()\nregistry = {}\n"
+                      f"def put(key):\n    with _guard:\n        {body}\n        registry[key] = 1\n")
+    assert len(found) == 1 and found[0].kind == expected
+
+
+def test_nested_class_lookup_does_not_inherit_an_outer_class_local(detector):
+    found = mutations(detector, "import threading\n_guard = threading.Lock()\nregistry = {}\n"
+                      "class Other:\n    threading = fake_module\n    class Inner:\n        threading.Lock = make_guard\n"
+                      "def put(key):\n    with _guard:\n        registry[key] = 1\n")
+    assert len(found) == 1 and found[0].kind == "finding"
+
+
+@pytest.mark.parametrize("alias", ["", "new_lock = Lock\n"])
+def test_imported_factory_keeps_its_captured_object_after_module_replacement(detector, alias):
+    factory = "new_lock" if alias else "Lock"
+    found = mutations(detector, "import threading\nfrom threading import Lock\n" + alias +
+                      f"threading.Lock = make_guard\n_guard = {factory}()\nregistry = {{}}\n"
+                      "def put(key):\n    with _guard:\n        registry[key] = 1\n")
+    assert len(found) == 1 and found[0].kind == "candidate"
+
+
+def test_class_shadowing_cannot_hide_interference_before_the_assignment(detector):
+    found = mutations(detector, "import threading\n_guard = threading.Lock()\nregistry = {}\n"
+                      "class Other:\n    threading.Lock = make_guard\n    threading = fake_module\n"
+                      "def put(key):\n    with _guard:\n        registry[key] = 1\n")
+    assert len(found) == 1 and found[0].kind == "finding"
+
+
+@pytest.mark.parametrize("body", [
+    "alias = _guard\n            fail()\n        except Exception:\n            alias.release()",
+    "alias = _guard\n            fail()\n        finally:\n            alias.release()",
+])
+def test_exception_paths_keep_possible_guard_aliases(detector, body):
+    found = mutations(detector, "from threading import Lock\n_guard = Lock()\nregistry = {}\n"
+                      f"def put(key):\n    with _guard:\n        try:\n            {body}\n"
+                      "        registry[key] = 1\n")
+    assert len(found) == 1 and found[0].kind == "finding"
+
+
+def test_releasing_an_earlier_wildcard_object_does_not_release_a_later_guard(detector):
+    found = mutations(detector, "from app_guards import *\nalias = guard\nalias.release()\nfrom threading import Lock\n"
+                      "guard = Lock()\nregistry = {}\n"
+                      "def put(key):\n    with guard:\n        alias.release()\n        registry[key] = 1\n")
+    assert len(found) == 1 and found[0].kind == "candidate"
