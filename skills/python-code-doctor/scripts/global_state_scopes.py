@@ -38,6 +38,15 @@ def definition_inputs(node):
             + ([node.returns] if getattr(node, "returns", None) is not None else []))
 
 
+def bare_annotation_target_inputs(target):
+    """A bare complex annotation evaluates inputs without performing a store."""
+    if isinstance(target, ast.Attribute):
+        return [target.value]
+    if isinstance(target, ast.Subscript):
+        return [target.value, target.slice]
+    return []
+
+
 def callable_bound_names(node):
     if not isinstance(node, ast.Lambda):
         return bound_names(node)
@@ -125,7 +134,7 @@ def module_scope_nodes(tree, *, include_class_bodies=False, skipped=frozenset())
             stack.extend(v for v in node.args.kw_defaults if v is not None)
             continue
         if isinstance(node, ast.AnnAssign) and node.value is None:
-            stack.append(node.annotation)   # a bare annotation assigns no value
+            stack.extend([node.annotation, *bare_annotation_target_inputs(node.target)])
             continue
         if isinstance(node, ast.comprehension):
             stack.extend([node.iter] + list(node.ifs))
@@ -212,7 +221,19 @@ def function_scopes(tree):
     yield from visit(tree, frozenset())
 
 
-def entry_function_scopes(tree):
+def _exposes_locals(node, contexts):
+    if not isinstance(node, ast.Call) or node.args or node.keywords:
+        return False
+    origins = [origin for origin in contexts.get(node.func, ()) if origin[0] != "global"]
+    if any(kind == "builtin" and name in {"locals", "vars"} for kind, name in origins):
+        return True
+    # Unknown parameters may be the builtin; a visible shadowing callable
+    # instead retains its own body analysis without borrowing that spelling.
+    return (isinstance(node.func, ast.Name) and node.func.id in {"locals", "vars"}
+            and (not origins or any(kind != "callable" for kind, _ in origins)))
+
+
+def entry_function_scopes(tree, contexts):
     """Functions that may be entered independently of visible local call sites.
 
     A plain nested helper bound once, used only as a direct call in its owner's
@@ -238,6 +259,7 @@ def entry_function_scopes(tree):
             loads = [node for node in ast.walk(owner) if isinstance(node, ast.Name)
                      and isinstance(node.ctx, ast.Load) and node.id == fn.name]
             if (bindings[fn.name] == 1 and fn.name not in declarations and loads
+                    and not any(_exposes_locals(node, contexts) for node in lexical)
                     and all(node in lexical and isinstance(parents.get(node), ast.Call)
                             and parents[node].func is node for node in loads)):
                 continue

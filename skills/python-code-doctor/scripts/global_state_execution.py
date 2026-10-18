@@ -28,7 +28,7 @@ def _eager_children(node, contexts=None):
     elif isinstance(node, ast.GeneratorExp):
         children = [node.generators[0].iter]
     elif isinstance(node, ast.AnnAssign) and node.value is None:
-        children = [node.annotation]
+        children = [node.annotation, *scopes.bare_annotation_target_inputs(node.target)]
     else:
         children = list(ast.iter_child_nodes(node))
     if isinstance(node, ast.Call):

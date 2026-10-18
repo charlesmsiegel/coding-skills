@@ -74,6 +74,7 @@ class ImportReferences(ast.NodeVisitor):
         self._loop_continues = []
         self._suppressed_prefixes = []
         self._future_annotations = False
+        self._expression_values = {}
 
     def visit_Assign(self, node: ast.Assign):
         # Python evaluates the value with the old binding, then stores each
@@ -95,7 +96,7 @@ class ImportReferences(ast.NodeVisitor):
 
     def _assignment_origins(self, target, value):
         if isinstance(target, ast.Name):
-            names = self._canonical_names(value, self._annotation_origins())
+            names = self._value_names(value)
             # Other aliases have ordinary expression semantics. Collapsing
             # those origins also keeps repeated attribute stores a finite
             # domain when a loop's transfer is applied to a fixed point.
@@ -105,8 +106,15 @@ class ImportReferences(ast.NodeVisitor):
                     for name, origin in self._assignment_origins(left, right).items()}
         return {}
 
+    def _value_names(self, node):
+        names = self._expression_values.get(node)
+        if names is None:
+            names = self._canonical_names(node, self._annotation_origins())
+        return frozenset(name if name in _TYPING_ORIGINS else "" for name in names) or frozenset({""})
+
     def visit_NamedExpr(self, node: ast.NamedExpr):
         self.visit(node.value)
+        self._expression_values[node] = self._value_names(node.value)
         origins = self._assignment_origins(node.target, node.value)
         # Unlike a comprehension's iteration target, a walrus binds in its
         # containing non-comprehension scope (PEP 572).
@@ -123,7 +131,11 @@ class ImportReferences(ast.NodeVisitor):
 
     def visit_For(self, node: ast.For | ast.AsyncFor):
         self.visit(node.iter)
-        return self._visit_loop(node, [node.target, *node.body])
+        # Literal values capture before a target or body can rebind their names.
+        values = ([self._assignment_origins(node.target, item) for item in node.iter.elts]
+                  if isinstance(node.iter, (ast.Tuple, ast.List))
+                  and not any(isinstance(item, ast.Starred) for item in node.iter.elts) else None)
+        return self._visit_loop(node, node.body, values)
 
     def visit_While(self, node: ast.While):
         self.visit(node.test)
@@ -141,7 +153,7 @@ class ImportReferences(ast.NodeVisitor):
             return bool(node.iter.value)
         return None
 
-    def _visit_loop(self, node, body):
+    def _visit_loop(self, node, body, values=None):
         # A break skips else; a continue feeds the next iteration. Literal
         # sequences have an exact trip count. Otherwise join loop-head origins
         # until their finite typing-origin domain reaches a fixed point.
@@ -163,6 +175,10 @@ class ImportReferences(ast.NodeVisitor):
             iteration = 0
             while enters is not False:
                 self._restore_origins(head)
+                if isinstance(node, (ast.For, ast.AsyncFor)):
+                    self.visit(node.target)
+                    if values is not None:
+                        self._store_origins(values[iteration])
                 start = len(continues)
                 normal = self._visit_statements(body)
                 backedges = continues[start:]
@@ -173,7 +189,8 @@ class ImportReferences(ast.NodeVisitor):
                 following = self._joined_origins(backedges)
                 iteration += 1
                 if count is not None:
-                    if iteration == count or following == head:
+                    # Equal states do not skip later, different literal values.
+                    if iteration == count or values is None and following == head:
                         exhausted = [following]
                         break
                     head = following
@@ -267,6 +284,8 @@ class ImportReferences(ast.NodeVisitor):
 
     def visit_IfExp(self, node: ast.IfExp):
         self._visit_conditional(node.test, [node.body], [node.orelse])
+        values = [node.body if node.test.value else node.orelse] if isinstance(node.test, ast.Constant) else [node.body, node.orelse]
+        self._expression_values[node] = frozenset().union(*(self._value_names(value) for value in values))
 
     def _visit_conditional(self, test, body, otherwise):
         # The symbol table already establishes function-local names, including
@@ -280,17 +299,26 @@ class ImportReferences(ast.NodeVisitor):
             return self._join_branches((body, otherwise))
 
     def _visit_statements(self, statements, partial=None):
-        for statement in statements:
-            result = self.visit(statement)
-            state = self._origin_state()
+        if partial is not None:
+            partial_scope = tuple(id(origins) for _kind, origins, _globals in self._annotation_scopes)
+            self._suppressed_prefixes.append((partial_scope, partial))
+        try:
+            for statement in statements:
+                result = self.visit(statement)
+                self._capture_prefix()
+                if result is _TERMINATED:
+                    return False
+            return True
+        finally:
             if partial is not None:
-                partial.append(state)
-            for scopes, prefixes in self._suppressed_prefixes:
-                if tuple(id(origins) for _kind, origins, _globals in self._annotation_scopes) == scopes:
-                    prefixes.append(state)
-            if result is _TERMINATED:
-                return False
-        return True
+                self._suppressed_prefixes.pop()
+
+    def _capture_prefix(self):
+        """Handlers and suppressing contexts share prefixes in their own frame."""
+        scope = tuple(id(origins) for _kind, origins, _globals in self._annotation_scopes)
+        for scopes, prefixes in self._suppressed_prefixes:
+            if scope == scopes:
+                prefixes.append(self._origin_state())
 
     def _join_branches(self, alternatives):
         # Neither branch is known to run. Keep each possible origin; the last
@@ -355,14 +383,21 @@ class ImportReferences(ast.NodeVisitor):
         handler_entry = self._joined_origins(partial)
         normal_continues = body_continues and self._visit_statements(node.orelse, partial)
         continuing = [self._origin_state()] if normal_continues else []
-        for handler in node.handlers:
+        for handler in node.handlers if self._body_may_raise(node.body) else ():
             self._restore_origins(handler_entry)
+            if handler.type is not None:
+                self.visit(handler.type)
+            unmatched = self._origin_state()
             if self._visit_exception_handler(handler, partial):
                 continuing.append(self._origin_state())
             if isinstance(node, ast.TryStar):
                 # Several except* handlers can run in order; an ordinary except
                 # chooses only one. The next group may also skip earlier ones.
-                handler_entry = self._joined_origins([handler_entry, self._origin_state()])
+                handler_entry = self._joined_origins([unmatched, self._origin_state()])
+            else:
+                handler_entry = unmatched
+            if handler.type is None:
+                break
         normal = self._joined_origins(continuing) if continuing else self._origin_state()
         self._restore_origins(normal)
         if not node.finalbody:
@@ -387,9 +422,14 @@ class ImportReferences(ast.NodeVisitor):
 
     visit_TryStar = visit_Try
 
+    @staticmethod
+    def _body_may_raise(statements):
+        # Only syntactically inert bodies can rule handlers out. Dynamic
+        # values, imports and definitions retain the existing uncertainty.
+        return any(not isinstance(node, (ast.Pass, ast.Global, ast.Nonlocal, ast.Break, ast.Continue))
+                   and not (isinstance(node, ast.Expr) and isinstance(node.value, ast.Constant)) for node in statements)
+
     def _visit_exception_handler(self, handler, partial):
-        if handler.type is not None:
-            self.visit(handler.type)
         if handler.name:
             self._store_origins({handler.name: None})
         continues = self._visit_statements(handler.body, partial)
@@ -424,16 +464,41 @@ class ImportReferences(ast.NodeVisitor):
 
     def visit_BoolOp(self, node: ast.BoolOp):
         self.visit(node.values[0])
+        possible = frozenset()
         conditional = False
         for previous, value in zip(node.values, node.values[1:]):
             known = isinstance(previous, ast.Constant)
             if known and bool(previous.value) != isinstance(node.op, ast.And):
+                possible |= self._value_names(previous)
                 break
+            if not known:
+                possible |= self._value_names(previous)
             conditional = conditional or not known
             if conditional:
                 self._join_branches(([], [value]))
             else:
                 self.visit(value)
+        else:
+            possible |= self._value_names(node.values[-1])
+        self._expression_values[node] = possible
+
+    def visit_Compare(self, node):
+        self.visit(node.left)
+        self.visit(node.comparators[0])
+        for value in node.comparators[1:]:
+            self._join_branches(([], [value]))
+
+    def visit_Assert(self, node):
+        self.visit(node.test)
+        if isinstance(node.test, ast.Constant) and node.test.value:
+            return
+        before = self._origin_state()
+        if node.msg is not None:
+            self.visit(node.msg)
+        self._capture_prefix()  # A caught/suppressed AssertionError keeps the message's stores.
+        if isinstance(node.test, ast.Constant):
+            return _TERMINATED
+        self._restore_origins(before)
 
     @staticmethod
     def _origin_options(value):
@@ -590,6 +655,8 @@ class ImportReferences(ast.NodeVisitor):
         if isinstance(node.value, ast.Name):
             self.used_names.add(node.value.id)
         self.generic_visit(node)
+        if isinstance(node.ctx, ast.Load):
+            self._expression_values[node] = self._canonical_names(node, self._annotation_origins())
 
     def _expression_references(self, node: ast.AST) -> None:
         """Metadata expressions use names, while their strings remain data.
@@ -812,6 +879,7 @@ class ImportReferences(ast.NodeVisitor):
                 origins[node.id] = None
         if isinstance(node.ctx, ast.Load):
             self.used_names.add(node.id)
+            self._expression_values[node] = self._canonical_names(node, self._annotation_origins())
             parent = self.parents.get(node)
             if not (isinstance(parent, ast.Call) and parent.func is node):
                 self.value_references.add(node.id)

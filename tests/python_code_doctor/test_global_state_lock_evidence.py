@@ -1418,3 +1418,62 @@ def test_namespace_helper_effects_follow_call_order_for_saved_factories(detector
                       "_guard = Lock()\nregistry = {}\n"
                       "def put(key):\n    with _guard:\n        registry[key] = 1\n")
     assert len(found) == 1 and found[0].kind == expected
+
+
+@pytest.mark.parametrize("setup, snapshot, expected", [
+    ("", "locals()", "finding"),
+    ("", "vars()", "finding"),
+    ("", "snapshot()", "finding"),
+    ("import builtins\n", "builtins.locals()", "finding"),
+    ("locals = lambda: {}\n", "locals()", "candidate"),
+])
+def test_local_namespace_exposure_keeps_nested_helper_entry_conservative(detector, setup, snapshot, expected):
+    found = mutations(detector, "from threading import Lock\n_guard = Lock()\nregistry = {}\n" + setup +
+                      "def outer(key):\n    snapshot = locals\n    def helper():\n        registry[key] = 1\n"
+                      "    with _guard:\n        helper()\n    return " + snapshot + "\n")
+    assert len(found) == 1 and found[0].kind == expected
+
+
+def test_unknown_local_namespace_callable_cannot_prove_a_nested_helper_does_not_escape(detector):
+    found = mutations(detector, "from threading import Lock\n_guard = Lock()\nregistry = {}\n"
+                      "def outer(key, locals):\n    def helper():\n        registry[key] = 1\n"
+                      "    with _guard:\n        helper()\n    return locals()\n")
+    assert len(found) == 1 and found[0].kind == "finding"
+
+
+@pytest.mark.parametrize("target, expected", [
+    ("(_guard.release() or object()).marker", "finding"),
+    ("registry[_guard.release()]", "finding"),
+    ("registry[key]", "candidate"),
+])
+def test_bare_annotation_evaluates_target_inputs_without_storing(detector, target, expected):
+    body = ("        " + target + ": int\n        registry[key] = 1\n" if expected == "finding" else
+            "        registry[key] = 1\n    " + target + ": int\n")
+    found = mutations(detector, "from threading import Lock\n_guard = Lock()\nregistry = {}\n"
+                      "def put(key):\n    with _guard:\n" + body)
+    assert len(found) == 1 and found[0].kind == expected
+
+
+@pytest.mark.parametrize("returned, mutation", [
+    ("threading", "namespace().Lock = fake"),
+    ("threading.__dict__", 'namespace()["Lock"] = fake'),
+])
+@pytest.mark.parametrize("capture_first", [False, True])
+def test_returned_namespace_interference_preserves_original_factory_capture(detector, returned, mutation, capture_first):
+    capture = "from threading import Lock\n"
+    setup = capture + mutation + "\n" if capture_first else mutation + "\n" + capture
+    found = mutations(detector, "import threading\ndef namespace():\n    return " + returned + "\n" + setup +
+                      "_guard = Lock()\nregistry = {}\ndef put(key):\n    with _guard:\n        registry[key] = 1\n")
+    assert len(found) == 1 and found[0].kind == ("candidate" if capture_first else "finding")
+
+
+@pytest.mark.parametrize("metaclass, expected", [
+    (", metaclass=lambda name, bases, ns: (_guard.release(), type(name, bases, ns))[1]", "finding"),
+    (", metaclass=lambda name, bases, ns: type(name, bases, ns)", "finding"),
+    ("", "candidate"),
+])
+def test_visible_metaclass_execution_declines_unsupported_class_machinery(detector, metaclass, expected):
+    found = mutations(detector, "from threading import Lock\n_guard = Lock()\nregistry = {}\n"
+                      "def put(key):\n    with _guard:\n        class Entry(object" + metaclass + "):\n            pass\n"
+                      "        registry[key] = 1\n")
+    assert len(found) == 1 and found[0].kind == expected

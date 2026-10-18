@@ -19,7 +19,7 @@ _UNKNOWN_ORIGINS = frozenset({("unknown", "")})
 _ATTRIBUTE_BUILTINS = {"setattr": 3, "delattr": 2}
 _ITERATOR_CONSUMERS = {"list", "tuple", "set", "dict", "sum", "any", "all", "min", "max", "sorted", "next"}
 _LAZY_CALLBACKS = {"map", "filter"}
-_BUILTINS = set(_ATTRIBUTE_BUILTINS) | _ITERATOR_CONSUMERS | _LAZY_CALLBACKS | {"vars", "iter", "globals", "getattr"}
+_BUILTINS = set(_ATTRIBUTE_BUILTINS) | _ITERATOR_CONSUMERS | _LAZY_CALLBACKS | {"vars", "locals", "iter", "globals", "getattr"}
 _LAZY_KINDS = {"generator", "deferred", "callback_iterator", "uncertain_iterator"}
 _NAMESPACE_KEYS = {"threading": mutexes.LOCK_FACTORIES, "imports": {"threading"}, "builtins": {"__import__"}, "globals": {"*"}}
 # In a proven threading namespace, setdefault cannot replace the present factory.
@@ -229,6 +229,8 @@ class _LockInterference(ast.NodeVisitor):
         self.visit(node.annotation)
         if node.value is not None:
             self.visit_Assign(ast.Assign(targets=[node.target], value=node.value))
+        else:
+            self._body(scopes.bare_annotation_target_inputs(node.target))
 
     def visit_NamedExpr(self, node):
         self.visit(node.value)
@@ -445,7 +447,8 @@ class _LockInterference(ast.NodeVisitor):
     def _return_deferred(self, origins, node):
         # Possible returned operations keep their canonical receiver. Unknown
         # paths remain unknown: this does not prove a returned context manager.
-        operations = frozenset((kind, value) for kind, value in origins if kind in {"guard", "release", "acquire"})
+        operations = frozenset((kind, value) for kind, value in origins
+                               if kind in {"guard", "release", "acquire", "module", "namespace", "namespace_method"})
         if operations:
             self.returned_origins |= operations | _UNKNOWN_ORIGINS
         for kind, value in origins:
@@ -804,6 +807,11 @@ class _LockInterference(ast.NodeVisitor):
         nonlocals = {name for item in scopes.module_scope_nodes(ast.Module(body=node.body, type_ignores=[]))
                      if isinstance(item, ast.Nonlocal) for name in item.names}
         self._apply_scope_effects(child, nonlocals)
+        if any(keyword.arg == "metaclass" and any(kind == "callable" for kind, _ in self._origins(keyword.value))
+               for keyword in node.keywords):
+            # Invoking class machinery is unsupported positive evidence of
+            # retaining a mutex, even when its metaclass value is visible.
+            self._decline_mutex_proof()
         self._apply_decorators(node, decorators)
         self._set(node.name, _UNKNOWN_ORIGINS)
 
@@ -833,7 +841,7 @@ def _lock_interference(tree, threading_modules, lock_names, contexts, builtin_or
     for builtin in _BUILTINS:
         if builtin not in bindings and builtin not in module_globals and not wildcard:
             known[builtin] = frozenset({("builtin", builtin)})
-    for fn, enclosing in scopes.entry_function_scopes(tree):
+    for fn, enclosing in scopes.entry_function_scopes(tree, contexts):
         global_names = {name for node in scopes.module_scope_nodes(ast.Module(body=fn.body, type_ignores=[]))
                         if isinstance(node, ast.Global) for name in node.names}
         local = (scopes.bound_names(fn) | enclosing) - global_names
@@ -860,7 +868,7 @@ def mutation_guards(tree, candidate_names):
     locks = {name: mutex for name, mutex in locks.items() if mutex.identity not in prior}
     invalid_acquires = {node for node in contexts if execution.blocking_acquire(node, locks, contexts)}
     guarded = defaultdict(list)
-    for fn, _ in scopes.entry_function_scopes(tree):
+    for fn, _ in scopes.entry_function_scopes(tree, contexts):
         for node, held in execution.guarded_nodes(fn.body, locks, contexts, invalid_acquires, skipped):
             for name in execution.mutated_names(node, candidate_names, contexts):
                 guarded[name].append(held)
