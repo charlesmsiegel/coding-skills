@@ -221,12 +221,15 @@ def function_scopes(tree):
     yield from visit(tree, frozenset())
 
 
-def _exposes_locals(node, contexts):
+def _exposes_locals(node, contexts, parent):
     if not isinstance(node, ast.Call) or node.args or node.keywords:
         return False
     origins = [origin for origin in contexts.get(node.func, ()) if origin[0] != "global"]
     if any(kind == "builtin" and name in {"locals", "vars"} for kind, name in origins):
-        return True
+        # A standalone builtin call discards its snapshot without exposing it.
+        # Unknown callees can have effects even when their result is discarded.
+        return not (isinstance(parent, ast.Expr)
+                    and all(kind == "builtin" and name in {"locals", "vars"} for kind, name in origins))
     # Unknown parameters may be the builtin; a visible shadowing callable
     # instead retains its own body analysis without borrowing that spelling.
     return (isinstance(node.func, ast.Name) and node.func.id in {"locals", "vars"}
@@ -259,7 +262,7 @@ def entry_function_scopes(tree, contexts):
             loads = [node for node in ast.walk(owner) if isinstance(node, ast.Name)
                      and isinstance(node.ctx, ast.Load) and node.id == fn.name]
             if (bindings[fn.name] == 1 and fn.name not in declarations and loads
-                    and not any(_exposes_locals(node, contexts) for node in lexical)
+                    and not any(_exposes_locals(node, contexts, parents.get(node)) for node in lexical)
                     and all(node in lexical and isinstance(parents.get(node), ast.Call)
                             and parents[node].func is node for node in loads)):
                 continue

@@ -1441,6 +1441,43 @@ def test_unknown_local_namespace_callable_cannot_prove_a_nested_helper_does_not_
     assert len(found) == 1 and found[0].kind == "finding"
 
 
+@pytest.mark.parametrize("snapshot", ["locals()", "vars()", "snapshot()", "builtins.locals()"])
+@pytest.mark.parametrize("before_helper", [False, True])
+def test_discarded_builtin_namespace_snapshots_do_not_expose_a_nested_helper(detector, snapshot, before_helper):
+    before = "    " + snapshot + "\n" if before_helper else ""
+    after = "" if before_helper else "    " + snapshot + "\n"
+    found = mutations(detector, "import builtins\nfrom threading import Lock\n_guard = Lock()\nregistry = {}\n"
+                      "def outer(key):\n    snapshot = locals\n" + before +
+                      "    def helper():\n        registry[key] = 1\n"
+                      "    with _guard:\n        helper()\n" + after)
+    assert len(found) == 1 and found[0].kind == "candidate"
+
+
+@pytest.mark.parametrize("snapshot", ["locals()", "vars()"])
+@pytest.mark.parametrize("expose", ["return SNAPSHOT", "escaped = SNAPSHOT\n    return escaped",
+                                   "snapshots.append(SNAPSHOT)", "consume(SNAPSHOT)"])
+def test_used_namespace_snapshots_keep_possible_independent_helper_calls(detector, snapshot, expose):
+    found = mutations(detector, "from threading import Lock\n_guard = Lock()\nregistry = {}\n"
+                      "def outer(key, snapshots, consume):\n    def helper():\n        registry[key] = 1\n"
+                      "    with _guard:\n        helper()\n    " + expose.replace("SNAPSHOT", snapshot) + "\n")
+    assert len(found) == 1 and found[0].kind == "finding"
+
+
+def test_discarding_an_unknown_namespace_callable_result_does_not_prove_no_escape(detector):
+    found = mutations(detector, "from threading import Lock\n_guard = Lock()\nregistry = {}\n"
+                      "def outer(key, locals):\n    def helper():\n        registry[key] = 1\n"
+                      "    with _guard:\n        helper()\n    locals()\n")
+    assert len(found) == 1 and found[0].kind == "finding"
+
+
+def test_discarded_namespace_call_with_mixed_origins_still_retains_uncertainty(detector):
+    found = mutations(detector, "from threading import Lock\n_guard = Lock()\nregistry = {}\n"
+                      "def outer(key, replacement, flag):\n    snapshot = locals if flag else replacement\n"
+                      "    def helper():\n        registry[key] = 1\n"
+                      "    with _guard:\n        helper()\n    snapshot()\n")
+    assert len(found) == 1 and found[0].kind == "finding"
+
+
 @pytest.mark.parametrize("target, expected", [
     ("(_guard.release() or object()).marker", "finding"),
     ("registry[_guard.release()]", "finding"),
