@@ -407,3 +407,48 @@ def test_a_lambda_walrus_declares_a_local_before_its_first_reference(tmp_path):
     source = ('import unused\nfrom typing import cast as convert\n'
               'run = lambda value: (convert("unused.Type", value), (convert := converter))\n')
     assert "unused" in unused_imports(tmp_path, source)
+
+
+@pytest.mark.parametrize("condition,body", [
+    ('False', '        cast = converter\n'),
+    ('True', '        pass\n    else:\n        cast = converter\n'),
+])
+def test_a_nonexecuting_local_branch_preserves_a_previous_cast_import(tmp_path, condition, body):
+    source = ('import used\ndef run(value):\n    from typing import cast\n'
+              f'    if {condition}:\n{body}'
+              '    return cast("used.Type", value)\n')
+    assert "used" not in unused_imports(tmp_path, source)
+
+
+@pytest.mark.parametrize("target,imports", [
+    ('holder.value', 'import holder'),
+    ('mapping[key]', 'import mapping\nimport key'),
+    ('holder.values[key]', 'import holder\nimport key'),
+])
+def test_a_value_less_complex_annotation_reads_its_target(tmp_path, target, imports):
+    assert unused_imports(tmp_path, f'{imports}\n{target}: int\n') == set()
+
+
+@pytest.mark.skipif(sys.version_info < (3, 12), reason="PEP 695 type parameters require Python 3.12")
+@pytest.mark.parametrize("declaration", [
+    'def build[T: "models.Model"](): pass',
+    'class Build[T: "models.Model"]: pass',
+    'type Build[T: "models.Model"] = T',
+    'def build[T: (int, "models.Model")](): pass',
+    'class Build[T: (int, "models.Model")]: pass',
+    'type Build[T: (int, "models.Model")] = T',
+])
+def test_quoted_type_parameter_bounds_and_constraints_use_imports(tmp_path, declaration):
+    assert "models" not in unused_imports(tmp_path, f'import models\n{declaration}\n')
+
+
+@pytest.mark.skipif(sys.version_info < (3, 13), reason="PEP 696 defaults require Python 3.13")
+@pytest.mark.parametrize("declaration", [
+    'def build[T = "models.Model"](): pass',
+    'class Build[T = "models.Model"]: pass',
+    'type Build[T = "models.Model"] = T',
+    'def build[**P = ["models.Model"]](): pass',
+    'def build[*Ts = *tuple["models.Model"]](): pass',
+])
+def test_quoted_type_parameter_defaults_use_imports(tmp_path, declaration):
+    assert "models" not in unused_imports(tmp_path, f'import models\n{declaration}\n')
