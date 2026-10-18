@@ -175,9 +175,11 @@ def parse_federal_register(payload: bytes) -> list[Authority]:
 
 # --- eCFR: the codified regulations ---------------------------------------
 
-def ecfr_query_url(query: str, limit: int = 50, page: int = 1) -> str:
-    params = urlencode({"query": query, "per_page": min(limit, 100), "page": page})
-    return ECFR_SEARCH_API + "?" + params
+def ecfr_query_url(query: str, limit: int = 50, page: int = 1, as_of: str = "") -> str:
+    params = {"query": query, "per_page": min(limit, 100), "page": page}
+    if as_of:
+        params["date"] = as_of
+    return ECFR_SEARCH_API + "?" + urlencode(params)
 
 
 def ecfr_full_text_url(as_of: str, title: str, section: str = "") -> str:

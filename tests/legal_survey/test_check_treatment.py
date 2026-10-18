@@ -215,6 +215,19 @@ def test_an_opinion_stored_as_html_is_still_read(treat, tmp_path):
     assert read(tmp_path)["treatments"][0]["status"] == "negative"
 
 
+@pytest.mark.parametrize("body", [{}, {"plain_text": "  "},
+                                  {"html": "<p></p>"},
+                                  {"plain_text": "A different opinion without the cited authority."}])
+def test_unreadable_or_unlocated_citer_cannot_validate_a_case(treat, tmp_path, body):
+    setup(tmp_path, [case()])
+
+    treat.run(tmp_path, FakeHttp(citers(500), {"500": body}))
+
+    record = read(tmp_path)["treatments"][0]
+    assert record["status"] == "unchecked"
+    assert record["citing_checked"] == 0
+
+
 # --- honesty about limits ------------------------------------------------
 
 def test_a_truncated_walk_is_reported_rather_than_absorbed(treat, tmp_path):

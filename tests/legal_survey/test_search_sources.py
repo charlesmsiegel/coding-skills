@@ -85,6 +85,17 @@ def test_a_full_run_records_every_source_and_the_question(search, tmp_path):
     assert payload["question"] == "exemption 5"
 
 
+def test_ecfr_fetch_url_uses_the_requested_historical_date(search, tmp_path):
+    http = FakeHttp()
+    search.run("applicability", [], tmp_path, http, as_of="2019-01-01",
+               source_names=["ecfr"])
+
+    [authority] = read(tmp_path)["authorities"]
+    assert authority["as_of"] == "2019-01-01"
+    assert "/2019-01-01/" in authority["landing_url"]
+    assert "date=2019-01-01" in http.urls[0]
+
+
 def test_one_dead_source_is_a_caveat_not_a_crash(search, tmp_path):
     result = search.run("exemption 5", [], tmp_path, FakeHttp(dead={"api.crossref.org"}))
 

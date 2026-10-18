@@ -66,8 +66,9 @@ def run(question: str, issues: list[str], out: Path, http, forum: str = "",
         build_url, parse = PARSERS[name]
         for query in queries:
             try:
-                response = http.get(build_url(query, limit=limit))
-                found.extend(parse(response.body))
+                version = {"as_of": as_of} if name == "ecfr" else {}
+                response = http.get(build_url(query, limit=limit, **version))
+                found.extend(parse(response.body, **version))
                 succeeded[name] = succeeded.get(name, 0) + 1
             except Exception as exc:  # noqa: BLE001 - any source failure is a caveat
                 failures.setdefault(name, []).append(query + ": " + str(exc))

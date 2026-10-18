@@ -133,7 +133,7 @@ def _opinion_text(payload: dict) -> str:
     for field in ("plain_text", "html_with_citations", "html", "html_lawbox",
                   "html_columbia", "xml_harvard"):
         value = payload.get(field)
-        if value:
+        if value and _normalize(_strip_tags(value)):
             return value
     return ""
 
@@ -191,8 +191,11 @@ def check_one(authority: Authority, http, citing_cap: int, now=_now) -> Treatmen
                     body = http.get_json(_opinion_text_url(str(citing_id)))
                 except Exception:  # noqa: BLE001 - one dead citer is not a dead check
                     continue
+                text = _normalize(_strip_tags(_opinion_text(body)))
+                if not pattern.search(text):
+                    continue  # Empty or unlocatable opinions provide no treatment evidence.
                 checked += 1
-                signals.extend(find_signals(_opinion_text(body), pattern,
+                signals.extend(find_signals(text, pattern,
                                             citing=str(citing_id)))
                 break
 
