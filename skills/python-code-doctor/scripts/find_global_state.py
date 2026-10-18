@@ -32,6 +32,7 @@ from pathlib import Path
 from dataclasses import dataclass, asdict
 from collections import defaultdict
 import global_state_evidence as evidence
+import global_state_scopes as scopes
 from common import (sort_findings, cached_parse, SEVERITY_ICONS, configure_output, find_python_files,
                     reasoned_noqa, warn_detector_error, warn_unparseable)
 
@@ -112,7 +113,7 @@ def detect(tree, filename, lines, ignore):
 
     # Pass 2: scan every function for `global` rebinds and mutations of candidates
     locks, guarded = evidence.mutation_guards(tree, set(candidates))
-    for fn, _ in evidence.function_scopes(tree):
+    for fn, _ in scopes.function_scopes(tree):
         body = list(_same_scope_nodes(fn.body))
         global_lines = {}
         for n in body:

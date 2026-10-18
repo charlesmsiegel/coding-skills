@@ -868,3 +868,66 @@ def test_uncertain_deferred_consumption_before_entry_also_declines_the_proof(det
                       "def helper(lock):\n    lock.release()\n    yield None\n"
                       "def put(key):\n    list(helper(_guard))\n    with _guard:\n        registry[key] = 1\n")
     assert len(found) == 1 and found[0].kind == "finding"
+
+
+@pytest.mark.parametrize("annotation", [
+    "def helper(value: registry.pop(key)):\n        pass",
+    "def helper() -> registry.pop(key):\n        pass",
+    "class Notes:\n        value: registry.pop(key)",
+])
+@pytest.mark.parametrize("postponed", [False, True])
+def test_future_annotations_are_data_while_eager_definition_inputs_still_execute(detector, annotation, postponed):
+    prefix = "from __future__ import annotations\n" if postponed else ""
+    found = mutations(detector, prefix + "from threading import Lock\n_guard = Lock()\nregistry = {}\n"
+                      "def put(key):\n    with _guard:\n        registry[key] = 1\n    " + annotation + "\n")
+    assert len(found) == 1 and found[0].kind == ("candidate" if postponed else "finding")
+
+
+def test_postponing_annotations_does_not_postpone_defaults(detector):
+    found = mutations(detector, "from __future__ import annotations\nfrom threading import Lock\n_guard = Lock()\nregistry = {}\n"
+                      "def put(key):\n    with _guard:\n        registry[key] = 1\n"
+                      "    def helper(value=registry.pop(key)):\n        pass\n")
+    assert len(found) == 1 and found[0].kind == "finding"
+
+
+@pytest.mark.parametrize("body, expected", [("op = _guard.release", "finding"), ("return op", "candidate")])
+def test_invoked_helper_global_writes_decline_proof_but_reads_do_not(detector, body, expected):
+    found = mutations(detector, "from threading import Lock\n_guard = Lock()\nregistry = {}\nop = lambda: None\n"
+                      f"def configure():\n    global op\n    {body}\n"
+                      "def put(key):\n    configure()\n    with _guard:\n        op()\n        registry[key] = 1\n")
+    assert len(found) == 1 and found[0].kind == expected
+
+
+@pytest.mark.parametrize("declaration, assigned, expected", [
+    ("nonlocal op", "_guard.release", "finding"),
+    ("nonlocal op", "lambda: None", "candidate"),
+    ("pass", "_guard.release", "candidate"),
+])
+def test_class_nonlocals_update_the_owner_but_class_privates_do_not(detector, declaration, assigned, expected):
+    found = mutations(detector, "from threading import Lock\n_guard = Lock()\nregistry = {}\n"
+                      "def put(key):\n    op = lambda: None\n    class Configure:\n"
+                      f"        {declaration}\n        op = {assigned}\n"
+                      "    with _guard:\n        op()\n        registry[key] = 1\n")
+    assert len(found) == 1 and found[0].kind == expected
+
+
+@pytest.mark.parametrize("statement, expected", [
+    ("for alias in (_guard,):\n            alias.release()", "finding"),
+    ("for alias, in ((_guard,),):\n            alias.release()", "finding"),
+    ("for alias in (fake_guard,):\n            alias.release()", "candidate"),
+    ("[alias.release() for alias in (_guard,)]", "finding"),
+    ("[alias.release() for alias in (fake_guard,)]", "candidate"),
+])
+def test_literal_iteration_uses_the_same_element_binding_rule(detector, statement, expected):
+    found = mutations(detector, "from threading import Lock\n_guard = Lock()\nregistry = {}\n"
+                      f"def put(key):\n    with _guard:\n        {statement}\n        registry[key] = 1\n")
+    assert len(found) == 1 and found[0].kind == expected
+
+
+@pytest.mark.parametrize("method", ["difference_update", "intersection_update", "symmetric_difference_update"])
+@pytest.mark.parametrize("protected", [False, True])
+def test_public_inplace_set_methods_contribute_direct_write_evidence(detector, method, protected):
+    indent = "        " if protected else "    "
+    found = mutations(detector, "from threading import Lock\n_guard = Lock()\nregistry = set()\n"
+                      "def put(key):\n    with _guard:\n        registry.add(key)\n" + indent + f"registry.{method}({{key}})\n")
+    assert len(found) == 1 and found[0].kind == ("candidate" if protected else "finding")
