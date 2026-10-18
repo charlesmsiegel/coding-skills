@@ -39,7 +39,8 @@ _UNKNOWN_ORIGINS = frozenset({("unknown", "")})
 _ATTRIBUTE_BUILTINS = {"setattr": 3, "delattr": 2}
 _ITERATOR_CONSUMERS = {"list", "tuple", "set", "dict", "sum", "any", "all", "min", "max", "sorted", "next"}
 _LAZY_CALLBACKS = {"map", "filter"}
-_BUILTINS = set(_ATTRIBUTE_BUILTINS) | _ITERATOR_CONSUMERS | _LAZY_CALLBACKS | {"vars", "iter"}
+_BUILTINS = set(_ATTRIBUTE_BUILTINS) | _ITERATOR_CONSUMERS | _LAZY_CALLBACKS | {"vars", "iter", "getattr"}
+_MUTEX_OPERATIONS = {"release": "release", "__exit__": "release", "acquire": "acquire", "__enter__": "acquire"}
 _LAZY_KINDS = {"generator", "deferred", "callback_iterator", "uncertain_iterator"}
 _NAMESPACE_KEYS = {"threading": _LOCK_FACTORIES, "imports": {"threading"}}
 # In a proven threading namespace, setdefault cannot replace the present factory.
@@ -130,8 +131,8 @@ class _LockInterference(ast.NodeVisitor):
                                    and (value.attr not in _NAMESPACE_READERS or (name == "imports" and value.attr == "setdefault")))
             if namespaces:
                 return namespaces
-        if isinstance(value, ast.Attribute) and value.attr in {"release", "__exit__", "acquire", "__enter__"}:
-            operation = "release" if value.attr in {"release", "__exit__"} else "acquire"
+        if isinstance(value, ast.Attribute) and value.attr in _MUTEX_OPERATIONS:
+            operation = _MUTEX_OPERATIONS[value.attr]
             origins = frozenset((operation, name) for kind, name in self._origins(value.value) if kind == "guard")
             return origins or _UNKNOWN_ORIGINS
         if isinstance(value, ast.Attribute) and value.attr in _BUILTINS:
@@ -317,6 +318,8 @@ class _LockInterference(ast.NodeVisitor):
         # capture each argument's value before evaluating the next one.
         self.visit(node.func)
         callee = self._origins(node.func)
+        if any(kind == "uncertain_callable" for kind, _ in callee):
+            self._decline_mutex_proof()
         self.contexts[node.func] = self.contexts.get(node.func, frozenset()) | callee
         actual = []
         for value in node.args:
@@ -349,6 +352,14 @@ class _LockInterference(ast.NodeVisitor):
             self.expression_origins[node] = frozenset({("callback_iterator", node)})
         if ("builtin", "vars") in callee and len(actual) == 1 and ("module", "threading") in actual[0]:
             self.expression_origins[node] = frozenset({("namespace", "threading")})
+        if (("builtin", "getattr") in callee and len(actual) in {2, 3}
+                and isinstance(node.args[1], ast.Constant) and node.args[1].value in _MUTEX_OPERATIONS):
+            operation = _MUTEX_OPERATIONS[node.args[1].value]
+            self.expression_origins[node] = frozenset((operation, name) for kind, name in actual[0] if kind == "guard")
+        callback = keywords.get("key", frozenset())
+        if (isinstance(node.func, ast.Attribute) and node.func.attr == "sort"
+                and any(kind == "callable" for kind, _ in callback)):
+            self._apply_callbacks(node, callback, [_UNKNOWN_ORIGINS])
         if any(("builtin", name) in callee for name in _ITERATOR_CONSUMERS):
             if actual:
                 self._consume_values(node, actual[0])
@@ -428,6 +439,10 @@ class _LockInterference(ast.NodeVisitor):
         self._consume_values(node, self._origins(node.value))
 
     def _return_deferred(self, origins, node):
+        if any(kind in {"callable", "uncertain_callable"} for kind, _ in origins):
+            # A returned closure's cells are not modeled after its owner exits.
+            # Retain uncertainty until invocation rather than inventing origins.
+            self.returned_origins |= {("uncertain_callable", node)}
         values = frozenset((kind, value) for kind, value in origins if kind in _LAZY_KINDS)
         if values:
             # Creation/return does not consume a body. Its escaped closure and
@@ -514,6 +529,13 @@ class _LockInterference(ast.NodeVisitor):
     visit_AsyncFor = visit_For
 
     def _bind_iteration(self, node):
+        for kind, value in self._origins(node.iter):
+            if kind == "generator" and any(
+                    origin == "guard" for part in ast.walk(value.elt)
+                    for origin, _ in self.contexts.get(part, ())):
+                # Yielded container/alias ownership is not part of the iterator
+                # model. A visible mutex cannot disappear into an unknown target.
+                self._decline_mutex_proof()
         if isinstance(node.iter, (ast.Tuple, ast.List)) and node.iter.elts:
             before, outcomes = dict(self.bindings), []
             for value in node.iter.elts:
@@ -664,7 +686,7 @@ class _LockInterference(ast.NodeVisitor):
         if not outer_evaluated:
             self.visit(node.generators[0].iter)
         targets = {item.id for generator in node.generators for item in ast.walk(generator.target)
-                   if isinstance(item, ast.Name)}
+                   if isinstance(item, ast.Name) and isinstance(item.ctx, ast.Store)}
         outer = self.bindings if self.class_outer is None else self.class_outer
         child = self._child(outer, local_names=self.local_names | targets)
         for index, generator in enumerate(node.generators):
@@ -763,12 +785,12 @@ def _lock_interference(tree, threading_modules, lock_names, contexts, builtin_or
                    for node in scopes.module_scope_nodes(tree))
     stable = {name for name, count in bindings.items() if count == 1} - module_globals
     for name, origins in module.bindings.items():
-        if name in stable and any(kind in {"callable", "release", "acquire", "guard", "generator", "deferred", "namespace", "namespace_method", "callback_iterator"} for kind, _ in origins):
+        if name in stable and any(kind in {"callable", "uncertain_callable", "release", "acquire", "guard", "generator", "deferred", "namespace", "namespace_method", "callback_iterator"} for kind, _ in origins):
             known[name] = origins
     for builtin in _BUILTINS:
         if builtin not in bindings and builtin not in module_globals and not wildcard:
             known[builtin] = frozenset({("builtin", builtin)})
-    for fn, enclosing in scopes.function_scopes(tree):
+    for fn, enclosing in scopes.entry_function_scopes(tree):
         global_names = {name for node in scopes.module_scope_nodes(ast.Module(body=fn.body, type_ignores=[]))
                         if isinstance(node, ast.Global) for name in node.names}
         local = (scopes.bound_names(fn) | enclosing) - global_names
@@ -906,7 +928,7 @@ def mutation_guards(tree, candidate_names):
     locks = {name: mutex for name, mutex in locks.items() if mutex.identity not in prior}
     invalid_acquires = {node for node in contexts if execution.blocking_acquire(node, locks, contexts)}
     guarded = defaultdict(list)
-    for fn, _ in scopes.function_scopes(tree):
+    for fn, _ in scopes.entry_function_scopes(tree):
         for node, held in execution.guarded_nodes(fn.body, locks, contexts, invalid_acquires, skipped):
             for name in execution.mutated_names(node, candidate_names, contexts):
                 guarded[name].append(held)

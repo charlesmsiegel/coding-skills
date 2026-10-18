@@ -210,3 +210,34 @@ def function_scopes(tree):
             else:
                 yield from visit(child, enclosing)
     yield from visit(tree, frozenset())
+
+
+def entry_function_scopes(tree):
+    """Functions that may be entered independently of visible local call sites.
+
+    A plain nested helper bound once, used only as a direct call in its owner's
+    execution scope, cannot escape. Its invocation edges supply its mutex state.
+    Any alias, closure capture, decorator, rebinding or deferred body keeps the
+    independent scan rather than assuming an unseen caller is synchronized.
+    """
+    parents = {child: parent for parent in ast.walk(tree) for child in ast.iter_child_nodes(parent)}
+    inventories = {}
+    for fn, enclosing in function_scopes(tree):
+        owner = parents.get(fn)
+        while owner is not None and not isinstance(owner, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda)):
+            owner = parents.get(owner)
+        if (isinstance(owner, (ast.FunctionDef, ast.AsyncFunctionDef)) and not fn.decorator_list
+                and not callable_is_deferred(fn)):
+            if owner not in inventories:
+                scope = ast.Module(body=owner.body, type_ignores=[])
+                lexical = set(module_scope_nodes(scope))
+                declarations = {name for node in lexical if isinstance(node, (ast.Global, ast.Nonlocal)) for name in node.names}
+                inventories[owner] = lexical, module_bindings(scope), declarations
+            lexical, bindings, declarations = inventories[owner]
+            loads = [node for node in ast.walk(owner) if isinstance(node, ast.Name)
+                     and isinstance(node.ctx, ast.Load) and node.id == fn.name]
+            if (bindings[fn.name] == 1 and fn.name not in declarations and loads
+                    and all(node in lexical and isinstance(parents.get(node), ast.Call)
+                            and parents[node].func is node for node in loads)):
+                continue
+        yield fn, enclosing
