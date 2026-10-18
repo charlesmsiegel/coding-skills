@@ -25,12 +25,14 @@ def _definition_inputs(node):
     args = node.args
     params = list(args.posonlyargs) + list(args.args) + list(args.kwonlyargs)
     params += [arg for arg in (args.vararg, args.kwarg) if arg]
-    return (node.decorator_list + list(args.defaults) + [value for value in args.kw_defaults if value is not None]
+    return (getattr(node, "decorator_list", []) + list(args.defaults) + [value for value in args.kw_defaults if value is not None]
             + [arg.annotation for arg in params if arg.annotation is not None]
-            + ([node.returns] if node.returns is not None else []))
+            + ([node.returns] if getattr(node, "returns", None) is not None else []))
 
 
-def _lambda_bound_names(node):
+def _callable_bound_names(node):
+    if not isinstance(node, ast.Lambda):
+        return _bound_names(node)
     args = node.args
     params = list(args.posonlyargs) + list(args.args) + list(args.kwonlyargs)
     params += [arg for arg in (args.vararg, args.kwarg) if arg]
@@ -40,9 +42,10 @@ def _lambda_bound_names(node):
     return names
 
 
-def _lambda_is_generator(node):
-    return any(isinstance(item, (ast.Yield, ast.YieldFrom))
-               for item in _module_scope_nodes(ast.Module(body=[node.body], type_ignores=[])))
+def _callable_is_deferred(node):
+    body = [node.body] if isinstance(node, ast.Lambda) else node.body
+    return isinstance(node, ast.AsyncFunctionDef) or any(isinstance(item, (ast.Yield, ast.YieldFrom))
+               for item in _module_scope_nodes(ast.Module(body=body, type_ignores=[])))
 
 
 def _eager_children(node, contexts=None):
@@ -55,9 +58,11 @@ def _eager_children(node, contexts=None):
         return [node.generators[0].iter]
     children = list(ast.iter_child_nodes(node))
     if isinstance(node, ast.Call):
-        lambdas = {node.func} if isinstance(node.func, ast.Lambda) else {
-            value for kind, value in (contexts or {}).get(node.func, ()) if kind == "lambda"}
-        children.extend(value.body for value in lambdas if not _lambda_is_generator(value))
+        callables = {node.func} if isinstance(node.func, ast.Lambda) else {
+            value for kind, value in (contexts or {}).get(node.func, ()) if kind == "callable"}
+        for value in callables:
+            if not _callable_is_deferred(value):
+                children.extend([value.body] if isinstance(value, ast.Lambda) else value.body)
     return children
 
 
@@ -120,8 +125,7 @@ def _context_mutex(expression, locks, contexts):
 
 
 def _blocking_acquire(node, locks, contexts):
-    if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
-            and node.func.attr in {"acquire", "__enter__"}):
+    if not isinstance(node, ast.Call):
         return False
     kwargs = {keyword.arg: keyword.value for keyword in node.keywords}
     blocking = node.args[0] if node.args else kwargs.get("blocking")
@@ -132,7 +136,7 @@ def _blocking_acquire(node, locks, contexts):
         return False
     held = {locks[name].identity for kind, name in contexts.get(node, ()) if kind == "guard" and name in locks}
     return any(locks[name].factory == "Lock" and locks[name].identity in held
-               for kind, name in contexts.get(node.func.value, ()) if kind == "guard" and name in locks)
+               for kind, name in contexts.get(node.func, ()) if kind == "acquire" and name in locks)
 
 
 def _guarded_nodes(stmts, locks, contexts, invalid_acquires):
@@ -273,7 +277,7 @@ class _LockInterference(ast.NodeVisitor):
     """
 
     def __init__(self, bindings, replaced, released, contexts, *, module=False, class_outer=None,
-                 held=frozenset(), local_names=frozenset(), lambda_values=None, active_lambdas=None,
+                 held=frozenset(), local_names=frozenset(), callable_values=None, active_calls=None,
                  global_bindings=None):
         self.bindings = {name: frozenset({("builtin", name)}) for name in _ATTRIBUTE_BUILTINS} if module else dict(bindings)
         self.replaced, self.released = replaced, released
@@ -286,24 +290,31 @@ class _LockInterference(ast.NodeVisitor):
         self.local_names = local_names
         self.global_names = set()
         self.module = module
-        self.lambda_values = {} if lambda_values is None else lambda_values
-        self.active_lambdas = set() if active_lambdas is None else active_lambdas
+        self.callable_values = {} if callable_values is None else callable_values
+        self.active_calls = set() if active_calls is None else active_calls
         self.global_bindings = bindings if global_bindings is None else global_bindings
 
     def _child(self, bindings, *, class_outer=None, local_names=frozenset()):
         return _LockInterference(bindings, self.replaced, self.released, self.contexts,
                                  class_outer=class_outer, held=self.held, local_names=local_names,
-                                 lambda_values=self.lambda_values, active_lambdas=self.active_lambdas,
+                                 callable_values=self.callable_values, active_calls=self.active_calls,
                                  global_bindings=self.global_bindings)
 
     def _origins(self, value):
         if isinstance(value, ast.Name):
             missing = _UNKNOWN_ORIGINS if value.id in self.local_names else _UNKNOWN_ORIGINS | {("global", value.id)}
             return self._scoped_origins(value.id, self.bindings.get(value.id, missing))
-        if isinstance(value, ast.IfExp):
+        if isinstance(value, (ast.IfExp, ast.NamedExpr)):
             return self.expression_origins.get(value, _UNKNOWN_ORIGINS)
         if isinstance(value, ast.Lambda):
-            return frozenset({("lambda", value)})
+            return frozenset({("callable", value)})
+        if isinstance(value, ast.Attribute) and value.attr == "__dict__":
+            if ("module", "threading") in self._origins(value.value):
+                return frozenset({("namespace", "threading")})
+        if isinstance(value, ast.Attribute) and value.attr in {"release", "__exit__", "acquire", "__enter__"}:
+            operation = "release" if value.attr in {"release", "__exit__"} else "acquire"
+            origins = frozenset((operation, name) for kind, name in self._origins(value.value) if kind == "guard")
+            return origins or _UNKNOWN_ORIGINS
         if isinstance(value, ast.Attribute) and value.attr in _ATTRIBUTE_BUILTINS:
             if ("module", "builtins") in self._origins(value.value):
                 return frozenset({("builtin", value.attr)})
@@ -380,7 +391,9 @@ class _LockInterference(ast.NodeVisitor):
 
     def visit_NamedExpr(self, node):
         self.visit(node.value)
-        self._bind(node.target, self._origins(node.value))
+        origins = self._origins(node.value)
+        self.expression_origins[node] = origins
+        self._bind(node.target, origins)
 
     def visit_AugAssign(self, node):
         self.visit(node.value)
@@ -409,10 +422,18 @@ class _LockInterference(ast.NodeVisitor):
             self._set(alias.asname or alias.name, origins)
 
     def visit_Attribute(self, node):
+        self.visit(node.value)
         if isinstance(node.ctx, (ast.Store, ast.Del)) and node.attr in _LOCK_FACTORIES:
             if ("module", "threading") in self._origins(node.value):
                 self.replaced.add((node.attr, (node.lineno, node.col_offset)))
-        self.generic_visit(node)
+
+    def visit_Subscript(self, node):
+        self.visit(node.value)
+        namespace = self._origins(node.value)
+        self.visit(node.slice)
+        if (isinstance(node.ctx, (ast.Store, ast.Del)) and ("namespace", "threading") in namespace
+                and isinstance(node.slice, ast.Constant) and node.slice.value in _LOCK_FACTORIES):
+            self.replaced.add((node.slice.value, (node.lineno, node.col_offset)))
 
     def visit_Call(self, node):
         # Capture the callable/receiver before arguments can rebind names, and
@@ -420,7 +441,6 @@ class _LockInterference(ast.NodeVisitor):
         self.visit(node.func)
         callee = self._origins(node.func)
         self.contexts[node.func] = self.contexts.get(node.func, frozenset()) | callee
-        receiver = self._origins(node.func.value) if isinstance(node.func, ast.Attribute) else frozenset()
         actual = []
         for value in node.args:
             self.visit(value)
@@ -430,13 +450,11 @@ class _LockInterference(ast.NodeVisitor):
             self.visit(keyword.value)
             keywords[keyword.arg] = self._origins(keyword.value)
         for kind, value in callee:
-            if kind == "lambda":
-                self._invoke_lambda(value, actual, keywords)
-        if isinstance(node.func, ast.Attribute) and node.func.attr in {"acquire", "__enter__"}:
-            self.contexts[node.func.value] = self.contexts.get(node.func.value, frozenset()) | receiver
+            if kind == "callable":
+                self._invoke_callable(value, actual, keywords, any(isinstance(arg, ast.Starred) for arg in node.args))
+        if any(kind == "acquire" for kind, _ in callee):
             self.contexts[node] = self.contexts.get(node, frozenset()) | self.held
-        if isinstance(node.func, ast.Attribute) and node.func.attr in {"release", "__exit__"}:
-            self.released.update(name for kind, name in receiver if kind == "guard")
+        self.released.update(name for kind, name in callee if kind == "release")
         if any(("builtin", name) in callee and len(node.args) == arity for name, arity in _ATTRIBUTE_BUILTINS.items()):
             attribute = node.args[1]
             if ("module", "threading") in actual[0] and isinstance(attribute, ast.Constant):
@@ -546,24 +564,27 @@ class _LockInterference(ast.NodeVisitor):
         self.bindings = _merged_origins(*outcomes)
 
     def visit_FunctionDef(self, node):
-        self._body(_definition_inputs(node))
-        self._set(node.name, _UNKNOWN_ORIGINS)
+        self._record_callable(node)
+        self._set(node.name, frozenset({("callable", node)}))
 
     visit_AsyncFunctionDef = visit_FunctionDef
 
     def visit_Lambda(self, node):
+        self._record_callable(node)
+
+    def _record_callable(self, node):
         # Defaults capture values now; free local names remain late-bound in
-        # this lexical scope when a visible lambda value is called later.
+        # this lexical scope when a visible callable value is called later.
         positional = list(node.args.posonlyargs) + list(node.args.args)
         defaults = {}
-        values = list(zip(positional[len(positional) - len(node.args.defaults):], node.args.defaults))
-        values += list(zip(node.args.kwonlyargs, node.args.kw_defaults))
-        for param, value in values:
-            if value is not None:
-                self.visit(value)
-                defaults[param.arg] = self._origins(value)
-        previous = self.lambda_values.get(node, ({}, self.local_names))[0]
-        self.lambda_values[node] = (_merged_origins(previous, defaults) if previous else defaults, self.local_names)
+        values = dict(zip(node.args.defaults, positional[len(positional) - len(node.args.defaults):]))
+        values.update((value, param) for param, value in zip(node.args.kwonlyargs, node.args.kw_defaults) if value is not None)
+        for value in _definition_inputs(node):
+            self.visit(value)
+            if value in values:
+                defaults[values[value].arg] = self._origins(value)
+        previous = self.callable_values.get(node, ({}, self.local_names))[0]
+        self.callable_values[node] = (_merged_origins(previous, defaults) if previous else defaults, self.local_names)
 
     def visit_GeneratorExp(self, node):
         self.visit(node.generators[0].iter)
@@ -589,15 +610,22 @@ class _LockInterference(ast.NodeVisitor):
     visit_SetComp = _comprehension
     visit_DictComp = _comprehension
 
-    def _invoke_lambda(self, node, actual, keywords):
-        if _lambda_is_generator(node) or node in self.active_lambdas:
+    def _invoke_callable(self, node, actual, keywords, unpacked):
+        # These call shapes cannot supply positive evidence of safe retention.
+        # Async/generator creation itself defers the body; awaiting/consuming it
+        # is outside this synchronous call expansion.
+        if (node in self.active_calls or unpacked or None in keywords
+                or getattr(node, "decorator_list", ()) or node.args.vararg or node.args.kwarg):
+            self.released.update(name for kind, name in self.held if kind == "guard")
+            return
+        if _callable_is_deferred(node):
             return
         positional = list(node.args.posonlyargs) + list(node.args.args)
-        defaults, closure_names = self.lambda_values.get(node, ({}, frozenset()))
+        defaults, closure_names = self.callable_values.get(node, ({}, frozenset()))
         visible = self.bindings if self.class_outer is None else self.class_outer
         outer = dict(visible if self.module else self.global_bindings)
         outer.update((name, visible.get(name, _UNKNOWN_ORIGINS)) for name in closure_names)
-        child = self._child(outer, local_names=closure_names | _lambda_bound_names(node))
+        child = self._child(outer, local_names=closure_names | _callable_bound_names(node))
         params = positional + list(node.args.kwonlyargs) + [p for p in (node.args.vararg, node.args.kwarg) if p]
         for param in params:
             child._set(param.arg, defaults.get(param.arg, _UNKNOWN_ORIGINS))
@@ -606,14 +634,14 @@ class _LockInterference(ast.NodeVisitor):
         for name, origins in keywords.items():
             if name is not None:
                 child._set(name, origins)
-        local = _lambda_bound_names(node)
+        local = _callable_bound_names(node)
         for name in local - {param.arg for param in params}:
             child._set(name, _UNKNOWN_ORIGINS)
-        self.active_lambdas.add(node)
+        self.active_calls.add(node)
         try:
-            child.visit(node.body)
+            child._body([node.body] if isinstance(node, ast.Lambda) else node.body)
         finally:
-            self.active_lambdas.remove(node)
+            self.active_calls.remove(node)
 
     def visit_ClassDef(self, node):
         self._body(_definition_inputs(node))
@@ -632,7 +660,7 @@ def _lock_interference(tree, threading_modules, lock_names, contexts, builtin_or
     module = _LockInterference(known, replaced, released, contexts, module=True)
     module._body(tree.body)
     for name, origins in module.bindings.items():
-        if any(kind == "lambda" for kind, _ in origins):
+        if any(kind in {"callable", "release", "acquire"} for kind, _ in origins):
             known[name] = origins
     for builtin in _ATTRIBUTE_BUILTINS:
         if (builtin not in _module_bindings(tree)
@@ -646,7 +674,7 @@ def _lock_interference(tree, threading_modules, lock_names, contexts, builtin_or
         local = (_bound_names(fn) | enclosing) - global_names
         _LockInterference({name: origins for name, origins in known.items() if name not in local},
                           replaced, released, contexts, local_names=local, global_bindings=known,
-                          lambda_values=module.lambda_values)._body(fn.body)
+                          callable_values=module.callable_values)._body(fn.body)
     return replaced, released
 
 
