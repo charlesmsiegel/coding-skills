@@ -298,3 +298,47 @@ def test_a_nested_class_header_uses_its_enclosing_class_namespace(tmp_path):
     source = ("import used\nclass Container:\n    from typing import cast as convert\n"
               "    @convert('used.Type', lambda cls: cls)\n    class Nested:\n        pass\n")
     assert "used" not in unused_imports(tmp_path, source)
+
+
+@pytest.mark.parametrize("statement", [
+    "cast = cast('used.Type', None)",
+    "cast: object = cast('used.Type', None)",
+    "(cast := cast('used.Type', None))",
+    "for cast in cast('used.Type', []):\n    pass",
+])
+@pytest.mark.parametrize("scope", ["module", "class"])
+def test_rebinding_visits_the_value_before_shadowing_the_callee(tmp_path, statement, scope):
+    if scope == "class":
+        statement = "class Container:\n" + "\n".join("    " + line for line in statement.splitlines())
+    source = f"import used\nfrom typing import cast\n{statement}\n"
+    assert "used" not in unused_imports(tmp_path, source)
+
+
+def test_an_async_loop_reads_its_iterable_before_binding_its_target(tmp_path):
+    source = ("import used\nasync def outer():\n    from typing import cast\n"
+              "    async for cast in cast('used.Type', stream):\n        pass\n")
+    assert "used" not in unused_imports(tmp_path, source)
+
+
+@pytest.mark.parametrize("module", ["typing", "typing_extensions"])
+@pytest.mark.parametrize("binding", ["", "cast = converter\n", "from converter import *\n"])
+def test_typing_wildcard_records_cast_until_a_later_binding(tmp_path, module, binding):
+    source = f"import used\nfrom {module} import *\n{binding}value = cast('used.Type', None)\n"
+    assert ("used" in unused_imports(tmp_path, source)) == bool(binding)
+
+
+@pytest.mark.parametrize("condition,branches", [
+    ("False", "    cast = converter\n"),
+    ("True", "    pass\nelse:\n    cast = converter\n"),
+])
+def test_a_nonexecuting_branch_does_not_replace_the_visible_cast(tmp_path, condition, branches):
+    source = ("import used\nfrom typing import cast\n"
+              f"if {condition}:\n{branches}"
+              "def result(value):\n    return cast('used.Type', value)\n")
+    assert "used" not in unused_imports(tmp_path, source)
+
+
+def test_an_executing_branch_can_replace_the_visible_cast(tmp_path):
+    source = ("import unused\nfrom typing import cast\nif True:\n    cast = converter\n"
+              "def result(value):\n    return cast('unused.Type', value)\n")
+    assert "unused" in unused_imports(tmp_path, source)

@@ -265,7 +265,36 @@ class ScopeTracker(ast.NodeVisitor):
 
     def visit_Assign(self, node: ast.Assign):
         self._collect_dunder_all(node)
-        self.generic_visit(node)
+        # Python evaluates the value with the old binding, then stores each
+        # target. In `cast = cast("models.Model", value)` that order decides
+        # whether the first argument is a type or ordinary string data.
+        self.visit(node.value)
+        for target in node.targets:
+            self.visit(target)
+
+    def visit_NamedExpr(self, node: ast.NamedExpr):
+        self.visit(node.value)
+        self.visit(node.target)
+
+    def visit_For(self, node: ast.For | ast.AsyncFor):
+        self.visit(node.iter)
+        self.visit(node.target)
+        for statement in (*node.body, *node.orelse):
+            self.visit(statement)
+
+    visit_AsyncFor = visit_For
+
+    def visit_If(self, node: ast.If):
+        # Module and class bodies execute now. A literal condition cannot
+        # replace their imports through the branch that never executes. Keep
+        # the ordinary function walk: even an unreachable assignment makes a
+        # function-local name local throughout that function.
+        if isinstance(node.test, ast.Constant) and self._annotation_scopes[-1][0] in {"module", "class"}:
+            self.visit(node.test)
+            for statement in node.body if node.test.value else node.orelse:
+                self.visit(statement)
+        else:
+            self.generic_visit(node)
 
     def visit_AugAssign(self, node: ast.AugAssign):
         self._collect_dunder_all(node)
@@ -276,6 +305,8 @@ class ScopeTracker(ast.NodeVisitor):
         for alias in node.names:
             if alias.name == "*":
                 origins.clear()
+                if isinstance(node, ast.ImportFrom) and node.level == 0 and node.module in {"typing", "typing_extensions"}:
+                    origins.update((name, f"{node.module}.{name}") for name in ("cast", "Literal", "Annotated"))
                 continue
             local = alias.asname or alias.name.split(".")[0]
             if isinstance(node, ast.Import):
@@ -508,8 +539,11 @@ class ScopeTracker(ast.NodeVisitor):
                 self._annotation_references(arg.annotation)
 
     def visit_AnnAssign(self, node: ast.AnnAssign):
+        if node.value is not None:
+            self.visit(node.value)
+        self.visit(node.target)
         self._annotation_references(node.annotation)
-        self.generic_visit(node)
+        self.visit(node.annotation)
 
     def _visit_function(self, node: ast.FunctionDef | ast.AsyncFunctionDef):
         # These expressions execute before the function's parameters bind.
