@@ -12,51 +12,7 @@ from collections import defaultdict
 from dataclasses import dataclass
 
 import global_state_scopes as scopes
-
-
-_MUTATING_METHODS = {
-    "append", "extend", "insert", "remove", "pop", "clear", "sort", "reverse",
-    "add", "discard", "update", "setdefault", "popitem",
-    "difference_update", "intersection_update", "symmetric_difference_update",
-    "appendleft", "popleft", "extendleft", "rotate",
-}
-
-
-def _eager_children(node, contexts=None):
-    """Definition inputs execute here; deferred bodies retain their own walk."""
-    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-        return scopes.definition_inputs(node)
-    if isinstance(node, ast.Lambda):
-        return list(node.args.defaults) + [value for value in node.args.kw_defaults if value is not None]
-    if isinstance(node, ast.GeneratorExp):
-        return [node.generators[0].iter]
-    children = list(ast.iter_child_nodes(node))
-    if isinstance(node, ast.Call):
-        callables = {node.func} if isinstance(node.func, ast.Lambda) else {
-            value for kind, value in (contexts or {}).get(node.func, ()) if kind == "callable"}
-        for value in callables:
-            if not scopes.callable_is_deferred(value):
-                children.extend([value.body] if isinstance(value, ast.Lambda) else value.body)
-    for kind, value in (contexts or {}).get(node, ()):
-        if kind == "consume":
-            children.append(value.elt)
-            for index, generator in enumerate(value.generators):
-                children.extend(generator.ifs)
-                if index:
-                    children.append(generator.iter)
-    return children
-
-
-def _eager_nodes(stmts, contexts):
-    stack = list(stmts)
-    seen = set()
-    while stack:
-        node = stack.pop()
-        if node in seen:
-            continue
-        seen.add(node)
-        yield node
-        stack.extend(_eager_children(node, contexts))
+import global_state_execution as execution
 
 
 _LOCK_FACTORIES = {"Lock", "RLock"}
@@ -76,119 +32,16 @@ class _Factory:
     imported_at: tuple[int, int] | None = None
 
 
-def _module_name(value, names, contexts):
-    return (isinstance(value, ast.Name) and value.id in names
-            and ("global", value.id) in contexts.get(value, ()))
-
-
-def _mutates_name(node, names, contexts):
-    if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
-        if node.func.attr in _MUTATING_METHODS and _module_name(node.func.value, names, contexts):
-            return node.func.value.id
-    if isinstance(node, ast.Delete):
-        for t in node.targets:
-            if isinstance(t, ast.Subscript) and _module_name(t.value, names, contexts):
-                return t.value.id
-    if isinstance(node, (ast.Assign, ast.AugAssign)):
-        targets = node.targets if isinstance(node, ast.Assign) else [node.target]
-        for t in targets:
-            if isinstance(t, ast.Subscript) and _module_name(t.value, names, contexts):
-                return t.value.id
-    return None
-
-
-def _context_mutex(expression, locks, contexts):
-    origins = {origin for origin in contexts.get(expression, ()) if origin[0] != "global"}
-    if not origins or any(kind != "guard" or name not in locks for kind, name in origins):
-        return None
-    possible = {locks[name] for _, name in origins}
-    return next(iter(possible)) if len(possible) == 1 else None
-
-
-def _blocking_acquire(node, locks, contexts):
-    if not isinstance(node, ast.Call):
-        return False
-    kwargs = {keyword.arg: keyword.value for keyword in node.keywords}
-    blocking = node.args[0] if node.args else kwargs.get("blocking")
-    timeout = node.args[1] if len(node.args) > 1 else kwargs.get("timeout")
-    if isinstance(blocking, ast.Constant) and blocking.value in (False, 0):
-        return False
-    if isinstance(timeout, ast.Constant) and isinstance(timeout.value, (int, float)) and timeout.value >= 0:
-        return False
-    held = {locks[name].identity for kind, name in contexts.get(node, ()) if kind == "guard" and name in locks}
-    return any(locks[name].factory == "Lock" and locks[name].identity in held
-               for kind, name in contexts.get(node.func, ()) if kind == "acquire" and name in locks)
-
-
-def _guarded_nodes(stmts, locks, contexts, invalid_acquires, skipped):
-    """Same-scope nodes paired with the known module locks held at each node.
-
-    `locks` names the module-level Lock/RLock objects. A nested function is
-    its own scope and its own walk: it runs whenever it is called, which need
-    not be while the lock that surrounds its definition is held.
-    """
-    stack = [(s, frozenset()) for s in stmts]
-    seen = set()
-    while stack:
-        node, held = stack.pop()
-        if node in skipped:
-            continue
-        if (node, held) in seen:
-            continue
-        seen.add((node, held))
-        yield node, held if held is not None else frozenset()
-        if isinstance(node, ast.With):
-            # Context expressions are evaluated before their own __enter__,
-            # in order: the first expression is not protected by a later lock.
-            # A thread mutex cannot certify task exclusion across suspension;
-            # Lock also cannot be acquired twice by the same thread. Keep an
-            # invalid proof invalid through nested contexts, even a different
-            # lock: the surrounding operation can already suspend or deadlock.
-            entered = set(held or ())
-            invalid = held is None
-            for item in node.items:
-                if entered and _suspends([item.context_expr], skipped):
-                    invalid = True
-                if any(part in invalid_acquires for part in _eager_nodes([item.context_expr], contexts)):
-                    invalid = True
-                for kind, name in contexts.get(item.context_expr, ()):
-                    if kind == "guard" and name in locks and locks[name].identity in entered and locks[name].factory == "Lock":
-                        invalid = True
-                entered.update(locks[name].identity for kind, name in contexts.get(item.context_expr, ())
-                               if kind == "guard" and name in locks)
-            if entered and _suspends(node.body, skipped):
-                invalid = True
-            if any(part in invalid_acquires for part in _eager_nodes(node.body, contexts)):
-                invalid = True
-            if invalid:
-                held = None
-            children = []
-            for item in node.items:
-                children.append((item.context_expr, held))
-                mutex = _context_mutex(item.context_expr, locks, contexts)
-                if held is not None and mutex is not None:
-                    held = held | {mutex.identity}
-                if item.optional_vars:
-                    children.append((item.optional_vars, held))
-            children.extend((stmt, held) for stmt in node.body)
-            stack.extend(reversed(children))
-            continue
-        for child in _eager_children(node, contexts):
-            stack.append((child, held))
-
-
-def _suspends(stmts, skipped):
-    """Visible suspension in this execution scope, including implicit awaits."""
-    scope = ast.Module(body=list(stmts), type_ignores=[])
-    return any(isinstance(node, (ast.Await, ast.Yield, ast.YieldFrom, ast.AsyncFor, ast.AsyncWith))
-               or (isinstance(node, ast.comprehension) and node.is_async)
-               for node in scopes.module_scope_nodes(scope, include_class_bodies=True, skipped=skipped))
-
-
 _UNKNOWN_ORIGINS = frozenset({("unknown", "")})
 _ATTRIBUTE_BUILTINS = {"setattr": 3, "delattr": 2}
 _ITERATOR_CONSUMERS = {"list", "tuple", "set", "dict", "sum", "any", "all", "min", "max", "sorted", "next"}
-_BUILTINS = set(_ATTRIBUTE_BUILTINS) | _ITERATOR_CONSUMERS
+_LAZY_CALLBACKS = {"map", "filter"}
+_BUILTINS = set(_ATTRIBUTE_BUILTINS) | _ITERATOR_CONSUMERS | _LAZY_CALLBACKS | {"vars"}
+# setdefault cannot replace the already-present, proven factory. Other methods
+# must be known readers or their receiver may no longer expose that factory.
+_NAMESPACE_READERS = {"get", "keys", "values", "items", "copy", "fromkeys", "setdefault",
+                      "__getitem__", "__contains__", "__iter__", "__reversed__", "__len__",
+                      "__repr__", "__str__", "__class__", "__eq__", "__ne__", "__ge__", "__gt__", "__le__", "__lt__"}
 
 
 def _merged_origins(*paths):
@@ -207,7 +60,8 @@ class _LockInterference(ast.NodeVisitor):
 
     def __init__(self, bindings, replaced, released, contexts, *, module=False, class_outer=None,
                  held=frozenset(), local_names=frozenset(), callable_values=None, active_calls=None,
-                 global_bindings=None, skipped=frozenset()):
+                 global_bindings=None, skipped=frozenset(), execution_at=None,
+                 iterator_calls=None, active_iterators=None):
         self.bindings = {name: frozenset({("builtin", name)}) for name in _BUILTINS} if module else dict(bindings)
         self.replaced, self.released = replaced, released
         self.module_seeds = dict(bindings) if module else {}
@@ -224,16 +78,25 @@ class _LockInterference(ast.NodeVisitor):
         self.active_calls = set() if active_calls is None else active_calls
         self.global_bindings = bindings if global_bindings is None else global_bindings
         self.skipped = skipped
+        self.execution_at = execution_at
+        self.iterator_calls = {} if iterator_calls is None else iterator_calls
+        self.active_iterators = set() if active_iterators is None else active_iterators
 
     def visit(self, node):
         if node not in self.skipped:
             return super().visit(node)
 
-    def _child(self, bindings, *, class_outer=None, local_names=frozenset()):
+    def _child(self, bindings, *, class_outer=None, local_names=frozenset(), execution_at=None):
         return _LockInterference(bindings, self.replaced, self.released, self.contexts,
                                  class_outer=class_outer, held=self.held, local_names=local_names,
                                  callable_values=self.callable_values, active_calls=self.active_calls,
-                                 global_bindings=self.global_bindings, skipped=self.skipped)
+                                 global_bindings=self.global_bindings, skipped=self.skipped,
+                                 execution_at=self.execution_at if execution_at is None else execution_at,
+                                 iterator_calls=self.iterator_calls, active_iterators=self.active_iterators)
+
+    def _effect_position(self, node):
+        # A visible invocation runs its body now, not at its definition's line.
+        return self.execution_at or (node.lineno, node.col_offset)
 
     def _decline_mutex_proof(self):
         for origins in list(self.bindings.values()) + list(self.global_bindings.values()) + [self.held]:
@@ -252,9 +115,9 @@ class _LockInterference(ast.NodeVisitor):
         if isinstance(value, ast.Attribute) and value.attr == "__dict__":
             if ("module", "threading") in self._origins(value.value):
                 return frozenset({("namespace", "threading")})
-        if isinstance(value, ast.Attribute) and value.attr == "update":
+        if isinstance(value, ast.Attribute) and value.attr not in _NAMESPACE_READERS:
             if ("namespace", "threading") in self._origins(value.value):
-                return frozenset({("namespace_update", "threading")})
+                return frozenset({("namespace_method", value.attr)})
         if isinstance(value, ast.Attribute) and value.attr in {"release", "__exit__", "acquire", "__enter__"}:
             operation = "release" if value.attr in {"release", "__exit__"} else "acquire"
             origins = frozenset((operation, name) for kind, name in self._origins(value.value) if kind == "guard")
@@ -357,8 +220,15 @@ class _LockInterference(ast.NodeVisitor):
         self._bind(node.target, origins)
 
     def visit_AugAssign(self, node):
+        self.visit(node.target)
+        receiver = self._origins(node.target)
         self.visit(node.value)
-        self._bind(node.target)
+        if ("namespace", "threading") in receiver:
+            keys = self._namespace_write_keys("__ior__", [node.value], []) if isinstance(node.op, ast.BitOr) else _LOCK_FACTORIES
+            self.replaced.update((name, self._effect_position(node)) for name in keys)
+            self._bind(node.target, receiver)
+        else:
+            self._bind(node.target)
 
     def visit_Delete(self, node):
         for target in node.targets:
@@ -386,15 +256,15 @@ class _LockInterference(ast.NodeVisitor):
         self.visit(node.value)
         if isinstance(node.ctx, (ast.Store, ast.Del)) and node.attr in _LOCK_FACTORIES:
             if ("module", "threading") in self._origins(node.value):
-                self.replaced.add((node.attr, (node.lineno, node.col_offset)))
+                self.replaced.add((node.attr, self._effect_position(node)))
 
     def visit_Subscript(self, node):
         self.visit(node.value)
         namespace = self._origins(node.value)
         self.visit(node.slice)
-        if (isinstance(node.ctx, (ast.Store, ast.Del)) and ("namespace", "threading") in namespace
-                and isinstance(node.slice, ast.Constant) and node.slice.value in _LOCK_FACTORIES):
-            self.replaced.add((node.slice.value, (node.lineno, node.col_offset)))
+        if isinstance(node.ctx, (ast.Store, ast.Del)) and ("namespace", "threading") in namespace:
+            keys = {node.slice.value} & _LOCK_FACTORIES if isinstance(node.slice, ast.Constant) else _LOCK_FACTORIES
+            self.replaced.update((name, self._effect_position(node)) for name in keys)
 
     def visit_Call(self, node):
         # Capture the callable/receiver before arguments can rebind names, and
@@ -414,30 +284,54 @@ class _LockInterference(ast.NodeVisitor):
             if kind == "callable":
                 if scopes.callable_is_deferred(value):
                     self.expression_origins[node] = self.expression_origins.get(node, frozenset()) | {("deferred", value)}
-                self._invoke_callable(value, actual, keywords, any(isinstance(arg, ast.Starred) for arg in node.args))
+                self._invoke_callable(value, actual, keywords, any(isinstance(arg, ast.Starred) for arg in node.args),
+                                      self._effect_position(node))
+        lazy = any(("builtin", name) in callee for name in _LAZY_CALLBACKS)
+        if lazy and len(actual) >= 2:
+            # Origins contain only AST identities. Joining nested runtime-like
+            # descriptors would grow forever when a loop wraps its own iterator.
+            incoming = {"callback": actual[0]}
+            incoming.update((f"input{index}", value) for index, value in enumerate(actual[1:]))
+            for index, value in enumerate(node.args[1:]):
+                elements = (frozenset().union(*(self.contexts.get(item, self._origins(item)) for item in value.elts))
+                            if isinstance(value, (ast.Tuple, ast.List)) and value.elts else _UNKNOWN_ORIGINS)
+                incoming[f"element{index}"] = elements
+            previous = self.iterator_calls.get(node)
+            self.iterator_calls[node] = _merged_origins(previous, incoming) if previous else incoming
+            self.expression_origins[node] = frozenset({("callback_iterator", node)})
+        if ("builtin", "vars") in callee and len(actual) == 1 and ("module", "threading") in actual[0]:
+            self.expression_origins[node] = frozenset({("namespace", "threading")})
         if any(("builtin", name) in callee for name in _ITERATOR_CONSUMERS):
             if actual:
                 self._consume_values(node, actual[0])
-        elif not any(kind == "callable" for kind, _ in callee):
+        elif not lazy and not any(kind == "callable" for kind, _ in callee):
             for origins in actual + list(keywords.values()):
                 self._consume_values(node, origins)
         if any(kind == "acquire" for kind, _ in callee):
             self.contexts[node] = self.contexts.get(node, frozenset()) | self.held
         self.released.update(name for kind, name in callee if kind == "release")
-        if ("namespace_update", "threading") in callee:
-            self.replaced.update((name, (node.lineno, node.col_offset)) for name in self._namespace_update_keys(node))
+        for kind, operation in callee:
+            if kind == "namespace_method":
+                self.replaced.update((name, self._effect_position(node))
+                                     for name in self._namespace_write_keys(operation, node.args, node.keywords))
         if any(("builtin", name) in callee and len(node.args) == arity for name, arity in _ATTRIBUTE_BUILTINS.items()):
             attribute = node.args[1]
             if ("module", "threading") in actual[0] and isinstance(attribute, ast.Constant):
                 if isinstance(attribute.value, str) and attribute.value in _LOCK_FACTORIES:
-                    self.replaced.add((attribute.value, (node.lineno, node.col_offset)))
+                    self.replaced.add((attribute.value, self._effect_position(node)))
 
-    def _namespace_update_keys(self, node):
-        keys = {keyword.arg for keyword in node.keywords}
-        if None in keys or len(node.args) > 1:
+    def _namespace_write_keys(self, operation, args, keywords):
+        if operation in {"pop", "__delitem__", "__setitem__"}:
+            if args and isinstance(args[0], ast.Constant):
+                return {args[0].value} & _LOCK_FACTORIES
             return _LOCK_FACTORIES
-        if node.args:
-            value = node.args[0]
+        if operation not in {"update", "__ior__", "__init__"}:
+            return _LOCK_FACTORIES
+        keys = {keyword.arg for keyword in keywords}
+        if None in keys or len(args) > 1:
+            return _LOCK_FACTORIES
+        if args:
+            value = args[0]
             if not isinstance(value, ast.Dict) or any(not isinstance(key, ast.Constant) for key in value.keys):
                 return _LOCK_FACTORIES
             keys.update(key.value for key in value.keys)
@@ -598,12 +492,37 @@ class _LockInterference(ast.NodeVisitor):
         defaults = {}
         values = dict(zip(node.args.defaults, positional[len(positional) - len(node.args.defaults):]))
         values.update((value, param) for param, value in zip(node.args.kwonlyargs, node.args.kw_defaults) if value is not None)
+        decorators = []
         for value in scopes.definition_inputs(node):
             self.visit(value)
+            if value in getattr(node, "decorator_list", ()):
+                decorators.append(self._origins(value))
             if value in values:
                 defaults[values[value].arg] = self._origins(value)
         previous = self.callable_values.get(node, ({}, self.local_names))[0]
         self.callable_values[node] = (_merged_origins(previous, defaults) if previous else defaults, self.local_names)
+        self._apply_decorators(node, decorators)
+
+    def _apply_decorators(self, node, decorators):
+        if len(decorators) > 1:
+            # Applying the next decorator to a transformed value would need a
+            # return-value interpreter. Do not invent positive mutex evidence.
+            self._decline_mutex_proof()
+        for origins in reversed(decorators):
+            # External calls remain an indirect-effect review limit. A visible
+            # decorator, however, has a body whose effects execute right here.
+            if any(kind == "callable" for kind, _ in origins):
+                self._apply_callbacks(node, origins, [frozenset({("callable", node)})])
+
+    def _apply_callbacks(self, site, origins, actual):
+        for kind, value in origins:
+            if kind == "global":
+                continue
+            if kind != "callable" or scopes.callable_is_deferred(value):
+                self._decline_mutex_proof()
+                continue
+            self.contexts[site] = self.contexts.get(site, frozenset()) | {("callback_body", value)}
+            self._invoke_callable(value, actual, {}, False, self._effect_position(site))
 
     def visit_GeneratorExp(self, node):
         self.visit(node.generators[0].iter)
@@ -619,8 +538,22 @@ class _LockInterference(ast.NodeVisitor):
                 visible = self.bindings if self.class_outer is None else self.class_outer
                 outer = dict(visible if self.module else self.global_bindings)
                 outer.update((name, visible.get(name, _UNKNOWN_ORIGINS)) for name in closure_names)
-                child = self._child(outer, local_names=closure_names)
+                child = self._child(outer, local_names=closure_names, execution_at=self._effect_position(node))
                 child._comprehension(value, outer_evaluated=True)
+            elif kind == "callback_iterator":
+                if value in self.active_iterators:
+                    self._decline_mutex_proof()
+                    continue
+                self.active_iterators.add(value)
+                try:
+                    inputs = self.iterator_calls.get(value, {})
+                    for name, items in inputs.items():
+                        if name.startswith("input"):
+                            self._consume_values(node, items)
+                    actual = [inputs.get(f"element{index}", _UNKNOWN_ORIGINS) for index in range(len(value.args) - 1)]
+                    self._apply_callbacks(node, inputs.get("callback", _UNKNOWN_ORIGINS), actual)
+                finally:
+                    self.active_iterators.remove(value)
 
     def _comprehension(self, node, outer_evaluated=False):
         if not outer_evaluated:
@@ -644,7 +577,7 @@ class _LockInterference(ast.NodeVisitor):
     visit_SetComp = _comprehension
     visit_DictComp = _comprehension
 
-    def _invoke_callable(self, node, actual, keywords, unpacked):
+    def _invoke_callable(self, node, actual, keywords, unpacked, position):
         # These call shapes cannot supply positive evidence of safe retention.
         # Async/generator creation itself defers the body; awaiting/consuming it
         # is outside this synchronous call expansion.
@@ -664,7 +597,7 @@ class _LockInterference(ast.NodeVisitor):
         visible = self.bindings if self.class_outer is None else self.class_outer
         outer = dict(visible if self.module else self.global_bindings)
         outer.update((name, visible.get(name, _UNKNOWN_ORIGINS)) for name in closure_names)
-        child = self._child(outer, local_names=closure_names | scopes.callable_bound_names(node))
+        child = self._child(outer, local_names=closure_names | scopes.callable_bound_names(node), execution_at=position)
         params = positional + list(node.args.kwonlyargs) + [p for p in (node.args.vararg, node.args.kwarg) if p]
         for param in params:
             child._set(param.arg, defaults.get(param.arg, _UNKNOWN_ORIGINS))
@@ -687,13 +620,18 @@ class _LockInterference(ast.NodeVisitor):
             self.active_calls.remove(node)
 
     def visit_ClassDef(self, node):
-        self._body(scopes.definition_inputs(node))
+        decorators = []
+        for value in scopes.definition_inputs(node):
+            self.visit(value)
+            if value in node.decorator_list:
+                decorators.append(self._origins(value))
         outer = self.bindings if self.class_outer is None else self.class_outer
         child = self._child(outer, class_outer=dict(outer), local_names=self.local_names)
         child._body(node.body)
         nonlocals = {name for item in scopes.module_scope_nodes(ast.Module(body=node.body, type_ignores=[]))
                      if isinstance(item, ast.Nonlocal) for name in item.names}
         self._apply_scope_effects(child, nonlocals)
+        self._apply_decorators(node, decorators)
         self._set(node.name, _UNKNOWN_ORIGINS)
 
     def _apply_scope_effects(self, child, nonlocals):
@@ -717,7 +655,7 @@ def _lock_interference(tree, threading_modules, lock_names, contexts, builtin_or
                    for node in scopes.module_scope_nodes(tree))
     stable = {name for name, count in bindings.items() if count == 1} - module_globals
     for name, origins in module.bindings.items():
-        if name in stable and any(kind in {"callable", "release", "acquire", "guard", "generator", "deferred", "namespace_update"} for kind, _ in origins):
+        if name in stable and any(kind in {"callable", "release", "acquire", "guard", "generator", "deferred", "namespace_method", "callback_iterator"} for kind, _ in origins):
             known[name] = origins
     for builtin in _BUILTINS:
         if builtin not in bindings and builtin not in module_globals and not wildcard:
@@ -728,7 +666,7 @@ def _lock_interference(tree, threading_modules, lock_names, contexts, builtin_or
         local = (scopes.bound_names(fn) | enclosing) - global_names
         _LockInterference({name: origins for name, origins in known.items() if name not in local},
                           replaced, released, contexts, local_names=local, global_bindings=known,
-                          callable_values=module.callable_values, skipped=skipped)._body(fn.body)
+                          callable_values=module.callable_values, iterator_calls=module.iterator_calls, skipped=skipped)._body(fn.body)
     return replaced, released
 
 
@@ -850,11 +788,10 @@ def mutation_guards(tree, candidate_names):
                          if kind == "acquire" and name in locks and locks[name].factory == "Lock"
                          and locks[name].identity not in entered)
     locks = {name: mutex for name, mutex in locks.items() if mutex.identity not in prior}
-    invalid_acquires = {node for node in contexts if _blocking_acquire(node, locks, contexts)}
+    invalid_acquires = {node for node in contexts if execution.blocking_acquire(node, locks, contexts)}
     guarded = defaultdict(list)
     for fn, _ in scopes.function_scopes(tree):
-        for node, held in _guarded_nodes(fn.body, locks, contexts, invalid_acquires, skipped):
-            name = _mutates_name(node, candidate_names, contexts)
-            if name:
+        for node, held in execution.guarded_nodes(fn.body, locks, contexts, invalid_acquires, skipped):
+            for name in execution.mutated_names(node, candidate_names, contexts):
                 guarded[name].append(held)
     return locks, guarded
