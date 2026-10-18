@@ -7,6 +7,7 @@ policy, confidence, issue formatting and framework registration exemptions.
 
 import ast
 import symtable
+from collections import ChainMap
 from contextlib import contextmanager
 
 
@@ -21,7 +22,7 @@ def dotted_name(node) -> str | None:
     return None
 
 
-def function_bindings(source: str, filename: str) -> dict[tuple[int, str], set[str]]:
+def function_bindings(source: str, filename: str) -> dict[tuple[int, str], tuple[set[str], set[str]]]:
     """Use Python's lexical scope analysis rather than guessing locals from
     traversal order. Classes deliberately remain progressive namespaces."""
     try:
@@ -34,9 +35,12 @@ def function_bindings(source: str, filename: str) -> dict[tuple[int, str], set[s
     while tables:
         table = tables.pop()
         tables.extend(table.get_children())
-        if table.get_type() == "function" and table.get_name() != "lambda":
-            bindings[table.get_lineno(), table.get_name()] = {
-                symbol.get_name() for symbol in table.get_symbols() if symbol.is_local()}
+        if table.get_type() in {"function", "class"} and table.get_name() != "lambda":
+            symbols = table.get_symbols()
+            bindings[table.get_lineno(), table.get_name()] = (
+                {symbol.get_name() for symbol in symbols if symbol.is_local()},
+                {symbol.get_name() for symbol in symbols if symbol.is_declared_global()},
+            )
     return bindings
 
 
@@ -50,12 +54,13 @@ class ImportReferences(ast.NodeVisitor):
         self.value_references = set()
         self.called_functions = set()
         self.instantiated_classes = set()
-        self._annotation_scopes = [("module", {})]
+        self._annotation_scopes = [("module", {}, frozenset())]
         self._deferred_casts = []
         self._deferred_annotations = []
         self._quoted_depth = 0
         self._finishing_references = False
         self._reference_only = False
+        self._loop_breaks = []
 
     def visit_Assign(self, node: ast.Assign):
         # Python evaluates the value with the old binding, then stores each
@@ -65,7 +70,15 @@ class ImportReferences(ast.NodeVisitor):
         assignments = [self._assignment_origins(target, node.value) for target in node.targets]
         for target, origins in zip(node.targets, assignments):
             self.visit(target)
-            self._annotation_scopes[-1][1].update(origins)
+            self._store_origins(origins)
+
+    def _binding_namespace(self, name):
+        frame = self._annotation_scopes[0] if name in self._annotation_scopes[-1][2] else self._annotation_scopes[-1]
+        return frame[0], frame[1]
+
+    def _store_origins(self, assignments):
+        for name, origin in assignments.items():
+            self._binding_namespace(name)[1][name] = origin
 
     def _assignment_origins(self, target, value):
         if isinstance(target, ast.Name):
@@ -78,6 +91,7 @@ class ImportReferences(ast.NodeVisitor):
 
     def visit_NamedExpr(self, node: ast.NamedExpr):
         self.visit(node.value)
+        origins = self._assignment_origins(node.target, node.value)
         # Unlike a comprehension's iteration target, a walrus binds in its
         # containing non-comprehension scope (PEP 572).
         previous = self._annotation_scopes
@@ -87,16 +101,89 @@ class ImportReferences(ast.NodeVisitor):
         self._annotation_scopes = previous[:end]
         try:
             self.visit(node.target)
+            self._store_origins(origins)
         finally:
             self._annotation_scopes = previous
 
     def visit_For(self, node: ast.For | ast.AsyncFor):
         self.visit(node.iter)
-        # The iterable can be empty. Only an executing iteration binds its
-        # target or body, so retain the incoming origin beside that outcome.
-        self._join_branches(([], [node.target, *node.body]))
+        self._visit_loop(node, [node.target, *node.body])
+
+    def visit_While(self, node: ast.While):
+        self.visit(node.test)
+        self._visit_loop(node, node.body)
+
+    @staticmethod
+    def _loop_entry(node):
+        if isinstance(node, ast.While):
+            return bool(node.test.value) if isinstance(node.test, ast.Constant) else None
+        if isinstance(node.iter, (ast.Tuple, ast.List, ast.Set)):
+            if not node.iter.elts:
+                return False
+            return True if any(not isinstance(item, ast.Starred) for item in node.iter.elts) else None
+        if isinstance(node.iter, ast.Constant) and isinstance(node.iter.value, (str, bytes)):
+            return bool(node.iter.value)
+        return None
+
+    def _visit_loop(self, node, body):
+        # A break skips else and belongs to its nearest loop. Preserve its
+        # bindings independently from normal exhaustion, including zero trips.
+        enters = self._loop_entry(node)
+        breaks = []
+        self._loop_breaks.append(breaks)
+        try:
+            if enters is not False:
+                self._join_branches((body,) if enters is True else ([], body))
+        finally:
+            self._loop_breaks.pop()
+        if isinstance(node, ast.While) and enters is True:
+            if breaks:
+                self._restore_origins(self._joined_origins(breaks))
+            return  # A constant-true loop cannot exhaust into else.
         for statement in node.orelse:
             self.visit(statement)
+        self._restore_origins(self._joined_origins([self._origin_state(), *breaks]))
+
+    def visit_Break(self, node):
+        if self._loop_breaks:
+            self._loop_breaks[-1].append(self._origin_state())
+
+    def visit_Match(self, node: ast.Match):
+        self.visit(node.subject)
+        unmatched = [self._origin_state()]
+        completed = []
+        for case in node.cases:
+            if not unmatched:
+                break
+            self._restore_origins(self._joined_origins(unmatched))
+            incoming = self._origin_state()
+            self.visit(case.pattern)
+            if case.guard is not None:
+                self.visit(case.guard)
+            captured = self._origin_state()
+            catches_all = isinstance(case.pattern, ast.MatchAs) and case.pattern.pattern is None
+            guard = (bool(case.guard.value) if isinstance(case.guard, ast.Constant)
+                     else True if case.guard is None else None)
+            unmatched = [] if catches_all else [incoming, captured]
+            if guard is not True:
+                unmatched.append(captured)
+            if guard is not False:
+                for statement in case.body:
+                    self.visit(statement)
+                completed.append(self._origin_state())
+        self._restore_origins(self._joined_origins([*completed, *unmatched]))
+
+    def visit_MatchAs(self, node: ast.MatchAs):
+        self.generic_visit(node)
+        if node.name:
+            self._store_origins({node.name: None})
+
+    visit_MatchStar = visit_MatchAs
+
+    def visit_MatchMapping(self, node: ast.MatchMapping):
+        self.generic_visit(node)
+        if node.rest:
+            self._store_origins({node.rest: None})
 
     def visit_If(self, node: ast.If):
         self._visit_conditional(node.test, node.body, node.orelse)
@@ -129,10 +216,10 @@ class ImportReferences(ast.NodeVisitor):
         self._restore_origins(self._joined_origins(branches))
 
     def _origin_state(self):
-        return [origins.copy() for _kind, origins in self._annotation_scopes]
+        return [origins.copy() for _kind, origins, _globals in self._annotation_scopes]
 
     def _restore_origins(self, state):
-        for (_kind, origins), original in zip(self._annotation_scopes, state):
+        for (_kind, origins, _globals), original in zip(self._annotation_scopes, state):
             origins.clear()
             origins.update(original)
 
@@ -179,14 +266,14 @@ class ImportReferences(ast.NodeVisitor):
         if handler.type is not None:
             self.visit(handler.type)
         if handler.name:
-            self._annotation_scopes[-1][1][handler.name] = None
+            self._store_origins({handler.name: None})
         for statement in handler.body:
             self.visit(statement)
             partial.append(self._origin_state())
         if handler.name:
             # Python deletes the exception target at handler exit; a class can
             # then fall back to an enclosing binding, unlike a function local.
-            kind, origins = self._annotation_scopes[-1]
+            kind, origins = self._binding_namespace(handler.name)
             if kind in {"module", "class"}:
                 origins.pop(handler.name, None)
             else:
@@ -233,25 +320,31 @@ class ImportReferences(ast.NodeVisitor):
         origins = self._annotation_scopes[-1][1]
         for alias in node.names:
             if alias.name == "*":
-                origins.clear()
+                # Unknown exports may replace any name, but do not prove that
+                # an existing typing helper disappeared. Known helpers from a
+                # typing star import do replace their corresponding bindings.
+                for name, origin in origins.items():
+                    origins[name] = self._origin_options(origin) | {None}
                 if isinstance(node, ast.ImportFrom) and node.level == 0 and node.module in {"typing", "typing_extensions"}:
                     origins.update((name, f"{node.module}.{name}") for name in ("cast", "Literal", "Annotated"))
                 continue
             local = alias.asname or alias.name.split(".")[0]
             if isinstance(node, ast.Import):
-                origins[local] = alias.name if alias.asname else local
+                self._store_origins({local: alias.name if alias.asname else local})
             elif node.level == 0 and node.module:
-                origins[local] = f"{node.module}.{alias.name}"
+                self._store_origins({local: f"{node.module}.{alias.name}"})
             else:
-                origins[local] = None
+                self._store_origins({local: None})
 
     def _annotation_origins(self) -> dict:
         """Visible import origins, with explicit local shadows. A function or
         comprehension does not close over a class's namespace; a class body
         itself can see the names it has already bound."""
         out = {}
-        for index, (kind, origins) in enumerate(self._annotation_scopes):
+        for index, (kind, origins, globals_) in enumerate(self._annotation_scopes):
             if kind != "class" or index == len(self._annotation_scopes) - 1:
+                for name in globals_:
+                    out[name] = self._origin_options(self._annotation_scopes[0][1].get(name, _FALLBACK))
                 for name, value in origins.items():
                     options = self._origin_options(value)
                     if _FALLBACK in options:
@@ -263,13 +356,25 @@ class ImportReferences(ast.NodeVisitor):
 
     @contextmanager
     def _preserve_annotation_bindings(self, enabled=True):
-        saved = [(origins, origins.copy()) for _kind, origins in self._annotation_scopes] if enabled else []
+        saved = [(origins, origins.copy()) for _kind, origins, _globals in self._annotation_scopes] if enabled else []
         try:
             yield
         finally:
             for origins, original in saved:
                 origins.clear()
                 origins.update(original)
+
+    @contextmanager
+    def _deferred_module_namespace(self):
+        # Global writes belong to this possible function invocation, while
+        # deferred nested reads retain its later writes and the live module.
+        # A separate overlay keeps an uninvoked body from changing later code.
+        original = self._annotation_scopes[0]
+        self._annotation_scopes[0] = (original[0], ChainMap({}, original[1]), original[2])
+        try:
+            yield
+        finally:
+            self._annotation_scopes[0] = original
 
     def _lambda_bindings(self, node: ast.Lambda) -> set[str]:
         names = set()
@@ -291,7 +396,8 @@ class ImportReferences(ast.NodeVisitor):
         # Python decides a function's locals for its whole body, including
         # bindings below a nested definition. An empty origin is pending; None
         # means a parameter or an already visited non-import binding.
-        origins = {name: "" for name in self.function_bindings.get((node.lineno, getattr(node, "name", "")), ())}
+        local_names, global_names = self.function_bindings.get((node.lineno, getattr(node, "name", "")), ((), ()))
+        origins = {} if is_class else {name: "" for name in local_names}
         if isinstance(node, ast.Lambda):
             origins.update((name, "") for name in self._lambda_bindings(node))
         args = getattr(node, "args", None)
@@ -302,7 +408,7 @@ class ImportReferences(ast.NodeVisitor):
         kind = ("class" if is_class else "function" if args is not None else "comprehension")
         if isinstance(node, ast.GeneratorExp):
             kind = "generator"
-        self._annotation_scopes.append((kind, origins))
+        self._annotation_scopes.append((kind, origins, global_names))
         try:
             yield
         finally:
@@ -423,7 +529,7 @@ class ImportReferences(ast.NodeVisitor):
             origins = self._assignment_origins(node.target, node.value)
         if node.value is not None or not isinstance(node.target, ast.Name):
             self.visit(node.target)
-            self._annotation_scopes[-1][1].update(origins)
+            self._store_origins(origins)
         self._annotation_references(node.annotation)
         self.visit(node.annotation)
 
@@ -434,6 +540,14 @@ class ImportReferences(ast.NodeVisitor):
         self._annotation_references(getattr(node, "bound", None))
         self._annotation_references(getattr(node, "default_value", None))
         self.generic_visit(node)
+
+    def visit_TypeAlias(self, node):
+        self.visit(node.name)
+        for parameter in node.type_params:
+            self.visit(parameter)
+        # PEP 695 values are lazy type expressions, so later enclosing imports
+        # can decide whether a string is a forward type or Literal data.
+        self._deferred_annotations.append((node.value, tuple(self._annotation_scopes)))
 
     def visit_Lambda(self, node: ast.Lambda):
         for default in (*node.args.defaults, *(d for d in node.args.kw_defaults if d is not None)):
@@ -467,8 +581,15 @@ class ImportReferences(ast.NodeVisitor):
         elif isinstance(node.func, ast.Attribute):
             self.called_functions.add(node.func.attr)
         if not self._typing_cast_references(node) and not self._finishing_references and self._unresolved_callee(node.func) and any(
-                kind in {"function", "generator"} for kind, _origins in self._annotation_scopes):
-            self._deferred_casts.append((node, tuple(self._annotation_scopes)))
+                kind in {"function", "generator"} for kind, _origins, _globals in self._annotation_scopes):
+            enclosing = list(self._annotation_scopes)
+            first = dotted_name(node.func).partition(".")[0]
+            module = enclosing[0]
+            if first in enclosing[-1][2] and isinstance(module[1], ChainMap):
+                # Its own later global import cannot repair an earlier call;
+                # a later module/enclosing-invocation import still can.
+                enclosing[0] = (module[0], module[1].parents, module[2])
+            self._deferred_casts.append((node, tuple(enclosing)))
 
     def _unresolved_callee(self, node: ast.AST) -> bool:
         dotted = dotted_name(node)
@@ -476,7 +597,7 @@ class ImportReferences(ast.NodeVisitor):
             return False
         first = dotted.partition(".")[0]
         origins = self._annotation_origins()
-        deferred = [local for kind, local in self._annotation_scopes if kind in {"function", "generator"}]
+        deferred = [local for kind, local, _globals in self._annotation_scopes if kind in {"function", "generator"}]
         if deferred and first in deferred[-1]:
             # A later import in this very function is an unbound local at the
             # current call. Only an enclosing namespace may complete later.
@@ -509,7 +630,7 @@ class ImportReferences(ast.NodeVisitor):
 
     def visit_Name(self, node):
         if isinstance(node.ctx, (ast.Store, ast.Del)):
-            kind, origins = self._annotation_scopes[-1]
+            kind, origins = self._binding_namespace(node.id)
             if kind == "class" and isinstance(node.ctx, ast.Del):
                 origins.pop(node.id, None)
             else:
@@ -528,8 +649,10 @@ class ImportReferences(ast.NodeVisitor):
         for parameter in getattr(node, "type_params", ()):
             self.visit(parameter)
         self._signature_references(node)
-        self._annotation_scopes[-1][1][node.name] = None
-        with self._annotation_scope(node):
+        self._store_origins({node.name: None})
+        # A function body is deferred. Its global stores are visible within
+        # that body (and nested readers), not evidence that it already ran.
+        with self._preserve_annotation_bindings(), self._deferred_module_namespace(), self._annotation_scope(node):
             for statement in node.body:
                 self.visit(statement)
 
@@ -543,4 +666,4 @@ class ImportReferences(ast.NodeVisitor):
         with self._annotation_scope(node):
             for statement in node.body:
                 self.visit(statement)
-        self._annotation_scopes[-1][1][node.name] = None
+        self._store_origins({node.name: None})
