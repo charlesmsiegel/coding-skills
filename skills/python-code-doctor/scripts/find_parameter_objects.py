@@ -41,7 +41,7 @@ import argparse
 from pathlib import Path
 from dataclasses import dataclass, asdict, field
 from itertools import combinations
-from collections import defaultdict
+from collections import Counter, defaultdict
 from common import (configure_output, copied_signatures, find_python_files, is_test_file,
                     upstream_marks, warn_detector_error, warn_unparseable, is_route_handler)
 
@@ -231,7 +231,10 @@ def detect(path: Path, ignore: set):
     for data in _families(list(by_support.values())):
         names = sorted(data["names"])
         locs = data["locs"]
-        f0, ln0, _ = min(data["marked"] or locs)
+        anchors = data["marked"] or locs
+        counts = Counter(file for file, _line, _name in anchors)
+        owner = min(counts, key=lambda file: (-counts[file], file))
+        f0, ln0, _ = min(location for location in anchors if location[0] == owner)
         where = ", ".join(f"{Path(f).name}:{ln} {fn}()" for f, ln, fn in sorted(locs)[:5])
         more = "" if len(locs) <= 5 else f" (+{len(locs) - 5} more)"
         issues.append(CodeSmell(
