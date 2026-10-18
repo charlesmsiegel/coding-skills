@@ -1,0 +1,262 @@
+"""Lexical binding ownership and receiver derivation for coupling analysis.
+
+One inventory owns every write and its extraction/import metadata. Owned-data
+derivation and original-receiver identity ask different questions of that same
+inventory; neither executes control flow, so every possible write must qualify.
+"""
+
+import ast
+from collections import defaultdict
+
+
+def _method_nodes(nodes):
+    """A method's nodes in source order, nested functions and lambdas included.
+
+    A nested class is skipped: it is analysed as a class of its own.
+    """
+    for node in nodes:
+        yield node
+        if isinstance(node, ast.ClassDef):
+            continue
+        yield from _method_nodes(ast.iter_child_nodes(node))
+
+
+_SCOPES = (ast.Module, ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda,
+           ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp)
+_COMPREHENSIONS = (ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp)
+# Builtins whose result is made of their first argument's elements.
+_TRANSPARENT = frozenset({"sorted", "list", "tuple", "set", "frozenset", "reversed", "iter"})
+_FOREIGN = None  # a binding whose value comes from outside: a parameter, `with ... as`, ...
+
+
+def _target_names(target):
+    return [n.id for n in ast.walk(target) if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Store)]
+
+
+class _Derivation:
+    """Which names in one method hold the object's own data.
+
+    `settings = self._settings()`, `request = self.job.request`, `ctx, job =
+    self.ctx, self.job`, `for job in self._jobs.values()`, and what is built from
+    them (`finished = sorted(job for job in self._jobs.values() ...)`): reading
+    these is reading self. A name is resolved to the scope that binds it — a
+    lambda's `job` parameter is not the loop's `job` — and it is self-derived
+    only when every binding in that scope is.
+    """
+
+    def __init__(self, func, receiver: str | None) -> None:
+        self.parent: dict[int, ast.AST] = {}
+        for node in _method_nodes([func]):
+            for child in ast.iter_child_nodes(node):
+                self.parent[id(child)] = node
+        self.receiver_key = (id(func), receiver) if receiver else None
+        self.bindings: dict[tuple, list] = defaultdict(list)
+        self.nonlocals: dict[tuple, ast.AST] = {}
+        self.module_keys: set = set()
+        self.iterated: set = set()  # id() of the iterables a loop or comprehension binds from
+        self.unpacked: set = set()  # binding keys that receive elements, rather than the whole value
+        receiver_arg = ([*func.args.posonlyargs, *func.args.args] or [None])[0] if receiver else None
+        if self.receiver_key:
+            self.bindings[self.receiver_key] = []
+        for node in _method_nodes([func]):
+            self._collect(node, receiver_arg)
+        self._link_nonlocal_writes()
+        self.state = {key: (bool(values) or key == self.receiver_key) and all(v is not _FOREIGN for v in values)
+                      for key, values in self.bindings.items()}
+        changed = True
+        while changed:  # greatest fixpoint: demote any name with a binding not derived
+            changed = False
+            for key, values in self.bindings.items():
+                if self.state[key] and key != self.receiver_key and not all(self.derived(v) for v in values):
+                    self.state[key] = False
+                    changed = True
+
+    def _scope_of(self, node):
+        current = self.parent.get(id(node))
+        while current is not None and not isinstance(current, _SCOPES):
+            current = self.parent.get(id(current))
+        return current
+
+    def _pattern_subject(self, node, whole=False):
+        """The matched value; structural patterns extract rather than preserve it."""
+        while node is not None and not isinstance(node, ast.Match):
+            if whole and isinstance(node, ast.pattern) and not isinstance(node, (ast.MatchAs, ast.MatchOr)):
+                return None
+            node = self.parent.get(id(node))
+        return node.subject if node is not None else None
+
+    def _bind(self, scope, name, value):
+        if scope is not None:
+            self.bindings[(id(scope), name)].append(value)
+
+    def _link_nonlocal_writes(self):
+        """A closure writes its enclosing binding, not a new local copy.
+
+        Resolve after the inventory is complete: an enclosing assignment may
+        appear later. A read-only nonlocal declaration contributes no write.
+        """
+        for key, scope in self.nonlocals.items():
+            enclosing = self._scope_of(scope)
+            while enclosing is not None and not isinstance(enclosing, ast.Module):
+                owner = (id(enclosing), key[1])
+                if owner in self.bindings and owner not in self.nonlocals:
+                    self.bindings[owner].extend(self.bindings.pop(key, []))
+                    if key in self.unpacked:
+                        self.unpacked.add(owner)
+                    if key in self.module_keys:
+                        self.module_keys.add(owner)
+                        self.module_keys.discard(key)
+                    break
+                enclosing = self._scope_of(enclosing)
+            else:
+                self.bindings[key].append(_FOREIGN)  # the owner is outside this inventory
+
+    def _assign(self, scope, target, value):
+        if isinstance(target, ast.Name):
+            self._bind(scope, target.id, value)
+        elif (isinstance(target, (ast.Tuple, ast.List)) and isinstance(value, (ast.Tuple, ast.List))
+              and len(target.elts) == len(value.elts)
+              and not any(isinstance(e, ast.Starred) for e in (*target.elts, *value.elts))):
+            for sub_target, sub_value in zip(target.elts, value.elts):
+                self._assign(scope, sub_target, sub_value)
+        elif not isinstance(target, (ast.Attribute, ast.Subscript)):
+            for name in _target_names(target):  # a part of the value is derived when it is
+                self._bind(scope, name, value)
+                if scope is not None:
+                    self.unpacked.add((id(scope), name))
+
+    def _collect(self, node, receiver_arg) -> None:
+        if isinstance(node, ast.arg):  # the node itself, so its annotation can be read
+            if node is not receiver_arg:
+                self._bind(self._scope_of(node), node.arg, node)
+            return
+        if isinstance(node, (ast.comprehension, ast.For, ast.AsyncFor)):
+            scope = self._scope_of(node)
+            self.iterated.add(id(node.iter))
+            for name in _target_names(node.target):
+                self._bind(scope, name, node.iter)
+            return
+        scope = self._scope_of(node)
+        if isinstance(node, ast.NamedExpr):
+            # A walrus inside comprehensions writes the enclosing lexical cell;
+            # a nested lambda or function still owns its own assignments.
+            while isinstance(scope, _COMPREHENSIONS):
+                scope = self._scope_of(scope)
+        if isinstance(node, ast.Assign):
+            for target in node.targets:
+                self._assign(scope, target, node.value)
+        elif isinstance(node, (ast.AnnAssign, ast.NamedExpr)) and node.value is not None:
+            self._assign(scope, node.target, node.value)
+        elif (isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name)
+              and isinstance(scope, (ast.FunctionDef, ast.AsyncFunctionDef))):
+            # Only function annotations own a local cell; namespace annotations do not bind.
+            self.bindings.setdefault((id(scope), node.target.id), [])
+        elif isinstance(node, (ast.Import, ast.ImportFrom)):
+            for alias in node.names:
+                key = (id(scope), alias.asname or alias.name.split(".")[0])
+                self.bindings[key].append(node)
+                self.module_keys.add(key)
+        elif isinstance(node, ast.AugAssign):
+            for name in _target_names(node.target):
+                self._bind(scope, name, _FOREIGN)
+        elif isinstance(node, ast.withitem) and node.optional_vars is not None:
+            for name in _target_names(node.optional_vars):
+                self._bind(scope, name, _FOREIGN)
+        elif isinstance(node, ast.ExceptHandler) and node.name:
+            self._bind(scope, node.name, _FOREIGN)
+        elif isinstance(node, (ast.MatchAs, ast.MatchStar)) and node.name:
+            # An outer `as`/capture binds the entire subject, even when its
+            # subpattern is structured. Captures inside that structure do not.
+            subject = self._pattern_subject(node, whole=True) if isinstance(node, ast.MatchAs) else None
+            self._bind(scope, node.name, subject if subject is not None else node)
+        elif isinstance(node, ast.MatchMapping) and node.rest:
+            self._bind(scope, node.rest, node)
+        elif isinstance(node, ast.Nonlocal):
+            for name in node.names:
+                self.nonlocals[(id(scope), name)] = scope
+        elif isinstance(node, ast.Global):
+            for name in node.names:
+                self._bind(scope, name, _FOREIGN)
+        elif isinstance(node, ast.ClassDef):
+            self._bind(scope, node.name, node)
+        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            self._bind(self._scope_of(node), node.name, _FOREIGN)
+
+    def resolve(self, name_node):
+        """The (scope, name) a Name use refers to inside the method, or None if free."""
+        child, current = name_node, self.parent.get(id(name_node))
+        from_first_iterable = False
+        while current is not None:
+            if isinstance(current, ast.comprehension):
+                from_first_iterable = child is current.iter
+            elif isinstance(current, _SCOPES):
+                # A comprehension's first iterable is evaluated in the enclosing scope.
+                skip = (isinstance(current, _COMPREHENSIONS) and from_first_iterable
+                        and child is current.generators[0])
+                key = (id(current), name_node.id)
+                if not skip and key in self.bindings:
+                    return key
+                from_first_iterable = False
+            child, current = current, self.parent.get(id(current))
+        return None
+
+    def receiver_identity(self, expr) -> bool:
+        """A name alias grounded in the original receiver, never merely its data.
+
+        The caller checks every write to the receiver separately. Cycles among
+        other names, extraction, iteration, and even one unknown binding cannot
+        certify identity. Unlike owned-data derivation this is a grounded proof.
+        """
+        # A flat method can contain hundreds of aliases without a deeply
+        # nested AST. Walk their proof graph without consuming Python frames.
+        pending = [(expr, False)]
+        active, proven = set(), set()
+        while pending:
+            value, leaving = pending.pop()
+            if not isinstance(value, ast.Name) or id(value) in self.iterated:
+                return False
+            key = self.resolve(value)
+            if key is None or key in self.unpacked:
+                return False
+            if key == self.receiver_key or key in proven:
+                continue
+            if leaving:
+                active.remove(key)
+                proven.add(key)
+                continue
+            if key in active:
+                return False
+            values = self.bindings.get(key, [])
+            if not values:
+                return False
+            active.add(key)
+            pending.append((value, True))
+            pending.extend((binding, False) for binding in values)
+        return True
+
+    def derived(self, expr) -> bool:
+        """True when ``expr`` navigates from self or from a self-derived name."""
+        while True:
+            if isinstance(expr, (ast.Attribute, ast.Subscript)):
+                expr = expr.value
+            elif isinstance(expr, ast.Call):
+                if (isinstance(expr.func, ast.Name) and expr.func.id in _TRANSPARENT
+                        and expr.args and self.resolve(expr.func) is None):
+                    expr = expr.args[0]
+                else:
+                    expr = expr.func
+            elif isinstance(expr, (ast.GeneratorExp, ast.ListComp, ast.SetComp)):
+                expr = expr.elt
+            elif isinstance(expr, (ast.MatchAs, ast.MatchStar, ast.MatchMapping)):
+                # Captures extract the matched subject's data. Keep the pattern
+                # as the binding value: extraction does not prove identity.
+                expr = self._pattern_subject(expr)
+                if expr is None:
+                    return False
+            elif isinstance(expr, ast.Name):
+                key = self.resolve(expr)
+                return key is not None and self.state.get(key, False)
+            else:
+                return False
+
+

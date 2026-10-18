@@ -25,6 +25,7 @@ from dataclasses import dataclass, asdict, field
 from collections import Counter, defaultdict
 from common import first_party_modules, is_test_file, project_root, sort_findings, cached_parse, SEVERITY_ICONS, configure_output, find_python_files, warn_detector_error, warn_unparseable
 from find_mutation_hazards import ClassFamilyResolver
+from coupling_bindings import _Derivation, _FOREIGN, _SCOPES, _TRANSPARENT, _method_nodes, _target_names
 
 
 @dataclass
@@ -136,164 +137,6 @@ def _receiver(func) -> str | None:
             return None
     params = [*func.args.posonlyargs, *func.args.args]
     return params[0].arg if params else None
-
-
-def _method_nodes(nodes):
-    """A method's nodes in source order, nested functions and lambdas included.
-
-    A nested class is skipped: it is analysed as a class of its own.
-    """
-    for node in nodes:
-        yield node
-        if isinstance(node, ast.ClassDef):
-            continue
-        yield from _method_nodes(ast.iter_child_nodes(node))
-
-
-_SCOPES = (ast.Module, ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda,
-           ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp)
-_COMPREHENSIONS = (ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp)
-# Builtins whose result is made of their first argument's elements.
-_TRANSPARENT = frozenset({"sorted", "list", "tuple", "set", "frozenset", "reversed", "iter"})
-_FOREIGN = None  # a binding whose value comes from outside: a parameter, `with ... as`, ...
-
-
-def _target_names(target):
-    return [n.id for n in ast.walk(target) if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Store)]
-
-
-class _Derivation:
-    """Which names in one method hold the object's own data.
-
-    `settings = self._settings()`, `request = self.job.request`, `ctx, job =
-    self.ctx, self.job`, `for job in self._jobs.values()`, and what is built from
-    them (`finished = sorted(job for job in self._jobs.values() ...)`): reading
-    these is reading self. A name is resolved to the scope that binds it — a
-    lambda's `job` parameter is not the loop's `job` — and it is self-derived
-    only when every binding in that scope is.
-    """
-
-    def __init__(self, func, receiver: str | None) -> None:
-        self.parent: dict[int, ast.AST] = {}
-        for node in _method_nodes([func]):
-            for child in ast.iter_child_nodes(node):
-                self.parent[id(child)] = node
-        self.receiver_key = (id(func), receiver) if receiver else None
-        self.bindings: dict[tuple, list] = defaultdict(list)
-        self.module_keys: set = set()
-        self.iterated: set = set()  # id() of the iterables a loop or comprehension binds from
-        receiver_arg = ([*func.args.posonlyargs, *func.args.args] or [None])[0] if receiver else None
-        if self.receiver_key:
-            self.bindings[self.receiver_key] = []
-        for node in _method_nodes([func]):
-            self._collect(node, receiver_arg)
-        self.state = {key: all(v is not _FOREIGN for v in values) for key, values in self.bindings.items()}
-        changed = True
-        while changed:  # greatest fixpoint: demote any name with a binding not derived
-            changed = False
-            for key, values in self.bindings.items():
-                if self.state[key] and key != self.receiver_key and not all(self.derived(v) for v in values):
-                    self.state[key] = False
-                    changed = True
-
-    def _scope_of(self, node):
-        current = self.parent.get(id(node))
-        while current is not None and not isinstance(current, _SCOPES):
-            current = self.parent.get(id(current))
-        return current
-
-    def _bind(self, scope, name, value):
-        if scope is not None:
-            self.bindings[(id(scope), name)].append(value)
-
-    def _assign(self, scope, target, value):
-        if isinstance(target, ast.Name):
-            self._bind(scope, target.id, value)
-        elif (isinstance(target, (ast.Tuple, ast.List)) and isinstance(value, (ast.Tuple, ast.List))
-              and len(target.elts) == len(value.elts)
-              and not any(isinstance(e, ast.Starred) for e in (*target.elts, *value.elts))):
-            for sub_target, sub_value in zip(target.elts, value.elts):
-                self._assign(scope, sub_target, sub_value)
-        elif not isinstance(target, (ast.Attribute, ast.Subscript)):
-            for name in _target_names(target):  # a part of the value is derived when it is
-                self._bind(scope, name, value)
-
-    def _collect(self, node, receiver_arg) -> None:
-        if isinstance(node, ast.arg):  # the node itself, so its annotation can be read
-            if node is not receiver_arg:
-                self._bind(self._scope_of(node), node.arg, node)
-            return
-        if isinstance(node, ast.comprehension):
-            scope = self.parent.get(id(node))
-            self.iterated.add(id(node.iter))
-            for name in _target_names(node.target):
-                self._bind(scope, name, node.iter)
-            return
-        scope = self._scope_of(node)
-        if isinstance(node, ast.Assign):
-            for target in node.targets:
-                self._assign(scope, target, node.value)
-        elif isinstance(node, (ast.AnnAssign, ast.NamedExpr)) and node.value is not None:
-            self._assign(scope, node.target, node.value)
-        elif isinstance(node, (ast.For, ast.AsyncFor)):
-            self.iterated.add(id(node.iter))
-            for name in _target_names(node.target):
-                self._bind(scope, name, node.iter)
-        elif isinstance(node, (ast.Import, ast.ImportFrom)):
-            for alias in node.names:
-                key = (id(scope), alias.asname or alias.name.split(".")[0])
-                self.bindings[key].append(_FOREIGN)
-                self.module_keys.add(key)
-        elif isinstance(node, ast.AugAssign):
-            for name in _target_names(node.target):
-                self._bind(scope, name, _FOREIGN)
-        elif isinstance(node, ast.withitem) and node.optional_vars is not None:
-            for name in _target_names(node.optional_vars):
-                self._bind(scope, name, _FOREIGN)
-        elif isinstance(node, ast.ExceptHandler) and node.name:
-            self._bind(scope, node.name, _FOREIGN)
-        elif isinstance(node, (ast.Global, ast.Nonlocal)):
-            for name in node.names:
-                self._bind(scope, name, _FOREIGN)
-        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-            self._bind(self._scope_of(node), node.name, _FOREIGN)
-
-    def resolve(self, name_node):
-        """The (scope, name) a Name use refers to inside the method, or None if free."""
-        child, current = name_node, self.parent.get(id(name_node))
-        from_first_iterable = False
-        while current is not None:
-            if isinstance(current, ast.comprehension):
-                from_first_iterable = child is current.iter
-            elif isinstance(current, _SCOPES):
-                # A comprehension's first iterable is evaluated in the enclosing scope.
-                skip = (isinstance(current, _COMPREHENSIONS) and from_first_iterable
-                        and child is current.generators[0])
-                key = (id(current), name_node.id)
-                if not skip and key in self.bindings:
-                    return key
-                from_first_iterable = False
-            child, current = current, self.parent.get(id(current))
-        return None
-
-    def derived(self, expr) -> bool:
-        """True when ``expr`` navigates from self or from a self-derived name."""
-        while True:
-            if isinstance(expr, (ast.Attribute, ast.Subscript)):
-                expr = expr.value
-            elif isinstance(expr, ast.Call):
-                if (isinstance(expr.func, ast.Name) and expr.func.id in _TRANSPARENT
-                        and expr.args and self.resolve(expr.func) is None):
-                    expr = expr.args[0]
-                else:
-                    expr = expr.func
-            elif isinstance(expr, (ast.GeneratorExp, ast.ListComp, ast.SetComp)):
-                expr = expr.elt
-            elif isinstance(expr, ast.Name):
-                key = self.resolve(expr)
-                return key is not None and self.state.get(key, False)
-            else:
-                return False
 
 
 _BUILTIN_TYPES = frozenset({
@@ -422,7 +265,7 @@ class _ExternalTypes:
             return self.annotation(ann.value)
         return False
 
-    def _item_annotation(self, ann) -> bool:
+    def _item_annotation(self, ann, index=None) -> bool:
         """What subscripting a value of this annotation yields is external."""
         if isinstance(ann, ast.Constant) and isinstance(ann.value, str):
             try:
@@ -433,9 +276,16 @@ class _ExternalTypes:
             head = getattr(ann.value, "id", getattr(ann.value, "attr", None))
             args = ann.slice.elts if isinstance(ann.slice, ast.Tuple) else [ann.slice]
             if head in _UNWRAP:
-                return self._item_annotation(args[0])
+                return self._item_annotation(args[0], index)
             if head in _MAPPINGS:
                 return self.annotation(args[-1])
+            if head == "tuple" and not (len(args) == 2 and isinstance(args[-1], ast.Constant)
+                                        and args[-1].value is Ellipsis):
+                # A positional tuple does not have one uniform element type.
+                # An unknown index needs every possible position to qualify.
+                if index is None:
+                    return bool(args) and all(self.annotation(arg) for arg in args)
+                return -len(args) <= index < len(args) and self.annotation(args[index])
             if head in _SEQUENCES:
                 return self.annotation(args[0])
             return False
@@ -443,6 +293,35 @@ class _ExternalTypes:
         return self.annotation(ann) and getattr(ann, "id", None) not in _BUILTIN_TYPES
 
     # -- values ---------------------------------------------------------------
+    def _indexed_value(self, subject, derivation, index=None) -> bool:
+        """One element of an annotated parameter, shared by indexing and patterns."""
+        key = derivation.resolve(subject) if isinstance(subject, ast.Name) else None
+        values = derivation.bindings.get(key, []) if key else []
+        return bool(values) and all(isinstance(v, ast.arg) and v.annotation is not None
+                                    and self._item_annotation(v.annotation, index) for v in values)
+
+    def _pattern_value(self, capture, derivation) -> bool:
+        """A direct sequence/mapping extraction has the same type as indexing.
+
+        A library object's fields and nested containers need additional type
+        evidence. Do not infer their types merely from the outer annotation.
+        """
+        child = capture
+        parent = derivation.parent.get(id(child))
+        while isinstance(parent, (ast.MatchAs, ast.MatchOr)):
+            child = parent
+            parent = derivation.parent.get(id(child))
+        if not isinstance(parent, (ast.MatchSequence, ast.MatchMapping)):
+            return False
+        subject = derivation._pattern_subject(derivation.parent.get(id(parent)), whole=True)
+        index = None
+        if isinstance(parent, ast.MatchSequence):
+            index = parent.patterns.index(child)
+            star = next((i for i, pattern in enumerate(parent.patterns) if isinstance(pattern, ast.MatchStar)), None)
+            if star is not None and index > star:
+                index -= len(parent.patterns)  # suffix positions are known from the end
+        return self._indexed_value(subject, derivation, index)
+
     def _callee(self, func, derivation, seen) -> bool:
         if isinstance(func, ast.Name):
             if derivation.resolve(func) is not None:
@@ -467,10 +346,13 @@ class _ExternalTypes:
                         if not (isinstance(b, ast.Constant) and b.value is None)]
             return bool(branches) and all(self.value(b, derivation, seen) for b in branches)
         if isinstance(expr, ast.Subscript) and isinstance(expr.value, ast.Name):
-            key = derivation.resolve(expr.value)
-            values = derivation.bindings.get(key, []) if key else []
-            return bool(values) and all(isinstance(v, ast.arg) and v.annotation is not None
-                                        and self._item_annotation(v.annotation) for v in values)
+            index = expr.slice.value if isinstance(expr.slice, ast.Constant) and isinstance(expr.slice.value, int) else None
+            if (isinstance(expr.slice, ast.UnaryOp) and isinstance(expr.slice.op, ast.USub)
+                    and isinstance(expr.slice.operand, ast.Constant) and isinstance(expr.slice.operand.value, int)):
+                index = -expr.slice.operand.value
+            return self._indexed_value(expr.value, derivation, index)
+        if isinstance(expr, ast.MatchAs):
+            return self._pattern_value(expr, derivation)
         if isinstance(expr, ast.Name):
             return self.name(expr, derivation, seen)
         return False
@@ -598,6 +480,10 @@ def _read_method(func, module_names: set, types: "_ExternalTypes | None" = None)
         if (types is not None and isinstance(node, ast.Call) and len(node.args) == 1 and not node.keywords
                 and isinstance(node.args[0], ast.Name) and derivation.receiver_key is not None
                 and derivation.resolve(node.args[0]) == derivation.receiver_key
+                # Self-derived replacements can be a child with a different protocol.
+                and derivation.receiver_key not in derivation.unpacked
+                and all(derivation.receiver_identity(value)
+                        for value in derivation.bindings[derivation.receiver_key])
                 and not any(_name_of(dec) == "classmethod" for dec in func.decorator_list)):
             representation = types.representation_builtin(node.func, derivation)
             if representation is not None:
@@ -609,15 +495,22 @@ def _read_method(func, module_names: set, types: "_ExternalTypes | None" = None)
             key = derivation.resolve(base)
             if key is not None and key == derivation.receiver_key:
                 method.self_names.append(node.attr)
-            elif key is not None and key in derivation.module_keys:
-                pass  # a module imported in the method: no class to move to
+            elif key is not None and key in derivation.module_keys and all(
+                    isinstance(value, (ast.Import, ast.ImportFrom)) or derivation.derived(value)
+                    for value in derivation.bindings[key]):
+                pass  # module/owned-data reads are safe only when every write proves it
             elif key is not None and derivation.state.get(key):
                 method.derived_reads.add(f"{base.id}.{node.attr}")
             elif key is None and base.id in module_names:
                 pass  # a module has no class to move the method to
+            elif key is not None and derivation.bindings[key] and all(
+                    isinstance(value, ast.ClassDef) and not (value.bases or value.keywords or value.decorator_list)
+                    for value in derivation.bindings[key]):
+                pass  # a proven class namespace is not another instance's data
             elif types is not None and types.name(base, derivation):
                 pass  # a library or builtin object: nowhere to move the method to
-            elif key is not None and all(id(v) in derivation.iterated for v in derivation.bindings[key]):
+            elif key is not None and derivation.bindings[key] and all(
+                    id(v) in derivation.iterated for v in derivation.bindings[key]):
                 pass  # iteration elements are consumed here; the loop is not their owner
             elif key is not None and id(node) not in called and isinstance(node.ctx, ast.Load):
                 # Only local objects' distinct data reads count. Calls delegate work;
