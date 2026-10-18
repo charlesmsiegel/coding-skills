@@ -522,3 +522,66 @@ def test_a_possible_custom_generic_retains_its_type_argument(tmp_path):
               'if flag:\n    Literal = custom_generic\n'
               'value: Literal["used.Type"]\n')
     assert "used" not in unused_imports(tmp_path, source)
+
+
+@pytest.mark.parametrize("expression", [
+    '(cast := converter) if flag else None',
+    'None if flag else (cast := converter)',
+    'flag and (cast := converter)',
+    'flag or (cast := converter)',
+    'flag and True and (cast := converter)',
+    'flag or False or (cast := converter)',
+])
+def test_conditional_expression_stores_keep_the_unexecuted_path(tmp_path, expression):
+    source = ('import used\nfrom typing import cast\n' + expression + '\n'
+              'value = cast("used.Type", None)\n')
+    assert "used" not in unused_imports(tmp_path, source)
+
+
+@pytest.mark.parametrize("expression", [
+    '(cast := converter) if True else None',
+    'None if False else (cast := converter)',
+    'True and (cast := converter)',
+    'False or (cast := converter)',
+    'True and True and (cast := converter)',
+    'False or False or (cast := converter)',
+])
+def test_unconditional_expression_stores_replace_the_typing_origin(tmp_path, expression):
+    source = ('import unused\nfrom typing import cast\n' + expression + '\n'
+              'value = cast("unused.Type", None)\n')
+    assert "unused" in unused_imports(tmp_path, source)
+
+
+@pytest.mark.parametrize("guard,imports", [
+    ('TYPE_CHECKING', 'from typing import TYPE_CHECKING'),
+    ('tc', 'from typing import TYPE_CHECKING as tc'),
+    ('types.TYPE_CHECKING', 'import typing as types'),
+])
+@pytest.mark.parametrize("form,annotation", [
+    ('Literal', 'Literal["unused.Type"]'),
+    ('Annotated', 'Annotated[int, "unused.Type"]'),
+])
+def test_conditional_typing_only_origins_keep_metadata_as_data(tmp_path, guard, imports, form, annotation):
+    source = (f'from __future__ import annotations\nimport unused\n{imports}\n'
+              f'if {guard}:\n    from typing import {form}\nvalue: {annotation}\n')
+    assert "unused" in unused_imports(tmp_path, source)
+
+
+def test_a_generator_body_can_resolve_a_later_enclosing_import(tmp_path):
+    source = ('import used\nrows = (cast("used.Type", value) for value in values)\n'
+              'from typing import cast\nconsume(rows)\n')
+    assert "used" not in unused_imports(tmp_path, source)
+
+
+def test_a_generator_inside_a_function_can_use_a_later_local_import(tmp_path):
+    source = ('import used\ndef run(values):\n'
+              '    rows = (cast("used.Type", value) for value in values)\n'
+              '    from typing import cast\n    return list(rows)\n')
+    assert "used" not in unused_imports(tmp_path, source)
+
+
+def test_a_generators_first_iterable_cannot_use_a_later_local_import(tmp_path):
+    source = ('import unused\ndef run():\n'
+              '    rows = (value for value in cast("unused.Type", values))\n'
+              '    from typing import cast\n    return list(rows)\n')
+    assert "unused" in unused_imports(tmp_path, source)

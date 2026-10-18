@@ -70,7 +70,7 @@ class ImportReferences(ast.NodeVisitor):
         # containing non-comprehension scope (PEP 572).
         previous = self._annotation_scopes
         end = len(previous)
-        while previous[end - 1][0] == "comprehension":
+        while previous[end - 1][0] in {"comprehension", "generator"}:
             end -= 1
         self._annotation_scopes = previous[:end]
         try:
@@ -85,30 +85,54 @@ class ImportReferences(ast.NodeVisitor):
             self.visit(statement)
 
     def visit_If(self, node: ast.If):
+        self._visit_conditional(node.test, node.body, node.orelse)
+
+    def visit_IfExp(self, node: ast.IfExp):
+        self._visit_conditional(node.test, [node.body], [node.orelse])
+
+    def _visit_conditional(self, test, body, otherwise):
         # The symbol table already establishes function-local names, including
         # unreachable declarations. Only the executed branch can replace an
         # import's progressive origin, in any scope.
-        self.visit(node.test)
-        if isinstance(node.test, ast.Constant):
-            for statement in node.body if node.test.value else node.orelse:
+        self.visit(test)
+        if isinstance(test, ast.Constant):
+            for statement in body if test.value else otherwise:
                 self.visit(statement)
         else:
-            # Neither branch is known to run. Keep each possible origin; the
-            # last branch visited is not evidence that the other was skipped.
-            before = [origins.copy() for _kind, origins in self._annotation_scopes]
-            branches = []
-            for statements in (node.body, node.orelse):
-                for (_kind, origins), original in zip(self._annotation_scopes, before):
-                    origins.clear()
-                    origins.update(original)
-                for statement in statements:
-                    self.visit(statement)
-                branches.append([origins.copy() for _kind, origins in self._annotation_scopes])
-            for index, (_kind, origins) in enumerate(self._annotation_scopes):
+            self._join_branches((body, otherwise))
+
+    def _join_branches(self, alternatives):
+        # Neither branch is known to run. Keep each possible origin; the last
+        # branch visited is not evidence that the other was skipped. Restore
+        # maps in place: queued deferred bodies retain these namespace objects.
+        before = [origins.copy() for _kind, origins in self._annotation_scopes]
+        branches = []
+        for statements in alternatives:
+            for (_kind, origins), original in zip(self._annotation_scopes, before):
                 origins.clear()
-                for name in branches[0][index].keys() | branches[1][index].keys():
-                    origins[name] = frozenset().union(*(
-                        self._origin_options(branch[index].get(name, _FALLBACK)) for branch in branches))
+                origins.update(original)
+            for statement in statements:
+                self.visit(statement)
+            branches.append([origins.copy() for _kind, origins in self._annotation_scopes])
+        for index, (_kind, origins) in enumerate(self._annotation_scopes):
+            origins.clear()
+            names = set().union(*(branch[index] for branch in branches))
+            for name in names:
+                origins[name] = frozenset().union(*(
+                    self._origin_options(branch[index].get(name, _FALLBACK)) for branch in branches))
+
+    def visit_BoolOp(self, node: ast.BoolOp):
+        self.visit(node.values[0])
+        conditional = False
+        for previous, value in zip(node.values, node.values[1:]):
+            known = isinstance(previous, ast.Constant)
+            if known and bool(previous.value) != isinstance(node.op, ast.And):
+                break
+            conditional = conditional or not known
+            if conditional:
+                self._join_branches(([], [value]))
+            else:
+                self.visit(value)
 
     @staticmethod
     def _origin_options(value):
@@ -142,7 +166,7 @@ class ImportReferences(ast.NodeVisitor):
                     if _FALLBACK in options:
                         # A class branch may leave its local name absent. That
                         # path falls back to the enclosing namespace.
-                        options = (options - {_FALLBACK}) | self._origin_options(out.get(name, ""))
+                        options = (options - {_FALLBACK}) | self._origin_options(out.get(name, _FALLBACK))
                     out[name] = options
         return out
 
@@ -185,6 +209,8 @@ class ImportReferences(ast.NodeVisitor):
                 if arg is not None:
                     origins[arg.arg] = None
         kind = ("class" if is_class else "function" if args is not None else "comprehension")
+        if isinstance(node, ast.GeneratorExp):
+            kind = "generator"
         self._annotation_scopes.append((kind, origins))
         try:
             yield
@@ -222,7 +248,8 @@ class ImportReferences(ast.NodeVisitor):
         # possible custom generic still gives its strings type semantics.
         return {imported + (separator + rest if separator else "")
                 if isinstance(imported, str) and imported else ""
-                for imported in self._origin_options(origins.get(first))}
+                for imported in self._origin_options(origins.get(first, _FALLBACK))
+                if imported is not _FALLBACK and imported != ""}
 
     def visit_Attribute(self, node: ast.Attribute):
         if isinstance(node.value, ast.Name):
@@ -346,7 +373,7 @@ class ImportReferences(ast.NodeVisitor):
         elif isinstance(node.func, ast.Attribute):
             self.called_functions.add(node.func.attr)
         if not self._typing_cast_references(node) and not self._finishing_references and self._unresolved_callee(node.func) and any(
-                kind == "function" for kind, _origins in self._annotation_scopes):
+                kind in {"function", "generator"} for kind, _origins in self._annotation_scopes):
             self._deferred_casts.append((node, tuple(self._annotation_scopes)))
 
     def _unresolved_callee(self, node: ast.AST) -> bool:
@@ -355,12 +382,12 @@ class ImportReferences(ast.NodeVisitor):
             return False
         first = dotted.partition(".")[0]
         origins = self._annotation_origins()
-        functions = [local for kind, local in self._annotation_scopes if kind == "function"]
-        if functions and first in functions[-1]:
+        deferred = [local for kind, local in self._annotation_scopes if kind in {"function", "generator"}]
+        if deferred and first in deferred[-1]:
             # A later import in this very function is an unbound local at the
             # current call. Only an enclosing namespace may complete later.
             return False
-        return first not in origins or "" in self._origin_options(origins[first])
+        return first not in origins or bool({"", _FALLBACK} & self._origin_options(origins[first]))
 
     def _typing_cast_references(self, node: ast.Call) -> bool:
         # Only typing's cast gives its first argument type semantics. An
