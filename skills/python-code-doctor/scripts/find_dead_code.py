@@ -443,10 +443,15 @@ class ScopeTracker(ast.NodeVisitor):
         Literal enum members and Annotated metadata still need their imports,
         without interpreting a string argument as another forward reference.
         """
-        names = {child.id for child in ast.walk(node)
-                 if isinstance(child, ast.Name) and isinstance(child.ctx, ast.Load)}
-        self.used_names.update(names)
-        self.value_references.update(names)
+        nodes = list(ast.walk(node))
+        callees = {child.func for child in nodes if isinstance(child, ast.Call)}
+        for child in nodes:
+            if isinstance(child, ast.Name) and isinstance(child.ctx, ast.Load):
+                self.used_names.add(child.id)
+                if child not in callees:
+                    self.value_references.add(child.id)
+            elif isinstance(child, ast.Call):
+                self._call_references(child)
 
     def _annotation_references(self, node: ast.AST | None) -> None:
         """Read forward references only in annotation type positions."""
@@ -545,7 +550,7 @@ class ScopeTracker(ast.NodeVisitor):
             else:
                 self.current_app_config_names.discard(node.name)
 
-    def visit_Call(self, node: ast.Call):
+    def _call_references(self, node: ast.Call) -> None:
         if isinstance(node.func, ast.Name):
             self.called_functions.add(node.func.id)
             self.instantiated_classes.add(node.func.id)
@@ -555,6 +560,9 @@ class ScopeTracker(ast.NodeVisitor):
         callee = node.func.id if isinstance(node.func, ast.Name) else getattr(node.func, "attr", None)
         if callee == "cast" and node.args:
             self.used_names.update(_string_annotation_names(node.args[0]))
+
+    def visit_Call(self, node: ast.Call):
+        self._call_references(node)
         self.generic_visit(node)
 
     @staticmethod
