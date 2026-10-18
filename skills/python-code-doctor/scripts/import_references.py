@@ -325,7 +325,8 @@ class ImportReferences(ast.NodeVisitor):
     visit_AsyncWith = visit_With
 
     def _origin_state(self):
-        return [origins.copy() for _kind, origins, _globals in self._annotation_scopes]
+        return [(origins.maps[0] if isinstance(origins, ChainMap) else origins).copy()
+                for _kind, origins, _globals in self._annotation_scopes]
 
     def _restore_origins(self, state):
         for (_kind, origins, _globals), original in zip(self._annotation_scopes, state):
@@ -438,6 +439,15 @@ class ImportReferences(ast.NodeVisitor):
     def _origin_options(value):
         return value if isinstance(value, frozenset) else frozenset((value,))
 
+    def _mapping_options(self, origins, name):
+        if not isinstance(origins, ChainMap):
+            return self._origin_options(origins.get(name, _FALLBACK))
+        if len(origins.maps) == 1:
+            return self._mapping_options(origins.maps[0], name)
+        options = self._origin_options(origins.maps[0].get(name, _FALLBACK))
+        return ((options - {_FALLBACK}) | self._mapping_options(origins.parents, name)
+                if _FALLBACK in options else options)
+
     def _remember_annotation_imports(self, node):
         origins = self._annotation_scopes[-1][1]
         for alias in node.names:
@@ -466,9 +476,9 @@ class ImportReferences(ast.NodeVisitor):
         for index, (kind, origins, globals_) in enumerate(self._annotation_scopes):
             if kind != "class" or index == len(self._annotation_scopes) - 1:
                 for name in globals_:
-                    out[name] = self._origin_options(self._annotation_scopes[0][1].get(name, _FALLBACK))
+                    out[name] = self._mapping_options(self._annotation_scopes[0][1], name)
                 for name, value in origins.items():
-                    options = self._origin_options(value)
+                    options = self._mapping_options(origins, name)
                     if _FALLBACK in options:
                         # A class branch may leave its local name absent. That
                         # path falls back to the enclosing namespace.
@@ -478,7 +488,8 @@ class ImportReferences(ast.NodeVisitor):
 
     @contextmanager
     def _preserve_annotation_bindings(self, enabled=True):
-        saved = [(origins, origins.copy()) for _kind, origins, _globals in self._annotation_scopes] if enabled else []
+        saved = [(origins, (origins.maps[0] if isinstance(origins, ChainMap) else origins).copy())
+                 for _kind, origins, _globals in self._annotation_scopes] if enabled else []
         try:
             yield
         finally:
@@ -595,7 +606,7 @@ class ImportReferences(ast.NodeVisitor):
             return
         if isinstance(node, ast.Constant) and isinstance(node.value, str):
             try:
-                expression = ast.parse(node.value, mode="eval").body
+                expression = ast.parse(node.value.strip(), mode="eval").body
             except (SyntaxError, ValueError):
                 return
             # Quoted expressions need the same parent relationships as the

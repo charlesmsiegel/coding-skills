@@ -24,6 +24,85 @@ def unused_imports(tmp_path, source):
     return {item["name"] for item in dead_code_issues(tmp_path, source) if item["issue_type"] == "unused_import"}
 
 
+@pytest.mark.parametrize("statement, used", [
+    ('value: "  models.Type  "', True),
+    ('def result() -> "\\tmodels.Type\\t": pass', True),
+    ('value: Literal["  models.Type  "]', False),
+    ('value: \'  Literal["models.Type"]  \'', False),
+])
+def test_quoted_type_whitespace_does_not_change_type_and_metadata_positions(tmp_path, statement, used):
+    source = 'import models\nfrom typing import Literal\n' + statement + '\n'
+    assert ("models" not in unused_imports(tmp_path, source)) is used
+
+
+@pytest.mark.parametrize("body, used", [
+    ('from converter import convert\ndef run(value):\n    return convert("models.Type", value)\n'
+     'from typing import cast as convert\nrun(value)\n', True),
+    ('def outer():\n    from converter import convert\n    def inner(value):\n'
+     '        return convert("models.Type", value)\n    from typing import cast as convert\n    return inner\n', True),
+    ('def run(value):\n    from converter import convert\n    result = convert("models.Type", value)\n'
+     '    from typing import cast as convert\n    return result\n', False),
+    ('from converter import convert\nresult = convert("models.Type", value)\nfrom typing import cast as convert\n', False),
+])
+def test_completed_enclosing_rebindings_reconsider_known_deferred_callees(tmp_path, body, used):
+    assert ("models" not in unused_imports(tmp_path, 'import models\n' + body)) is used
+
+
+@pytest.mark.parametrize("pattern, used", [
+    ('_ as captured', False),
+    ('(_ as first) as captured', False),
+    ('_ as captured if flag', True),
+    ('1 as captured', True),
+])
+def test_nested_wildcard_capture_exhaustiveness_is_distinct_from_a_guarded_match(tmp_path, pattern, used):
+    source = ('import models\nfrom typing import cast\nmatch value:\n'
+              f'    case {pattern}:\n        cast = converter.cast\n'
+              'value = cast("models.Type", value)\n')
+    assert ("models" not in unused_imports(tmp_path, source)) is used
+
+
+@pytest.mark.parametrize("loop, used", [
+    ('for item in [1, 2]:\n    a, b, c = b, c, a\n', True),
+    ('while flag:\n    a, b, c = b, c, a\n', True),
+    ('for item in [1, 2]:\n    a, b, c = b, c, a\n    break\n', False),
+    ('for item in [1, 2]:\n    continue\n    b = a\n', False),
+])
+def test_loop_origins_reach_a_fixed_point_without_continuing_after_exits(tmp_path, loop, used):
+    source = ('import models\nimport typing\na = typing.cast\nb = converter.cast\nc = converter.cast\n'
+              + loop + 'value = b("models.Type", value)\n')
+    assert ("models" not in unused_imports(tmp_path, source)) is used
+
+
+@pytest.mark.parametrize("body, used", [
+    ('with suppress(Exception):\n    cast = typing.cast\n    may_fail()\n    cast = converter.cast\n', True),
+    ('with manager:\n    if flag:\n        cast = typing.cast\n        may_fail()\n    cast = converter.cast\n', True),
+    ('try:\n    with suppress(Exception):\n        cast = typing.cast\n        may_fail()\n'
+     '        cast = converter.cast\nfinally:\n    cast = converter.cast\n', False),
+])
+def test_suppressible_with_prefixes_preserve_only_possible_continuing_origins(tmp_path, body, used):
+    source = ('import models\nimport typing\ncast = converter.cast\n' + body + 'value = cast("models.Type", value)\n')
+    assert ("models" not in unused_imports(tmp_path, source)) is used
+
+
+@pytest.mark.parametrize("body, used", [
+    ('if flag:\n    raise SystemExit\nelse:\n    cast = converter.cast\n', False),
+    ('if flag:\n    value = cast("models.Type", value)\n    raise SystemExit\nelse:\n    cast = converter.cast\n', True),
+    ('match value:\n    case 1:\n        raise SystemExit\n    case _:\n        cast = converter.cast\n', False),
+    ('try:\n    may_fail()\nexcept Exception:\n    raise SystemExit\nelse:\n    cast = converter.cast\n', False),
+])
+def test_terminating_paths_do_not_supply_origins_to_later_calls(tmp_path, body, used):
+    source = 'import models\nfrom typing import cast\n' + body + 'value = cast("models.Type", value)\n'
+    assert ("models" not in unused_imports(tmp_path, source)) is used
+
+
+@pytest.mark.parametrize("exit_statement", ['return None', 'raise SystemExit'])
+def test_function_termination_excludes_the_dead_branch_and_following_statements(tmp_path, exit_statement):
+    source = ('import models\ndef run(value):\n    from typing import cast\n'
+              f'    if flag:\n        {exit_statement}\n    else:\n        cast = converter.cast\n'
+              '    value = cast("models.Type", value)\n    return value\n')
+    assert "models" in unused_imports(tmp_path, source)
+
+
 @pytest.mark.parametrize("declaration", [
     'def result() -> dict[str, "models.Model"]: pass',
     'async def result() -> "dict[str, models.Model]": pass',
