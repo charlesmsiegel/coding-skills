@@ -11,7 +11,7 @@ import argparse
 from pathlib import Path
 from dataclasses import dataclass, asdict
 from collections import defaultdict
-from find_coupling_issues import _Derivation, _method_nodes
+from find_coupling_issues import _Derivation, _forwarded_to, _method_nodes
 from common import (sort_findings, SEVERITY_ICONS, configure_output, find_python_files,
                     warn_detector_error, warn_unparseable)
 
@@ -25,6 +25,8 @@ class OverEngineeringIssue:
     description: str
     suggestion: str
     severity: str
+    kind: str = "finding"
+    also_caused_by: tuple[str, ...] = ()
 
 
 class ProjectAnalyzer:
@@ -35,7 +37,7 @@ class ProjectAnalyzer:
         self.factory_classes: list[tuple[str, str, int]] = []
         self.builder_classes: list[tuple[str, str, int]] = []
         self.strategy_classes: list[tuple[str, str, int]] = []
-        self.thin_wrappers: list[tuple[str, str, int, str]] = []
+        self.thin_wrappers: list[tuple[str, str, int, str, tuple[str, ...]]] = []
         self.issues: list[OverEngineeringIssue] = []
 
     def analyze_file(self, filepath: Path):
@@ -101,14 +103,21 @@ class ProjectAnalyzer:
                 ))
         
         # Thin wrappers
-        for name, file, line, wrapped in self.thin_wrappers:
+        for name, file, line, wrapped, behavior in self.thin_wrappers:
             self.issues.append(OverEngineeringIssue(
                 file=file, line=line,
                 issue_type="thin_wrapper",
                 name=name,
-                description=f"Class {name} is a thin wrapper around {wrapped}",
-                suggestion="Use the wrapped class directly unless abstraction is needed",
-                severity="low"
+                description=(f"Class {name} visibly stores only self.{wrapped} and mostly accesses it; "
+                             f"transparent forwarding is unproven for methods {', '.join(behavior)}"
+                             if behavior else f"Class {name} is a thin wrapper around {wrapped}"),
+                suggestion="" if behavior else "Use the wrapped class directly unless abstraction is needed",
+                severity="low",
+                kind="candidate" if behavior else "finding",
+                also_caused_by=(("A single stored object may contain the class's own state; "
+                                 "methods can aggregate, validate, transform, or reset it rather "
+                                 "than merely delegate. Inspect the named method bodies.",)
+                                if behavior else ()),
             ))
         
         # Premature strategy pattern
@@ -184,7 +193,9 @@ class ClassCollector(ast.NodeVisitor):
 
     def _check_thin_wrapper(self, node: ast.ClassDef):
         """A class whose only state is the one object it stores in __init__, and
-        whose methods mostly reach through to it.
+        whose methods mostly reach through to it. Reaching through alone is a
+        candidate: a dictionary accumulator can hold its policy in those methods.
+        Only bodies and arguments that transparently forward establish a finding.
 
         Every attribute the class stores on self counts, in any method and by
         any form of assignment (`self.x = `, `self.x: T = `, `self.a, self.b = `,
@@ -200,11 +211,41 @@ class ClassCollector(ast.NodeVisitor):
             return
         (wrapped_attr,) = stored
         methods = [item for item in defs if item.name != '__init__']
-        delegate_count = sum(1 for method in methods if any(
-            isinstance(inner, ast.Attribute) and isinstance(inner.value, ast.Attribute)
-            and inner.value.attr == wrapped_attr for inner in ast.walk(method)))
+        delegate_count = 0
+        for method in methods:
+            bindings = _Derivation(method, "self")
+            if any(isinstance(inner, ast.Attribute) and isinstance(inner.value, ast.Attribute)
+                   and inner.value.attr == wrapped_attr
+                   and isinstance(inner.value.value, ast.Name) and inner.value.value.id == "self"
+                   and bindings.resolve(inner.value.value) == bindings.receiver_key
+                   for inner in _method_nodes(method.body)):
+                delegate_count += 1
         if delegate_count >= len(methods) * 0.7 and len(methods) > 1:
-            self.analyzer.thin_wrappers.append((node.name, self.filename, node.lineno, wrapped_attr))
+            method_names = {method.name for method in defs}
+            behavior = tuple(method.name for method in methods
+                             if not _transparent_forward(method, wrapped_attr, method_names))
+            self.analyzer.thin_wrappers.append((node.name, self.filename, node.lineno, wrapped_attr, behavior))
+
+
+def _transparent_forward(method, wrapped_attr: str, method_names: set[str]) -> bool:
+    """Reuse the forwarding body recognizer, then require unchanged arguments.
+
+    Normalization, reordering, or constants may express an adapter's policy even
+    when the entire body is one return statement. Unknown shapes stay candidates.
+    """
+    if _forwarded_to(method, "self", method_names) != wrapped_attr:
+        return False
+    value = method.body[-1].value
+    call = value.value if isinstance(value, ast.Await) else value
+    params = method.args
+    positional = [ast.Name(id=arg.arg, ctx=ast.Load()) for arg in [*params.posonlyargs, *params.args][1:]]
+    if params.vararg:
+        positional.append(ast.Starred(value=ast.Name(id=params.vararg.arg, ctx=ast.Load()), ctx=ast.Load()))
+    keywords = [ast.keyword(arg=arg.arg, value=ast.Name(id=arg.arg, ctx=ast.Load())) for arg in params.kwonlyargs]
+    if params.kwarg:
+        keywords.append(ast.keyword(arg=None, value=ast.Name(id=params.kwarg.arg, ctx=ast.Load())))
+    return ([ast.dump(arg) for arg in call.args] == [ast.dump(arg) for arg in positional]
+            and [ast.dump(arg) for arg in call.keywords] == [ast.dump(arg) for arg in keywords])
 
 
 def _self_stores(defs: list) -> set:
@@ -265,9 +306,10 @@ def main():
         severity_icons = SEVERITY_ICONS
         by_type = defaultdict(int)
         for issue in issues:
-            by_type[issue.issue_type] += 1
+            if issue.kind == "finding":
+                by_type[issue.issue_type] += 1
         
-        print(f"Found {len(issues)} over-engineering issue(s):\n")
+        print(f"Found {sum(by_type.values())} over-engineering issue(s):\n")
         print("Summary:")
         for t, c in sorted(by_type.items(), key=lambda x: -x[1]):
             print(f"  {t}: {c}")
@@ -275,10 +317,15 @@ def main():
         
         for issue in issues:
             icon = severity_icons[issue.severity]
-            print(f"{icon} [{issue.severity.upper()}] {issue.file}:{issue.line}")
+            label = "? [CANDIDATE]" if issue.kind == "candidate" else f"{icon} [{issue.severity.upper()}]"
+            print(f"{label} {issue.file}:{issue.line}")
             print(f"   {issue.issue_type}: {issue.name}")
             print(f"   {issue.description}")
-            print(f"   → {issue.suggestion}\n")
+            if issue.suggestion:
+                print(f"   → {issue.suggestion}")
+            for reason in issue.also_caused_by:
+                print(f"   ? also caused by: {reason}")
+            print()
 
 
 if __name__ == '__main__':
