@@ -1,6 +1,6 @@
 # coding-skills
 
-Fifteen agentic skills for AI-assisted software work, plus seven Claude Code
+Sixteen agentic skills for AI-assisted software work, plus seven Claude Code
 output styles that change how the agent talks while it uses them.
 
 The skills pair **deterministic detectors** — stdlib-only scripts that parse the
@@ -134,6 +134,11 @@ list — an open issue usually records a design decision made and not yet acted 
 Language-agnostic, and each carries a script only where something is genuinely
 mechanical.
 
+- **[code-deleter](skills/code-deleter)** — safely remove redundant code,
+  defensive checks, duplication, and unnecessary abstractions. Every run must
+  reduce code lines or leave them constant. A worktree snapshot and blocking
+  line-budget check count production and tests, including new untracked files;
+  unproven simplifications stay untouched.
 - **[brutal-review](skills/brutal-review)** — adversarial review of a diff. Every
   finding must name the input that breaks the code; a complaint with no failing
   case is cut. Delegates to python-code-doctor's `analyze_diff.py` for Python.
@@ -241,7 +246,7 @@ python tools/validate_skills.py     # frontmatter, naming, description limit, ev
 ```
 
 `tools/validate_skills.py` is the single definition of a structurally valid
-skill: CI runs it over all fourteen on every pull request, and the release job
+skill: CI runs it over every skill on each pull request, and the release job
 runs it on the one skill it is about to package. It is stdlib-only, like the
 detectors, so it runs wherever the skills do. Its own rules are tested against
 deliberately-invalid skills in `tests/test_validate_skills.py` — a validator that
