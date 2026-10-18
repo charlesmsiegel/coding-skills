@@ -298,11 +298,10 @@ class ScopeTracker(ast.NodeVisitor):
     visit_AsyncFor = visit_For
 
     def visit_If(self, node: ast.If):
-        # Module and class bodies execute now. A literal condition cannot
-        # replace their imports through the branch that never executes. Keep
-        # the ordinary function walk: even an unreachable assignment makes a
-        # function-local name local throughout that function.
-        if isinstance(node.test, ast.Constant) and self._annotation_scopes[-1][0] in {"module", "class"}:
+        # The symbol table already establishes function-local names, including
+        # unreachable declarations. Only the executed branch can replace an
+        # import's progressive origin, in any scope.
+        if isinstance(node.test, ast.Constant):
             self.visit(node.test)
             for statement in node.body if node.test.value else node.orelse:
                 self.visit(statement)
@@ -588,9 +587,20 @@ class ScopeTracker(ast.NodeVisitor):
     def visit_AnnAssign(self, node: ast.AnnAssign):
         if node.value is not None:
             self.visit(node.value)
+        if node.value is not None or not isinstance(node.target, ast.Name):
             self.visit(node.target)
         self._annotation_references(node.annotation)
         self.visit(node.annotation)
+
+    def _type_parameter_references(self, node):
+        # PEP 695 bounds/constraints and PEP 696 defaults are type positions,
+        # including strings. The visitor names are harmless on Python 3.11,
+        # whose parser cannot produce these newer nodes.
+        self._annotation_references(getattr(node, "bound", None))
+        self._annotation_references(getattr(node, "default_value", None))
+        self.generic_visit(node)
+
+    visit_TypeVar = visit_ParamSpec = visit_TypeVarTuple = _type_parameter_references
 
     def _visit_function(self, node: ast.FunctionDef | ast.AsyncFunctionDef):
         # These expressions execute before the function's parameters bind.
