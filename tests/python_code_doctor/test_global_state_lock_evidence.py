@@ -931,3 +931,64 @@ def test_public_inplace_set_methods_contribute_direct_write_evidence(detector, m
     found = mutations(detector, "from threading import Lock\n_guard = Lock()\nregistry = set()\n"
                       "def put(key):\n    with _guard:\n        registry.add(key)\n" + indent + f"registry.{method}({{key}})\n")
     assert len(found) == 1 and found[0].kind == ("candidate" if protected else "finding")
+
+
+@pytest.mark.parametrize("initial, expression, expected", [
+    ("_guard", "key and (alias := fake_guard)", "finding"),
+    ("_guard", "key or (alias := fake_guard)", "finding"),
+    ("fake_guard", "key and (alias := _guard)", "finding"),
+    ("fake_guard", "key or (alias := _guard)", "finding"),
+    ("fake_guard", "key and (alias := other_fake)", "candidate"),
+])
+def test_short_circuit_paths_preserve_skipped_and_evaluated_bindings(detector, initial, expression, expected):
+    found = mutations(detector, "from threading import Lock\n_guard = Lock()\nregistry = {}\n"
+                      f"def put(key):\n    alias = {initial}\n    {expression}\n"
+                      "    with _guard:\n        alias.release()\n        registry[key] = 1\n")
+    assert len(found) == 1 and found[0].kind == expected
+
+
+def test_short_circuit_values_can_still_identify_one_mutex(detector):
+    found = mutations(detector, "from threading import Lock\n_guard = Lock()\nregistry = {}\n"
+                      "def put(key):\n    with (_guard or _guard):\n        registry[key] = 1\n")
+    assert len(found) == 1 and found[0].kind == "candidate"
+
+
+@pytest.mark.parametrize("statement, expected", [
+    ('threading.__dict__.update({"Lock": make_guard})', "finding"),
+    ('threading.__dict__.update(Lock=make_guard)', "finding"),
+    ('namespace = threading.__dict__\nupdate = namespace.update\nupdate({"Lock": make_guard})', "finding"),
+    ('threading.__dict__.update(values)', "finding"),
+    ('threading.__dict__.update({"other": value})', "candidate"),
+    ('fake_module.__dict__.update({"Lock": make_guard})', "candidate"),
+])
+def test_namespace_update_tracks_literal_keys_and_declines_unknown_keys(detector, statement, expected):
+    found = mutations(detector, "import threading\n" + statement + "\n_guard = threading.Lock()\nregistry = {}\n"
+                      "def put(key):\n    with _guard:\n        registry[key] = 1\n")
+    assert len(found) == 1 and found[0].kind == expected
+
+
+@pytest.mark.skipif(not hasattr(ast, "TypeAlias"), reason="type statements require Python3.12")
+@pytest.mark.parametrize("statement, expected", [
+    ("type Alias = registry.pop(key)", "candidate"),
+    ("type Alias = _guard.release()", "candidate"),
+    ("type Alias[T: registry.pop(key)] = T", "candidate"),
+    ("alias = registry.pop(key)", "finding"),
+])
+def test_type_statement_values_and_bounds_are_deferred(detector, statement, expected):
+    found = mutations(detector, "from threading import Lock\n_guard = Lock()\nregistry = {}\n"
+                      "def put(key):\n    with _guard:\n        registry[key] = 1\n    " + statement + "\n")
+    assert len(found) == 1 and found[0].kind == expected
+
+def test_a_saved_factory_survives_a_later_namespace_update(detector):
+    found = mutations(detector, "from threading import Lock\nimport threading\n"
+                      'threading.__dict__.update({"Lock": make_guard})\n_guard = Lock()\nregistry = {}\n'
+                      "def put(key):\n    with _guard:\n        registry[key] = 1\n")
+    assert len(found) == 1 and found[0].kind == "candidate"
+
+@pytest.mark.parametrize("expression", ["key < 1 < (alias := fake_guard)", "assert key, (alias := fake_guard)"])
+@pytest.mark.parametrize("initial, expected", [("_guard", "finding"), ("other_fake", "candidate")])
+def test_other_conditional_evaluations_do_not_overwrite_the_skipped_origin(detector, expression, initial, expected):
+    found = mutations(detector, "from threading import Lock\n_guard = Lock()\nregistry = {}\n"
+                      f"def put(key):\n    alias = {initial}\n    {expression}\n"
+                      "    with _guard:\n        alias.release()\n        registry[key] = 1\n")
+    assert len(found) == 1 and found[0].kind == expected
