@@ -300,12 +300,63 @@ class _ExternalTypes:
         return bool(values) and all(isinstance(v, ast.arg) and v.annotation is not None
                                     and self._item_annotation(v.annotation, index) for v in values)
 
-    def _pattern_value(self, capture, derivation) -> bool:
+    def _pattern_class_root(self, expression) -> bool:
+        """MatchClass needs the class actually bound here, not a flat import.
+
+        A module/enclosing replacement can turn an imported class into a local
+        one. Reuse the lexical inventory, skipping class namespaces just as an
+        ordinary method's lookup does; every possible nearest write must be an
+        external import. Qualified class expressions need the same root proof.
+        """
+        root = self._root_name(expression)
+        if root is None:
+            return False
+        current = self.parents.get(expression)
+        while current is not None:
+            if isinstance(current, _SCOPES):
+                if current not in self.scope_bindings:
+                    self.scope_bindings[current] = _Derivation(current, None).bindings
+                bindings = self.scope_bindings[current]
+                if (id(current), "*") in bindings:
+                    return False
+                key = (id(current), root)
+                if key in bindings:
+                    values = bindings[key]
+                    for value in values:
+                        if isinstance(value, ast.Import):
+                            modules = [alias.name.split(".")[0] for alias in value.names
+                                       if (alias.asname or alias.name.split(".")[0]) == root]
+                        elif isinstance(value, ast.ImportFrom) and not value.level:
+                            modules = [(value.module or "").split(".")[0]]
+                        else:
+                            return False
+                        if not modules or not all(self._external_module(top) for top in modules):
+                            return False
+                    return bool(values)
+            current = self.parents.get(current)
+        return isinstance(expression, ast.Name) and root in _BUILTIN_TYPES
+
+    def _pattern_type(self, pattern, derivation, seen) -> bool:
+        """The whole matched instance, not fields taken from that instance."""
+        if isinstance(pattern, ast.MatchClass):
+            return self._pattern_class_root(pattern.cls) and self._callee(pattern.cls, derivation, seen)
+        if isinstance(pattern, ast.MatchAs):
+            return self._pattern_type(pattern.pattern, derivation, seen)
+        if isinstance(pattern, ast.MatchOr):
+            return all(self._pattern_type(branch, derivation, seen) for branch in pattern.patterns)
+        return False
+
+    def _pattern_value(self, capture, derivation, seen) -> bool:
         """A direct sequence/mapping extraction has the same type as indexing.
 
         A library object's fields and nested containers need additional type
         evidence. Do not infer their types merely from the outer annotation.
         """
+        if self._pattern_type(capture.pattern, derivation, seen):
+            return True
+        subject = derivation._pattern_subject(capture, whole=True)
+        if subject is not None:
+            return self.value(subject, derivation, seen)
         child = capture
         parent = derivation.parent.get(id(child))
         while isinstance(parent, (ast.MatchAs, ast.MatchOr)):
@@ -352,7 +403,7 @@ class _ExternalTypes:
                 index = -expr.slice.operand.value
             return self._indexed_value(expr.value, derivation, index)
         if isinstance(expr, ast.MatchAs):
-            return self._pattern_value(expr, derivation)
+            return self._pattern_value(expr, derivation, seen)
         if isinstance(expr, ast.Name):
             return self.name(expr, derivation, seen)
         return False
@@ -482,7 +533,7 @@ def _read_method(func, module_names: set, types: "_ExternalTypes | None" = None)
                 and derivation.resolve(node.args[0]) == derivation.receiver_key
                 # Self-derived replacements can be a child with a different protocol.
                 and derivation.receiver_key not in derivation.unpacked
-                and all(derivation.receiver_identity(value)
+                and all(derivation.binding_identity(value, derivation.receiver_key)
                         for value in derivation.bindings[derivation.receiver_key])
                 and not any(_name_of(dec) == "classmethod" for dec in func.decorator_list)):
             representation = types.representation_builtin(node.func, derivation)
@@ -495,9 +546,7 @@ def _read_method(func, module_names: set, types: "_ExternalTypes | None" = None)
             key = derivation.resolve(base)
             if key is not None and key == derivation.receiver_key:
                 method.self_names.append(node.attr)
-            elif key is not None and key in derivation.module_keys and all(
-                    isinstance(value, (ast.Import, ast.ImportFrom)) or derivation.derived(value)
-                    for value in derivation.bindings[key]):
+            elif key is not None and derivation.module_namespace(base):
                 pass  # module/owned-data reads are safe only when every write proves it
             elif key is not None and derivation.state.get(key):
                 method.derived_reads.add(f"{base.id}.{node.attr}")

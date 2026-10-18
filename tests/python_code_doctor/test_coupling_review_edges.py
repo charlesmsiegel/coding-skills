@@ -248,3 +248,260 @@ def test_heterogeneous_tuple_extraction_uses_the_selected_position(detector, tmp
     assert namespace["Entry"]().save(values) == (namespace["Fraction"](7, 2) if external else 6)
     found = findings(detector, tmp_path, source, "feature_envy")
     assert bool(found) is not external
+
+
+@pytest.mark.parametrize("declaration,pattern,value,expected,external", [
+    ("", "int() as item", "3", 7, True),
+    ("from fractions import Fraction", "Fraction() as item", "Fraction(3, 2)", 6.5, True),
+    ("import fractions", "fractions.Fraction() as item", "fractions.Fraction(3, 2)", 6.5, True),
+    ("from fractions import Fraction", "(Fraction() | int()) as item", "3", 7, True),
+    ("from fractions import Fraction", "[Fraction() as item]", "[Fraction(3, 2)]", 6.5, True),
+    ("from fractions import Fraction", "{'key': Fraction() as item}", "{'key': Fraction(3, 2)}", 6.5, True),
+    ("", "Payload() as item", "Payload()", 6, False),
+    ("int = Payload", "int() as item", "Payload()", 6, False),
+    ("from fractions import Fraction", "(Fraction() | Payload()) as item", "Payload()", 6, False),
+    ("from types import SimpleNamespace", "SimpleNamespace(child=item)",
+     "SimpleNamespace(child=Payload())", 6, False),
+])
+def test_whole_class_pattern_capture_uses_only_its_proven_type(
+        detector, tmp_path, declaration, pattern, value, expected, external):
+    source = textwrap.dedent("""
+        class Payload:
+            numerator = 1
+            denominator = 2
+            real = 3
+    """) + declaration + "\n" + textwrap.dedent(f"""
+        class Entry:
+            def measure(self):
+                return self.metrics
+            def save(self, value):
+                match value:
+                    case {pattern}:
+                        return item.numerator + item.denominator + item.real
+    """)
+    namespace = {}
+    exec(source, namespace)
+    assert namespace["Entry"]().save(eval(value, namespace)) == expected
+    found = findings(detector, tmp_path, source, "feature_envy")
+    assert bool(found) is not external
+
+
+@pytest.mark.parametrize("shadow", ["parameter", "local"])
+def test_shadowed_class_pattern_cannot_prove_an_external_type(detector, tmp_path, shadow):
+    source = textwrap.dedent("""
+        from fractions import Fraction
+        class Payload:
+            numerator = 1
+            denominator = 2
+            real = 3
+        class Entry:
+            def measure(self):
+                return self.metrics
+            def save(self, value, Fraction=Payload):
+                match value:
+                    case Fraction() as item:
+                        return item.numerator + item.denominator + item.real
+    """)
+    if shadow == "local":
+        source = source.replace("value, Fraction=Payload", "value").replace(
+            "        match value:", "        Fraction = Payload\n        match value:")
+    namespace = {}
+    exec(source, namespace)
+    assert namespace["Entry"]().save(namespace["Payload"]()) == 6
+    [record] = findings(detector, tmp_path, source, "feature_envy")
+    assert record.metric_value == 3
+
+
+def test_class_capture_followed_by_foreign_write_is_not_external(detector, tmp_path):
+    source = textwrap.dedent("""
+        class Payload:
+            numerator = 1
+            denominator = 2
+            real = 3
+        class Entry:
+            def measure(self):
+                return self.metrics
+            def save(self, value, supplied):
+                match value:
+                    case int() as item:
+                        item = supplied
+                        return item.numerator + item.denominator + item.real
+    """)
+    namespace = {}
+    exec(source, namespace)
+    assert namespace["Entry"]().save(3, namespace["Payload"]()) == 6
+    [record] = findings(detector, tmp_path, source, "feature_envy")
+    assert record.metric_value == 3
+
+
+@pytest.mark.parametrize("binding", [
+    "import math as item\nalias = item\nitem = alias",
+    "import math as item\nalias = item\nsecond = alias\nitem = second",
+    "import math as module\nitem = module",
+    "import math as item\nalias = item\ndef restore():\n    nonlocal item\n    item = alias\nrestore()",
+    "import math as item\nalias = item\nitem, unused = alias, None",
+])
+def test_grounded_module_alias_preserves_namespace_exemption(detector, tmp_path, binding):
+    source = textwrap.dedent("""
+        class Entry:
+            def measure(self):
+                return self.metrics
+            def save(self):
+                BINDING
+                return item.pi + item.e + item.tau
+    """).replace("        BINDING", textwrap.indent(binding, "        "))
+    namespace = {}
+    exec(source, namespace)
+    assert namespace["Entry"]().save() == math.pi + math.e + math.tau
+    assert findings(detector, tmp_path, source, "feature_envy") == []
+
+
+@pytest.mark.parametrize("binding", [
+    "import math as item\nalias = supplied\nitem = alias",
+    "import math as item\nalias = item\nalias = supplied\nitem = alias",
+    "import math as item\nalias = item\nif flag:\n    alias = supplied\nitem = alias",
+    "import math as item\nalias: object\ndef replace():\n    nonlocal alias\n    alias = supplied\nreplace()\nitem = alias",
+])
+def test_possible_foreign_module_alias_write_retains_envy(detector, tmp_path, binding):
+    source = textwrap.dedent("""
+        class Payload:
+            pi = 1
+            e = 2
+            tau = 3
+        class Entry:
+            def measure(self):
+                return self.metrics
+            def save(self, supplied, flag=True):
+                BINDING
+                return item.pi + item.e + item.tau
+    """).replace("        BINDING", textwrap.indent(binding, "        "))
+    namespace = {}
+    exec(source, namespace)
+    assert namespace["Entry"]().save(namespace["Payload"]()) == 6
+    [record] = findings(detector, tmp_path, source, "feature_envy")
+    assert record.metric_value == 3
+
+
+def test_foreign_grounded_alias_cycle_does_not_borrow_an_import(detector, tmp_path):
+    source = textwrap.dedent("""
+        class Payload:
+            pi = 1
+            e = 2
+            tau = 3
+        class Entry:
+            def measure(self):
+                return self.metrics
+            def save(self, supplied):
+                import math as item
+                alias = supplied
+                other = alias
+                alias = other
+                item = alias
+                return item.pi + item.e + item.tau
+    """)
+    namespace = {}
+    exec(source, namespace)
+    assert namespace["Entry"]().save(namespace["Payload"]()) == 6
+    [record] = findings(detector, tmp_path, source, "feature_envy")
+    assert record.metric_value == 3
+
+
+@pytest.mark.parametrize("root,pattern,replacement", [
+    ("Fraction", "Fraction() as item", "Payload"),
+    ("fractions", "fractions.Fraction() as item", "Namespace"),
+])
+@pytest.mark.parametrize("binding", [
+    "ROOT = REPLACEMENT",
+    "if True:\n    ROOT = REPLACEMENT",
+    "for ROOT in (REPLACEMENT,):\n    pass",
+    "with nullcontext(REPLACEMENT) as ROOT:\n    pass",
+])
+def test_class_pattern_module_rebinding_retains_foreign_type(
+        detector, tmp_path, root, pattern, replacement, binding):
+    source = textwrap.dedent("""
+        import fractions
+        from fractions import Fraction
+        from contextlib import nullcontext
+        class Payload:
+            numerator = 1
+            denominator = 2
+            real = 3
+        class Namespace:
+            Fraction = Payload
+    """) + binding.replace("ROOT", root).replace("REPLACEMENT", replacement) + "\n" + textwrap.dedent(f"""
+        class Entry:
+            def measure(self):
+                return self.metrics
+            def save(self, value):
+                match value:
+                    case {pattern}:
+                        return item.numerator + item.denominator + item.real
+    """)
+    namespace = {}
+    exec(source, namespace)
+    assert namespace["Entry"]().save(namespace["Payload"]()) == 6
+    [record] = findings(detector, tmp_path, source, "feature_envy")
+    assert record.metric_value == 3
+
+
+@pytest.mark.parametrize("root,pattern,replacement", [
+    ("Fraction", "Fraction() as item", "Payload"),
+    ("fractions", "fractions.Fraction() as item", "Namespace"),
+])
+@pytest.mark.parametrize("binding", ["parameter", "local"])
+def test_class_pattern_enclosing_binding_overrides_module_import(
+        detector, tmp_path, root, pattern, replacement, binding):
+    source = textwrap.dedent(f"""
+        import fractions
+        from fractions import Fraction
+        class Payload:
+            numerator = 1
+            denominator = 2
+            real = 3
+        class Namespace:
+            Fraction = Payload
+        def make({root}={replacement}):
+            class Entry:
+                def measure(self):
+                    return self.metrics
+                def save(self, value):
+                    match value:
+                        case {pattern}:
+                            return item.numerator + item.denominator + item.real
+            return Entry
+        Entry = make()
+    """)
+    if binding == "local":
+        source = source.replace(f"def make({root}={replacement}):", f"def make():\n    {root} = {replacement}")
+    namespace = {}
+    exec(source, namespace)
+    assert namespace["Entry"]().save(namespace["Payload"]()) == 6
+    [record] = findings(detector, tmp_path, source, "feature_envy")
+    assert record.metric_value == 3
+
+
+@pytest.mark.parametrize("root,pattern", [
+    ("Fraction", "Fraction() as item"),
+    ("fractions", "fractions.Fraction() as item"),
+])
+@pytest.mark.parametrize("namespace_only", [False, True])
+def test_class_pattern_unshadowed_import_ignores_class_namespace(
+        detector, tmp_path, root, pattern, namespace_only):
+    source = textwrap.dedent(f"""
+        import fractions
+        from fractions import Fraction
+        class Entry:
+            {root} = object()
+            def measure(self):
+                return self.metrics
+            def save(self, value):
+                match value:
+                    case {pattern}:
+                        return item.numerator + item.denominator + item.real
+    """)
+    if not namespace_only:
+        source = source.replace(f"    {root} = object()\n", "")
+    namespace = {}
+    exec(source, namespace)
+    assert namespace["Entry"]().save(namespace["Fraction"](3, 2)) == 6.5
+    assert findings(detector, tmp_path, source, "feature_envy") == []

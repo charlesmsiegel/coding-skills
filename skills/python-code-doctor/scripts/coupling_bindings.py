@@ -165,10 +165,10 @@ class _Derivation:
         elif isinstance(node, ast.ExceptHandler) and node.name:
             self._bind(scope, node.name, _FOREIGN)
         elif isinstance(node, (ast.MatchAs, ast.MatchStar)) and node.name:
-            # An outer `as`/capture binds the entire subject, even when its
-            # subpattern is structured. Captures inside that structure do not.
-            subject = self._pattern_subject(node, whole=True) if isinstance(node, ast.MatchAs) else None
-            self._bind(scope, node.name, subject if subject is not None else node)
+            # Retain the pattern's narrowing evidence as well as its subject.
+            # Whole-value identity and extracted data ask different questions
+            # of this same capture; neither should erase the other's evidence.
+            self._bind(scope, node.name, node)
         elif isinstance(node, ast.MatchMapping) and node.rest:
             self._bind(scope, node.rest, node)
         elif isinstance(node, ast.Nonlocal):
@@ -200,10 +200,10 @@ class _Derivation:
             child, current = current, self.parent.get(id(current))
         return None
 
-    def receiver_identity(self, expr) -> bool:
-        """A name alias grounded in the original receiver, never merely its data.
+    def binding_identity(self, expr, origin) -> bool:
+        """A name alias grounded in one binding, never merely its data.
 
-        The caller checks every write to the receiver separately. Cycles among
+        The caller checks every write to the origin separately. Cycles among
         other names, extraction, iteration, and even one unknown binding cannot
         certify identity. Unlike owned-data derivation this is a grounded proof.
         """
@@ -213,12 +213,14 @@ class _Derivation:
         active, proven = set(), set()
         while pending:
             value, leaving = pending.pop()
+            if isinstance(value, ast.MatchAs):
+                value = self._pattern_subject(value, whole=True)
             if not isinstance(value, ast.Name) or id(value) in self.iterated:
                 return False
             key = self.resolve(value)
             if key is None or key in self.unpacked:
                 return False
-            if key == self.receiver_key or key in proven:
+            if key == origin or key in proven:
                 continue
             if leaving:
                 active.remove(key)
@@ -233,6 +235,18 @@ class _Derivation:
             pending.append((value, True))
             pending.extend((binding, False) for binding in values)
         return True
+
+    def module_namespace(self, expr) -> bool:
+        """A module alias stays exempt only while every origin write is safe.
+
+        Import writes ground the same iterative identity proof as the receiver.
+        A possible foreign replacement in that binding or any alias still wins;
+        merely encountering one import cannot certify the other writes.
+        """
+        return any(self.binding_identity(expr, origin) and all(
+            isinstance(value, (ast.Import, ast.ImportFrom)) or self.derived(value)
+            or self.binding_identity(value, origin) for value in self.bindings[origin])
+            for origin in self.module_keys)
 
     def derived(self, expr) -> bool:
         """True when ``expr`` navigates from self or from a self-derived name."""
