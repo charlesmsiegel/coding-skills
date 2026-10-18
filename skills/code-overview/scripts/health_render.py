@@ -167,7 +167,7 @@ def render_package_table(packages: list[dict], links: dict[str, str]) -> str:
             + "".join(rows) + "</tbody></table></div>")
 
 
-def render_candidates(candidates: list[dict]) -> str:
+def render_candidates(candidates: list[dict], limit: int | None = None) -> str:
     """Leads, rendered so nobody mistakes one for a defect.
 
     A candidate carries no fix and asserts nothing. The two things that keep it
@@ -180,13 +180,22 @@ def render_candidates(candidates: list[dict]) -> str:
             "A candidate is an unverified lead, not a defect: it names what was observed "
             "and the ways healthy code produces the same observation, and it deliberately "
             "carries no fix. Confirm one before acting on it.</div>")
-    if not candidates:
+    total = len(candidates)
+    shown = total if limit is None else min(total, limit)
+    if limit is not None:
+        note += (f'<p class="dim">Showing {shown} of {total} candidates; '
+                 f'{total - shown} omitted from this page. '
+                 'The display limit does not change analysis counts or grades.</p>')
+    if not total:
         return (note + '<p class="dim">No candidates were reported for this unit.</p>')
+    if not shown:
+        return note
 
     rows = []
-    for item in sorted(candidates, key=lambda c: (SEVERITY_ORDER.index(c.get("severity", "medium"))
-                                                  if c.get("severity") in SEVERITY_ORDER else 1,
-                                                  str(c.get("file")), line_number(c))):
+    ranked = sorted(candidates, key=lambda c: (SEVERITY_ORDER.index(c.get("severity", "medium"))
+                                               if c.get("severity") in SEVERITY_ORDER else 1,
+                                               str(c.get("file")), line_number(c)))
+    for item in ranked[:shown]:
         benign = "".join(f"<li>{esc(reason)}</li>"
                          for reason in item.get("also_caused_by") or [])
         location = f'{item.get("file", "")}:{line_number(item)}'

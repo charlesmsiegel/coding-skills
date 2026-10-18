@@ -22,6 +22,67 @@ CONTINUATIONS = frozenset({
     ",", "+", "-", "*", "/", "%", "=", "==", "===", "!=", "!==", "<", ">", "<=",
     ">=", "&&", "||", "??", "?", ":", "=>", "|", "&", ".", "(", "[", "{", "...",
 })
+# Keyword operators that need an operand after them, so a line ending in one
+# continues: `return rows as\n  Record<K, V>` is one statement. `return`,
+# `throw`, `yield`, `break` and `continue` are deliberately absent — a line
+# break after those ends the statement.
+KEYWORD_CONTINUATIONS = frozenset({
+    "as", "satisfies", "instanceof", "in", "typeof", "keyof", "new", "await",
+    "void", "delete", "extends",
+})
+
+
+def continues_line(file: TsFile, index: int) -> bool:
+    """True when the token at ``index`` cannot end an expression at a line end."""
+    token = file.tokens[index]
+    if token.kind == "op":
+        return token.value in CONTINUATIONS
+    # `x.new` and `x.in` are property names, not operators.
+    return token.kind == "name" and token.value in KEYWORD_CONTINUATIONS \
+        and not (index and file.tokens[index - 1].is_op(".", "?."))
+
+
+# Tokens that cannot appear inside a type-argument list at its own level.
+# Meeting one means the `<` was a comparison after all.
+_NOT_IN_TYPE_ARGUMENTS = frozenset({
+    ";", "=", "==", "===", "!=", "!==", "&&", "||", "??", ")", "]", "}",
+    ">=", ">>=", ">>>=",
+})
+_STATEMENT_KEYWORDS = frozenset({"const", "let", "var", "function", "class", "return", "if", "for", "while"})
+
+
+def angle_group_end(file: TsFile, index: int, stop: int, assignment_boundary: bool = False) -> int:
+    """Index just past the `>` closing the `<` at ``index``; -1 if it is no type-argument list.
+
+    `<` and `>` are not bracket-matched — they are comparisons too — so this
+    counts them, stepping over bracket groups, and gives up at a token that
+    cannot sit inside a list of types. The lexer reads `>>` and `>>>` as one
+    token, which is how `Map<string, Array<number>>` ends, so those close two
+    and three levels at once. At an annotation/default boundary the lexer can
+    fuse the closing angles and `=`; only that type context accepts the token.
+    """
+    depth = 0
+    cursor = index
+    while cursor < stop:
+        token = file.tokens[cursor]
+        if token.kind == "op":
+            if token.value in OPENERS:
+                cursor = file.skip_group(cursor)
+                continue
+            if assignment_boundary and token.value in {">=", ">>=", ">>>="}:
+                return cursor + 1 if depth == len(token.value) - 1 else -1
+            if token.value in _NOT_IN_TYPE_ARGUMENTS:
+                return -1
+            if token.value == "<":
+                depth += 1
+            elif token.value in (">", ">>", ">>>"):
+                depth -= len(token.value)
+                if depth <= 0:
+                    return cursor + 1
+        elif token.kind == "name" and token.value in _STATEMENT_KEYWORDS:
+            return -1
+        cursor += 1
+    return -1
 
 
 def modifiers_before(file: TsFile, index: int) -> tuple[int, set[str]]:
@@ -56,9 +117,20 @@ def read_type_after_colon(file: TsFile, colon: int, stop: int) -> tuple[str, int
     """
     cursor = colon + 1
     start = cursor
+    after_arguments = -1  # the index just past the last `<...>` stepped over
     while cursor < stop:
         token = file.tokens[cursor]
         if token.kind == "op":
+            if token.value == "<":
+                # In a type every `<` opens type arguments, and their commas
+                # are not the end of the type: `Record<string, X>` is one type.
+                end = angle_group_end(file, cursor, stop, assignment_boundary=True)
+                if end > 0:
+                    if file.tokens[end - 1].is_op(">=", ">>=", ">>>="):
+                        cursor = end - 1
+                        break
+                    cursor = after_arguments = end
+                    continue
             if token.value == "{":
                 previous = file.tokens[cursor - 1]
                 if previous.value not in _TYPE_CONTINUING and not previous.is_name("extends", "keyof", "infer"):
@@ -73,36 +145,68 @@ def read_type_after_colon(file: TsFile, colon: int, stop: int) -> tuple[str, int
         if token.kind == "name" and token.value in ("const", "let", "var", "function", "class", "return"):
             break
         # A newline followed by something that cannot continue a type ends it.
+        # The `>` closing type arguments ends a type rather than continuing it.
         previous = file.tokens[cursor - 1]
-        if cursor > start and token.line > previous.line and previous.value not in CONTINUATIONS \
+        # `void` is a complete type here, even though it needs an operand
+        # as a value operator in statement scanning.
+        continued = continues_line(file, cursor - 1) and not previous.is_name("void") and cursor != after_arguments
+        if cursor > start and token.line > previous.line and not continued \
                 and token.value not in CONTINUATIONS and token.kind == "name":
             break
         cursor += 1
     if cursor > start:
         file.type_spans.append((start, cursor - 1))
-    return file.slice(start, cursor).strip(), cursor
+    text = file.slice(start, cursor)
+    if cursor < stop and file.tokens[cursor].is_op(">=", ">>=", ">>>="):
+        text += file.tokens[cursor].value[:-1]  # closing angles belong to the type, `=` does not
+    return text.strip(), cursor
 
 
 def _parse_params(file: TsFile, open_index: int, close_index: int) -> list[Param]:
     params: list[Param] = []
     cursor = open_index + 1
     while cursor < close_index:
-        chunk_end = cursor
-        depth_guard = 0
-        while chunk_end < close_index:
-            token = file.tokens[chunk_end]
-            if token.kind == "op" and token.value in OPENERS:
-                chunk_end = file.skip_group(chunk_end)
-                depth_guard += 1
-                continue
-            if token.kind == "op" and token.value == ",":
-                break
-            chunk_end += 1
+        chunk_end = _parameter_end(file, cursor, close_index)
         param = _parse_one_param(file, cursor, chunk_end)
         if param is not None:
             params.append(param)
         cursor = chunk_end + 1
     return params
+
+
+def _parameter_end(file: TsFile, start: int, stop: int) -> int:
+    """Index of the `,` ending the parameter that starts at ``start`` (``stop`` for the last).
+
+    Bracket groups are stepped over, and so is a `<...>` wherever it opens
+    type arguments rather than comparing: anywhere in the annotation, and in
+    the default value when a call follows it (`= new Map<string, number>()`).
+    Splitting at every comma made `fields: Record<string, number>` two
+    parameters, the second one named `number` and untyped.
+    """
+    cursor = start
+    annotated = defaulted = False
+    while cursor < stop:
+        token = file.tokens[cursor]
+        if token.kind == "op":
+            if token.value in OPENERS:
+                cursor = file.skip_group(cursor)
+                continue
+            if token.value == ",":
+                return cursor
+            if token.value == ":" and not defaulted:
+                annotated = True
+            elif token.value == "=":
+                defaulted = True
+            elif token.value == "<":
+                end = angle_group_end(file, cursor, stop, assignment_boundary=annotated and not defaulted)
+                generic_call = defaulted and 0 < end < stop and file.tokens[end].is_op("(") \
+                    and file.tokens[cursor - 1].kind == "name"
+                if end > 0 and ((annotated and not defaulted) or generic_call):
+                    defaulted = defaulted or file.tokens[end - 1].is_op(">=", ">>=", ">>>=")
+                    cursor = end
+                    continue
+        cursor += 1
+    return stop
 
 
 def _parse_one_param(file: TsFile, start: int, stop: int) -> Param | None:
@@ -150,7 +254,7 @@ def _parse_one_param(file: TsFile, start: int, stop: int) -> Param | None:
     type_text = ""
     if cursor < stop and file.tokens[cursor].is_op(":"):
         type_text, cursor = read_type_after_colon(file, cursor, stop)
-    has_default = cursor < stop and file.tokens[cursor].is_op("=")
+    has_default = cursor < stop and file.tokens[cursor].is_op("=", ">=", ">>=", ">>>=")
     return Param(
         name=name, type_text=type_text, line=file.tokens[start].line, optional=optional,
         has_default=has_default, is_rest=is_rest, is_destructured=destructured,
@@ -501,13 +605,16 @@ def _parse_class_body(file: TsFile, klass: Class) -> None:
         )
         if cursor < klass.body_close and tokens[cursor].is_op(":"):
             prop.type_text, cursor = read_type_after_colon(file, cursor, klass.body_close)
-        if cursor < klass.body_close and tokens[cursor].is_op("="):
+        if cursor < klass.body_close and tokens[cursor].is_op("=", ">=", ">>=", ">>>="):
             prop.has_initializer = True
             init_start = cursor + 1
             cursor = skip_to_statement_end(file, cursor + 1, klass.body_close)
             prop.initializer = file.slice(init_start, cursor)[:200].rstrip(";").strip()
-        else:
+        elif cursor < klass.body_close and tokens[cursor].line == tokens[cursor - 1].line:
             cursor = skip_to_statement_end(file, cursor, klass.body_close)
+        # Otherwise a line break ended the declaration (`x: number` with no
+        # `;`), and the token here starts the next member: skipping a
+        # statement from it would swallow that member.
         klass.props.append(prop)
 
 
@@ -519,21 +626,45 @@ def _accessibility(modifiers: set[str], name: str) -> str | None:
 
 
 def skip_to_statement_end(file: TsFile, index: int, stop: int) -> int:
-    """Advance past the end of a statement: a `;`, or an ASI-style line break."""
+    """Advance past the end of a statement: a `;`, or an ASI-style line break.
+
+    A bracket group and a JSX element are each stepped over whole, and the line
+    break after one is then judged like any other. The scan used to jump a
+    group without looking at the break behind it, so in code written without
+    semicolons `throw new Error("x")` ran on into the next line's statement, or
+    past the block's `}`, and whatever followed was called unreachable. A
+    closer this scan did not open ends the statement as well: it belongs to
+    the enclosing block or call.
+    """
     cursor = index
     while cursor < stop:
         token = file.tokens[cursor]
+        if token.kind == "op":
+            if token.value == ";":
+                return cursor + 1
+            if token.value in CLOSERS:
+                return cursor
+        # `last` is the token whose line end decides the break: the group's
+        # closer or the element's final `>` when one starts here. Either ends a
+        # complete value, so it never continues the line the way a bare `>` does.
+        last = cursor
         if token.kind == "op" and token.value in OPENERS:
-            cursor = file.skip_group(cursor)
-            continue
-        if token.is_op(";"):
-            return cursor + 1
-        nxt = file.tokens[cursor + 1] if cursor + 1 < stop else None
-        if nxt is not None and nxt.line > token.line \
-                and token.value not in CONTINUATIONS and nxt.value not in CONTINUATIONS:
-            return cursor + 1
-        cursor += 1
+            last = max(file.closer(cursor), cursor)
+        elif cursor in file.jsx_spans:
+            last = file.jsx_spans[cursor]
+        if last + 1 >= stop:
+            return stop
+        nxt = file.tokens[last + 1]
+        continued = last == cursor and continues_line(file, last)
+        if nxt.line > file.tokens[last].line and not continued and nxt.value not in CONTINUATIONS:
+            return last + 1
+        cursor = last + 1
     return stop
+
+
+def _breaks_statement(token, nxt) -> bool:
+    """True when a line break between two tokens is an automatic-semicolon point."""
+    return nxt.line > token.line and token.value not in CONTINUATIONS and nxt.value not in CONTINUATIONS
 
 
 def extract_object_methods(file: TsFile) -> None:

@@ -25,8 +25,13 @@ the checker out of spite. Adopt it as a ratchet.
    mostly by ignoring, not fixing, at first. That establishes the baseline.
 2. **Annotate boundaries first.** Public functions, public methods, module-level
    APIs — the surfaces other code calls. That's exactly what `find_type_gaps.py`
-   flags as `missing_return_annotation` / `missing_param_annotation`. Internal
-   one-line helpers can wait; their callers will infer fine.
+   flags as `missing_return_annotation` / `missing_param_annotation` (a signature
+   missing both is one finding naming both). Internal one-line helpers can wait;
+   their callers will infer fine — which is why closures and methods of `_Private`
+   classes are not flagged. Neither are web route handlers: the framework calls
+   them, and in FastAPI a return annotation *becomes* the response model, so adding
+   one changes validation and the published schema. Decide that on purpose, not as
+   part of a typing pass.
 3. **Tighten file by file.** Use per-module overrides to enable
    `disallow_untyped_defs` on modules you've fully typed, leaving the rest lax.
    Each cleaned module ratchets one notch; the baseline can only shrink.
@@ -83,7 +88,44 @@ versions that float (so "works today" doesn't mean "works tomorrow").
   works only because the package happens to be installed. A clean install breaks.
   Add it to the manifest. (Mind the import-vs-distribution name gap — `import yaml`
   ↔ `PyYAML`, `import bs4` ↔ `beautifulsoup4`, `import cv2` ↔ `opencv-python`; the
-  detector knows the common ones and stays quiet when unsure.)
+  detector knows the common ones and stays quiet when unsure.) An import inside a
+  `try` whose `except` names `ImportError` or `ModuleNotFoundError` and visibly
+  degrades — its last statement is `pass`, `continue`, a falsy `return`, `x = None`,
+  `x = fallback` or a fallback import of the same name, or a `warnings.warn` or
+  logging call — is not reported: the code runs on without the package, so it is
+  optional by construction. If users should be able to install it, declare it as
+  an extra (`[project.optional-dependencies]`), where it counts as used. Any other
+  handler does not make it optional: `sys.exit("pip install x")`, `raise
+  ImportError(...)` or a bare `raise` is how a script says x is required, and a
+  `die()` helper, an aliased exit or `return 1` from `main()` may be too. So the
+  module is a *candidate* (a wrong guess costs a lead, not a silence), as is
+  one imported in a `try` with other third-party imports (stdlib and relative
+  ones do not count) whose handler rebinds only the others' names — `x = None`,
+  `x = fallback` or a fallback import is what makes each one optional. A guarded site that degrades speaks only for itself: another site of the
+  same module whose handler stops is still a candidate, and one unguarded import of
+  the same name anywhere makes it required again. (A repo with no manifest whose
+  third-party imports are all exit-guarded gets one candidate per module rather
+  than the `no_dependency_manifest` finding.) A bare
+  `except:` or `except Exception:` does not count as a guard, and neither does an
+  `except ImportError:` written after one, which never runs. A module imported only after its
+  own file puts a directory on `sys.path` that the source cannot place inside the
+  repo — one that resolves outside the tree (a relative entry, such as Sphinx's
+  `sys.path.insert(0, os.path.abspath('..'))` in `docs/conf.py`, is read from both the
+  repo root and the file's own directory, and is inside if either is), or that
+  reads a function parameter,
+  `os.environ`/`os.getenv`, `sys.argv`, an argparse result (`args.x` from
+  `parse_args()`) or a name bound more than once — is reported
+  as a *candidate*: a harness run under another program's interpreter imports that
+  program's modules this way, and no manifest here could declare them. Confirm
+  which it is before adding anything. A directory the source resolves inside the
+  repo explains nothing, and neither does one spelled in a way the detector cannot
+  follow but with none of those run-time sources in it, so imports after either
+  stay findings. Know the scope before trusting a clean report: one such addition
+  turns *every* undeclared module imported only after it in that file into a
+  candidate, not just the ones the added directory provides. A production module
+  that loads plugins from `$PLUGIN_DIR` and then imports `requests`, or a lazy
+  import in any function below a `def add_dir(d): sys.path.append(d)` helper,
+  becomes a candidate too — which is why it is a candidate and not silence.
 - **`unused_dependency` (declared, never imported).** Usually cruft from deleted
   code; remove it. But confirm by reading first — some deps are real without an
   `import`: build/runtime plugins, CLI tools, things imported via entry points or

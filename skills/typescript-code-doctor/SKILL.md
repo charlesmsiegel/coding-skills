@@ -53,8 +53,9 @@ just cloned or on a project whose build is currently broken. The only requiremen
 is a **Python 3.11+ interpreter** to launch them with; nothing needs installing.
 
 `run_external_tools.py` additionally drives `tsc`, ESLint, Biome, Prettier, madge,
-knip, `npm audit` and coverage *when the project already has them*; it reports the
-ones that are missing rather than failing, and no detector depends on it.
+knip, `npm`/`pnpm`/`yarn` audit (whichever the lockfile names) and coverage *when
+the project already has them*; it reports the ones that are missing rather than
+failing, and no detector depends on it.
 
 **What the scanner cannot do:** it reads syntax, not types. Questions that need
 the type checker — is this promise handled, is this condition always true, is this
@@ -146,12 +147,12 @@ python "$SKILL/scripts/find_code_smells.py" .          # ==, var, nested ternari
 
 # Architecture & repo structure (cross-file)
 python "$SKILL/scripts/find_module_issues.py" .        # import cycles, barrel files, god modules, deep relative paths
-python "$SKILL/scripts/find_dependency_issues.py" .    # package.json vs imports: missing, unused, misplaced, unpinned
+python "$SKILL/scripts/find_dependency_issues.py" .    # package.json vs imports, stylesheets, HTML, tool configs: missing, unused, misplaced, unpinned
 python "$SKILL/scripts/find_dead_code.py" .            # unused imports/exports, unreachable code, dead private members
-python "$SKILL/scripts/find_duplicates.py" .           # duplicated blocks, identical type shapes, repeated literals
+python "$SKILL/scripts/find_duplicates.py" .           # duplicated blocks, identical type shapes, repeated literals (not CSS class lists)
 
 # Safety net (build this BEFORE refactoring — see references/safety-net-and-testing.md)
-python "$SKILL/scripts/find_untested_modules.py" .     # source modules no test imports; "no tests in repo" alarm
+python "$SKILL/scripts/find_untested_modules.py" .     # source modules no test reaches; "no tests in repo" alarm
 python "$SKILL/scripts/find_test_smells.py" .          # assertion-less tests, .only/.skip, unawaited rejects, over-mocking
 
 # Simplification & hygiene
@@ -174,7 +175,51 @@ aggregates them and can drop whole categories with `--skip cat1,cat2`
 (`--skip-duplicates` is shorthand for the slowest one). They are deliberately
 conservative (false negatives over false positives) so the output stays
 trustworthy, and several apply a lighter standard inside test files — a cast that
-installs a mock is not a claim about the product's types.
+installs a mock is not a claim about the product's types. A test file is one
+under `tests/`, `__tests__/`, `spec/`, `e2e/` or `cypress/` *below the project
+root* (the outermost `package.json` or tsconfig inside the checkout, bounded by
+the first `.git`), or one named
+`*.test.*` / `*.spec.*` — where the checkout itself lives does not change the
+classification. The scaffolding suites share counts as test code too: anything
+under `__mocks__/`, `__fixtures__/`, `testkit/`, `test-utils/`, `testutils/` or
+`test-helpers/` (below the root, by the same rule), and the runner's setup file —
+`test-setup.*`, `setupTests.*`, `vitest.setup.*`, `jest.setup.*`.
+
+Declaration files (`.d.ts`, `.d.mts`, `.d.cts`) carry no implementation, so the
+code detectors skip them. So does any file whose first five lines say
+`@generated` or `DO NOT EDIT`: a tool owns it and a finding there is a bug report
+against the generator, not the checkout. The skipped generated files are counted
+— on stderr by the standalone detectors, and in `meta.generated_files_skipped`
+(and the report header) by `analyze_all.py` — so their silence is never mistaken
+for a clean bill.
+
+**Findings and candidates.** Most records assert a defect and carry the fix. A
+record that instead carries `"kind": "candidate"` is an *unverified lead* — it
+names what was observed, not what is wrong, because the detector reads syntax
+one file at a time and the evidence that settles it is elsewhere. A candidate
+carries `also_caused_by`, the benign readings a healthy codebase produces, and
+**no `suggestion`**: there is nothing to fix until the lead is confirmed.
+
+Thirteen heuristics are always reported this way: `type_assertion`,
+`missing_return_type`, `all_optional_type`, `definite_assignment_assertion`,
+`await_in_loop`, `single_implementation_interface`, `barrel_file`, `data_clump`,
+`primitive_obsession`, `public_mutable_field`, `switch_without_default` (whether
+a missing `default` matters depends on the discriminant's type),
+`boolean_without_predicate_name` (a noun, or an adjective?) and
+`falsy_default_with_or` (the left operand's type decides). Three more are
+candidates in their ambiguous shape only: a bare `alert()` under
+`browser_dialog`; a `swallowed_rejection` that a comment explains, that waits on
+a promise someone else holds, or that sits in a test; and a
+`mutates_argument_property` that edits a syntax-tree parameter in place.
+Each is ordinary, correct TypeScript often enough that only a reader with the
+surrounding context can tell. Confirm one before acting on it — an `as` at a
+boundary where the value really was checked is the honest spelling, not a defect.
+
+`format_findings.py` files candidates as *Investigate*, not *Refactor*;
+`analyze_all.py` counts them in `summary.total_candidates`, lists them under
+their own heading rather than among the high-severity issues, and never lets one
+buy a RECOMMENDATIONS bullet; and **code-overview excludes them from a
+code-health score**, so a candidate never costs a grade.
 
 ## Use the project's own tools when they exist
 
@@ -205,13 +250,15 @@ Four of these answer questions the detectors structurally **cannot**:
   a range is unpinned; only an advisory database can say the version you have is
   vulnerable.
 - **coverage** — what actually executed. `find_untested_modules.py` answers "does
-  a test import this"; coverage answers "does this code ever run".
+  a test reach this through its imports"; coverage answers "does this code ever run".
 
 **When a tool is missing, ask before installing.** The script never installs
 anything and never runs `npx` in download mode; it lists each absent tool with an
-`npm install --save-dev` hint under `missing_tools`. When that list is non-empty
-and the tools would help, **ask the user whether to install them** (e.g. via the
-AskUserQuestion tool) and only install on confirmation.
+`npm install --save-dev` hint under `missing_tools` — except `audit`, whose hint
+names the package manager the lockfile calls for, since that is what is missing.
+When that list is non-empty and the tools would help, **ask the user whether to
+install them** (e.g. via the AskUserQuestion tool) and only install on
+confirmation.
 
 ## Reviewing a change request (diff lens)
 
@@ -298,7 +345,7 @@ Keep `SKILL.md` lean; pull in depth only when a review needs it.
 | `x && x.y` / `x \|\| 0` | `x?.y` / `x ?? 0` |
 | `require()` / `module.exports` / `namespace` | ESM `import` / `export` |
 | `<T>value` cast | `value as T` |
-| `if/else if` ladder on `typeof x` or `x.kind` | Discriminated union + exhaustive `switch` with `assertNever` |
+| `if/else if` ladder on `x.kind` | Discriminated union + exhaustive `switch` with `assertNever` |
 | Boolean flag parameter | Split the function, or take a named option |
 | 3+ adjacent `string` parameters | Options object, or branded types |
 | Index loop over an array | `for…of`, `map`, `filter` |

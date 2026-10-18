@@ -11,6 +11,11 @@ Finds:
   - public_function_no_docstring : top-level public function (non-trivial) with no docstring
   - public_method_no_docstring   : public method of a public class (non-trivial) with no docstring
   - public_class_no_docstring    : top-level public class with no docstring
+
+Not the public surface, so not reported: functions, classes and methods in a
+private module (`_name.py`, which its package imports and nobody else should),
+and an exception class whose body is only `pass`/`...` — its name and its base
+are the whole of what it says.
 """
 
 import ast
@@ -19,7 +24,7 @@ import argparse
 from pathlib import Path
 from dataclasses import dataclass, asdict
 from collections import defaultdict
-from common import sort_findings, cached_parse, SEVERITY_ICONS, configure_output, find_python_files, warn_detector_error, warn_unparseable
+from common import project_parts, sort_findings, cached_parse, SEVERITY_ICONS, configure_output, find_python_files, warn_detector_error, warn_unparseable
 
 
 @dataclass
@@ -40,7 +45,7 @@ def _get_line(lines, lineno):
 
 
 def _is_test_file(filepath: Path) -> bool:
-    parts = filepath.parts
+    parts = project_parts(filepath)[:-1]  # below its project, not wherever it is checked out
     if "tests" in parts:
         return True
     name = filepath.name
@@ -52,6 +57,34 @@ def _is_test_file(filepath: Path) -> bool:
 def _is_trivial(node) -> bool:
     """Return True if the function/method body has fewer than 3 statements."""
     return len(node.body) < 3
+
+
+def _is_private_module(filename: str) -> bool:
+    """`_impl.py` is private by the same convention as `_helper`; `__init__.py` is not."""
+    stem = Path(filename).stem
+    return stem.startswith("_") and not (stem.startswith("__") and stem.endswith("__"))
+
+
+_EXCEPTION_SUFFIXES = ("Exception", "Error", "Warning")
+
+
+def _is_bare_exception_class(node: ast.ClassDef) -> bool:
+    """`class FooError(BarError): pass` — a name and a base, nothing to document.
+
+    The function checks already exempt bodies under three statements; this is
+    the class-shaped version of that, held to exception classes because an
+    empty *ordinary* class is usually a placeholder that does deserve a word.
+    """
+    if not all(isinstance(stmt, ast.Pass)
+               or (isinstance(stmt, ast.Expr) and isinstance(stmt.value, ast.Constant)
+                   and stmt.value.value is ...)
+               for stmt in node.body):
+        return False
+    for base in node.bases:
+        name = base.id if isinstance(base, ast.Name) else getattr(base, "attr", "")
+        if name.endswith(_EXCEPTION_SUFFIXES):
+            return True
+    return False
 
 
 def detect(tree, filename, lines, ignore):
@@ -81,6 +114,11 @@ def detect(tree, filename, lines, ignore):
             "Add a module-level docstring explaining what this module does and why it exists (its intent, not just a restatement of its name).",
             "low")
 
+    # A private module's names are reached through its package, not imported
+    # by callers, so none of them is public API whatever its own spelling.
+    if _is_private_module(filename):
+        return issues
+
     # Check top-level public functions
     for node in tree.body:
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
@@ -102,7 +140,7 @@ def detect(tree, filename, lines, ignore):
             continue
 
         # Check class docstring
-        if ast.get_docstring(node) is None:
+        if ast.get_docstring(node) is None and not _is_bare_exception_class(node):
             add(node.lineno, "public_class_no_docstring",
                 f"Public class '{node.name}' has no docstring",
                 f"Add a one-line docstring to '{node.name}' stating what it represents and why it exists (intent, not a restatement of the name).",

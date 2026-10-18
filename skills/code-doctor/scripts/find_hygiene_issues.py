@@ -18,7 +18,7 @@ from pathlib import Path
 
 from common import (Reporter, ScanPathError, build_parser, configure_output,
                     coverage_gaps, emit, fail_on_bad_path, is_probably_binary,
-                    parse_ignore, read_text, tracked_paths, unmerged_paths,
+                    looks_minified, parse_ignore, read_text, tracked_paths, unmerged_paths,
                     walk_files, walk_paths, warn_detector_error, warn_unreadable)
 
 MERGE_MARKERS = ("<<<<<<< ", "=======", ">>>>>>> ")
@@ -40,11 +40,47 @@ MAX_COMMITTED_BYTES = 10 * 1024 * 1024
 # prefix allows.
 LINE_COMMENT_PREFIXES = ("//", "#", "--", ";")
 
-_STRING_LITERAL = re.compile(r"""(["'`])(?:\\.|(?!\1).)*\1""")
+# `[^\\]`, not `.`: with `.` a backslash could be consumed either as the
+# start of an escape or as an ordinary character, and an unterminated quote
+# followed by a run of backslashes then backtracks through every split of the
+# run — exponential in its length. One committed Vite bundle held the whole
+# detector past a ten-minute timeout that way.
+_STRING_LITERAL = re.compile(r"""(["'`])(?:\\.|(?!\1)[^\\])*\1""")
+# Past this a line is data or a bundle, not a place a person writes a comment.
+# Bounding it also bounds the quadratic cost of a line full of unmatched quotes.
+MAX_COMMENT_SCAN = 4096
 _TODO = re.compile(r"\b(TODO|FIXME|HACK|XXX)\b")
 # A commented line that looks like code: ends in a statement terminator or
-# opener, or contains an assignment or a call.
-_LOOKS_LIKE_CODE = re.compile(r"[;{}]\s*$|\)\s*[;{]?\s*$|=[^=]|\w+\s*\(")
+# opener, or contains an assignment or a call. A call is a name *touching* its
+# parenthesis — `compute(1)` — because prose puts a space there: "every route
+# (see the module docstring)" is an aside, not a call — and a name starts with
+# a letter, so "ruling 6(c)" is a citation. The control keywords
+# that conventionally take a space before theirs are named instead. A closing
+# parenthesis at the end of the line is not evidence on its own, for the same
+# reason: a sentence ending in an aside ends in one too.
+_LOOKS_LIKE_CODE = re.compile(
+    r"[;{}]\s*$|=[^=]|\b[A-Za-z_]\w*\(|\b(?:if|for|while|switch|catch|return)\s*\(")
+
+# Commented-out code is a line that was disabled by commenting it out, so the
+# prefix opens the line. A prefix found mid-line was overwhelmingly never a
+# comment at all: `;` inside `for (i = 0; i < n; i++)`, `--` in `i--`, `#` in
+# a CSS colour — and where it is one, it trails live code rather than
+# replacing it. `#`, `--` and `;` must also be followed by whitespace or end
+# the line. Written flush, each opens something else at the start of a line
+# in a common language: a CSS custom property (`--accent: #0a6;`), a CSS id
+# selector (`#main {`), a C preprocessor directive (`#include <x.h>`), a
+# Python attribute doc comment (`#: what this holds`). `//` has no such
+# reading at the start of a line.
+_WHOLE_LINE_COMMENT = re.compile(r"^\s*(?://|(?:#|--|;)(?=\s|$))")
+# A run of four plain lowercase words is a sentence. Code that has commented
+# itself out reads as names, operators and punctuation; a comment that names a
+# call — "a direct caller of validate() sees instead" — is prose about code.
+# Costs: a commented-out line of English-shaped code (`for item in items if
+# ready`) is missed, which a candidate list can afford.
+_PROSE_RUN = re.compile(r"(?:\b[a-z]{2,}\b[ ,]+){3}\b[a-z]{2,}\b")
+# Documentation comments hold examples by design, and an example is not a
+# leftover: `///` and `//!` (Rust, C#, Doxygen) and `#:` (Sphinx).
+_DOC_COMMENT = re.compile(r"^\s*(?:///|//!|#:)")
 
 # Filenames whose whole purpose is to hold secrets. `.npmrc` and `.pypirc`
 # are deliberately absent: both routinely hold nothing but registry, index,
@@ -87,6 +123,8 @@ def blank_literals(line: str) -> str:
 
 def comment_body(line: str) -> str | None:
     """The text after a line-comment prefix, or None if there is no comment."""
+    if len(line) > MAX_COMMENT_SCAN:
+        return None
     blanked = blank_literals(line)
     for prefix in LINE_COMMENT_PREFIXES:
         index = blanked.find(prefix)
@@ -95,16 +133,37 @@ def comment_body(line: str) -> str | None:
     return None
 
 
+def whole_line_comment_body(line: str) -> str | None:
+    """The text of a line that is nothing but a comment, or None.
+
+    The TODO inventory wants every comment, trailing ones included —
+    `retry()  # TODO back off` is debt. Commented-out code is narrower: a
+    line somebody disabled, which is a comment from its first token on.
+    """
+    if _DOC_COMMENT.match(line):
+        return None
+    opener = _WHOLE_LINE_COMMENT.match(line)
+    if opener is None:
+        return None
+    return line[opener.end():].strip()
+
+
 def check_text_file(path: Path, text: str, report: Reporter,
-                    unmerged: set[Path] | None) -> None:
-    """Checks that are valid in any text file, source or not."""
+                    unmerged: set[Path] | None, *, generated: bool = False) -> None:
+    """Checks that are valid in any text file, source or not.
+
+    A ``generated`` file still gets the merge-marker check — a conflict in a
+    committed bundle breaks the build like any other — but not the TODO
+    inventory: a bundler's output carries its dependencies' TODOs, and none of
+    them is this repository's debt.
+    """
     is_conflicted = unmerged is not None and path.resolve() in unmerged
 
     for number, line in enumerate(text.splitlines(), 1):
         # The TODO inventory belongs here, not in the source pass: a TODO in
         # deployment.yaml or settings.toml is debt exactly like one in a .go
         # file, and the design's stated scope for it is all text.
-        body = comment_body(line)
+        body = None if generated else comment_body(line)
         if body is not None:
             todo = _TODO.search(body)
             if todo:
@@ -226,11 +285,15 @@ def check_source_file(path: Path, text: str, report: Reporter) -> None:
             )
 
         # TODOs are inventoried in the text pass, which covers this file too.
-        body = comment_body(line)
+        body = whole_line_comment_body(line)
         if body is None or _TODO.search(body):
             continue
 
-        if _LOOKS_LIKE_CODE.search(body):
+        # Matched against the body with its quoted and backticked spans
+        # blanked: prose that names code — "the `reload()` calls" — is
+        # describing it, and an inline code span is how prose names it.
+        blanked = blank_literals(body)
+        if _LOOKS_LIKE_CODE.search(blanked) and not _PROSE_RUN.search(blanked):
             report.candidate(
                 number, "commented_out_code",
                 "Commented-out line that looks like code",
@@ -253,7 +316,7 @@ def main() -> int:
     root = Path(args.path)
 
     findings = []
-    unreadable, failed = [], []
+    unreadable, failed, generated_files = [], [], []
     try:
         text_files = set(walk_files(root, source_only=False))
         source_files = set(walk_files(root, source_only=True))
@@ -275,8 +338,14 @@ def main() -> int:
                     unreadable.append(str(filepath))
                     findings.extend(report.findings)
                     continue
-                check_text_file(filepath, text, report, unmerged)
-                if filepath in source_files:
+                generated = looks_minified(text)
+                if generated:
+                    generated_files.append(str(filepath))
+                check_text_file(filepath, text, report, unmerged, generated=generated)
+                # Line length, file length and commented-out code are
+                # questions about what a person wrote; a bundle answers every
+                # one of them with noise.
+                if filepath in source_files and not generated:
                     check_source_file(filepath, text, report)
         except Exception as exc:
             warn_detector_error(filepath, exc)
@@ -285,6 +354,14 @@ def main() -> int:
         findings.extend(report.findings)
 
     completeness = coverage_gaps(unreadable, failed)
+    if generated_files:
+        # Named, not silently dropped: a reader comparing two runs should see
+        # that these were read for merge markers only.
+        names = sorted(generated_files)
+        completeness["generated_files_skipped"] = (
+            f"{len(names)} generated file(s) checked for merge markers only: "
+            + ", ".join(names[:5]) + ("…" if len(names) > 5 else "")
+        )
     if unmerged is None:
         completeness["merge_state"] = (
             "git unavailable — conflict markers reported as candidates, "

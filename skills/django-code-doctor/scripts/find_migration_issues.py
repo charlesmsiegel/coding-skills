@@ -187,6 +187,10 @@ def collect(ctx):
                 field = keyword(operation, "field")
                 if isinstance(field, ast.Call):
                     kind = call_name(field)
+                    # Many-to-many relationships use an intermediary table, not a
+                    # new column on existing rows (including explicit through models).
+                    if kind == "ManyToManyField":
+                        continue
                     nullable = keyword(field, "null")
                     has_default = (keyword(field, "default") is not None
                                    or keyword(field, "db_default") is not None)

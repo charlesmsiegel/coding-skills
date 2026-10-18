@@ -2,7 +2,7 @@
 """Coverage tab: per-file test coverage from an existing artifact, joined with
 size/complexity so untested-AND-complex files stand out.
 
-Usage: python analyze_coverage.py REPO_DIR --tabs-dir TABS_DIR [--coverage-file PATH]
+Usage: python analyze_coverage.py REPO_DIR --tabs-dir TABS_DIR [--coverage-file PATH] [--root DIR ...]
 
 Emits: TABS_DIR/09-coverage.html and a JSON summary on stdout.
 
@@ -18,9 +18,9 @@ import json
 import sys
 from pathlib import Path
 
-from common import (CODE_LANGS, bar_cell, detect_lang, esc, is_test_path,
-                    json_block, loc_and_complexity, read_text, walk_source,
-                    write_fragment)
+from common import (CODE_LANGS, ROOT_HELP, bar_cell, detect_lang, esc,
+                    is_test_path, json_block, loc_and_complexity, read_text,
+                    scope_roots, walk_source, write_fragment)
 from coverage_data import artifact_age_days, discover, parse, resolve_paths
 
 
@@ -32,8 +32,14 @@ def main() -> int:
                     help="explicit artifact path (skips auto-discovery); kind inferred from name/content")
     ap.add_argument("--exclude", default="",
                     help="comma-separated extra directory names to skip")
+    ap.add_argument("--root", action="append", default=[], help=ROOT_HELP)
     args = ap.parse_args()
     repo = Path(args.repo).resolve()
+    try:
+        roots = scope_roots(repo, args.root)
+    except ValueError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
     tabs = Path(args.tabs_dir)
     extra_exclude = {d.strip() for d in args.exclude.split(",") if d.strip()}
 
@@ -73,7 +79,9 @@ def main() -> int:
     rows = []
     measured_covered = measured_total = 0
     unmeasured = []
-    for rel, p in walk_source(repo, extra_exclude=extra_exclude):
+    # Artifact paths were matched against the whole repo above, so a unique
+    # suffix stays unique; only the rows are limited to the roots.
+    for rel, p in walk_source(repo, extra_exclude=extra_exclude, roots=roots):
         if detect_lang(rel) not in CODE_LANGS or is_test_path(rel):
             continue
         loc, branches, _ = loc_and_complexity(read_text(p))
@@ -148,6 +156,7 @@ def main() -> int:
     write_fragment(tabs, "09-coverage.html", "Coverage", body)
 
     print(json.dumps({
+        **({"roots": list(roots)} if roots else {}),
         "artifact": str(artifact), "format": kind,
         "artifact_age_days": round(age_days, 1),
         "overall_line_coverage_pct": round(overall, 1),

@@ -17,10 +17,12 @@ Stdlib only; the caller supplies the file index so this module never walks a tre
 """
 import ast
 import re
+from bisect import bisect_right
 from collections import defaultdict
 from pathlib import Path
 
 from common import detect_lang, read_text
+from jslex import scan_js
 from jvmdecl import (JVM_EXTS, build_decl_indexes, cs_usings,
                      jvm_import_specs, resolve_jvm)
 from manifests import (join_inside, RustWorkspace, go_modules, nearest_dir,
@@ -59,6 +61,8 @@ class ResolutionStats:
     declared package root, a workspace crate, a module path, a relative spec).
     resolved is a subset of first_party; everything else is external. Samples
     keep the first few unresolved first-party specs for the summary.
+    skipped_in_strings (JS/TS) counts import-shaped text the lexer found
+    inside literals — the guard's own work, made visible.
     """
 
     def __init__(self):
@@ -76,8 +80,25 @@ class ResolutionStats:
         elif len(s["samples"]) < 8:
             s["samples"].append(f"{spec}  ({rel})")
 
+    def skip_in_strings(self, lang, n):
+        """Record n import-shaped matches set aside as string-literal text.
+
+        Reported even when zero: a guard that skips real imports also keeps
+        them out of first_party, so without this count a resolver that saw a
+        tenth of the imports still reads 100% resolved.
+        """
+        s = self.by_lang[lang]
+        s["skipped_in_strings"] = s.get("skipped_in_strings", 0) + n
+
     def summary(self):
         return {lang: dict(s) for lang, s in sorted(self.by_lang.items())}
+
+    def mostly_skipped(self):
+        """Languages where import text inside strings rivals the imports that
+        counted — what a string-literal guard misfiring looks like."""
+        return [(lang, s) for lang, s in sorted(self.by_lang.items())
+                if s.get("skipped_in_strings", 0) >= 10
+                and s["skipped_in_strings"] >= 0.5 * (s["first_party"] + s["external"])]
 
     def under_resolved(self):
         """Languages where imports the repo appears to own mostly failed to
@@ -305,10 +326,12 @@ def resolve_unique_suffix(spec, by_base, exts=("",), scope=None):
 def extract(paths, all_paths, file_set):
     """Resolve every import in every file: (edges: src -> {dst}, ResolutionStats).
 
-    ``paths`` maps repo-relative POSIX path -> Path for code files; ``all_paths``
-    additionally holds non-code files, where the manifests live (go.mod and
-    Cargo.toml are what make Go and Rust imports resolvable); ``file_set`` is
-    ``paths``'s key set (passed separately because callers already hold it).
+    ``paths`` maps repo-relative POSIX path -> Path for the code files whose
+    imports are read; ``all_paths`` holds every file, the non-code ones
+    included, which is where the manifests live (go.mod and Cargo.toml are what
+    make Go and Rust imports resolvable); ``file_set`` is every code file an
+    import may resolve to — ``paths``'s key set for a repo-wide run, the whole
+    repo's code when the caller reports on a few roots of it.
     """
     py_idx = build_python_index(file_set)
     # Path segments that hold Python — the "does the repo plausibly own this
@@ -317,7 +340,7 @@ def extract(paths, all_paths, file_set):
     py_roots = {seg for rel in file_set if rel.endswith((".py", ".pyi"))
                 for seg in rel.rsplit(".", 1)[0].split("/")}
     go_mods, go_replaces, go_work_replaces = go_modules(all_paths)
-    jvm_idx, cs_idx = build_decl_indexes(paths)
+    jvm_idx, cs_idx = build_decl_indexes({rel: all_paths[rel] for rel in file_set})
     rust_ws = RustWorkspace(all_paths)
     npm_by_dir, npm_names, npm_local, npm_ws_roots = npm_packages(all_paths)
     ts_roots = ts_config_roots(all_paths)
@@ -399,23 +422,13 @@ def extract(paths, all_paths, file_set):
     return edges, stats
 
 
-def _mask_js_comments(text):
-    """JS/TS text with comments blanked. Strings stay: import specs are
-    string literals. `://` (URLs) is not a comment start."""
-    def blank(m):
-        return re.sub(r"[^\n]", " ", m.group(0))
-    text = re.sub(r"/\*.*?\*/", blank, text, flags=re.S)
-    text = re.sub(r"(?<!:)//[^\n]*", " ", text)
-    return text
-
-
 def _js_edges(rel, text, file_set, by_base, npm_by_dir, npm_names,
               npm_local, npm_ws_roots, ts_roots, lang, edges, stats):
     # bare specifiers resolve against the repo only where a tsconfig/jsconfig
     # declares baseUrl or paths — without one, Node treats them as packages
     has_base_url = any(not r or rel == r or rel.startswith(r + "/")
                        for r in ts_roots)
-    text = _mask_js_comments(text)
+    text, literals = scan_js(text)
     pkg_dir = nearest_dir(rel, npm_by_dir)
     npm_deps = npm_by_dir.get(pkg_dir, set()) if pkg_dir is not None else set()
     local = npm_local.get(pkg_dir, {}) if pkg_dir is not None else {}
@@ -457,12 +470,18 @@ def _js_edges(rel, text, file_set, by_base, npm_by_dir, npm_names,
         for stem_c in ("src/index", "index", "src/main", "lib/index"):
             cands += [f"{d}/{stem_c}{e}" for e in JS_EXTS]
         return next((c for c in cands if c in file_set), None)
-    for jm in JS_IMPORT_RE.finditer(text):
-        # an `import ...` that sits inside a string literal is documentation,
-        # not code: skip matches immediately preceded by a quote
-        prev = text[:jm.start()].rstrip()[-1:]
-        if prev in ("'", '"', "`"):
+    starts = [start for start, _ in literals]
+    skipped = pos = 0
+    while (jm := JS_IMPORT_RE.search(text, pos)) is not None:
+        k = bisect_right(starts, jm.start()) - 1
+        if k >= 0 and jm.start() < literals[k][1]:
+            # import-shaped text inside a string or template literal is
+            # documentation, not a statement. Searching resumes after the
+            # literal, so its quotes are never read as a real spec's.
+            skipped += 1
+            pos = literals[k][1]
             continue
+        pos = jm.end()
         spec = jm.group(1)
         # a require() call resolves the package's CommonJS condition
         mode = "require" if jm.group(0).lstrip().startswith("require") else "import"
@@ -574,6 +593,7 @@ def _js_edges(rel, text, file_set, by_base, npm_by_dir, npm_names,
             if t and t != rel:
                 edges[rel].add(t)
             stats.count(lang, spec, rel, known_local or bool(t), bool(t))
+    stats.skip_in_strings(lang, skipped)
 
 
 def _mask_go_comments(text):

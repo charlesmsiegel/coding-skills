@@ -94,6 +94,21 @@ DETECTOR_CATEGORIES = {
     "unpythonic": "hygiene",
 }
 
+# A detector's category is where its findings land unless the finding's own
+# type says otherwise. Some detectors emit an item that belongs in a lighter
+# category than the detector's headline: python-code-doctor's exception
+# detector finds swallowed errors (a wrong answer, Correctness) but also a
+# `raise` without `from`, whose original survives as implicit `__context__` —
+# a traceback that reads less clearly, not a wrong answer — and a narrow
+# `except X: pass` whose fix, `contextlib.suppress(X)`, changes no behaviour.
+# Charging either at Correctness's weight and half-life made a codebase that
+# translates domain errors into HTTP errors fail Correctness for its style.
+TYPE_CATEGORY_OVERRIDES = {
+    "raise_without_from": "hygiene",
+    "suppressible_exception": "hygiene",
+    "literal_import": "design",
+}
+
 # code-doctor's own detector registry (`analyze_all.DETECTORS`) uses its own
 # tokens, and those are what reach a grader as `analyzers_run`. They were
 # absent from the table above, so every one of them failed to resolve and
@@ -345,11 +360,14 @@ def categorize(finding: dict) -> tuple[str, bool]:
     records those types so a rubric gap is visible in the output instead of
     silently landing in hygiene.
     """
+    token = finding_type(finding)
+    if token in TYPE_CATEGORY_OVERRIDES:
+        return TYPE_CATEGORY_OVERRIDES[token], True
+
     detector = finding.get("category")
     if detector and detector in DETECTOR_CATEGORIES:
         return DETECTOR_CATEGORIES[detector], True
 
-    token = finding_type(finding)
     if token in SMELL_TYPE_CATEGORIES:
         return SMELL_TYPE_CATEGORIES[token], True
 

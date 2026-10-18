@@ -2,16 +2,53 @@
 """
 Detect code smells in Python code via AST analysis.
 Finds: magic numbers, bare excepts, mutable defaults, type comparisons,
-       god classes, data classes, long parameter lists.
+       god classes, data classes.
+
+A long parameter list is analyze_complexity's `parameter_count`; it is not
+reported here too, because one signature is one defect.
+
+A magic number is a bare literal that encodes meaning a name should carry. A
+test file is not checked: the literal in `assert total == 3` is the expected
+value, the specification itself, and naming it would only restate it or import
+the production constant the test exists to check. In production code an HTTP
+status code where a status is expected (`HTTPException(404)`,
+`resp.status_code == 409`) and a mode written in octal (`0o755`) already say
+what they are.
 """
 
 import ast
 import json
 import argparse
+import re
 from pathlib import Path
 from dataclasses import dataclass, asdict
 from collections import defaultdict
-from common import sort_findings, cached_parse, SEVERITY_ICONS, configure_output, find_python_files, warn_detector_error, warn_unparseable
+from common import framework_hook_overrides, is_test_file, sort_findings, cached_parse, SEVERITY_ICONS, configure_output, find_python_files, warn_detector_error, warn_unparseable, looks_like_test
+
+
+# Callables whose first positional argument is an HTTP status code.
+_STATUS_CALLEES = frozenset({"HTTPException", "HTTPError", "abort"})
+_HTTP_STATUS = range(100, 600)
+_BEHAVIOR_PROTOCOLS = frozenset({
+    '__enter__', '__exit__', '__aenter__', '__aexit__',
+    '__iter__', '__next__', '__aiter__', '__anext__', '__call__',
+    '__getitem__', '__setitem__', '__delitem__', '__contains__',
+})
+
+
+def _callee_name(call: ast.Call) -> str | None:
+    if isinstance(call.func, ast.Name):
+        return call.func.id
+    if isinstance(call.func, ast.Attribute):
+        return call.func.attr
+    return None
+
+
+def _names_a_status(node: ast.AST) -> bool:
+    """`status`, `status_code`, `resp.status_code`, `http_status`, ..."""
+    name = node.id if isinstance(node, ast.Name) else (
+        node.attr if isinstance(node, ast.Attribute) else None)
+    return bool(name) and (name.lower().endswith("status") or name.lower().endswith("status_code"))
 
 
 @dataclass
@@ -23,6 +60,8 @@ class CodeSmell:
     suggestion: str
     severity: str
     code_snippet: str = ""
+    kind: str = "finding"
+    also_caused_by: tuple[str, ...] = ()
 
 
 # Classes with these decorators/bases are data containers on purpose.
@@ -33,12 +72,180 @@ DATA_CLASS_MARKERS = frozenset({
     "BaseModel",  # pydantic
 })
 
+# Public concrete generic views; an arbitrary *View name proves no contract.
+DJANGO_GENERIC_VIEWS = {
+    "django.views.generic": frozenset({
+        "View", "TemplateView", "RedirectView", "DetailView", "ListView",
+        "FormView", "CreateView", "UpdateView", "DeleteView", "ArchiveIndexView",
+        "YearArchiveView", "MonthArchiveView", "WeekArchiveView", "DayArchiveView",
+        "TodayArchiveView", "DateDetailView",
+    }),
+    "django.views.generic.base": frozenset({"View", "TemplateView", "RedirectView"}),
+    "django.views.generic.detail": frozenset({"DetailView"}),
+    "django.views.generic.list": frozenset({"ListView"}),
+    "django.views.generic.edit": frozenset({"FormView", "CreateView", "UpdateView", "DeleteView"}),
+    "django.views.generic.dates": frozenset({
+        "ArchiveIndexView", "YearArchiveView", "MonthArchiveView", "WeekArchiveView",
+        "DayArchiveView", "TodayArchiveView", "DateDetailView",
+    }),
+}
+
+
+# These bases supply persistence, validation, or declarative configuration APIs;
+# replacing their subclasses with dataclasses would discard inherited behavior.
+DJANGO_DECLARATIVE_BASES = {
+    **DJANGO_GENERIC_VIEWS,
+    "django.db.models": frozenset({"Model", "Choices", "TextChoices", "IntegerChoices"}),
+    "django.db.models.base": frozenset({"Model"}),
+    "django.db.models.enums": frozenset({"Choices", "TextChoices", "IntegerChoices"}),
+    "django.forms": frozenset({"Form", "BaseForm", "ModelForm", "BaseModelForm",
+                               "BaseFormSet", "BaseModelFormSet", "BaseInlineFormSet"}),
+    "django.forms.forms": frozenset({"Form", "BaseForm"}),
+    "django.forms.models": frozenset({"ModelForm", "BaseModelForm", "BaseModelFormSet", "BaseInlineFormSet"}),
+    "django.forms.formsets": frozenset({"BaseFormSet"}),
+    "django.contrib.admin": frozenset({"ModelAdmin", "TabularInline", "StackedInline"}),
+    "django.contrib.admin.options": frozenset({"ModelAdmin", "InlineModelAdmin", "TabularInline", "StackedInline"}),
+}
+
+
+# ModelBase and ModelFormMetaclass consume these immediate inner Meta classes.
+# BaseModelForm alone does not install ModelFormMetaclass.
+DJANGO_META_CONSUMERS = frozenset({
+    "django.db.models.Model", "django.db.models.base.Model",
+    "django.forms.ModelForm", "django.forms.models.ModelForm",
+})
+
+
+def _dotted_name(node):
+    if isinstance(node, ast.Name):
+        return node.id
+    if isinstance(node, ast.Attribute):
+        parent = _dotted_name(node.value)
+        return f"{parent}.{node.attr}" if parent else None
+    return None
+
+
+def _module_binding_facts(tree):
+    """Only trust unconditional imports with no other bindings or mutations.
+
+    Scope-insensitive invalidation deliberately favors reporting a candidate
+    defect over suppressing one when a nested scope shadows an import.
+    """
+    bindings = defaultdict(list)
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.Import, ast.ImportFrom)):
+            for alias in node.names:
+                name = alias.asname or alias.name.split('.')[0]
+                bindings[name].append(node)
+        elif isinstance(node, ast.Name) and isinstance(node.ctx, (ast.Store, ast.Del)):
+            bindings[node.id].append(node)
+        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            bindings[node.name].append(node)
+        elif isinstance(node, ast.arg):
+            bindings[node.arg].append(node)
+        elif isinstance(node, ast.ExceptHandler) and node.name:
+            bindings[node.name].append(node)
+        elif isinstance(node, (ast.MatchAs, ast.MatchStar)) and node.name:
+            bindings[node.name].append(node)
+        elif isinstance(node, ast.MatchMapping) and node.rest:
+            bindings[node.rest].append(node)
+        elif isinstance(node, (ast.Attribute, ast.Subscript)) and isinstance(node.ctx, (ast.Store, ast.Del)):
+            root = node.value
+            while isinstance(root, (ast.Attribute, ast.Subscript)):
+                root = root.value
+            if isinstance(root, ast.Name):
+                bindings[root.id].append(node)
+    imports = {}
+    for node in tree.body:
+        if not isinstance(node, (ast.Import, ast.ImportFrom)):
+            continue
+        if isinstance(node, ast.ImportFrom) and node.level:
+            continue
+        for alias in node.names:
+            name = alias.asname or alias.name.split('.')[0]
+            if bindings[name] != [node]:
+                continue
+            if isinstance(node, ast.ImportFrom):
+                imports[name] = (f"{node.module}.{alias.name}", node.lineno)
+            else:
+                imports[name] = (alias.name if alias.asname else name, node.lineno)
+    # A wildcard can replace any imported identity.
+    wildcard = any(isinstance(n, ast.ImportFrom) and any(a.name == '*' for a in n.names)
+                   for n in ast.walk(tree))
+    if wildcard:
+        imports = {}
+    return imports, set(bindings) | ({"object"} if wildcard else set())
+
+
+def _stable_imports(tree):
+    return _module_binding_facts(tree)[0]
+
+
+def _constant_expression(node: ast.AST | None) -> bool:
+    """Whether ``node`` is arithmetic over literals only: `4 << 20`, `30 * 60`."""
+    if isinstance(node, ast.Constant):
+        return isinstance(node.value, (int, float)) and not isinstance(node.value, bool)
+    if isinstance(node, ast.UnaryOp):
+        return _constant_expression(node.operand)
+    if isinstance(node, ast.BinOp):
+        return _constant_expression(node.left) and _constant_expression(node.right)
+    return False
+
 
 def _unwrap_negative(node: ast.AST) -> ast.AST:
     """-5 parses as UnaryOp(USub, Constant(5)); return the inner constant."""
     if isinstance(node, ast.UnaryOp) and isinstance(node.op, (ast.USub, ast.UAdd)):
         return node.operand
     return node
+
+
+_CONSTANT_NAME = re.compile(r"_*[A-Z][A-Z0-9_]*")
+
+
+def _defines_constants(stmt) -> bool:
+    """`MAX = ...`, `LIMIT: int = ...`, `LOW, HIGH = ...`: every name bound is UPPER_CASE."""
+    targets = stmt.targets if isinstance(stmt, ast.Assign) else [stmt.target]
+    names = []
+    for target in targets:
+        for element in target.elts if isinstance(target, (ast.Tuple, ast.List)) else [target]:
+            if not isinstance(element, ast.Name):
+                return False
+            names.append(element.id)
+    return bool(names) and all(_CONSTANT_NAME.fullmatch(name) for name in names)
+
+
+def _value_literals(node: ast.AST):
+    """The literals in an expression, leaving out lambda bodies: code that runs later."""
+    if isinstance(node, ast.Constant):
+        yield node
+    elif not isinstance(node, ast.Lambda):
+        for child in ast.iter_child_nodes(node):
+            yield from _value_literals(child)
+
+
+def _constant_definition_literals(node: ast.AST):
+    """The literals in the value of a module- or class-level constant.
+
+    `MAX_UPLOAD_PIXELS = 50 * MEGAPIXEL` and `RULE = "=" * 78` are where 50 and
+    78 get their names: the expression is the constant's definition, exactly as
+    `TIMEOUT = 30` is. Assignments inside a function are not constants, and a
+    lambda's body runs later, so literals there are still judged.
+    """
+    for child in ast.iter_child_nodes(node):
+        if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+            continue
+        if (isinstance(child, (ast.Assign, ast.AnnAssign)) and child.value is not None
+                and _defines_constants(child)):
+            yield from _value_literals(child.value)
+        yield from _constant_definition_literals(child)
+
+
+def _is_type_call(node) -> bool:
+    """`type(x)` asking an object's type. `type(None)` is not one: it names
+    NoneType, as when an annotation's arguments are compared against it."""
+    return (isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "type"
+            and not (len(node.args) == 1 and isinstance(node.args[0], ast.Constant)
+                     and node.args[0].value is None))
 
 
 class CodeSmellDetector(ast.NodeVisitor):
@@ -48,30 +255,53 @@ class CodeSmellDetector(ast.NodeVisitor):
         16, 32, 64, 128, 255, 256, 512, 1024,
     })
 
-    def __init__(self, filename: str, source_lines: list[str], ignore: set[str] = None):
+    def __init__(self, filename: str, source_lines: list[str], ignore: set[str] = None,
+                 is_test_file: bool = False):
         self.filename = filename
         self.source_lines = source_lines
         self.issues: list[CodeSmell] = []
         self.ignore = ignore or set()
+        # In a test a literal is fixture data or an expected value — the number
+        # *is* the specification, and naming it would only move it a line up.
+        self.is_test_file = is_test_file
         self.current_class = None
         self.class_info: dict[str, dict] = {}
         self._named_constants: set[int] = set()
+        self._hooks: frozenset = frozenset()
+        self._in_assert = 0
+        self._framework_imports = {}
+        self._object_is_builtin = True
+        self._framework_meta_nodes = set()
+        self.is_test_file = looks_like_test(Path(filename))
 
     def visit_Module(self, node: ast.Module):
+        self._hooks = framework_hook_overrides(node)
+        self._framework_imports, bound_names = _module_binding_facts(node)
+        self._object_is_builtin = "object" not in bound_names
         # A literal is only "magic" when nothing names it. Collect the node
         # ids of literals that already have a name or a self-explaining
         # position, so visit_Constant can skip them:
         #   NAME = 30              the assignment names it
+        #   obj.timeout = 30       an attribute also names the value
+        #   MAX = 50 * MEGAPIXEL   so does a module/class constant's definition
         #   def f(timeout=30)      the parameter names it
         #   get(url, timeout=30)   the keyword names it
         #   text[:200]             slice bounds
         #   [1, 30, 5] / {...}     data tables, not control values
+        self._named_constants = {id(literal) for literal in _constant_definition_literals(node)}
         for parent in ast.walk(node):
             if isinstance(parent, (ast.Assign, ast.AnnAssign)):
                 targets = parent.targets if isinstance(parent, ast.Assign) else [parent.target]
-                value = _unwrap_negative(getattr(parent, "value", None))
-                if isinstance(value, ast.Constant) and any(isinstance(t, ast.Name) for t in targets):
-                    self._named_constants.add(id(value))
+                value = getattr(parent, "value", None)
+                # `MAX_BODY = 4 << 20` names the expression, and with it every
+                # literal the expression is built from.
+                if _constant_expression(value) and any(isinstance(t, ast.Name) for t in targets):
+                    for sub in ast.walk(value):
+                        if isinstance(sub, ast.Constant):
+                            self._named_constants.add(id(sub))
+                elif isinstance(_unwrap_negative(value), ast.Constant) and any(
+                        isinstance(t, ast.Attribute) for t in targets):
+                    self._named_constants.add(id(_unwrap_negative(value)))
             elif isinstance(parent, ast.keyword):
                 value = _unwrap_negative(parent.value)
                 if isinstance(value, ast.Constant):
@@ -95,20 +325,52 @@ class CodeSmellDetector(ast.NodeVisitor):
                     elt = _unwrap_negative(elt) if elt else elt
                     if isinstance(elt, ast.Constant):
                         self._named_constants.add(id(elt))
+            # An HTTP status where a status is expected names itself:
+            #   HTTPException(404, ...)   raise/abort with a status
+            #   JSONResponse(body, 201)   a *Response's positional status
+            #   resp.status_code == 409   compared against a status
+            elif isinstance(parent, ast.Call) and parent.args:
+                callee = _callee_name(parent) or ""
+                if callee in _STATUS_CALLEES:
+                    self._name_status(parent.args[0])
+                elif callee.endswith("Response"):
+                    # Frameworks disagree on where the status sits (second for
+                    # Starlette and Flask, third for Django), and a response's
+                    # body is not an int in the status range.
+                    for arg in parent.args:
+                        self._name_status(arg)
+            elif isinstance(parent, ast.Compare):
+                operands = [parent.left, *parent.comparators]
+                if any(_names_a_status(o) for o in operands):
+                    for operand in operands:
+                        self._name_status(operand)
         self.generic_visit(node)
+
+    def _name_status(self, node: ast.AST) -> None:
+        if isinstance(node, ast.Constant) and isinstance(node.value, int) \
+                and not isinstance(node.value, bool) and node.value in _HTTP_STATUS:
+            self._named_constants.add(id(node))
+
+    def _written_in_octal(self, node: ast.Constant) -> bool:
+        """`0o755` is a permission mode by its spelling; nobody writes a count in octal."""
+        if 0 < node.lineno <= len(self.source_lines):
+            text = self.source_lines[node.lineno - 1][node.col_offset:node.col_offset + 2]
+            return text.lower() == "0o"
+        return False
 
     def _get_line(self, lineno: int) -> str:
         if 0 < lineno <= len(self.source_lines):
             return self.source_lines[lineno - 1].strip()[:60]
         return ""
 
-    def _add(self, line: int, smell_type: str, desc: str, suggestion: str, severity: str = "medium"):
+    def _add(self, line: int, smell_type: str, desc: str, suggestion: str, severity: str = "medium",
+             *, kind="finding", also_caused_by=()):
         if smell_type in self.ignore:
             return
         self.issues.append(CodeSmell(
             file=self.filename, line=line, smell_type=smell_type,
             description=desc, suggestion=suggestion, severity=severity,
-            code_snippet=self._get_line(line)
+            code_snippet=self._get_line(line), kind=kind, also_caused_by=tuple(also_caused_by)
         ))
 
     def visit_FunctionDef(self, node: ast.FunctionDef):
@@ -134,13 +396,6 @@ class CodeSmellDetector(ast.NodeVisitor):
                         f"Mutable default from {default.func.id}() in {node.name}",
                         "Use None and create inside function", "high")
 
-        # Long parameter list
-        total_params = len(node.args.args) + len(node.args.kwonlyargs)
-        if total_params > 6:
-            self._add(node.lineno, "long_parameter_list",
-                f"{node.name} has {total_params} parameters",
-                "Group into dataclass or config object", "medium")
-
     def visit_ExceptHandler(self, node: ast.ExceptHandler):
         if node.type is None:
             self._add(node.lineno, "bare_except",
@@ -149,27 +404,35 @@ class CodeSmellDetector(ast.NodeVisitor):
         self.generic_visit(node)
 
     def visit_Constant(self, node: ast.Constant):
-        if (isinstance(node.value, (int, float)) and not isinstance(node.value, bool)
+        if (not self.is_test_file
+                and isinstance(node.value, (int, float)) and not isinstance(node.value, bool)
                 and id(node) not in self._named_constants
                 and node.value not in self.MAGIC_NUMBER_WHITELIST
-                and abs(node.value) > 2):
+                and abs(node.value) > 2
+                and not self._written_in_octal(node)):
             self._add(node.lineno, "magic_number",
                 f"Magic number {node.value}",
                 "Extract to named constant", "low")
         self.generic_visit(node)
 
+    def visit_Assert(self, node: ast.Assert):
+        # In a test, `assert type(x) is float` pins the exact type on purpose —
+        # isinstance would accept a subclass, which is what the test rules out.
+        self._in_assert += 1
+        self.generic_visit(node)
+        self._in_assert -= 1
+
     def visit_Compare(self, node: ast.Compare):
-        for comparator in node.comparators:
-            if isinstance(comparator, ast.Call):
-                if isinstance(comparator.func, ast.Name) and comparator.func.id == 'type':
+        if not (self.is_test_file and self._in_assert):
+            # Identity deliberately requests an exact type; only equality
+            # suggests an accidental substitute for isinstance.
+            operands = [node.left, *node.comparators]
+            for operator, left, right in zip(node.ops, operands, operands[1:]):
+                if isinstance(operator, (ast.Eq, ast.NotEq)) and (_is_type_call(left) or _is_type_call(right)):
                     self._add(node.lineno, "type_comparison",
                         "Using type() for comparison",
-                        "Use isinstance() instead", "medium")
-        if isinstance(node.left, ast.Call):
-            if isinstance(node.left.func, ast.Name) and node.left.func.id == 'type':
-                self._add(node.lineno, "type_comparison",
-                    "Using type() for comparison",
-                    "Use isinstance() instead", "medium")
+                        "Use isinstance() for subclasses, or `type(x) is T` for an exact type", "medium")
+                    break
         self.generic_visit(node)
 
     def visit_ClassDef(self, node: ast.ClassDef):
@@ -197,7 +460,9 @@ class CodeSmellDetector(ast.NodeVisitor):
                                     attributes.add(target.attr)
         
         # God class
-        non_dunder = [m for m in methods if not m.startswith('_')]
+        behavior_methods = [m for m in methods
+                            if not (m.startswith('__') and m.endswith('__'))
+                            or m in _BEHAVIOR_PROTOCOLS]
         if len(methods) > 15 and len(attributes) > 10:
             self._add(node.lineno, "god_class",
                 f"Class {node.name} has {len(methods)} methods and {len(attributes)} attributes",
@@ -221,10 +486,41 @@ class CodeSmellDetector(ast.NodeVisitor):
             elif isinstance(base, ast.Subscript) and isinstance(base.value, ast.Name):
                 marker_names.add(base.value.id)
         is_declared_data = bool(marker_names & DATA_CLASS_MARKERS)
-        if len(attributes) > 3 and len(non_dunder) == 0 and not is_declared_data:
-            self._add(node.lineno, "data_class",
-                f"Class {node.name} has only data, no behavior methods",
-                "Consider using @dataclass or namedtuple", "low")
+        has_framework_behavior = False
+        consumes_meta = False
+        for base in node.bases:
+            dotted = _dotted_name(base)
+            if not dotted:
+                continue
+            root, _, suffix = dotted.partition('.')
+            imported = self._framework_imports.get(root)
+            if imported and imported[1] < node.lineno:
+                resolved = f"{imported[0]}.{suffix}" if suffix else imported[0]
+                module, _, name = resolved.rpartition('.')
+                if name in DJANGO_DECLARATIVE_BASES.get(module, ()):
+                    has_framework_behavior = True
+                if resolved in DJANGO_META_CONSUMERS:
+                    consumes_meta = True
+        if consumes_meta:
+            # AST identities tie the exemption to immediate class-body members;
+            # sibling classes and classes inside methods receive no contract.
+            self._framework_meta_nodes.update(child for child in node.body
+                                              if isinstance(child, ast.ClassDef) and child.name == "Meta")
+        if (len(attributes) > 3 and not behavior_methods and not is_declared_data
+                and not has_framework_behavior and node not in self._framework_meta_nodes):
+            inherited_behavior_unknown = any(not (isinstance(base, ast.Name) and base.id == "object"
+                                                  and self._object_is_builtin)
+                                             for base in node.bases)
+            if inherited_behavior_unknown:
+                self._add(node.lineno, "data_class",
+                    f"Class {node.name} declares data locally; check the behavior inherited from its bases",
+                    "", "low", kind="candidate",
+                    also_caused_by=("Base classes may supply validation, persistence, or other behavior.",
+                                    "Class attributes may configure an inherited framework API."))
+            else:
+                self._add(node.lineno, "data_class",
+                    f"Class {node.name} has only data, no behavior methods",
+                    "Consider using @dataclass or namedtuple", "low")
         
         self.generic_visit(node)
         self.current_class = old_class
@@ -251,7 +547,7 @@ def analyze_file(filepath: Path, ignore: set[str]) -> list[CodeSmell]:
     try:
         source, tree = cached_parse(filepath)
         lines = source.splitlines()
-        detector = CodeSmellDetector(str(filepath), lines, ignore)
+        detector = CodeSmellDetector(str(filepath), lines, ignore, is_test_file(filepath))
         detector.visit(tree)
         return detector.issues
     except (SyntaxError, ValueError) as exc:
@@ -290,7 +586,8 @@ def main():
         for issue in all_issues:
             by_type[issue.smell_type] += 1
         
-        print(f"Found {len(all_issues)} code smell(s):\n")
+        candidate_count = sum(issue.kind == "candidate" for issue in all_issues)
+        print(f"Found {len(all_issues) - candidate_count} finding(s), {candidate_count} candidate(s):\n")
         print("Summary:")
         for smell, count in sorted(by_type.items(), key=lambda x: -x[1]):
             print(f"  {smell}: {count}")
@@ -299,11 +596,16 @@ def main():
         severity_icons = SEVERITY_ICONS
         for issue in all_issues:
             icon = severity_icons[issue.severity]
-            print(f"{icon} [{issue.severity.upper()}] {issue.file}:{issue.line}")
+            marker = "? [CANDIDATE]" if issue.kind == "candidate" else f"{icon} [{issue.severity.upper()}]"
+            print(f"{marker} {issue.file}:{issue.line}")
             print(f"   {issue.smell_type}: {issue.description}")
             if issue.code_snippet:
                 print(f"   Code: {issue.code_snippet}")
-            print(f"   → {issue.suggestion}\n")
+            if issue.suggestion:
+                print(f"   → {issue.suggestion}")
+            for reason in issue.also_caused_by:
+                print(f"   ? also caused by: {reason}")
+            print()
 
 
 if __name__ == '__main__':

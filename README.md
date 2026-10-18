@@ -47,13 +47,17 @@ list — an open issue usually records a design decision made and not yet acted 
 - **[typescript-code-doctor](skills/typescript-code-doctor)** — the same idea for
   TypeScript, and fully standalone: it ships its own TS/TSX scanner (strings,
   template literals, regex-vs-division, JSX text, bracket matching) so the
-  detectors run against a checkout with no `node_modules` and no build. Covers
-  the type system (`any`/`as`/`!`/`@ts-ignore` and a tsconfig strictness audit),
+  detectors run against a checkout with no `node_modules` and no build.
+  Contextual heuristics — an ordinary `as` cast, an `await` in a loop, a
+  barrel file, a data clump — are reported as candidates with their benign
+  readings attached, never as defects. Covers the type system (`any`/`as`/`!`/
+  `@ts-ignore` and a tsconfig strictness audit),
   promise bugs, encapsulation leaks, import cycles and barrels, dependency
   reconciliation, and the usual smell/design/duplication set.
   `run_external_tools.py` drives `tsc`, ESLint, Biome, Prettier, madge, knip,
-  `npm audit` and coverage when the project already has them — the compiler
-  answers what a syntax scanner structurally cannot.
+  `npm`/`pnpm`/`yarn` audit (whichever the lockfile names) and coverage when the
+  project already has them — the compiler answers what a syntax scanner
+  structurally cannot.
 - **[rust-code-doctor](skills/rust-code-doctor)** — the same idea for Rust, and
   fully standalone: it ships its own Rust scanner (raw strings with any number
   of hashes, block comments that nest, the `'` that is a char in one place and a
@@ -267,12 +271,16 @@ references — templates, prompts, embedded data), and `llmops.py` (LLM call sit
 models, prompt lineage). The copies are byte-identical and CI enforces it — a
 skill directory has to be self-contained to be zipped and installed on its own,
 so the duplication is deliberate, not drift. `assemble.py` is identical except
-for one line (the `--label` default) across *four* skills — those two plus
-literature-survey and legal-survey, which assemble their reports with the same
-fragment protocol — and CI checks every copy against the others. Two files differ on purpose
-and are NOT synced: `assets/template.html` (each skill has its own theme; the
-renderers and placeholders match, which a test pins) and `references/llm-tabs.md`
-(different tab sets).
+for one line (the `--label` default) across *three* skills — those two and
+literature-survey, which assembles its report with the same fragment protocol —
+and CI checks all three copies against each other. The renderers — sortable
+tables, force graph, treemap, Mermaid — are `assets/renderers.css` and
+`assets/renderers.js`, byte-identical in both visualization skills and
+CI-enforced; `assemble.py` inlines them into whatever page shell `--template`
+names, which is what lets code-overview restyle an atlas without losing its
+graphs. Two files differ on purpose and are NOT synced: `assets/template.html`
+(each skill has its own theme around the same placeholders and tab contract)
+and `references/llm-tabs.md` (different tab sets).
 
 literature-survey and legal-survey each ship a `common.py` of their own that is
 **not** a copy of anybody's: same filename, entirely different subject (HTTP

@@ -42,10 +42,9 @@ def _check_unused_imports(tsfile, path: Path, add) -> None:
         if record.namespace_name:
             bindings.append(record.namespace_name)
         for name in bindings:
-            used = any(
-                token.kind == "name" and token.value == name and token.line != record.line
-                for token in tsfile.tokens
-            )
+            # `names()` includes the code inside template substitutions: a
+            # helper read only in `` `${seg(id)}` `` is still read.
+            used = any(token.value == name and token.line != record.line for token in tsfile.names())
             in_jsx = tsfile.is_tsx and any(name in t.value for t in tsfile.jsx_text)
             if not used and not in_jsx:
                 add(path, record.line, "unused_import",
@@ -70,12 +69,13 @@ def _check_unreachable(tsfile, path: Path, add) -> None:
         previous = tsfile.tokens[index - 1]
         if not (previous.kind == "op" and previous.value in (";", "{", "}")):
             continue  # a braceless if/else/loop body, a label, or a `case`
-        # `return <div\n  attr="x" />;` — a JSX element spans lines whose ends
-        # are not operators, so the statement-end heuristic stops early and the
-        # next attribute looks like a new statement. Not worth guessing at.
-        if tsfile.is_tsx and index + 1 < len(tsfile) and tsfile.tokens[index + 1].is_op("<", "("):
-            continue
-        cursor = statement_end(tsfile, index + 1)
+        if index + 1 < len(tsfile) and tsfile.tokens[index + 1].line > token.line \
+                and token.value != "throw":
+            # A line break straight after `return`, `break` or `continue` ends
+            # the statement there (the operand is not read across it).
+            cursor = index + 1
+        else:
+            cursor = statement_end(tsfile, index + 1)
         while cursor < len(tsfile) and tsfile.tokens[cursor].is_op(";"):
             cursor += 1
         if cursor >= len(tsfile):
@@ -85,10 +85,28 @@ def _check_unreachable(tsfile, path: Path, add) -> None:
             continue
         if following.is_name("case", "default", "else", "catch", "finally", "while", "function", "class"):
             continue
+        if _is_hoisted_declaration(tsfile, cursor):
+            continue
         add(path, following.line, "unreachable_code",
             f"Statement after `{token.value}` on line {token.line} can never run",
             "Delete it, or move it above the exit. Unreachable code is usually a merge artefact "
             "or an exit that was added and never followed through.", "high")
+
+
+def _is_hoisted_declaration(tsfile, index: int) -> bool:
+    """True for a declaration that never runs as a statement, so cannot be unreachable.
+
+    A function declaration is hoisted — a helper written after the `throw` that
+    uses it is a common layout — and `async function` is one too. `interface`
+    and `type` aliases emit no code at all.
+    """
+    token = tsfile.tokens[index]
+    nxt = tsfile.tokens[index + 1] if index + 1 < len(tsfile) else None
+    if nxt is None:
+        return False
+    if token.is_name("async"):
+        return nxt.is_name("function")
+    return token.is_name("interface", "type") and nxt.kind == "name"
 
 
 def _check_private_members(tsfile, path: Path, add) -> None:
@@ -98,10 +116,8 @@ def _check_private_members(tsfile, path: Path, add) -> None:
             if accessibility != "private" or getattr(member, "kind", "") == "constructor":
                 continue
             name = member.name.lstrip("#")
-            uses = sum(
-                1 for index in range(klass.body_open, klass.body_close)
-                if tsfile.tokens[index].kind == "name" and tsfile.tokens[index].value.lstrip("#") == name
-            )
+            uses = sum(1 for token in tsfile.names(klass.body_open, klass.body_close)
+                       if token.value.lstrip("#") == name)
             if uses <= 1:
                 add(path, member.line, "unused_private_member",
                     f"`{klass.name}.{member.name}` is private and referenced nowhere in the class",
@@ -118,7 +134,7 @@ def analyze(root: Path, ignore: set[str], _args) -> list[Finding]:
             findings.append(Finding(file=str(path), line=line, smell_type=smell,
                                     description=description, suggestion=suggestion, severity=severity))
 
-    for path, tsfile in project.files.items():
+    for path, tsfile in project.analyzable.items():
         if is_declaration_file(path):
             continue
         _check_unused_imports(tsfile, path, add)
@@ -155,7 +171,7 @@ def _check_unused_exports(project, add) -> None:
                 star_reexported.add(target)
             imported.setdefault(target, set()).update(names)
 
-    for path, tsfile in project.files.items():
+    for path, tsfile in project.analyzable.items():
         posix = path.as_posix()
         if is_test_file(path) or is_declaration_file(path) or ENTRY_PATTERNS.search(posix):
             continue

@@ -99,6 +99,17 @@ class Tokenizer:
         self.tokens: list[Token] = []
         self.comments: list[Token] = []
         self.jsx_text: list[Token] = []
+        # Side channels for what the flat token list cannot say on its own,
+        # each keyed by an index into `tokens`:
+        # - the code inside a template literal's `${...}`, keyed by the
+        #   template token (see _template);
+        # - the last token of each JSX element, keyed by its opening `<`, so
+        #   a statement scan can step over an element the way it steps over a
+        #   bracket group;
+        # - the JSX attribute names, which are neither variables nor writes.
+        self.substitutions: dict[int, list[Token]] = {}
+        self.jsx_spans: dict[int, int] = {}
+        self.jsx_attributes: set[int] = set()
 
     # -- low level ---------------------------------------------------------- #
 
@@ -163,54 +174,76 @@ class Tokenizer:
     def _template(self) -> None:
         """Scan a whole template literal, `${...}` interiors included.
 
-        The interior is kept as raw text rather than tokenized separately: the
-        detectors that care about it (shell interpolation, SQL concatenation)
-        want the substituted expression as a string, and the ones that do not
-        are better off seeing a single opaque value token.
+        The literal stays ONE value token: the detectors that care about it
+        (shell interpolation, SQL concatenation, a thrown string) want the
+        substituted expression as text, and every statement and argument scan
+        is simpler for seeing a single opaque value.
+
+        But the code inside each `${...}` is real code, and a name used only
+        there is still used. So each interior is tokenized by a nested scanner
+        — which also finds its closing `}` correctly past a regex, a comment or
+        a nested template — and its tokens are kept in `substitutions` under
+        this template's index. Without that, `` `/x/${seg(id)}` `` was the one
+        place `seg` was read and an unused-import check called it unused.
         """
         text, n = self.text, len(self.text)
         start, line = self.i, self.line
+        inner: list[Token] = []
         j = self.i + 1
-        depth = 0
         while j < n:
             char = text[j]
             if char == "\\":
                 j += 2
                 continue
-            if depth == 0 and char == "`":
+            if char == "`":
                 j += 1
                 break
-            if depth == 0 and char == "$" and j + 1 < n and text[j + 1] == "{":
-                depth = 1
-                j += 2
+            if char == "$" and j + 1 < n and text[j + 1] == "{":
+                j = self._substitution(j + 2, inner)
                 continue
-            if depth:
-                if char == "{":
-                    depth += 1
-                elif char == "}":
-                    depth -= 1
-                elif char in "'\"`":
-                    j = self._skip_nested_string(j)
-                    continue
             j += 1
         else:
             j = n
         self._advance(j)
+        if inner:
+            self.substitutions[len(self.tokens)] = inner
         self._emit("template", start, j, line)
 
-    def _skip_nested_string(self, j: int) -> int:
-        """Skip a string that lives inside a template's `${...}`. Returns the end."""
-        text, n = self.text, len(self.text)
-        quote = text[j]
-        k = j + 1
-        while k < n:
-            if text[k] == "\\":
-                k += 2
+    def _substitution(self, begin: int, inner: list[Token]) -> int:
+        """Tokenize one `${...}` interior from ``begin``. Returns the index past its `}`.
+
+        The interior's tokens (and those of any template nested inside it) go to
+        ``inner``; its comments and JSX text join this scanner's own lists.
+        """
+        nested = Tokenizer(self.text, self.jsx)
+        nested.i = begin
+        nested.line = self.line + self.text.count("\n", self.i, begin)
+        depth = 0
+        end = len(self.text)
+        while True:
+            before = len(nested.tokens)
+            if not nested._step():
+                break
+            # A brace is always a step's only token. A step that emitted none
+            # read a comment; one that emitted several read a JSX element,
+            # whose own braces balance inside it.
+            if len(nested.tokens) != before + 1:
                 continue
-            if text[k] == quote:
-                return k + 1
-            k += 1
-        return n
+            token = nested.tokens[-1]
+            if token.is_op("{"):
+                depth += 1
+            elif token.is_op("}"):
+                if depth == 0:
+                    nested.tokens.pop()
+                    end = token.end
+                    break
+                depth -= 1
+        for index, token in enumerate(nested.tokens):
+            inner.append(token)
+            inner.extend(nested.substitutions.get(index, ()))
+        self.comments.extend(nested.comments)
+        self.jsx_text.extend(nested.jsx_text)
+        return end
 
     def _regex(self) -> None:
         text, n = self.text, len(self.text)
@@ -274,7 +307,19 @@ class Tokenizer:
         return not _IDENT.match(self.text, k) or self.text[k:k + 7] != "extends"
 
     def _jsx_element(self) -> None:
-        """Consume one JSX element (assumes the cursor sits on its `<`)."""
+        """Consume one JSX element (assumes the cursor sits on its `<`).
+
+        The element's extent is recorded in `jsx_spans`: its attributes sit on
+        lines that end in neither an operator nor a `;`, so a statement scan
+        that cannot step over the element whole reads each line as a new
+        statement.
+        """
+        opener = len(self.tokens)
+        self._element_body()
+        if len(self.tokens) > opener:
+            self.jsx_spans[opener] = len(self.tokens) - 1
+
+    def _element_body(self) -> None:
         self._punct("<")
         self._jsx_tag_name()
         while self.i < len(self.text):
@@ -298,22 +343,43 @@ class Tokenizer:
             else:
                 match = _IDENT.match(self.text, self.i)
                 if match:
-                    self._jsx_tag_name()
+                    # An attribute name. It stays a `name` token — a detector
+                    # looking for `dangerouslySetInnerHTML=` must still see it —
+                    # but it is recorded, because `err={err}` is neither a
+                    # write to `err` nor a read of it.
+                    index = len(self.tokens)
+                    if self._jsx_name():
+                        self.jsx_attributes.add(index)
+                    else:
+                        self._advance(self.i + 1)
                 else:
                     self._advance(self.i + 1)  # stray character; do not stall
         self._jsx_children()
 
     def _jsx_tag_name(self) -> None:
-        """A tag or attribute name, which may contain `.`, `:` and `-`."""
+        """A tag name: `div`, `svg:path`, `my-element`, or a member chain.
+
+        `<Ctx.Provider>` is a property read of `Ctx`, so a dotted name is
+        emitted as `Ctx` `.` `Provider` — as one token, the import that binds
+        `Ctx` looked unused.
+        """
+        self._jsx_name()
+        while self.text[self.i:self.i + 1] == "." and _IDENT.match(self.text, self.i + 1):
+            self._punct(".")
+            self._jsx_name()
+
+    def _jsx_name(self) -> bool:
+        """One JSX identifier, which may contain `-` and `:`. False when there is none."""
         text, n = self.text, len(self.text)
         start, line = self.i, self.line
         j = self.i
-        while j < n and (text[j].isalnum() or text[j] in "_$.-:"):
+        while j < n and (text[j].isalnum() or text[j] in "_$-:"):
             j += 1
         if j == start:
-            return
+            return False
         self._advance(j)
         self._emit("name", start, j, line)
+        return True
 
     def _jsx_expression_container(self) -> None:
         """`{ ... }` inside JSX: ordinary code, scanned by the ordinary loop."""

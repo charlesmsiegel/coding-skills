@@ -3,6 +3,8 @@
 import json
 from pathlib import Path
 
+import pytest
+
 SKILL = Path(__file__).resolve().parent.parent.parent / "skills" / "code-doctor"
 SCRIPT = SKILL / "scripts" / "find_secrets.py"
 
@@ -104,6 +106,24 @@ def test_unquoted_dotenv_assignment_is_detected(repo, run_script):
     """.env and YAML normally write the value bare — the highest-value case."""
     repo.write("prod.env", "API_TOKEN=hJ8s0Kd93LwmZq2XvRt7YbNc4PfGh6Aa\n")
     repo.commit("oops")
+    result = run_script(SCRIPT, repo.path, "--format", "json")
+    assert records_of(result, "hardcoded_secret_assignment")
+
+
+def test_an_unquoted_expression_is_not_a_hardcoded_value(repo, run_script):
+    """Bare values are literals in .env and YAML; in code they are expressions,
+    and the entropy of `revision.current(cid)` is the entropy of its names."""
+    repo.write("app.py", "token = revision.current(campaign_identifier)\n"
+                         "chain = call(resolved, max_tokens=budget.max_output_tokens)\n"
+                         "secret_holder = settings.provider_credentials.primary\n")
+    repo.write("view.ts", "const req = { token: ++altsReq.current.token, cid };\n")
+    result = run_script(SCRIPT, repo.path, "--format", "json")
+    assert not records_of(result, "hardcoded_secret_assignment")
+
+
+def test_an_unquoted_credential_in_yaml_is_still_reported(repo, run_script):
+    """The narrowing is about expressions — a bare base64 value still counts."""
+    repo.write("deploy.yaml", "api_token: hJ8s0Kd93LwmZq2Xv/Rt7YbNc4PfGh6Aa+==\n")
     result = run_script(SCRIPT, repo.path, "--format", "json")
     assert records_of(result, "hardcoded_secret_assignment")
 
@@ -260,3 +280,75 @@ def test_credential_in_a_utf16_file_is_still_found(repo, run_script):
     repo.commit("oops")
     result = run_script(SCRIPT, repo.path, "--format", "json")
     assert records_of(result, "cloud_credential")
+
+
+# --------------------------------------------------------------------------- #
+# A secret-shaped NAME on the left of `=` in source code is not evidence: the
+# right-hand side is an expression, and a credential written into code is a
+# string literal. These all came from one real repository's report.
+# --------------------------------------------------------------------------- #
+
+def test_an_expression_assigned_to_a_secret_shaped_name_is_not_reported(repo, run_script):
+    repo.write("usage.py",
+               "def tally(event, compaction, CancelToken, field, secrets):\n"
+               "    tokens = _fields(event.get('usage'))\n"
+               "    reserve_tokens = compaction.RESERVE_TOKENS\n"
+               "    token: CancelToken = field(default_factory=CancelToken)\n"
+               "    session_token = secrets.token_urlsafe(32)\n"
+               "    return tokens, reserve_tokens, token, session_token\n")
+    repo.write("api.js",
+               "export const token = document.querySelector('meta[name=\"t\"]')?.content ?? '';\n"
+               "const TOKEN_RE = /%[^\\n]*|\\\\[A-Za-z]+\\*?|\\\\\\[|\\$\\$?/g;\n")
+    result = run_script(SCRIPT, repo.path, "--format", "json")
+    assert not records_of(result, "hardcoded_secret_assignment")
+
+
+def test_a_quoted_literal_in_source_code_is_still_a_candidate(repo, run_script):
+    repo.write("settings.js", 'const apiToken = "hJ8s0Kd93LwmZq2XvRt7YbNc4PfGh6Aa";\n')
+    result = run_script(SCRIPT, repo.path, "--format", "json")
+    assert records_of(result, "hardcoded_secret_assignment")
+
+
+def test_an_unquoted_value_in_yaml_is_still_a_candidate(repo, run_script):
+    """Bare values are literals in configuration formats — keep that recall."""
+    repo.write("deploy.yaml", "api_token: hJ8s0Kd93LwmZq2XvRt7YbNc4PfGh6Aa\n")
+    result = run_script(SCRIPT, repo.path, "--format", "json")
+    assert records_of(result, "hardcoded_secret_assignment")
+
+
+def test_a_minified_bundle_is_not_mined_for_secret_shaped_names(repo, run_script):
+    """A bundler's output assigns `tokens=` hundreds of times on one line."""
+    body = ";".join(f"var tokens{i}=lex(src{i}).filter(keep)" for i in range(400))
+    repo.write("static/assets/index-U_FZj3ND.js", body + "\n")
+    result = run_script(SCRIPT, repo.path, "--format", "json")
+    assert not records_of(result, "hardcoded_secret_assignment")
+
+
+def test_a_credential_inside_a_minified_bundle_is_still_found(repo, run_script):
+    """An inlined build-time key is exactly the leak a bundle can carry."""
+    body = ";".join(f"var v{i}=f(x{i})" for i in range(400))
+    repo.write("static/assets/index-AbC123.js", body + ';var k="AKIA2E0RSCHEMAQ7VXBN"\n')
+    repo.commit("bundle")
+    result = run_script(SCRIPT, repo.path, "--format", "json")
+    assert records_of(result, "cloud_credential")
+
+
+def test_long_config_values_do_not_hide_an_unrelated_secret(repo, run_script):
+    repo.write("settings.env", "API_SECRET=aB3dE6gH9kL2nP5rT8wY1zC4\n"
+               "PUBLIC_CERT=" + "x" * 1600 + "\n")
+    result = run_script(SCRIPT, repo.path, "--format", "json")
+    found = records_of(result, "hardcoded_secret_assignment")
+    assert len(found) == 1 and found[0]["line"] == 1
+
+
+@pytest.mark.parametrize("suffix", ["js", "go"])
+def test_a_static_backtick_secret_is_a_literal(repo, run_script, suffix):
+    repo.write("settings." + suffix, "const apiToken = `aB3dE6gH9kL2nP5rT8wY1zC4`;\n")
+    result = run_script(SCRIPT, repo.path, "--format", "json")
+    assert records_of(result, "hardcoded_secret_assignment")
+
+
+def test_an_interpolated_template_is_an_expression(repo, run_script):
+    repo.write("settings.js", "const apiToken = `${config.publicValue}${session.identifier}`;\n")
+    result = run_script(SCRIPT, repo.path, "--format", "json")
+    assert not records_of(result, "hardcoded_secret_assignment")

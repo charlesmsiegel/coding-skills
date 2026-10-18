@@ -59,6 +59,56 @@ def is_config(path) -> bool:
 # thousands of candidates from one artifact, which buries everything else.
 MAX_SOURCE_BYTES = 2_000_000
 
+# A bundler does not always say so in the name: Vite writes
+# `assets/index-U_FZj3ND.js`. What it cannot hide is the shape — source whose
+# lines average this long was written by a machine. The mean, not the longest
+# line, so a hand-written module with one embedded constant still reads as source.
+MINIFIED_MEAN_LINE_LENGTH = 500
+
+# Past this a line is data, not something a person wrote one statement at a time,
+# and the heuristic patterns stop reading it. The bound is what keeps one
+# pathological line from holding a whole scan: every pattern costs at least
+# linear time in the line, and several were found costing far more.
+MAX_SCAN_LINE = 10_000
+
+
+def looks_generated(path, lines) -> bool:
+    """Whether a source file is a bundler's output rather than code a person wrote.
+
+    Source only. A long single-line JSON or YAML file is still the configuration a
+    run loads — the scanners deliberately read minified config — so the shape
+    test never applies to it.
+    """
+    if Path(path).suffix not in CODE_SUFFIXES or not lines:
+        return False
+    return sum(len(line) for line in lines) / len(lines) > MINIFIED_MEAN_LINE_LENGTH
+
+
+def bound_lines(lines: list) -> tuple:
+    """(lines cut to MAX_SCAN_LINE characters, how many were cut)."""
+    cut = sum(1 for line in lines if len(line) > MAX_SCAN_LINE)
+    if not cut:
+        return lines, 0
+    return [line[:MAX_SCAN_LINE] for line in lines], cut
+
+
+def coverage_note(generated: list, truncated: int = 0) -> str:
+    """What the scan deliberately did not read, for the caveat. '' when nothing.
+
+    Generated files are named rather than dropped: a reader comparing two runs, or
+    wondering why a bundle's code is absent, has to be able to see the choice.
+    """
+    note = ""
+    if generated:
+        shown = ", ".join(generated[:3]) + (", ..." if len(generated) > 3 else "")
+        note += (" " + str(len(generated)) + " generated file(s) were not mined (" + shown
+                 + "): their lines average over " + str(MINIFIED_MEAN_LINE_LENGTH)
+                 + " characters, which is a bundler's output — read the source it was built from.")
+    if truncated:
+        note += (" " + str(truncated) + " line(s) longer than " + str(MAX_SCAN_LINE)
+                 + " characters were read only that far, so anything past it is not covered.")
+    return note
+
 
 def configure_output():
     """UTF-8 out, and never crash on a console that cannot encode a character."""
@@ -84,6 +134,15 @@ def wanted(path: Path, suffixes) -> bool:
     return CONFIG_SUFFIXES <= suffixes and is_config(path)
 
 
+# Installed skill payloads belong to the tooling, not to the host project.
+# Match the pair, not the agent directory: hooks and other configuration there
+# are still project inputs. Paths are relative to the scan root so an explicit
+# scan of a skill continues to work.
+def is_installed_skill(parts) -> bool:
+    return any(parent in {".codex", ".claude", ".kiro", ".agents"} and child == "skills"
+               for parent, child in zip(parts, parts[1:]))
+
+
 def iter_files(root: Path, suffixes) -> list:
     """Every file under `root` with one of `suffixes`, sorted, vendored trees skipped."""
     root = Path(root)
@@ -93,7 +152,8 @@ def iter_files(root: Path, suffixes) -> list:
     for path in root.rglob("*"):
         if not path.is_file() or not wanted(path, suffixes):
             continue
-        if EXCLUDE_DIRS.isdisjoint(path.relative_to(root).parts):
+        if (EXCLUDE_DIRS.isdisjoint(path.relative_to(root).parts)
+                and not is_installed_skill(path.relative_to(root).parts)):
             found.append(path)
     return sorted(found)
 

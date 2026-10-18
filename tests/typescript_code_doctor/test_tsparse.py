@@ -70,6 +70,37 @@ def test_unbalanced_brackets_raise_rather_than_report_nonsense(ts):
         parse(ts, "function f() { return 1;")
 
 
+def test_a_regex_inside_a_template_substitution_is_not_a_string(ts):
+    """`/"/g` inside `${...}` must not open a string that runs to the next `"`.
+
+    The substitution is code, so a `/` after `(` there starts a regex exactly as
+    it would outside the template — and a regex may contain any quote character.
+    """
+    source = (
+        "export function cell(value: string): string {\n"
+        "  return value.includes('\"') ? `\"${value.replace(/\"/g, '\"\"')}\"` : value\n"
+        "}\n"
+        "const after = 1;\n"
+    )
+    file = parse(ts, source)  # raised "unclosed '{'" before
+    templates = [t for t in file.tokens if t.kind == "template"]
+    assert len(templates) == 1 and templates[0].value.endswith('"`')
+    assert any(t.is_name("after") for t in file.tokens)
+    assert file.functions[0].name == "cell" and file.line_of(file.functions[0].body_close) == 3
+
+
+def test_division_inside_a_template_substitution_is_still_division(ts):
+    file = parse(ts, "const s = `${total / count} and ${a}/${b}`; const after = 1;")
+    assert [t.kind for t in file.tokens].count("template") == 1
+    assert any(t.is_name("after") for t in file.tokens)
+
+
+def test_a_brace_inside_a_substitution_string_does_not_end_the_template(ts):
+    file = parse(ts, "const s = `${ '}' + \"{\" + `${'}'}` }`; const after = 1;")
+    assert [t.kind for t in file.tokens].count("template") == 1
+    assert any(t.is_name("after") for t in file.tokens)
+
+
 def test_line_numbers_survive_multiline_literals(ts):
     file = parse(ts, "const a = `one\ntwo\nthree`;\nconst b = 2;\n")
     binding = next(t for t in file.tokens if t.is_name("b"))
@@ -115,6 +146,81 @@ export abstract class Repo extends Base implements Reader {
     load = next(m for m in klass.methods if m.name == "load")
     assert load.is_abstract and not load.has_body
     assert next(m for m in klass.methods if m.kind == "constructor").params[0].accessibility == "private"
+
+
+def test_a_comma_inside_a_generic_return_type_does_not_end_it(ts):
+    """`): Record<string, number> {` — the `{` after the `>` is the body."""
+    source = """\
+export function counts(): Record<string, number> {
+  return {}
+}
+class Store {
+  getCache(): Map<string, Array<number>> {
+    return new Map()
+  }
+  run(): void {}
+}
+"""
+    file = parse(ts, source)
+    counts = next(f for f in file.functions if f.name == "counts")
+    assert counts.return_type == "Record<string, number>" and counts.has_body
+    klass = file.classes[0]
+    cache = next(m for m in klass.methods if m.name == "getCache")
+    assert cache.has_body and cache.return_type == "Map<string, Array<number>>"
+    assert [m.name for m in klass.methods] == ["getCache", "run"] and klass.props == []
+
+
+def test_a_comma_inside_a_generic_parameter_type_does_not_split_the_parameter(ts):
+    """`Map<string, number>` is one parameter's type, not two parameters."""
+    source = (
+        "export function g(m: Map<string, number>, pick: Pick<A, 'a' | 'b'> = {},\n"
+        "  n = a < b, o = c > d ? e : f, cb: (x: Array<Set<number>>, y: T) => R): void {}\n"
+        "export const h = (a: Record<string, number>, flag: boolean) => a\n"
+    )
+    file = parse(ts, source)
+    by_name = {f.name: f for f in file.functions}
+    assert [(p.name, p.type_text, p.has_default) for p in by_name["g"].params] == [
+        ("m", "Map<string, number>", False), ("pick", "Pick<A, 'a' | 'b'>", True),
+        ("n", "", True), ("o", "", True), ("cb", "(x: Array<Set<number>>, y: T) => R", False),
+    ]
+    assert [(p.name, p.type_text) for p in by_name["h"].params] == [
+        ("a", "Record<string, number>"), ("flag", "boolean"),
+    ]
+
+
+def test_every_member_of_a_semicolon_less_interface_is_read(ts):
+    """Without separators the line break ends a member; the next line is the next member."""
+    source = """\
+interface Props {
+  a: string
+  b: number
+  readonly c?: boolean
+  d(x: number): string
+  e: Map<string, number>
+  f: () => void
+  g: { nested: string; other: number }
+}
+type Q = {
+  h: string
+  i: number
+}
+"""
+    file = parse(ts, source)
+    members = {t.name: [(m.name, m.type_text) for m in t.members] for t in file.types}
+    assert members["Props"] == [
+        ("a", "string"), ("b", "number"), ("c", "boolean"), ("d", "(x: number): string"),
+        ("e", "Map<string, number>"), ("f", "() => void"), ("g", "{ nested: string; other: number }"),
+    ]
+    assert members["Q"] == [("h", "string"), ("i", "number")]
+    props = {m.name: m for m in file.types[0].members}
+    assert props["c"].readonly and props["c"].optional
+
+
+def test_a_generic_member_type_ends_at_its_line(ts):
+    """The `>` closing `Map<…>` ends the member; `kind` on the next line is not part of it."""
+    file = parse(ts, "interface Props {\n  grouped: Map<string, number[]>;\n  kind: string | null;\n}\n")
+    members = {m.name: m.type_text for m in file.types[0].members}
+    assert members == {"grouped": "Map<string, number[]>", "kind": "string | null"}
 
 
 def test_a_function_type_is_not_a_function(ts):
@@ -207,6 +313,89 @@ def test_statement_end_spans_a_multiline_expression(ts):
     ret = next(i for i, t in enumerate(file.tokens) if t.is_name("return"))
     end = ts.statement_end(file, ret + 1)
     assert file.tokens[end].is_op("}"), "the ASI heuristic cut a chained expression in half"
+
+
+def _end_after_return(ts, source: str):
+    file = parse(ts, source)
+    ret = next(i for i, t in enumerate(file.tokens) if t.is_name("return"))
+    return file, file.tokens[ts.statement_end(file, ret + 1)]
+
+
+def test_statement_end_stops_at_the_brace_that_closes_its_block(ts):
+    """`return {...}` as a body's last statement ends at the body's `}`, not after it."""
+    file, end = _end_after_return(ts, "function f() {\n  return {\n    a: 1,\n  }\n}\nlet counter = 0\n")
+    assert end.is_op("}") and end.line == 5, f"the statement ran on to {end.value!r} on line {end.line}"
+
+
+def test_statement_end_stops_at_an_enclosing_brace_after_a_call(ts):
+    file, end = _end_after_return(ts, "function f() {\n  if (x) {\n    return g(x)\n  }\n  return 2\n}\n")
+    assert end.is_op("}") and end.line == 4
+
+
+def test_a_bare_return_ends_at_the_closing_brace(ts):
+    file, end = _end_after_return(ts, "function f() {\n  return\n}\nlet counter = 0\n")
+    assert end.is_op("}") and end.line == 3
+
+
+def test_statement_end_breaks_at_a_line_break_after_a_bracket_group(ts):
+    """`return g(a)\\n  log(a)` is two statements; the second starts a new line."""
+    file, end = _end_after_return(ts, "function f() {\n  return g(a)\n  log(a)\n}\n")
+    assert end.is_name("log")
+
+
+def test_statement_end_keeps_a_chain_that_continues_after_a_group(ts):
+    file, end = _end_after_return(ts, "function f() {\n  return g(a)\n    .then(h)\n}\n")
+    assert end.is_op("}")
+
+
+def test_a_multiline_type_alias_does_not_swallow_what_follows_it(ts):
+    """The alias ends at its closing brace; the declarations after it are still found."""
+    source = """\
+type Props = {
+  title: string
+}
+export const make = (n: number) => {
+  return n + 1
+}
+type Other = { a: string }
+"""
+    file = parse(ts, source)
+    by_name = {t.name: t for t in file.types}
+    assert file.line_of(by_name["Props"].end) == 3
+    assert "Other" in by_name
+    assert "make" in {f.name for f in file.functions}
+
+
+def test_a_multiline_property_initializer_does_not_swallow_the_methods_after_it(ts):
+    source = """\
+class Store {
+  options = {
+    retries: 1,
+  }
+  run() {
+    return this.options.retries
+  }
+}
+"""
+    klass = parse(ts, source).classes[0]
+    assert [m.name for m in klass.methods] == ["run"]
+    assert [p.name for p in klass.props] == ["options"]
+
+
+def test_callback_target_names_the_call_a_function_is_passed_to(ts):
+    source = """\
+useEffect(() => { tick() }, [open])
+describe.each(rows)('t', function () { run() })
+const bare = () => { run() }
+const wrapped = [() => { run() }]
+const value = run(() => { other() } && x)
+"""
+    file = parse(ts, source)
+    targets = {file.line_of(f.start): ts.callback_target(file, f) for f in file.functions}
+    assert targets == {
+        1: ("useEffect", 0), 2: ("describe.each", 1),
+        3: ("", -1), 4: ("", -1), 5: ("", -1),
+    }
 
 
 def test_callee_of_reads_a_dotted_call(ts):

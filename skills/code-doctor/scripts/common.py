@@ -68,6 +68,13 @@ DOC_DIR_NAMES = frozenset({"docs", "doc", "documentation", "examples", "example"
 # line lengths would dominate every size metric.
 GENERATED_MARKERS = (".min.js", ".min.css", ".bundle.js", "_pb2.py", ".g.dart", ".generated.")
 
+# A bundler does not always say so in the name: Vite writes
+# `assets/index-U_FZj3ND.js`. What it cannot hide is the shape — a file whose
+# lines average this long is machine-written. The mean, not the longest line,
+# so a hand-written module with one embedded base64 constant still reads as
+# source.
+MINIFIED_MEAN_LINE_LENGTH = 500
+
 _BINARY_SNIFF_BYTES = 8192
 
 # UTF-16 is NUL-riddled by construction (every ASCII character is followed by
@@ -141,6 +148,23 @@ def read_text(path: Path) -> str:
     return data.decode("utf-8", errors="replace")
 
 
+# A template engine's suffix says how a file is rendered, not what it holds:
+# `chat.md.j2` is Markdown, `module.py.j2` is code. Such a file is classified
+# by its inner suffix, exactly as the rendered file would be.
+TEMPLATE_SUFFIXES = frozenset({
+    ".j2", ".jinja", ".jinja2", ".tmpl", ".tpl", ".mustache", ".hbs", ".handlebars",
+    ".liquid", ".njk", ".ejs", ".erb", ".mako",
+})
+
+
+def _content_suffix(path: Path) -> str:
+    """The suffix naming what a file holds — the inner one, for a template."""
+    suffixes = [suffix.lower() for suffix in path.suffixes]
+    if len(suffixes) >= 2 and suffixes[-1] in TEMPLATE_SUFFIXES:
+        return suffixes[-2]
+    return path.suffix.lower()
+
+
 def is_source(rel_parts: tuple[str, ...], path: Path) -> bool:
     """Whether the code-only detectors should read this file.
 
@@ -149,12 +173,25 @@ def is_source(rel_parts: tuple[str, ...], path: Path) -> bool:
     """
     if any(part.lower() in DOC_DIR_NAMES for part in rel_parts[:-1]):
         return False
-    if path.suffix.lower() in NON_CODE_SUFFIXES:
+    if _content_suffix(path) in NON_CODE_SUFFIXES:
         return False
     name = path.name.lower()
     if not path.suffix and name.split(".")[0] in NON_CODE_BASENAMES:
         return False
     return not any(marker in name for marker in GENERATED_MARKERS)
+
+
+def looks_minified(text: str) -> bool:
+    """Whether ``text`` has the shape of a bundler's output rather than source.
+
+    Name markers catch `app.min.js`; this catches the hashed bundles that carry
+    none. Detectors use it to stop mining such a file for the things a person
+    writes — comments, TODOs, secret-shaped variable names — while the checks
+    that matter in any bytes (key material, recognisable credentials, merge
+    markers) still read it.
+    """
+    lines = text.count("\n") + 1
+    return len(text) / lines > MINIFIED_MEAN_LINE_LENGTH
 
 
 def gitignored_paths(root: Path) -> set[Path]:
@@ -181,6 +218,15 @@ def gitignored_paths(root: Path) -> set[Path]:
     return {(root / rel.strip()).resolve() for rel in listing.splitlines() if rel.strip()}
 
 
+# Installed skill payloads belong to the tooling, not to the host project.
+# Match the pair, not the agent directory: hooks and other configuration there
+# are still project inputs. Paths are relative to the scan root so an explicit
+# scan of a skill continues to work.
+def is_installed_skill(parts) -> bool:
+    return any(parent in {".codex", ".claude", ".kiro", ".agents"} and child == "skills"
+               for parent, child in zip(parts, parts[1:]))
+
+
 def walk_paths(root: Path, *, skip_gitignored: bool = False) -> Iterator[Path]:
     """Yield every non-excluded file path under ``root``, binaries included.
 
@@ -193,6 +239,12 @@ def walk_paths(root: Path, *, skip_gitignored: bool = False) -> Iterator[Path]:
     this skill inspect host data and report a credential found there as
     committed to this repository. Git stores only the link target string, so
     there is nothing of the target's content to review in any case.
+
+    **A nested git checkout is another repository.** A directory below
+    ``root`` holding its own `.git` — a file for a worktree or a submodule, a
+    directory for a nested clone — is pruned: a credential in a sibling
+    worktree is not committed to *this* repo, and reporting it here (once per
+    copy of the tree) would say it was. ``root`` itself is never pruned.
     """
     if root.is_symlink():
         raise ScanPathError(
@@ -214,7 +266,8 @@ def walk_paths(root: Path, *, skip_gitignored: bool = False) -> Iterator[Path]:
     for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
         dirnames[:] = sorted(d for d in dirnames
                              if d not in EXCLUDE_DIRS
-                             and not Path(dirpath, d).is_symlink())
+                             and not Path(dirpath, d).is_symlink()
+                             and not os.path.lexists(Path(dirpath, d, ".git")))
         if ignored:
             dirnames[:] = [d for d in dirnames if Path(dirpath, d).resolve() not in ignored]
         for name in sorted(filenames):
@@ -240,6 +293,8 @@ def walk_files(root: Path, *, source_only: bool) -> Iterator[Path]:
     # candidates rather than committed leaks; it cannot do that if the walk
     # hides them.
     for path in walk_paths(root, skip_gitignored=source_only):
+        if source_only and is_installed_skill(path.relative_to(root).parts):
+            continue
         if source_only and not is_source(path.relative_to(root).parts
                                          if root.is_dir() else (path.name,), path):
             continue

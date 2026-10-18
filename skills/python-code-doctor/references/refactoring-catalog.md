@@ -55,7 +55,8 @@ loose `(x, y)` tuple passed everywhere.
 Array with Object → a dataclass instead of a positional tuple or stringly-keyed
 dict. Validation and behavior move onto the type; the rest of the code stops
 re-checking it.
-**Detector:** partial — `find_code_smells.py` (magic numbers),
+**Detector:** partial — `find_code_smells.py` (magic numbers; not in tests, where
+a literal is the expected value, nor an HTTP status where a status belongs),
 `find_parameter_objects.py` (primitives travelling together). The single
 meaning-laden primitive is found by reading.
 
@@ -68,7 +69,10 @@ function could just take?"
 Parameter with Method Call when the callee could fetch the value itself; Introduce
 Parameter Object when the group recurs. Boolean steering flags: split the function
 (see `find_boolean_params.py`).
-**Detector:** `find_code_smells.py`, `analyze_complexity.py`.
+**Detector:** `analyze_complexity.py` (`parameter_count`: positional parameters meet
+the threshold, keyword-only ones only a total of twice it — a keyword-only option is
+already the fix — and `self`/`cls` and pytest tests and fixtures, whose parameters are
+fixtures resolved by name, are not counted).
 **Ignore when:** bundling would couple modules that are deliberately independent —
 explicit parameters are sometimes the honest dependency injection.
 
@@ -80,7 +84,9 @@ others still make sense? If not, it's a clump.
 **Fix:** Extract Class / Introduce Parameter Object → a (frozen) dataclass; then
 Preserve Whole Object at the call sites. Watch the behavior that follows the data —
 it often wants to move onto the new class.
-**Detector:** `find_parameter_objects.py`.
+**Detector:** `find_parameter_objects.py` — each clump once, each function's
+parameters charged to one clump; pytest tests and fixtures and web route handlers
+are skipped, because the framework, not a caller, supplies their arguments.
 
 ## Object-Orientation Abusers
 
@@ -100,7 +106,9 @@ classes — via Replace Type Code with Subclasses first if needed. If branches j
 call one method with different arguments, Replace Parameter with Explicit Methods.
 If one branch handles None, consider Introduce Null Object (sparingly — see
 `overengineering-and-abstraction.md`).
-**Detector:** `find_design_smells.py` (`type_switch`).
+**Detector:** `find_design_smells.py` (`type_switch`: a finding when the ladder
+has six or more branches or its subject is switched in more than one ladder; one
+short ladder is a candidate, for the reason below).
 **Ignore when:** one simple switch in one place is often the clearest form —
 factory functions legitimately switch on what to build. The smell is complexity
 and repetition, not the keyword.
@@ -115,6 +123,9 @@ and its scratch state into its own small object (the method-object move).
 **Detector:** `find_design_smells.py` (`temporary_field`).
 **Ignore when:** a lazy-init cache behind a `@property`/`@cached_property` is
 idiomatic — better yet, use `functools.cached_property` and delete the field.
+A field the method reads before it writes it (the key of what is cached, a
+running total) holds what the previous call left, so it persists by design;
+the detector does not report it.
 
 ### Refused bequest
 **Spot it:** a subclass that inherits methods it doesn't want and overrides them
@@ -262,7 +273,9 @@ Things that change together should live together.
 **Fix:** Move Method to the data it envies; if only part of the method envies,
 Extract Method first and move that piece. Using several classes' data? Move it to
 the one with the most.
-**Detector:** `find_coupling_issues.py`.
+**Detector:** `find_coupling_issues.py` — a candidate (distinct attributes on
+each side; a module or a loop variable is never the envied object), because one
+file cannot rule out the case below.
 **Ignore when:** behavior is deliberately kept separate from data — Strategy,
 Visitor and friends do this on purpose to allow swapping behavior.
 
@@ -274,7 +287,9 @@ spend too much time together; mutual dependence.
 Delegate to make the relationship official; mutual dependence → Change
 Bidirectional Association to Unidirectional. Subclass-parent intimacy: either
 accept it explicitly (Replace Delegation with Inheritance) or break it.
-**Detector:** `find_design_smells.py` (`inappropriate_intimacy`).
+**Detector:** `find_design_smells.py` (`inappropriate_intimacy`; a private name
+a class in the same module defines is not reported, and a relatively-imported
+sibling module's private name is a candidate).
 **Python note:** touching `_private` names within the *same module* is
 conventional and fine; the smell is cross-module reaching.
 

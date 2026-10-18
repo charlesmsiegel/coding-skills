@@ -66,10 +66,8 @@ def _check_unused_options(file: TsFile, report: Reporter) -> None:
                 or param.type_text.strip().startswith("{")
             if not looks_like_options:
                 continue
-            used = any(
-                file.tokens[i].kind == "name" and file.tokens[i].value == param.name
-                for i in body_indices(func)
-            )
+            # `names()` reaches into template substitutions: `${options.x}` reads it.
+            used = any(t.value == param.name for t in file.names(func.body_open + 1, func.body_close))
             if not used:
                 report.add(func.line, "ignored_options_parameter",
                            f"`{func.qualname}` takes `{param.name}` and never reads it",

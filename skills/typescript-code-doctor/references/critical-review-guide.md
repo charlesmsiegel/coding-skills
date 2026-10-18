@@ -72,7 +72,8 @@ facts. The findings with real false-positive modes:
 - `unreleased_resource` — released in a different file, or intentionally
   process-lifetime.
 - `single_implementation_interface` — a second implementation may live in a
-  package this scan did not include.
+  package this scan did not include. Reported as a candidate: the record lists
+  the benign readings to rule out before acting.
 
 When you report a finding you have not verified, say so.
 

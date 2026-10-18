@@ -4,13 +4,14 @@ Run every detector over a Rust project and merge the output into one report.
 """
 
 import argparse
+import dataclasses
 import io
 import json
 import sys
 from datetime import datetime
 from pathlib import Path
 
-from common import SEVERITY_ICONS, configure_output
+from common import SEVERITY_ICONS, Finding, configure_output
 from runner import default_jobs, run_detectors
 
 # category -> (module, progress label, kind). One row per detector analyze_all
@@ -18,6 +19,11 @@ from runner import default_jobs, run_detectors
 # answer from a single parsed file and are sharded across the pool, TREE
 # detectors need the whole project at once and share one load of it.
 FILE, TREE = "file", "tree"
+
+# The contract's own fields. A detector that also attaches something of its
+# own — a line span, a rule id — has not broken the contract, so the extra key
+# is ignored on the hop instead of costing the whole record.
+_FINDING_FIELDS = {field.name for field in dataclasses.fields(Finding)}
 
 ANALYZERS = [
     ("cargo", "find_cargo_issues", "Auditing Cargo.toml", TREE),
@@ -104,12 +110,14 @@ def generate_report(path: str, skip: set | None = None, jobs: int | None = None)
         },
         "summary": {
             "total_issues": 0,
+            "total_candidates": 0,
             "by_severity": {"high": 0, "medium": 0, "low": 0},
             "by_category": {},
         },
         "categories": {},
     }
 
+    rejected: dict[str, list[str]] = {}
     for category, data in results.items():
         issues = []
         if isinstance(data, list):
@@ -121,18 +129,43 @@ def generate_report(path: str, skip: set | None = None, jobs: int | None = None)
 
         normalized = []
         for issue in issues:
-            if isinstance(issue, dict):
-                issue.setdefault("severity", "medium")
-                issue["category"] = category
-                normalized.append(issue)
+            if not isinstance(issue, dict):
+                continue
+            # Re-validate on the hop. One malformed record from a buggy detector
+            # is dropped and named here, instead of reaching a grader as a
+            # finding it never proved.
+            try:
+                Finding(**{k: v for k, v in issue.items() if k in _FINDING_FIELDS})
+            except (TypeError, ValueError) as exc:
+                rejected.setdefault(category, []).append(str(exc))
+                continue
+            issue.setdefault("severity", "medium")
+            issue.setdefault("kind", "finding")
+            issue["category"] = category
+            normalized.append(issue)
 
         report["categories"][category] = {"issues": normalized, "count": len(normalized)}
         report["summary"]["total_issues"] += len(normalized)
+        report["summary"]["total_candidates"] += sum(
+            1 for issue in normalized if issue.get("kind") == "candidate")
         report["summary"]["by_category"][category] = len(normalized)
         for issue in normalized:
             severity = issue.get("severity", "medium")
             if severity in report["summary"]["by_severity"]:
                 report["summary"]["by_severity"][severity] += 1
+
+    if rejected:
+        report["meta"]["records_rejected"] = {
+            category: f"{len(errors)} record(s) did not satisfy the findings schema "
+                      f"and were dropped: {errors[0]}"
+            for category, errors in sorted(rejected.items())
+        }
+        # A detector emitting contract-invalid records is a broken detector, so
+        # the same message goes into analyzer_errors: that is what the
+        # ⚠️ ANALYSIS INCOMPLETE block prints and what code-overview's coverage
+        # logic reads, so the category is treated as ungraded rather than clean.
+        for category, message in report["meta"]["records_rejected"].items():
+            report["meta"]["analyzer_errors"].setdefault(category, message)
 
     return report
 
@@ -150,6 +183,12 @@ def print_text_report(report: dict) -> None:
     print("📈 SUMMARY")
     print("-" * 40)
     print(f"Total issues found: {summary['total_issues']}")
+    # Worded as python-code-doctor words it. The candidates ARE part of the
+    # total above — a line that says they are "not counted" contradicts the
+    # number it sits under.
+    candidate_count = summary.get("total_candidates", 0)
+    if candidate_count:
+        print(f"  ❓ of which {candidate_count} are candidates — unverified leads, not defects")
     print()
     print("By severity:")
     for severity, count in summary["by_severity"].items():
@@ -180,25 +219,60 @@ def print_text_report(report: dict) -> None:
     print("=" * 70)
     print("🔴 HIGH SEVERITY ISSUES")
     print("=" * 70)
-    high = [issue for data in report["categories"].values()
-            for issue in data["issues"] if issue.get("severity") == "high"]
+    # A candidate is kept out of this list on purpose. Listing a lead among the
+    # high-severity defects is how a reader acts on one without confirming it.
+    high, candidates = [], []
+    for data in report["categories"].values():
+        for issue in data["issues"]:
+            if issue.get("kind") == "candidate":
+                candidates.append(issue)
+            elif issue.get("severity") == "high":
+                high.append(issue)
+
+    def _describe(issue):
+        print(f"\n📍 {issue.get('file', '?')}:{issue.get('line', '?')}")
+        print(f"   [{issue['category']}] {issue.get('smell_type', '?')}")
+        if issue.get("description"):
+            print(f"   {issue['description']}")
+        if issue.get("suggestion"):
+            print(f"   → {issue['suggestion']}")
+        for reason in issue.get("also_caused_by") or []:
+            print(f"   ? also caused by: {reason}")
+
     if not high:
         print("None found!")
     else:
         for issue in high[:25]:
-            print(f"\n📍 {issue.get('file', '?')}:{issue.get('line', '?')}")
-            print(f"   [{issue['category']}] {issue.get('smell_type', '?')}")
-            if issue.get("description"):
-                print(f"   {issue['description']}")
-            if issue.get("suggestion"):
-                print(f"   → {issue['suggestion']}")
+            _describe(issue)
         if len(high) > 25:
             print(f"\n... and {len(high) - 25} more high severity issues")
-
     print()
+
+    if candidates:
+        print("=" * 70)
+        print("❓ CANDIDATES — leads to confirm, not defects")
+        print("=" * 70)
+        print("Each names something the syntax alone cannot prove. Rule out the")
+        print("benign explanation before changing anything; graders exclude these.")
+        for issue in candidates[:20]:
+            _describe(issue)
+        if len(candidates) > 20:
+            print(f"\n... and {len(candidates) - 20} more candidates")
+        print()
+
     print("=" * 70)
     print("💡 RECOMMENDATIONS")
     print("=" * 70)
+
+    # Recommendations are instructions to change code, so they are counted off
+    # the asserted defects only. `by_category` deliberately counts everything
+    # reported — telling someone to "replace narrowing `as` casts" because a
+    # lead was raised is advice about a defect nothing found.
+    summary = {**summary, "by_category": {
+        category: sum(1 for issue in data["issues"] if issue.get("kind") != "candidate")
+        for category, data in report["categories"].items()
+    }}
+
     advice = [RECOMMENDATIONS[category] for category in CATEGORIES
               if summary["by_category"].get(category, 0) and category in RECOMMENDATIONS]
     for line in advice or ["• Your code is in good shape! Consider minor improvements."]:

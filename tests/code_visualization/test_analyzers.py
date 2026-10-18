@@ -2184,6 +2184,136 @@ def test_deps_js_import_text_inside_a_string_is_ignored(repo, tabs, run_script):
     summary = _deps_summary(repo, tabs, run_script)
 
     assert summary["import_edges"] == 0
+    assert summary["resolution"]["TypeScript"]["skipped_in_strings"] == 1
+
+
+# The in-string guard used to look at the character before an `import` after
+# stripping ALL whitespace, newlines included. In semicolon-free code the line
+# above an import usually ends in its own spec's quote, so every import but the
+# first was dropped — and never counted, so the summary still read 100%
+# resolved. On a real 300-file Vite app: 66 of 695 relative imports seen.
+
+
+def test_deps_js_semicolon_free_consecutive_imports_all_count(repo, tabs, run_script):
+    repo.write("src/a.ts", "export const a = 1\n")
+    repo.write("src/b.ts", "export const b = 2\n")
+    repo.write("src/c.ts", "export const c = 3\n")
+    repo.write("src/d.ts", "export const d = 4\n")
+    repo.write("src/main.ts",
+               "import { a } from './a'\n"
+               "import { b } from \"./b\"\n"
+               "export { c } from './c'\n"
+               "const { d } = require('./d')\n")
+
+    summary = _deps_summary(repo, tabs, run_script)
+
+    fan_in = {row["path"]: row["fan_in"] for row in summary["top_fan_in_files"]}
+    assert {f: fan_in.get(f) for f in ("src/a.ts", "src/b.ts", "src/c.ts", "src/d.ts")} \
+        == dict.fromkeys(("src/a.ts", "src/b.ts", "src/c.ts", "src/d.ts"), 1)
+    res = summary["resolution"]["TypeScript"]
+    assert res["first_party"] == 4 and res["skipped_in_strings"] == 0
+
+
+def test_deps_js_import_after_a_line_ending_in_a_string_counts(repo, tabs, run_script):
+    repo.write("src/dep.ts", "export const x = 1\n")
+    repo.write("src/lazy.ts", "export const y = 2\n")
+    repo.write("src/main.ts",
+               "export const greeting = 'hello'\n"
+               "import { x } from './dep'\n"
+               "const tpl = `${greeting} world`\n"
+               "export const later = () => import('./lazy')\n")
+
+    summary = _deps_summary(repo, tabs, run_script)
+
+    fan_in = {row["path"]: row["fan_in"] for row in summary["top_fan_in_files"]}
+    assert fan_in.get("src/dep.ts") == 1
+    assert fan_in.get("src/lazy.ts") == 1
+
+
+def test_deps_js_import_text_in_template_and_mid_line_strings_is_skipped(
+        repo, tabs, run_script):
+    """The guard is about what encloses the `import`, not the character
+    before it: a template literal spanning lines and a string whose import
+    text starts mid-sentence are both literal text, and both are counted as
+    skipped so a reader can see the guard fired."""
+    repo.write("src/dep.ts", "export const x = 1\n")
+    repo.write("src/docs.ts",
+               "export const usage = `\n"
+               "Usage:\n"
+               "  import { x } from './dep'\n"
+               "`\n"
+               "export const hint = \"see: import x from './dep' for details\"\n"
+               "export const nested = `${usage} and import('./dep') too`\n")
+
+    summary = _deps_summary(repo, tabs, run_script)
+
+    assert summary["import_edges"] == 0
+    assert summary["resolution"]["TypeScript"]["skipped_in_strings"] == 3
+
+
+def test_deps_js_template_substitution_and_regex_literals_are_code(repo, tabs, run_script):
+    """A `${...}` substitution is code, so a dynamic import inside one counts;
+    a backtick or quote inside a regex literal opens nothing, so the import
+    on the next line is still seen."""
+    repo.write("src/dep.ts", "export const x = 1\n")
+    repo.write("src/other.ts", "export const y = 2\n")
+    repo.write("src/main.ts",
+               "export const m = `${await import('./dep')}`\n"
+               "const tick = /`'\"/g\n"
+               "import { y } from './other'\n")
+
+    summary = _deps_summary(repo, tabs, run_script)
+
+    fan_in = {row["path"]: row["fan_in"] for row in summary["top_fan_in_files"]}
+    assert fan_in.get("src/dep.ts") == 1
+    assert fan_in.get("src/other.ts") == 1
+
+
+def test_deps_js_string_text_never_swallows_the_next_real_import(repo, tabs, run_script):
+    """Import-shaped text inside a string must not be matched onward into the
+    real statement that follows it on the same line."""
+    repo.write("src/dep.ts", "export const x = 1\n")
+    repo.write("src/main.ts",
+               "const s = \"import \"; import { x } from './dep'\n")
+
+    summary = _deps_summary(repo, tabs, run_script)
+
+    fan_in = {row["path"]: row["fan_in"] for row in summary["top_fan_in_files"]}
+    assert fan_in.get("src/dep.ts") == 1
+
+
+def test_deps_js_comments_with_quotes_hide_nothing(repo, tabs, run_script):
+    repo.write("src/a.ts", "export const a = 1\n")
+    repo.write("src/b.ts", "export const b = 2\n")
+    repo.write("src/main.tsx",
+               "// don't import this: import z from './gone'\n"
+               "import { a } from './a'\n"
+               "/* `unclosed backtick in a comment */\n"
+               "const url = 'http://example.com' // it's fine\n"
+               "export const el = <p>Don't panic</p>\n"
+               "import { b } from './b'\n")
+
+    summary = _deps_summary(repo, tabs, run_script)
+
+    fan_in = {row["path"]: row["fan_in"] for row in summary["top_fan_in_files"]}
+    assert fan_in.get("src/a.ts") == 1
+    assert fan_in.get("src/b.ts") == 1
+    assert summary["resolution"]["TypeScript"]["first_party"] == 2
+
+
+def test_deps_js_mass_skips_are_flagged_in_the_tab(repo, tabs, run_script, fragment):
+    """A file that is mostly import text inside strings (a code generator, a
+    docs page) is legitimate — but a skip count that rivals the real imports
+    is what a broken guard looks like, so the tab says so."""
+    repo.write("src/dep.ts", "export const x = 1\n")
+    repo.write("src/gen.ts", "".join(
+        f"export const t{i} = \"import x{i} from './dep'\"\n" for i in range(12)))
+
+    summary = _deps_summary(repo, tabs, run_script)
+
+    assert summary["resolution"]["TypeScript"]["skipped_in_strings"] == 12
+    body = fragment.body(tabs / "03-dependencies.html")
+    assert "inside string literals" in body
 
 
 def test_deps_js_bare_suffix_fallback_requires_ts_config(repo, tabs, run_script):
@@ -3015,3 +3145,140 @@ def test_extraction_gives_coverage_tab_its_canonical_prefix(tmp_path, tabs, run_
     result = run_script(SCRIPTS / "extract_tabs.py", atlas, "--out-dir", tmp_path / "rec")
 
     assert json.loads(result.stdout)["fragments"] == ["01-overview.html", "09-coverage.html"]
+
+
+# --------------------------------------------------------------------------- #
+# Scoping to a package's roots (--root)
+#
+# The failure these pin down: --exclude matches directory NAMES, so a package
+# rooted at `src/app` plus `tests` could not be analyzed without dropping every
+# other `scripts` or `tests` directory too, and the workaround was a sparse
+# clone per package. --root names the directories to report on, repeatable;
+# the rest of the repo is still read where it gives context.
+# --------------------------------------------------------------------------- #
+
+
+def _package_repo(repo):
+    """A package rooted at src/app and tests, beside a top-level scripts/ the
+    package does not own — and a tests/scripts/ it does."""
+    repo.write("src/app/__init__.py", "")
+    repo.write("src/app/core.py", "from shared import util\n\n\ndef run(x):\n"
+               "    return util.twice(x) if x else 0\n")
+    repo.write("src/app/prompts.py", "TEXT = open('prompts/system.md').read()\n")
+    repo.write("tests/test_core.py", "from app import core\n\n\ndef test_run():\n"
+               "    assert core.run(1) == 2\n")
+    repo.write("tests/scripts/fixture_gen.py", "from app import core\n")
+    repo.write("scripts/release.py", "from app import core\n\n\ndef main():\n    core.run(2)\n")
+    repo.write("shared/__init__.py", "")
+    repo.write("shared/util.py", "def twice(x):\n    return 2 * x\n")
+    repo.write("prompts/system.md", "You are terse.\n")
+
+
+def test_inventory_root_keeps_nested_names_the_basename_exclude_would_drop(
+        repo, tabs, run_script):
+    _package_repo(repo)
+
+    summary = json.loads(run_script(SCRIPTS / "analyze_inventory.py", repo.path, "--tabs-dir", tabs,
+                                    "--root", "src/app", "--root", "tests").stdout)
+
+    assert summary["roots"] == ["src/app", "tests"]
+    largest = {row["path"] for row in summary["largest_files"]}
+    assert "tests/scripts/fixture_gen.py" in largest
+    assert not largest & {"scripts/release.py", "shared/util.py"}
+    assert set(summary["top_dirs"]) == {"src", "tests"}
+
+
+def test_deps_root_draws_the_package_and_counts_what_it_reaches_outside(
+        repo, tabs, run_script, fragment):
+    _package_repo(repo)
+
+    summary = json.loads(run_script(SCRIPTS / "analyze_deps.py", repo.path, "--tabs-dir", tabs,
+                                    "--root", "src/app", "--root", "tests").stdout)
+
+    fan_in = {row["path"]: row["fan_in"] for row in summary["top_fan_in_files"]}
+    # tests/ and tests/scripts/ import core; scripts/release.py is outside and unseen.
+    assert fan_in.get("src/app/core.py") == 2
+    # shared/util.py resolved — it is not an unresolved gap — but it is not drawn.
+    assert "shared/util.py" not in fan_in
+    res = summary["resolution"]["Python"]
+    assert res["first_party"] == res["resolved"] == 3
+    # `from shared import util` names the package and the module.
+    assert ({row["path"] for row in summary["outside_roots"]["top"]}
+            == {"shared/__init__.py", "shared/util.py"})
+    # A prompt outside the roots, loaded from inside them, is still a node.
+    assert "prompts/system.md" in summary["asset_nodes"]["paths"]
+    assert "outside those roots" in fragment.body(tabs / "03-dependencies.html")
+
+
+def test_deps_root_finds_manifests_outside_the_roots(repo, tabs, run_script):
+    """go.mod sits at the repo root, above the package being drawn: without it
+    every module-path import would read as external."""
+    repo.write("go.mod", "module example.com/svc\n\ngo 1.22\n")
+    repo.write("pkg/db/db.go", "package db\n\nfunc Open() {}\n")
+    repo.write("pkg/api/api.go",
+               'package api\n\nimport "example.com/svc/pkg/db"\n\nfunc Serve() { db.Open() }\n')
+
+    summary = json.loads(run_script(SCRIPTS / "analyze_deps.py", repo.path, "--tabs-dir", tabs,
+                                    "--root", "pkg").stdout)
+
+    fan_in = {row["path"]: row["fan_in"] for row in summary["top_fan_in_files"]}
+    assert fan_in.get("pkg/db/db.go") == 1
+
+
+def test_hotspots_root_counts_only_commits_that_touch_the_roots(repo, tabs, run_script):
+    _package_repo(repo)
+    repo.commit("init")
+    for i in range(3):
+        repo.write("scripts/release.py", f"def main():\n    return {i}\n")
+        repo.commit(f"release tweak {i}")
+    repo.write("src/app/core.py", "def run(x):\n    if x:\n        return x\n    return 0\n")
+    repo.commit("core")
+
+    summary = json.loads(run_script(SCRIPTS / "analyze_hotspots.py", repo.path, "--tabs-dir", tabs,
+                                    "--root", "src/app", "--root", "tests").stdout)
+
+    assert summary["commits_analyzed"] == 2  # init and core; the release tweaks are elsewhere
+    paths = {row["path"] for row in summary["top_hotspots"]}
+    assert "src/app/core.py" in paths and "scripts/release.py" not in paths
+
+
+def test_coverage_root_limits_rows_not_artifact_matching(repo, tabs, run_script):
+    repo.write("src/core.py", "def f(x):\n    if x:\n        return 1\n    return 0\n")
+    repo.write("src/util.py", "def g():\n    return 2\n")
+    repo.write("tools/util.py", "def h():\n    return 3\n")
+    repo.write("coverage.xml", COBERTURA)
+
+    summary = json.loads(run_script(SCRIPTS / "analyze_coverage.py", repo.path, "--tabs-dir", tabs,
+                                    "--root", "src").stdout)
+
+    assert summary["files_measured"] == 2
+    assert summary["files_unmeasured"] == 0  # tools/util.py is outside the roots
+
+
+def test_llm_root_reports_its_call_sites_with_prompts_from_anywhere(repo, tabs, run_script):
+    call = ("import anthropic\nSYSTEM = open('prompts/system.md').read()\n"
+            "client = anthropic.Anthropic()\n"
+            "def ask(q):\n"
+            "    return client.messages.create(model='claude-opus-5', max_tokens=512,\n"
+            "                                  system=SYSTEM, messages=[])\n")
+    repo.write("agent/run.py", call)
+    repo.write("scripts/batch.py", call)
+    repo.write("prompts/system.md", "You are helpful.\n")
+
+    summary = json.loads(run_script(SCRIPTS / "analyze_llm.py", repo.path, "--tabs-dir", tabs,
+                                    "--root", "agent").stdout)
+
+    assert [site["cite"] for site in summary["sites"]] == ["agent/run.py:5"]
+    assert summary["prompt_assets"] == {"prompts/system.md": ["agent/run.py"]}
+
+
+@pytest.mark.parametrize("script", ["analyze_inventory.py", "analyze_deps.py",
+                                    "analyze_hotspots.py", "analyze_coverage.py",
+                                    "analyze_llm.py"])
+def test_a_root_that_is_not_a_directory_in_the_repo_is_refused(script, repo, tabs, run_script):
+    repo.write("src/a.py", "x = 1\n")
+
+    for bad in ("sorc", "../elsewhere", "src/a.py"):
+        result = run_script(SCRIPTS / script, repo.path, "--tabs-dir", tabs, "--root", bad,
+                            expect_rc=2)
+        assert f"error: --root {bad} is" in result.stderr, result.stderr

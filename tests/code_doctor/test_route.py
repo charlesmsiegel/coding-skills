@@ -209,3 +209,33 @@ def test_django_declared_in_a_python_manifest_still_routes(repo, run_script):
 
     assert skills_in(payload) == ["python-code-doctor", "django-code-doctor"]
     assert payload["routes"][1]["evidence"] == ["requirements.txt"]
+
+
+def test_a_module_named_setup_py_is_not_a_manifest(repo, run_script):
+    """`app/setup.py` holding a `setup` command is code, not a packaging script."""
+    repo.write("pyproject.toml", '[project]\nname = "x"\n')
+    repo.write("src/x/app/__init__.py", "")
+    repo.write("src/x/app/setup.py", '"""Toolchain discovery."""\nname = "backend"\n')
+    repo.commit()
+
+    payload = routes_for(repo, run_script)
+
+    assert payload["routes"][0]["evidence"] == ["pyproject.toml"]
+
+
+def test_a_real_setup_script_is_still_evidence(repo, run_script):
+    repo.write("setup.py", "from setuptools import setup\nsetup(name='x')\n")
+    repo.commit()
+
+    payload = routes_for(repo, run_script)
+
+    assert skills_in(payload) == ["python-code-doctor"]
+    assert payload["routes"][0]["evidence"] == ["setup.py"]
+
+
+def test_a_setup_import_after_another_module_is_still_evidence(repo, run_script):
+    repo.write("setup.py", "import os, setuptools\nsetuptools.setup(name='x')\n")
+    repo.commit()
+    payload = routes_for(repo, run_script)
+    assert skills_in(payload) == ["python-code-doctor"]
+    assert payload["routes"][0]["evidence"] == ["setup.py"]

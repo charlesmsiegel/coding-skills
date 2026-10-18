@@ -443,6 +443,14 @@ def main():
                         help="Run the suite under coverage first (SLOW; EXECUTES the tests)")
     args = parser.parse_args()
 
+    wanted = {name.strip() for name in args.tools.split(",")} if args.tools else set(TOOLS)
+    unknown = sorted(wanted - set(TOOLS))
+    if unknown:
+        # Validate the request even when cargo is unavailable: a typo must not
+        # look like a successful invocation with missing tools.
+        parser.error(f"--tools names unknown tools: {', '.join(unknown)} "
+                     f"(choices: {', '.join(sorted(TOOLS))})")
+
     root = _project_root(Path(args.path).resolve())
     cargo_binary = shutil.which("cargo")
     if cargo_binary is None:
@@ -465,14 +473,6 @@ def main():
             print(absent)
         return
     cargo = [cargo_binary]
-
-    wanted = {name.strip() for name in args.tools.split(",")} if args.tools else set(TOOLS)
-    unknown = sorted(wanted - set(TOOLS))
-    if unknown:
-        # Silently dropping `--tools chek` would report "no tools run, no
-        # findings" — a compilation check that never happened, reading as clean.
-        parser.error(f"--tools names unknown tools: {', '.join(unknown)} "
-                     f"(choices: {', '.join(sorted(TOOLS))})")
 
     available, missing = {}, []
     for name in TOOLS:

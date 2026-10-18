@@ -9,9 +9,30 @@ per script; this module is the single copy.
 
 import ast
 import contextlib
+import functools
+import io
+import os
+import re
 import sys
+import tokenize
+import warnings
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterator
+
+# Preserve the shared import surface; project-backed signature discovery stays below.
+from signature_contracts import (
+    FRAMEWORK_HOOKS as FRAMEWORK_HOOKS,
+    PARAMETER_LIMIT as PARAMETER_LIMIT,
+    _decorator_target as _decorator_target,
+    _parameter_names,
+    count_parameters as count_parameters,
+    framework_hook_overrides as framework_hook_overrides,
+    is_cli_command as is_cli_command,
+    parameter_severity as parameter_severity,
+    registers_config as registers_config,
+    signature_is_a_contract as signature_is_a_contract,
+)
 
 # Severity → icon, in report order.
 SEVERITY_ICONS = {"high": "🔴", "medium": "🟡", "low": "🟢"}
@@ -24,6 +45,91 @@ EXCLUDE_DIRS = frozenset({
     ".tox", ".nox", "build", "dist", ".eggs", "site-packages",
     ".mypy_cache", ".pytest_cache", ".ruff_cache",
 })
+
+
+@functools.lru_cache(maxsize=None)
+def _production_signatures(root: Path) -> tuple:
+    """The parameter names of every function and method in ``root``'s non-test code."""
+    signatures = set()
+    for path in _python_files(root):  # walking the project must not move the analysis root
+        if is_test_file(path):
+            continue
+        try:
+            tree = ast.parse(path.read_text(encoding="utf-8", errors="replace"))
+        except (SyntaxError, ValueError, OSError):
+            continue
+        signatures.update(_parameter_names(node) for node in ast.walk(tree)
+                          if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)))
+    signatures.discard(frozenset())
+    return tuple(signatures)
+
+
+def _copies_production_signature(func: ast.FunctionDef | ast.AsyncFunctionDef, filepath: Path) -> bool:
+    """Whether ``func`` takes only parameters that one function or method in
+    the project's own code also takes."""
+    names = _parameter_names(func)
+    return bool(names) and any(names <= real for real in _production_signatures(project_root(Path(filepath))))
+
+
+def copied_signatures(tree: ast.AST, filepath: Path, limit: int = PARAMETER_LIMIT) -> frozenset:
+    """id() of every test double in a test file, over ``limit`` parameters, that
+    copies a production signature.
+
+    A test double is a method of a class there or a function defined inside
+    another: a fake pipeline's `__call__`, a stand-in transformer's `forward`,
+    a closure handed to the code under test as a hook. It copies a production
+    signature when every parameter it names is a parameter of one function or
+    method in the project's own code. It takes what the real one takes because
+    the code under test calls it that way, and the parameter names are what is
+    copied, not the function's own name, since a callback can be called
+    anything. Such a signature belongs to the interface it copies and is judged
+    once, where that interface is defined. A module-level function in a test
+    file is a helper the tests call, so it is judged on its own even when its
+    parameters match.
+
+    Only definitions over ``limit`` are looked up, so a run with none never
+    reads the rest of the project.
+    """
+    if not is_test_file(Path(filepath)):
+        return frozenset()
+    nested = {id(inner): inner for node in ast.walk(tree)
+              if isinstance(node, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef))
+              for inner in ast.walk(node)
+              if inner is not node and isinstance(inner, (ast.FunctionDef, ast.AsyncFunctionDef))}
+    return frozenset(key for key, func in nested.items()
+                     if count_parameters(func) > limit and _copies_production_signature(func, filepath))
+
+
+# One defect that two detectors report under different names: alias -> canonical.
+# A too-long signature is analyze_complexity's parameter_count and
+# find_code_smells' long_parameter_list; a report shows it once.
+FINDING_ALIASES = {"long_parameter_list": "parameter_count"}
+_SEVERITY_RANK = {"low": 0, "medium": 1, "high": 2}
+
+
+def _record_type(record: dict):
+    return next((record[key] for key in ("smell_type", "issue_type", "pattern_type", "type")
+                 if record.get(key)), None)
+
+
+def drop_aliased(records: list) -> list:
+    """``records`` without each alias whose canonical twin is at the same file and line.
+
+    The twin keeps the higher of the two severities, so dropping a duplicate
+    never lowers what the report says about the code. An alias with no twin —
+    its detector ran and the canonical one did not — is kept.
+    """
+    canonical = {(r.get("file"), r.get("line"), _record_type(r)): r
+                 for r in records if isinstance(r, dict)}
+    kept = []
+    for record in records:
+        target = FINDING_ALIASES.get(_record_type(record)) if isinstance(record, dict) else None
+        twin = canonical.get((record.get("file"), record.get("line"), target)) if target else None
+        if twin is None:
+            kept.append(record)
+        elif _SEVERITY_RANK.get(record.get("severity"), 0) > _SEVERITY_RANK.get(twin.get("severity"), 0):
+            twin["severity"] = record["severity"]
+    return kept
 
 
 def configure_output() -> None:
@@ -41,14 +147,244 @@ def configure_output() -> None:
                 reconfigure(errors="replace")
 
 
+def is_test_file(filepath: Path) -> bool:
+    """A test module or test infrastructure: test_*.py, *_test.py, conftest.py,
+    or anything under a tests/ (or test/) directory *of its project*.
+
+    Detectors that judge design use it to stand down where a test's shape is set
+    by what it tests: a literal there is an expected value, a fake mirrors the
+    interface it stands in for, and each test function is a case, not a
+    responsibility. The directory rule reads project_parts(), so a checkout that
+    lives under a directory named `tests` is not all tests.
+    """
+    name = filepath.name
+    if name.startswith("test_") or name.endswith("_test.py") or name == "conftest.py":
+        return True
+    directories = project_parts(filepath)[:-1]
+    return "tests" in directories or "test" in directories
+
+
+def in_nested_repository(root: Path, path: Path, cache: dict | None = None) -> bool:
+    """True when the file ``path`` lies in another repository nested below ``root``.
+
+    A directory below the scanned root that holds a ``.git`` entry is a
+    different repository: a file there for a git worktree or a submodule, a
+    directory for a nested clone. A worktree checked out under the project is a
+    second copy of its code, and scoring it as the project's counts every
+    finding twice. ``root``'s own ``.git`` is not consulted — scanning a
+    worktree is scanning a repository. ``cache`` (directory -> verdict) lets a
+    caller walking many files stat each directory once.
+    """
+    cache = {} if cache is None else cache
+    current = root
+    for part in path.relative_to(root).parts[:-1]:
+        current = current / part
+        nested = cache.get(current)
+        if nested is None:
+            nested = cache[current] = os.path.lexists(current / ".git")
+        if nested:
+            return True
+    return False
+# Installed skill payloads belong to the tooling, not to the host project.
+# Match the pair, not the agent directory: hooks and other configuration there
+# are still project inputs. Paths are relative to the scan root so an explicit
+# scan of a skill continues to work.
+def is_installed_skill(parts) -> bool:
+    return any(parent in {".codex", ".claude", ".kiro", ".agents"} and child == "skills"
+               for parent, child in zip(parts, parts[1:]))
+
+
 def find_python_files(path: Path) -> Iterator[Path]:
-    """Yield the .py files under ``path``, skipping vendored/generated dirs."""
+    """Yield the .py files under ``path``, skipping vendored/generated dirs and
+    any repository nested below it (see in_nested_repository).
+
+    Records ``path`` as the analysis root (see set_analysis_root) before
+    walking: this is where a run says what it is analysing.
+    """
+    set_analysis_root(path)
+    return _python_files(path)
+
+
+def _python_files(path: Path) -> Iterator[Path]:
+    """find_python_files' walk, without recording an analysis root."""
+    path = Path(path)
     if path.is_file() and path.suffix == ".py":
         yield path
     elif path.is_dir():
+        nested: dict = {}
         for p in path.rglob("*.py"):
-            if EXCLUDE_DIRS.isdisjoint(p.relative_to(path).parts):
+            if (EXCLUDE_DIRS.isdisjoint(p.relative_to(path).parts)
+                    and not in_nested_repository(path, p, nested)
+                    and not is_installed_skill(p.relative_to(path).parts)):
                 yield p
+
+
+# Files whose presence marks the top of a project.
+_PROJECT_MARKERS = (".git", "pyproject.toml", "setup.py", "setup.cfg")
+
+class _Analysis:
+    """The directory this run analyses, resolved; None for a single file.
+
+    A per-file detector is handed one path and nothing else, so this is how it
+    learns which part of that path is the project and which is merely where the
+    project was checked out. find_python_files() records it, and the runner
+    passes it to every worker as a parameter rather than trusting fork to copy
+    process state. One instance, mutated in place: the state belongs to the run,
+    and no caller rebinds the module's name for it.
+    """
+
+    root: Path | None = None
+
+
+_ANALYSIS = _Analysis()
+
+
+def set_analysis_root(path) -> None:
+    """Record what this run analyses: a directory, or None for a single file."""
+    candidate = Path(path) if path is not None else None
+    _ANALYSIS.root = candidate.resolve() if candidate is not None and candidate.is_dir() else None
+
+
+def analysis_root() -> Path | None:
+    """The directory this run analyses, or None (a single file, or nothing yet)."""
+    return _ANALYSIS.root
+
+
+@functools.lru_cache(maxsize=4096)
+def _has_marker(directory: Path) -> bool:
+    return any(os.path.lexists(directory / marker) for marker in _PROJECT_MARKERS)
+
+
+def _anchor(path: Path) -> Path | None:
+    """The directory a file's place in its project is measured from.
+
+    The nearest enclosing directory with a project marker, so analysing a
+    project's own `tests/` directory still sees `tests` in the parts below its
+    root; the analysis root when no directory above the file is marked; for a
+    lone file with neither, None.
+    """
+    resolved = Path(path).resolve()
+    root = _ANALYSIS.root
+    bounded = root is not None and (resolved == root or root in resolved.parents)
+    for directory in resolved.parents:
+        if _has_marker(directory):
+            return directory
+        if bounded and directory == root and root.name.lower() not in {"test", "tests"}:
+            break
+    if root is not None and (resolved == root or root in resolved.parents):
+        return root.parent if root.name.lower() in {"test", "tests"} else root
+    return None
+
+
+def project_parts(path: Path) -> tuple[str, ...]:
+    """``path``'s parts below its project (see _anchor); its own parts when it
+    belongs to none.
+
+    `/home/runner/work/tests/tests/src/app.py` is ("src", "app.py"): the
+    `tests` directories are where CI checked the repository out, not part of it.
+    """
+    anchor = _anchor(path)
+    if anchor is not None:
+        return Path(path).resolve().relative_to(anchor).parts
+    return Path(path).parts
+
+
+def project_root(path: Path) -> Path:
+    """The project a file belongs to: its anchor (a project marker, bounded by
+    the analysis root, or that root); failing that, the directory its top-level
+    package sits in.
+
+    A per-file detector knows only the file it was handed, so this is how one
+    finds the tree that first_party_modules describes.
+    """
+    anchor = _anchor(path)
+    if anchor is not None:
+        return anchor
+    path = Path(path).resolve()
+    base = path if path.is_dir() else path.parent
+    while (base / "__init__.py").exists() and base.parent != base:
+        base = base.parent
+    return base
+
+
+@functools.lru_cache(maxsize=None)
+def first_party_modules(root: Path) -> frozenset:
+    """Top-level import names that resolve to this repository's own code.
+
+    The stem of every module and the name of every package anywhere in the
+    tree, plus each directory of modules directly under ``root`` or
+    ``root/src`` (a PEP 420 namespace package, such as ``tests/``). This is
+    find_dependency_issues' rule for an import no manifest has to declare, and
+    the coupling detector's for a type a method could be moved onto.
+    """
+    names = set()
+    for p in _python_files(root):  # walking another tree must not move the analysis root
+        rel = p.relative_to(root).parts
+        names.add(p.parent.name if p.name == "__init__.py" else p.stem)
+        if len(rel) >= 2:
+            names.add(rel[1] if rel[0] == "src" and len(rel) >= 3 else rel[0])
+    names.discard("src")
+    return frozenset(names)
+
+
+def looks_like_test(path) -> bool:
+    """Shared test predicate, scoped to the project rather than checkout ancestors."""
+    return is_test_file(Path(path))
+
+
+# The verbs a router or app object registers a handler under: FastAPI and
+# Starlette (get/post/.../api_route/websocket), Flask and friends (route).
+ROUTE_VERBS = frozenset({"get", "post", "put", "patch", "delete", "head", "options",
+                         "api_route", "route", "websocket"})
+
+
+def is_route_handler(node) -> bool:
+    """True for a function registered by a decorator call like `@router.get(...)`.
+
+    The framework, not the author, calls it: its parameters are bound by name from
+    the request, and its return annotation becomes the response model, so several
+    rules that are about a function's callers do not apply to it.
+    """
+    return any(isinstance(dec, ast.Call) and isinstance(dec.func, ast.Attribute)
+               and dec.func.attr in ROUTE_VERBS for dec in node.decorator_list)
+
+
+# A noqa comment's code list followed by a separator and some text: the suppression
+# says why. The separators are the ones people actually type after a noqa list;
+# the reason must start with something other than another separator character,
+# so a trailing `--` with nothing after it is still a bare suppression.
+_REASONED_NOQA = re.compile(
+    r"#\s*noqa:\s*(?P<codes>[A-Z]+\d+(?:\s*,\s*[A-Z]+\d+)*)\s*(?:--|—|-|:)\s*[^\s\-—:]",
+    re.IGNORECASE,
+)
+
+
+def reasoned_noqa(lines: list[str], lineno: int, code: str) -> bool:
+    """True when ``lineno`` carries ``# noqa: <code>`` *with a stated reason*.
+
+    A repo that gates on Ruff has already adjudicated the line a detector is about
+    to flag, and the reason it wrote down is the benign explanation a candidate
+    names — so a detector that mirrors a Ruff rule reads a reasoned suppression
+    of that rule as "a lead to confirm", not as a defect. A bare ``# noqa: CODE``
+    states no reason and proves nothing; it stays a finding.
+
+    The suppression may sit on the flagged line itself or on a comment-only line
+    directly below it (the first line of a block body, where a long reason lands
+    once the header line is full). ``lines`` is the file's text split into lines,
+    ``lineno`` is 1-based.
+    """
+    wanted = code.upper()
+    for index in (lineno, lineno + 1):
+        if not 0 < index <= len(lines):
+            continue
+        text = lines[index - 1]
+        if index != lineno and not text.lstrip().startswith("#"):
+            continue
+        for match in _REASONED_NOQA.finditer(text):
+            codes = {c.strip().upper() for c in match.group("codes").split(",")}
+            if wanted in codes:
+                return True
+    return False
 
 
 class _ParseCache:
@@ -128,6 +464,100 @@ def cached_source(filepath: Path) -> str:
     return _PARSE_CACHE.source(filepath)
 
 
+# --------------------------------------------------------------------------- #
+# Code copied verbatim from another project: the author's opt-in
+# --------------------------------------------------------------------------- #
+
+# `# doctor: verbatim-upstream <source>` — on its own line before the module's
+# first statement it covers the whole file; directly above a def or class (or
+# its decorators) it covers that definition. It is for code copied unchanged
+# from another project, kept that way so a diff against the source stays
+# readable, and it must name that source. analyze_all does not charge such code
+# for its shape (UPSTREAM_EXEMPT_CATEGORIES) and reports what it withheld.
+UPSTREAM_MARKER = "# doctor: verbatim-upstream"
+_UPSTREAM_MARKER = re.compile(r"#\s*doctor:\s*verbatim-upstream\b(?P<source>.*)$")
+
+# What a verbatim copy is not charged for: its shape — complexity, design,
+# hygiene, duplication — which cannot change without breaking the diff it is
+# kept for. Correctness and security categories are absent on purpose: a bug or
+# an injection copied from upstream is still one here.
+UPSTREAM_EXEMPT_CATEGORIES = frozenset({
+    "complexity", "code_smells", "overengineering", "design_smells", "pattern_issues",
+    "dead_code", "unpythonic", "coupling", "parameter_objects", "boolean_params",
+    "return_issues", "loop_simplifications", "naming_issues", "comment_smells",
+    "outdated_idioms", "missing_docstrings", "type_gaps", "test_smells", "ai_scaffolding",
+    "local_imports", "duplicates",
+})
+
+
+@dataclass(frozen=True)
+class UpstreamMarks:
+    """What one file's verbatim-upstream markers declare.
+
+    ``ranges`` are (first line, last line, source) spans the markers cover;
+    ``ignored`` are (marker line, reason) for markers that cover nothing — one
+    that names no source, or that sits above no definition.
+    """
+
+    ranges: tuple = ()
+    ignored: tuple = ()
+
+    def covers(self, line) -> bool:
+        return isinstance(line, int) and any(start <= line <= end for start, end, _ in self.ranges)
+
+
+@functools.lru_cache(maxsize=1024)
+def upstream_marks(path: str) -> UpstreamMarks:
+    """The verbatim-upstream markers in ``path`` (see UPSTREAM_MARKER)."""
+    try:
+        source = Path(path).read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return UpstreamMarks()
+    if "verbatim-upstream" not in source:
+        return UpstreamMarks()
+    try:
+        markers = [(tok.start[0], match.group("source").strip())
+                   for tok in tokenize.generate_tokens(io.StringIO(source).readline)
+                   if tok.type == tokenize.COMMENT
+                   and (match := _UPSTREAM_MARKER.match(tok.string.strip()))]
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")  # the detectors already said what they had to
+            tree = ast.parse(source)
+    except (SyntaxError, ValueError, tokenize.TokenError):
+        return UpstreamMarks()
+    lines = source.splitlines()
+
+    def start_of(node):
+        return min([node.lineno, *(d.lineno for d in getattr(node, "decorator_list", []))])
+
+    body = tree.body
+    if (body and isinstance(body[0], ast.Expr) and isinstance(body[0].value, ast.Constant)
+            and isinstance(body[0].value.value, str)):
+        body = body[1:]
+    first_statement = start_of(body[0]) if body else len(lines) + 1
+    definitions = {start_of(node): node for node in ast.walk(tree)
+                   if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))}
+
+    ranges, ignored = [], []
+    for line, source_named in markers:
+        if not source_named:
+            ignored.append((line, "it names no source; say what project and file the code was copied from"))
+            continue
+        if line < first_statement:
+            ranges.append((1, len(lines), source_named))
+            continue
+        following = line + 1
+        while following <= len(lines) and (not lines[following - 1].strip()
+                                           or lines[following - 1].lstrip().startswith("#")):
+            following += 1
+        node = definitions.get(following)
+        if node is None:
+            ignored.append((line, "it sits above no def or class, and after the module's first statement"))
+            continue
+        ranges.append((following, node.end_lineno, source_named))
+    return UpstreamMarks(tuple(ranges), tuple(ignored))
+
+
 def sort_findings(findings: list) -> list:
     """The order a report is read in: severity first, then file, then line.
 
@@ -138,6 +568,123 @@ def sort_findings(findings: list) -> list:
     findings.sort(key=lambda f: (f.severity != "high", f.severity != "medium",
                                  f.file, f.line))
     return findings
+
+
+# --------------------------------------------------------------------------- #
+# The confidence discipline, as a type
+# --------------------------------------------------------------------------- #
+
+class SchemaError(ValueError):
+    """A detector tried to emit a record its evidence does not support."""
+
+
+VALID_KINDS = frozenset({"finding", "candidate"})
+
+
+@dataclass(frozen=True)
+class Finding:
+    """One output record, in one of two kinds.
+
+    A **finding** asserts a defect. It carries a concrete fix, because a claim
+    you cannot act on is not worth making.
+
+    A **candidate** reports a lead that needs verification. It carries the
+    specific ways a healthy codebase produces the same observation, and it
+    carries no fix — recommending an edit on heuristic evidence is how a tool
+    like this talks someone into deleting live code.
+
+    The constructor enforces the difference. Prose in a reference file does not
+    survive contact with a detector author in a hurry; a raised exception does.
+
+    Frozen to ensure the schema enforcement holds across the lifetime of the
+    object, not just at construction time.
+    """
+
+    file: str
+    line: int
+    smell_type: str
+    description: str
+    suggestion: str = ""
+    # Tuples, not lists. `frozen=True` blocks reassignment but not in-place
+    # mutation, so a list here would let `candidate.also_caused_by.clear()`
+    # walk a validated record into a schema-invalid state that
+    # __post_init__ never re-checks — and it would then serialise and emit
+    # like any other record. __post_init__ below coerces any list handed to
+    # the constructor (including one that came back out of json.loads,
+    # which knows nothing about tuples) into a tuple, so the type is
+    # actually enforced, not just annotated.
+    also_caused_by: tuple[str, ...] = ()
+    severity: str = "medium"
+    kind: str = "finding"
+    code_snippet: str = ""
+    # Other lines that participate in the same finding. analyze_diff.py uses
+    # these so a cross-declaration smell surfaces when any participant changed.
+    related_lines: tuple[int, ...] = ()
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "also_caused_by", tuple(self.also_caused_by))
+        object.__setattr__(self, "related_lines", tuple(self.related_lines))
+        if self.kind not in VALID_KINDS:
+            raise SchemaError(
+                f"{self.smell_type}: kind must be one of {sorted(VALID_KINDS)}, got {self.kind!r}"
+            )
+        if self.kind == "finding":
+            if not self.suggestion.strip():
+                raise SchemaError(
+                    f"{self.smell_type}: a finding asserts a defect and must carry a suggestion; "
+                    "if you cannot name the fix, emit a candidate instead"
+                )
+            if self.also_caused_by:
+                raise SchemaError(
+                    f"{self.smell_type}: also_caused_by belongs to candidates; a finding that has "
+                    "benign explanations is a candidate"
+                )
+        else:
+            if self.suggestion.strip():
+                raise SchemaError(
+                    f"{self.smell_type}: a candidate must not carry a suggestion — it is an "
+                    "unverified lead, and a fix on unverified evidence is how live code gets deleted"
+                )
+            if not self.also_caused_by or not any(s.strip() for s in self.also_caused_by):
+                raise SchemaError(
+                    f"{self.smell_type}: a candidate must name the ways a healthy codebase produces "
+                    "this observation in also_caused_by, so the reader can rule them out"
+                )
+
+
+# The keys Python detectors use for the same three ideas. `format_findings.py`
+# and `analyze_all.py` already read these alternatives; the validator accepts
+# the same spellings so a detector need not be rewritten to be checked.
+_TYPE_KEYS = ("smell_type", "issue_type", "pattern_type", "type")
+
+
+def _severity_of(record: dict) -> str:
+    if record.get("severity"):
+        return str(record["severity"])
+    confidence = record.get("confidence")
+    if isinstance(confidence, (int, float)):
+        return "high" if confidence >= 90 else ("medium" if confidence >= 70 else "low")
+    return "medium"
+
+
+def validate_record(record: dict) -> dict:
+    """Check one detector record against the finding/candidate contract.
+
+    Raises SchemaError when a finding has no fix or a candidate has no benign
+    explanation. Returns a copy of the record with `kind` made explicit, so a
+    consumer never has to guess what an absent key meant. The argument is not
+    mutated.
+    """
+    smell = next((str(record[key]) for key in _TYPE_KEYS if record.get(key)), "issue")
+    suggestion = str(record.get("suggestion") or record.get("after") or "")
+    kind = str(record.get("kind") or "finding")
+    Finding(
+        file=str(record.get("file", "")), line=int(record.get("line") or 1),
+        smell_type=smell, description=str(record.get("description", "")),
+        suggestion=suggestion, severity=_severity_of(record), kind=kind,
+        also_caused_by=tuple(record.get("also_caused_by") or ()),
+    )
+    return {**record, "kind": kind}
 
 
 class _SaidOnce:

@@ -12,9 +12,23 @@ catalog that the other detectors don't already handle:
   refused_bequest                 - subclass no-ops or raises on inherited concrete behavior
   lazy_class                      - subclass that adds nothing over its base
 
-Each finding names the catalog refactoring to apply. These are candidates: the
-judgment call (and the subtler instances no parser can see) belongs to
-references/refactoring-catalog.md and references/refactoring-techniques.md.
+Each finding names the catalog refactoring to apply; the judgment call (and the
+subtler instances no parser can see) belongs to references/refactoring-catalog.md
+and references/refactoring-techniques.md.
+
+type_switch is a finding when the ladder is long (six or more branches) or its
+subject is switched on in more than one ladder in the module — the catalog's
+smell is complexity and repetition. One short ladder in one place "is often the
+clearest form", so it is a candidate.
+
+inappropriate_intimacy is cross-module reaching. A private name some class in
+this module defines (`self._x = ...`, `def _x`) may be same-module access,
+which the catalog calls conventional: an untyped receiver remains a candidate,
+while a receiver annotated with an imported type is still foreign. A private name of a module this file
+imports relatively (`from . import overlay; overlay._ledger`) is a candidate:
+it is a sibling module's internals unless the package spells package-internal
+with an underscore, which one file cannot tell. Absolute imports stay exempt:
+`sys._getframe` and `os._exit` are documented API spelled with an underscore.
 """
 
 import ast
@@ -22,9 +36,10 @@ import json
 import argparse
 from pathlib import Path
 from dataclasses import dataclass, asdict
-from typing import Iterator
 from collections import defaultdict
-from common import (sort_findings, cached_parse, SEVERITY_ICONS, configure_output, find_python_files,
+from ast_scopes import (_only_initial_resets, _reads_before_writing, body_kind, decorator_names, is_dotted_name, is_dunder, local_bindings,
+                        walk_loop_level, walk_same_scope)
+from common import (is_test_file, sort_findings, cached_parse, SEVERITY_ICONS, configure_output, find_python_files,
                     warn_detector_error, warn_unparseable)
 
 
@@ -37,10 +52,38 @@ class DesignSmell:
     suggestion: str
     severity: str
     code_snippet: str = ""
+    kind: str = "finding"
+    also_caused_by: tuple[str, ...] = ()
+
+
+_SHORT_SWITCH_REASONS = (
+    "one short switch in one place is often the clearest form — a factory "
+    "choosing what to build, or a test dispatching on a parametrize value",
+    "the cases are fixed by an external format or protocol and will not grow",
+)
+_SIBLING_PRIVATE_REASONS = (
+    "the package uses a leading underscore for package-internal rather than "
+    "module-internal names, and sibling modules share these helpers by design",
+)
+_LOCAL_PRIVATE_REASONS = (
+    "a class in this module defines the same private member, and an untyped receiver "
+    "may be one of its instances; confirm the receiver's owner before changing it",
+)
+# A ladder this long is a finding even when it is the only one on its subject.
+LONG_SWITCH_BRANCHES = 6
 
 
 # Public-by-convention namedtuple machinery; touching these is not intimacy.
 NAMEDTUPLE_API = frozenset({"_replace", "_asdict", "_fields", "_make", "_field_defaults"})
+
+# Documented Options operations provide Django context, not proof of the
+# receiver's type. Keep these observations as candidates when identity is unknown.
+DJANGO_META_API = frozenset({
+    "get_field", "get_fields", "db_table", "local_fields", "related_objects",
+    "fields", "concrete_fields", "many_to_many", "model", "model_name",
+    "app_label", "label", "label_lower", "verbose_name", "verbose_name_plural",
+    "abstract", "proxy", "managed", "ordering", "indexes", "constraints", "pk",
+})
 
 # Receivers that mean "my own class", not someone else's internals.
 OWN_RECEIVERS = frozenset({"self", "cls", "mcs", "mcls"})
@@ -59,110 +102,6 @@ MIN_EQ_BRANCHES = 4
 MIN_ISINSTANCE_BRANCHES = 4
 
 
-def _is_dunder(name: str) -> bool:
-    return name.startswith("__") and name.endswith("__")
-
-
-def _walk_same_scope(stmts: list[ast.stmt]) -> Iterator[ast.AST]:
-    """Walk statements without descending into nested scopes (defs, classes,
-    lambdas) — a name assigned there is a different variable."""
-    stack: list[ast.AST] = list(stmts)
-    while stack:
-        node = stack.pop()
-        yield node
-        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda)):
-            stack.extend(ast.iter_child_nodes(node))
-
-
-def _walk_loop_level(stmts: list[ast.stmt]) -> Iterator[ast.AST]:
-    """Walk statements without descending into nested scopes OR nested loops —
-    a flag assigned inside an inner loop cannot be replaced by a `break` of
-    the outer one."""
-    stack: list[ast.AST] = list(stmts)
-    while stack:
-        node = stack.pop()
-        yield node
-        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef,
-                                 ast.Lambda, ast.While, ast.For, ast.AsyncFor)):
-            stack.extend(ast.iter_child_nodes(node))
-
-
-def _strip_docstring(body: list[ast.stmt]) -> list[ast.stmt]:
-    if body and isinstance(body[0], ast.Expr) and isinstance(body[0].value, ast.Constant) \
-            and isinstance(body[0].value.value, str):
-        return body[1:]
-    return body
-
-
-def _body_kind(body: list[ast.stmt]) -> str | None:
-    """Classify a trivial body: 'noop' (pass/.../docstring only), 'raise_nie', or None."""
-    rest = _strip_docstring(body)
-    if not rest or all(
-        isinstance(s, ast.Pass)
-        or (isinstance(s, ast.Expr) and isinstance(s.value, ast.Constant) and s.value.value is Ellipsis)
-        for s in rest
-    ):
-        return "noop"
-    if len(rest) == 1 and isinstance(rest[0], ast.Raise):
-        exc = rest[0].exc
-        if isinstance(exc, ast.Call):
-            exc = exc.func
-        if isinstance(exc, ast.Name) and exc.id == "NotImplementedError":
-            return "raise_nie"
-    return None
-
-
-def _local_bindings(node: ast.FunctionDef | ast.AsyncFunctionDef) -> tuple[frozenset[str], frozenset[str]]:
-    """(shadows, local_imports) for the function's own scope. Shadows are names
-    bound by parameters/assignments/loop targets — they hide a module-level
-    name; local imports are module-internal receivers within this scope only."""
-    a = node.args
-    shadows = {p.arg for p in (*a.posonlyargs, *a.args, *a.kwonlyargs)}
-    if a.vararg:
-        shadows.add(a.vararg.arg)
-    if a.kwarg:
-        shadows.add(a.kwarg.arg)
-    imports = set()
-    for inner in _walk_same_scope(node.body):
-        if isinstance(inner, (ast.Import, ast.ImportFrom)):
-            for alias in inner.names:
-                imports.add(alias.asname or alias.name.split(".")[0])
-            continue
-        if isinstance(inner, ast.Assign):
-            targets = inner.targets
-        elif isinstance(inner, (ast.AnnAssign, ast.AugAssign, ast.NamedExpr)):
-            targets = [inner.target]
-        elif isinstance(inner, (ast.For, ast.AsyncFor)):
-            targets = [inner.target]
-        elif isinstance(inner, ast.withitem) and inner.optional_vars is not None:
-            targets = [inner.optional_vars]
-        else:
-            continue
-        for target in targets:
-            for name_node in ast.walk(target):
-                if isinstance(name_node, ast.Name):
-                    shadows.add(name_node.id)
-    return frozenset(shadows), frozenset(imports)
-
-
-def _is_dotted_name(expr: ast.expr) -> bool:
-    """True for attribute chains rooted at a bare name (Kind.CREATE, mod.Kind.CREATE)."""
-    while isinstance(expr, ast.Attribute):
-        expr = expr.value
-    return isinstance(expr, ast.Name)
-
-
-def _decorator_names(node: ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef) -> set[str]:
-    names = set()
-    for dec in node.decorator_list:
-        target = dec.func if isinstance(dec, ast.Call) else dec
-        if isinstance(target, ast.Name):
-            names.add(target.id)
-        elif isinstance(target, ast.Attribute):
-            names.add(target.attr)
-    return names
-
-
 class DesignSmellDetector(ast.NodeVisitor):
     def __init__(self, filename: str, source_lines: list[str], tree: ast.Module,
                  ignore: set[str] = None, is_test_file: bool = False):
@@ -171,9 +110,38 @@ class DesignSmellDetector(ast.NodeVisitor):
         self.issues: list[DesignSmell] = []
         self.ignore = ignore or set()
         self.is_test_file = is_test_file
+        self._django_context = any(
+            (isinstance(n, ast.ImportFrom) and n.level == 0 and n.module is not None
+             and (n.module == "django" or n.module.startswith("django.")))
+            or (isinstance(n, ast.Import) and any(
+                a.name == "django" or a.name.startswith("django.") for a in n.names))
+            for n in ast.walk(tree)
+        )
+        self._metadata_operations = {
+            id(n.value) for n in ast.walk(tree)
+            if isinstance(n, ast.Attribute) and isinstance(n.value, ast.Attribute)
+            and n.value.attr == "_meta" and n.attr in DJANGO_META_API
+        }
         self._func_stack: list[tuple[str, frozenset[str], frozenset[str]]] = []
         self._class_depth = 0
         self._ladder_members: set[int] = set()
+        # Qualifying type switches, held until the whole module is read: whether
+        # one is a finding depends on whether its subject is switched elsewhere.
+        self._switches: list[tuple[ast.If, str, str, int, tuple[str, ...]]] = []
+        # A matching private name is evidence of a possible local owner, not
+        # proof of ownership for every receiver with that spelling.
+        self.module_privates: set[str] = self._collect_module_privates(tree)
+        self._parents = {id(child): parent for parent in ast.walk(tree)
+                         for child in ast.iter_child_nodes(parent)}
+        self._import_names = {alias.asname or alias.name.split(".")[0]
+                              for stmt in tree.body if isinstance(stmt, (ast.Import, ast.ImportFrom))
+                              for alias in stmt.names}
+        # Names a relative import binds: sibling modules of this package.
+        self.relative_imports: set[str] = {
+            alias.asname or alias.name.split(".")[0]
+            for node in ast.walk(tree) if isinstance(node, ast.ImportFrom) and node.level
+            for alias in node.names}
+        self._reported: set[tuple[int, str]] = set()
         # Names that are module-scope imports or module-scope classes: touching
         # their _private members is module-internal by convention. Function-local
         # imports exempt only their own scope (tracked on the function stack).
@@ -186,6 +154,36 @@ class DesignSmellDetector(ast.NodeVisitor):
         self._class_env: dict[int, dict[str, ast.ClassDef]] = {}
         self._all_classes: list[ast.ClassDef] = []
         self._index_classes(tree.body, {})
+
+    @staticmethod
+    def _collect_module_privates(tree: ast.Module) -> set[str]:
+        """`_x` names a class here defines: `self._x = ...`, `def _x`, `_x = ...`.
+
+        Double-underscore names are left out: a class's `self.__x` is mangled to
+        `_Class__x`, so the same spelling elsewhere does not reach it.
+        """
+        names: set[str] = set()
+        for klass in ast.walk(tree):
+            if not isinstance(klass, ast.ClassDef):
+                continue
+            for item in klass.body:
+                if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    names.add(item.name)
+                elif isinstance(item, (ast.Assign, ast.AnnAssign)):
+                    targets = item.targets if isinstance(item, ast.Assign) else [item.target]
+                    names.update(t.id for t in targets if isinstance(t, ast.Name))
+            for inner in ast.walk(klass):
+                targets = []
+                if isinstance(inner, ast.Assign):
+                    targets = inner.targets
+                elif isinstance(inner, (ast.AnnAssign, ast.AugAssign)):
+                    targets = [inner.target]
+                for target in targets:
+                    for sub in ast.walk(target):
+                        if isinstance(sub, ast.Attribute) and isinstance(sub.value, ast.Name) \
+                                and sub.value.id == "self":
+                            names.add(sub.attr)
+        return {n for n in names if n.startswith("_") and not n.startswith("__")}
 
     def _collect_module_names(self, body: list[ast.stmt]):
         """Imports and class names bound at module scope, in execution order
@@ -268,13 +266,14 @@ class DesignSmellDetector(ast.NodeVisitor):
             return self.source_lines[lineno - 1].strip()[:60]
         return ""
 
-    def _add(self, line: int, smell_type: str, desc: str, suggestion: str, severity: str = "medium"):
+    def _add(self, line: int, smell_type: str, desc: str, suggestion: str, severity: str = "medium",
+             *, kind: str = "finding", also_caused_by: tuple[str, ...] = ()):
         if smell_type in self.ignore:
             return
         self.issues.append(DesignSmell(
             file=self.filename, line=line, smell_type=smell_type,
             description=desc, suggestion=suggestion, severity=severity,
-            code_snippet=self._get_line(line)
+            code_snippet=self._get_line(line), kind=kind, also_caused_by=also_caused_by,
         ))
 
     # ----------------------------------------------------------------- #
@@ -296,7 +295,7 @@ class DesignSmellDetector(ast.NodeVisitor):
                 self.visit(arg.annotation)
         if node.returns is not None:
             self.visit(node.returns)
-        shadows, local_imports = _local_bindings(node)
+        shadows, local_imports = local_bindings(node)
         self._func_stack.append((node.name, shadows, local_imports))
         for stmt in node.body:
             self.visit(stmt)
@@ -385,7 +384,7 @@ class DesignSmellDetector(ast.NodeVisitor):
             for subject, case in ((test.left, test.comparators[0]), (test.comparators[0], test.left)):
                 if isinstance(subject, (ast.Name, ast.Attribute)) and (
                         isinstance(case, ast.Constant)
-                        or (isinstance(case, ast.Attribute) and _is_dotted_name(case))):
+                        or (isinstance(case, ast.Attribute) and is_dotted_name(case))):
                     out.append((subject, "eq"))
         elif (isinstance(test, ast.Call) and isinstance(test.func, ast.Name)
                 and test.func.id == "isinstance" and len(test.args) == 2
@@ -415,16 +414,39 @@ class DesignSmellDetector(ast.NodeVisitor):
             left, right = test.left, test.comparators[0]
             return ast.dump(right if ast.dump(left) == subject_dump else left)
 
-        if len({case_of(t) for t in tests}) != len(tests):
+        cases = tuple(sorted(case_of(t) for t in tests))
+        if len(set(cases)) != len(tests):
             return
-        subject_src = ast.unparse(next(s for s, k in candidates[0]
-                                       if ast.dump(s) == subject_dump and k == kind))
-        via = "isinstance checks on" if kind == "isinstance" else "comparisons against"
-        self._add(node.lineno, "type_switch",
-            f"if/elif ladder with {len(tests)} branches dispatching via {via} '{subject_src}'",
-            "Replace Conditional with Polymorphism, a dispatch dict, or match — "
-            "adding a case should mean adding an entry, not editing a ladder",
-            "high" if len(tests) >= 6 else "medium")
+        self._switches.append((node, subject_dump, kind, len(tests), cases))
+
+    def visit_Module(self, node: ast.Module):
+        self.generic_visit(node)
+        self._report_type_switches()
+
+    def _report_type_switches(self):
+        """A long ladder, or a subject switched in several ladders, is the smell;
+        one short ladder alone is a lead."""
+        ladders_per_subject = defaultdict(int)
+        for _, subject_dump, kind, _, cases in self._switches:
+            ladders_per_subject[(subject_dump, kind, cases)] += 1
+        for node, subject_dump, kind, branches, cases in self._switches:
+            subject_src = ast.unparse(next(
+                s for t in [node.test] for s, k in self._switch_candidates(t)
+                if ast.dump(s) == subject_dump and k == kind))
+            via = "isinstance checks on" if kind == "isinstance" else "comparisons against"
+            description = f"if/elif ladder with {branches} branches dispatching via {via} '{subject_src}'"
+            repeated = ladders_per_subject[(subject_dump, kind, cases)]
+            # The description depends on the ladder alone, never on its siblings:
+            # analyze_diff matches a pre-existing finding by its description, and
+            # a new ladder elsewhere must not make an unchanged one look new.
+            if branches >= LONG_SWITCH_BRANCHES or repeated >= 2:
+                self._add(node.lineno, "type_switch", description,
+                    "Replace Conditional with Polymorphism, a dispatch dict, or match — "
+                    "adding a case should mean adding an entry, not editing a ladder",
+                    "high" if branches >= LONG_SWITCH_BRANCHES else "medium")
+            else:
+                self._add(node.lineno, "type_switch", description, "", "low",
+                          kind="candidate", also_caused_by=_SHORT_SWITCH_REASONS)
 
     def _check_duplicate_fragments(self, node: ast.If, bodies: list[list[ast.stmt]], final_else: bool):
         if not final_else or len(bodies) < 2 or any(not b for b in bodies):
@@ -467,7 +489,7 @@ class DesignSmellDetector(ast.NodeVisitor):
         # since then the terminating value may never reach the loop boundary.
         assigned_values = [
             inner.value.value
-            for inner in _walk_loop_level(node.body)
+            for inner in walk_loop_level(node.body)
             if any(isinstance(t, ast.Name) and t.id == flag for t in
                    (inner.targets if isinstance(inner, ast.Assign)
                     else [inner.target] if isinstance(inner, ast.AnnAssign) and inner.value is not None
@@ -513,7 +535,7 @@ class DesignSmellDetector(ast.NodeVisitor):
         saw_call = False
         while isinstance(root, (ast.Attribute, ast.Subscript, ast.Call)):
             if isinstance(root, ast.Attribute):
-                if root.attr.startswith("_") and not _is_dunder(root.attr):
+                if root.attr.startswith("_") and not is_dunder(root.attr):
                     return None  # already navigating private structure; the inner access is the finding
                 root = root.value
             elif isinstance(root, ast.Subscript):
@@ -539,11 +561,36 @@ class DesignSmellDetector(ast.NodeVisitor):
                 return name
         return None
 
+    def _has_imported_receiver_type(self, value: ast.expr) -> bool:
+        """Whether an un-rebound parameter is annotated with an imported type."""
+        if not isinstance(value, ast.Name):
+            return False
+        current = self._parents.get(id(value))
+        while current is not None:
+            if isinstance(current, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                args = current.args
+                parameters = [*args.posonlyargs, *args.args, *args.kwonlyargs]
+                parameter = next((arg for arg in parameters if arg.arg == value.id), None)
+                shadowed = any(isinstance(n, ast.Name) and n.id == value.id
+                               and isinstance(n.ctx, (ast.Store, ast.Del))
+                               for n in walk_same_scope(current.body))
+                if shadowed:
+                    return False
+                if parameter is not None:
+                    annotation = parameter.annotation
+                    while isinstance(annotation, (ast.Attribute, ast.Subscript)):
+                        annotation = annotation.value
+                    local_classes = {klass.name for klass in self._all_classes}
+                    return (isinstance(annotation, ast.Name) and annotation.id in self._import_names
+                            and annotation.id not in local_classes)
+            current = self._parents.get(id(current))
+        return False
+
     def visit_Attribute(self, node: ast.Attribute):
         enclosing = self._innermost_function_name()
-        in_dunder = bool(enclosing) and _is_dunder(enclosing)
+        in_dunder = bool(enclosing) and is_dunder(enclosing)
         attr = node.attr
-        private = attr.startswith("_") and not _is_dunder(attr)
+        private = attr.startswith("_") and not is_dunder(attr)
         # Inside a class body, `other.__secret` is name-mangled to this class —
         # by construction a same-class access, not intimacy. At module level it
         # reaches into another class's deliberately private state.
@@ -552,13 +599,50 @@ class DesignSmellDetector(ast.NodeVisitor):
         if (not self.is_test_file and not in_dunder and private
                 and attr not in NAMEDTUPLE_API):
             receiver = self._foreign_receiver(node.value)
-            if receiver is not None:
+            key = (node.lineno, f"{receiver or ast.unparse(node.value)}.{attr}")
+            if (receiver is not None and attr == "_meta" and self._django_context
+                    and id(node) in self._metadata_operations):
+                if "inappropriate_intimacy" not in self.ignore:
+                    self.issues.append(DesignSmell(
+                        file=self.filename, line=node.lineno,
+                        smell_type="inappropriate_intimacy",
+                        description=f"'{receiver}._meta' uses a documented Django metadata operation; "
+                                    "receiver identity is unresolved",
+                        suggestion="", severity="medium", code_snippet=self._get_line(node.lineno),
+                        kind="candidate", also_caused_by=(
+                            "Django Model._meta is a public metadata API despite its leading underscore; "
+                            "this module imports Django, but static analysis cannot prove the receiver "
+                            "is a Django model. Verify its type before treating this as private coupling.",),
+                    ))
+            elif receiver is not None:
+                self._reported.add(key)
+                if attr in self.module_privates and not self._has_imported_receiver_type(node.value):
+                    if "inappropriate_intimacy" not in self.ignore:
+                        self.issues.append(DesignSmell(
+                            self.filename, node.lineno, "inappropriate_intimacy",
+                            f"Reaching into '{receiver}.{attr}' — its owner is not established",
+                            "", "low", self._get_line(node.lineno),
+                            kind="candidate", also_caused_by=_LOCAL_PRIVATE_REASONS))
+                else:
+                    self._add(node.lineno, "inappropriate_intimacy",
+                        f"Reaching into '{receiver}.{node.attr}' — another object's private internals",
+                        "Move Method to where the data lives, or expose an intentional API "
+                        "(Hide Delegate); classes should know as little about each other as possible",
+                        "medium")
+            elif self._reaches_sibling_module(node.value) and "inappropriate_intimacy" not in self.ignore:
+                self._reported.add(key)
                 self._add(node.lineno, "inappropriate_intimacy",
-                    f"Reaching into '{receiver}.{node.attr}' — another object's private internals",
-                    "Move Method to where the data lives, or expose an intentional API "
-                    "(Hide Delegate); classes should know as little about each other as possible",
-                    "medium")
+                          f"Reaching into '{ast.unparse(node.value)}.{attr}' — a sibling module's private name",
+                          "", "low", kind="candidate", also_caused_by=_SIBLING_PRIVATE_REASONS)
         self.generic_visit(node)
+
+    def _reaches_sibling_module(self, value: ast.expr) -> bool:
+        """True for `mod._x` / `mod.sub._x` where `mod` is a relative import
+        that resolves here as the imported module."""
+        while isinstance(value, ast.Attribute):
+            value = value.value
+        return (isinstance(value, ast.Name) and value.id in self.relative_imports
+                and self._is_exempt_name(value.id))
 
     # ----------------------------------------------------------------- #
     # Temporary Field, Refused Bequest, Lazy Class
@@ -593,7 +677,7 @@ class DesignSmellDetector(ast.NodeVisitor):
         # Discovery stays in __init__'s own scope: an assignment inside a nested
         # callback does not run during construction. Disqualification stays
         # broad (any read, any non-None write) — broader means quieter.
-        for inner in _walk_same_scope(init.body):
+        for inner in walk_same_scope(init.body):
             targets, value = [], None
             if isinstance(inner, ast.Assign):
                 targets, value = inner.targets, inner.value
@@ -626,18 +710,20 @@ class DesignSmellDetector(ast.NodeVisitor):
         returned_in: dict[str, set[str]] = defaultdict(set)
         reset_in: dict[str, set[str]] = defaultdict(set)
         accessor_like: set[str] = set()
+        bodies: dict = {}
         for klass, method in ((k, m) for k in relatives for m in self._methods(k)):
             if klass is node and method.name == "__init__":
                 continue
             # Identity-keyed: same-named classes in different containers must
             # not collapse into one method.
             qualname = (id(klass), f"{klass.name}.{method.name}")
-            decorators = _decorator_names(method)
+            bodies[qualname] = method.body
+            decorators = decorator_names(method)
             if decorators & PROPERTY_DECORATORS or {"setter", "getter", "deleter"} & decorators:
                 accessor_like.add(qualname)
             # Same-scope only: a deferred callback's accesses are not the
             # method's own — it may run long after the method returns.
-            for inner in _walk_same_scope(method.body):
+            for inner in walk_same_scope(method.body):
                 if isinstance(inner, ast.Attribute) and isinstance(inner.value, ast.Name) \
                         and inner.value.id == "self" and inner.attr in none_fields:
                     usage[inner.attr].add(qualname)
@@ -671,18 +757,32 @@ class DesignSmellDetector(ast.NodeVisitor):
                 continue
             only_key = next(iter(methods))
             # Lazy-init caches behind a property are idiomatic; a field never
-            # populated is dead weight; a reset back to None proves the "None
-            # except during one operation" lifecycle. Without a reset, a field
+            # populated is dead weight; a later reset back to None suggests the
+            # "None except during one operation" lifecycle. Without a reset, a field
             # the method *returns* is an output for callers (part of the state
-            # model), and a field only written is an output too — only a field
-            # populated and read back without being exposed is method-local
-            # scratch.
+            # model), and a field only written is an output too. A field the
+            # method reads before writing it carries what the previous call left
+            # (a cache key, a running value), so it persists by design. Only a
+            # field populated and then read back without being exposed is
+            # method-local scratch.
             is_temporary = only_key in populated.get(attr, set()) and (
                 only_key in reset_in.get(attr, set())
                 or (only_key in loaded_in.get(attr, set())
-                    and only_key not in returned_in.get(attr, set())))
+                    and only_key not in returned_in.get(attr, set())
+                    and not _reads_before_writing(bodies[only_key], attr)))
             if is_temporary:
                 only = only_key[1]
+                # Clearing a previous public result before population does not
+                # prove that the next result is scratch. Keep the evidence.
+                if not attr.startswith("_") and (only_key not in reset_in.get(attr, set())
+                        or _only_initial_resets(bodies[only_key], attr)):
+                    self._add(line, "temporary_field",
+                        f"Public field 'self.{attr}' starts as None and is populated and read only "
+                        f"in '{only}' within this hierarchy; no later reset is visible", "", "low",
+                        kind="candidate", also_caused_by=(
+                            "The field may publish a completed result or status for callers to read after "
+                            "this method returns; inspect external consumers before replacing it with local scratch.",))
+                    continue
                 self._add(line, "temporary_field",
                     f"Field 'self.{attr}' is None except inside '{only}' — a temporary field",
                     f"Pass the value through parameters or extract '{only}' and its data into "
@@ -747,18 +847,18 @@ class DesignSmellDetector(ast.NodeVisitor):
         inherited: dict[str, bool] = {}
         for klass in mro[1:]:
             for method in self._methods(klass):
-                if method.name not in inherited and "overload" not in _decorator_names(method):
-                    inherited[method.name] = ("abstractmethod" not in _decorator_names(method)
-                                              and _body_kind(method.body) is None)
+                if method.name not in inherited and "overload" not in decorator_names(method):
+                    inherited[method.name] = ("abstractmethod" not in decorator_names(method)
+                                              and body_kind(method.body) is None)
         if not inherited:
             return
         for method in self._methods(node):
-            decorators = _decorator_names(method)
+            decorators = decorator_names(method)
             # @overload declarations are intentionally `...`-bodied signatures
             # preceding the real implementation, not refusals.
-            if _is_dunder(method.name) or {"abstractmethod", "overload"} & decorators:
+            if is_dunder(method.name) or {"abstractmethod", "overload"} & decorators:
                 continue
-            kind = _body_kind(method.body)
+            kind = body_kind(method.body)
             if kind and inherited.get(method.name) is True:
                 action = "raises NotImplementedError on" if kind == "raise_nie" else "no-ops"
                 self._add(method.lineno, "refused_bequest",
@@ -798,7 +898,7 @@ class DesignSmellDetector(ast.NodeVisitor):
         # deleting it would unregister the plugin.
         if self._hierarchy_defines(node, base, "__init_subclass__"):
             return
-        if _body_kind(node.body) == "noop":
+        if body_kind(node.body) == "noop":
             self._add(node.lineno, "lazy_class",
                 f"Class '{node.name}' adds nothing over '{base.id}'",
                 f"Use '{base.id}' directly and delete this class (Inline Class / Collapse "
@@ -809,10 +909,7 @@ def analyze_file(filepath: Path, ignore: set[str]) -> list[DesignSmell]:
     try:
         source, tree = cached_parse(filepath)
         lines = source.splitlines()
-        is_test_file = (filepath.name.startswith("test_") or filepath.name.endswith("_test.py")
-                        or filepath.name == "conftest.py"
-                        or "tests" in filepath.parts or "test" in filepath.parts)
-        detector = DesignSmellDetector(str(filepath), lines, tree, ignore, is_test_file)
+        detector = DesignSmellDetector(str(filepath), lines, tree, ignore, is_test_file(filepath))
         detector.visit(tree)
         return detector.issues
     except (SyntaxError, ValueError, OSError) as exc:
@@ -843,15 +940,16 @@ def main():
     if args.format == 'json':
         print(json.dumps([asdict(i) for i in all_issues], indent=2))
     else:
+        proven = [issue for issue in all_issues if issue.kind == "finding"]
         if not all_issues:
             print("✅ No design smells found!")
             return
 
         by_type = defaultdict(int)
-        for issue in all_issues:
+        for issue in proven:
             by_type[issue.smell_type] += 1
 
-        print(f"Found {len(all_issues)} design smell(s):\n")
+        print(f"Found {len(proven)} design smell(s):\n")
         print("Summary:")
         for smell, count in sorted(by_type.items(), key=lambda x: -x[1]):
             print(f"  {smell}: {count}")
@@ -859,12 +957,18 @@ def main():
 
         severity_icons = SEVERITY_ICONS
         for issue in all_issues:
-            icon = severity_icons[issue.severity]
-            print(f"{icon} [{issue.severity.upper()}] {issue.file}:{issue.line}")
+            if issue.kind == "candidate":
+                print(f"? [CANDIDATE] {issue.file}:{issue.line}")
+            else:
+                print(f"{severity_icons[issue.severity]} [{issue.severity.upper()}] {issue.file}:{issue.line}")
             print(f"   {issue.smell_type}: {issue.description}")
             if issue.code_snippet:
                 print(f"   Code: {issue.code_snippet}")
-            print(f"   → {issue.suggestion}\n")
+            if issue.suggestion:
+                print(f"   → {issue.suggestion}")
+            for reason in issue.also_caused_by:
+                print(f"   ? also caused by: {reason}")
+            print()
 
 
 if __name__ == '__main__':

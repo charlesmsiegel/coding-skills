@@ -216,3 +216,135 @@ def test_generated_files_are_skipped(runner, tmp_path):
         sys.path.remove(str(SCRIPTS_DIR))
     files = {Path(i["file"]).name for i in results["errors"]}
     assert files == {"lib.rs"}, f"generated file was analysed: {files}"
+
+
+def test_candidates_are_counted_separately_and_kept_out_of_the_high_list(tmp_path, load_module, capsys):
+    """A candidate is a lead, not a defect: it has its own count and its own
+    heading, and never appears under HIGH SEVERITY ISSUES."""
+    module = load_module(SCRIPTS_DIR, "analyze_all")
+    report = {
+        "meta": {"analyzed_path": str(tmp_path), "timestamp": "t",
+                 "analyzers_run": ["types"], "analyzers_skipped": [], "analyzer_errors": {}},
+        "summary": {"total_issues": 2, "total_candidates": 1,
+                    "by_severity": {"high": 2, "medium": 0, "low": 0},
+                    "by_category": {"types": 2}},
+        "categories": {"types": {"count": 2, "issues": [
+            {"file": "a.rs", "line": 1, "smell_type": "unwrap_in_fallible_fn", "description": "a defect",
+             "suggestion": "fix it", "severity": "high", "kind": "finding", "category": "types"},
+            {"file": "a.rs", "line": 2, "smell_type": "narrowing_cast", "description": "a lead",
+             "suggestion": "", "severity": "high", "kind": "candidate", "category": "types",
+             "also_caused_by": ["the value was narrowed by a runtime check"]},
+        ]}},
+    }
+    module.print_text_report(report)
+    out = capsys.readouterr().out
+    high_block = out[out.index("HIGH SEVERITY ISSUES"):out.index("CANDIDATES")]
+    assert "a defect" in high_block and "a lead" not in high_block
+    assert "a lead" in out[out.index("CANDIDATES"):]
+    assert "Total issues found: 2" in out
+    assert "of which 1 are candidates" in out, \
+        "the summary line claimed the candidates were excluded from the total"
+
+
+def test_generate_report_counts_candidates_and_rejects_invalid_records(tree, load_module, monkeypatch):
+    """The report hop re-validates every record. A candidate with no benign
+    explanation is dropped and named, never silently counted as a finding."""
+    module = load_module(SCRIPTS_DIR, "analyze_all")
+
+    def fake_run_detectors(path, file_specs, tree_specs, jobs=None):
+        return {"types": [
+            {"file": "a.rs", "line": 1, "smell_type": "unwrap_in_fallible_fn", "description": "d",
+             "suggestion": "fix", "severity": "high", "kind": "finding",
+             "also_caused_by": [], "code_snippet": "", "related_lines": []},
+            {"file": "a.rs", "line": 2, "smell_type": "narrowing_cast", "description": "d",
+             "suggestion": "", "severity": "low", "kind": "candidate",
+             "also_caused_by": ["benign"], "code_snippet": "", "related_lines": []},
+            {"file": "a.rs", "line": 3, "smell_type": "bogus", "description": "d",
+             "suggestion": "", "severity": "low", "kind": "candidate",
+             "also_caused_by": [], "code_snippet": "", "related_lines": []},
+        ]}
+
+    monkeypatch.setattr(module, "run_detectors", fake_run_detectors)
+    monkeypatch.setattr(module, "ANALYZERS", [("types", "find_type_issues", "Types", module.FILE)])
+    report = module.generate_report(str(tree))
+    assert report["summary"]["total_issues"] == 2
+    assert report["summary"]["total_candidates"] == 1
+    assert "bogus" in report["meta"]["records_rejected"]["types"]
+    # A detector emitting contract-invalid records is a broken detector, and
+    # analyzer_errors is what code-overview's coverage logic reads — so the
+    # category is graded as ungraded rather than as clean.
+    assert "did not satisfy" in report["meta"]["analyzer_errors"]["types"]
+
+
+def test_the_diff_lens_marks_a_candidate_as_a_lead_not_a_ranked_defect(load_module, capsys):
+    """No diff-safe Rust detector emits a candidate yet, so the renderer is
+    exercised directly — the shape it must print the day one does.
+
+    A severity icon on a lead reads as a verdict the syntax never proved, and a
+    bare arrow reads as a fix that was forgotten. What the record has instead is
+    the benign readings the reader must rule out first.
+    """
+    module = load_module(SCRIPTS_DIR, "analyze_diff")
+    findings = [
+        {"file": "a.rs", "line": 1, "smell_type": "unwrap_in_fallible_fn",
+         "description": "a defect", "suggestion": "fix it", "severity": "high",
+         "kind": "finding"},
+        {"file": "a.rs", "line": 2, "smell_type": "narrowing_cast",
+         "description": "a lead", "suggestion": "", "severity": "high",
+         "kind": "candidate",
+         "also_caused_by": ["the range was checked by the caller"]},
+    ]
+    module.print_text(["a.rs"], findings, "0123456789abcdef")
+    out = capsys.readouterr().out
+
+    assert "[CANDIDATE]" in out
+    assert "? also caused by: the range was checked by the caller" in out
+    marked = [line for line in out.splitlines() if "[CANDIDATE]" in line]
+    assert marked and not any(icon in line for line in marked for icon in "🔴🟡🟢"), \
+        "a candidate was given a severity icon it did not earn"
+    assert [line for line in out.splitlines() if line.strip() == "→"] == [], \
+        "a candidate rendered a fix arrow with nothing after it"
+    assert "1 finding(s), 1 candidate(s)" in out, \
+        "the count line still calls every record a finding"
+
+
+def test_a_candidate_only_category_earns_no_recommendation(tmp_path, load_module, capsys):
+    """RECOMMENDATIONS tells the reader to change code. A category whose only
+    record is an unverified lead has not earned an instruction."""
+    module = load_module(SCRIPTS_DIR, "analyze_all")
+    report = {
+        "meta": {"analyzed_path": str(tmp_path), "timestamp": "t",
+                 "analyzers_run": ["type_issues"], "analyzers_skipped": [], "analyzer_errors": {}},
+        "summary": {"total_issues": 1, "total_candidates": 1,
+                    "by_severity": {"high": 0, "medium": 0, "low": 1},
+                    "by_category": {"type_issues": 1}},
+        "categories": {"type_issues": {"count": 1, "issues": [
+            {"file": "a.rs", "line": 2, "smell_type": "narrowing_cast", "description": "a lead",
+             "suggestion": "", "severity": "low", "kind": "candidate", "category": "type_issues",
+             "also_caused_by": ["the range was checked by the caller"]},
+        ]}},
+    }
+    module.print_text_report(report)
+    out = capsys.readouterr().out
+    assert module.RECOMMENDATIONS["type_issues"] not in out, \
+        "a lead bought advice about a defect nothing found"
+
+
+def test_the_report_hop_keeps_a_record_carrying_an_extra_key(tree, load_module, monkeypatch):
+    """The hop validates the contract's fields; a detector that also attaches
+    something of its own has not broken the contract. Dropping the record loses
+    a real finding over a key the validator simply did not know about."""
+    module = load_module(SCRIPTS_DIR, "analyze_all")
+
+    def fake_run_detectors(path, file_specs, tree_specs, jobs=None):
+        return {"types": [
+            {"file": "a.rs", "line": 1, "smell_type": "unwrap_in_fallible_fn", "description": "d",
+             "suggestion": "fix", "severity": "high", "kind": "finding",
+             "also_caused_by": [], "code_snippet": "", "related_lines": [], "lines": 5},
+        ]}
+
+    monkeypatch.setattr(module, "run_detectors", fake_run_detectors)
+    monkeypatch.setattr(module, "ANALYZERS", [("types", "find_type_issues", "Types", module.FILE)])
+    report = module.generate_report(str(tree))
+    assert [i["smell_type"] for i in report["categories"]["types"]["issues"]] == ["unwrap_in_fallible_fn"]
+    assert not report["meta"].get("records_rejected")

@@ -323,3 +323,50 @@ def test_weighting_by_size_balances_better_than_by_count(runner_modules):
     by_count = heaviest(chunk(items, 2))
     by_size = heaviest(chunk(items, 2, weight=lambda i: sizes[i]))
     assert by_size < by_count, f"by_size={by_size} did not beat by_count={by_count}"
+
+
+def test_generate_report_rejects_records_that_break_the_contract(tmp_path, load_module, monkeypatch):
+    """The report hop is where every Python detector's records pass, so it is
+    where the contract is enforced: a candidate with no benign explanation is
+    dropped and named, and every surviving record carries an explicit kind."""
+    module = load_module(SCRIPTS_DIR, "analyze_all")
+
+    def fake_run_detectors(path, file_specs, tree_specs, jobs=None):
+        return {"security": [
+            {"file": "a.py", "line": 1, "smell_type": "eval_call", "description": "d",
+             "suggestion": "fix", "severity": "high"},
+            {"file": "a.py", "line": 2, "smell_type": "sql_injection", "description": "d",
+             "suggestion": "", "severity": "high", "kind": "candidate"},
+        ]}
+
+    monkeypatch.setattr(module, "run_detectors", fake_run_detectors)
+    monkeypatch.setattr(module, "ANALYZERS", [("security", "find_security_issues", "Security", module.FILE)])
+    report = module.generate_report(str(tmp_path))
+    issues = report["categories"]["security"]["issues"]
+    assert [i["smell_type"] for i in issues] == ["eval_call"]
+    assert issues[0]["kind"] == "finding"
+    assert "sql_injection" in report["meta"]["records_rejected"]["security"]
+    # A detector emitting contract-invalid records is a broken detector, and
+    # analyzer_errors is what code-overview's coverage logic reads — so the
+    # category is graded as ungraded rather than as clean.
+    assert "did not satisfy" in report["meta"]["analyzer_errors"]["security"]
+
+
+def test_a_worker_learns_the_analysis_root_from_its_parameters(runner_modules, tmp_path):
+    """A spawned worker inherits no globals, so the shard task carries the root.
+
+    Starting from a worker that knows nothing (as under spawn or forkserver), the
+    shard must still judge `src/core.py` of a project checked out under `tests/`
+    as source, not as a test.
+    """
+    common, runner = runner_modules["common"], runner_modules["runner"]
+    project = tmp_path / "tests" / "app"
+    (project / "src").mkdir(parents=True)
+    source = project / "src" / "core.py"
+    source.write_text("def area(width):\n    return width * 7\n")
+
+    common.set_analysis_root(None)
+    out = runner.run_file_shard([source], [("code_smells", "find_code_smells")], set(), project)
+
+    assert common.analysis_root() == project.resolve()
+    assert any(r["smell_type"] == "magic_number" for r in out["code_smells"])

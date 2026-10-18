@@ -15,7 +15,7 @@ import argparse
 from pathlib import Path
 from dataclasses import dataclass, asdict
 from collections import defaultdict
-from common import sort_findings, cached_parse, SEVERITY_ICONS, configure_output, find_python_files, warn_detector_error, warn_unparseable
+from common import project_parts, project_root, _has_marker, sort_findings, cached_parse, SEVERITY_ICONS, configure_output, find_python_files, warn_detector_error, warn_unparseable
 
 
 @dataclass
@@ -39,7 +39,14 @@ def _is_cli_file(tree, filepath: Path) -> bool:
     """Return True if the file looks like a legitimate CLI/script entrypoint."""
     # Check path segments for script/cli/bin/tools directories
     cli_dirs = {"scripts", "bin", "cli", "tools"}
-    if cli_dirs & set(filepath.parts):
+    # Directories of its project: a checkout under ~/scripts/ is not all entrypoints.
+    if cli_dirs & set(project_parts(filepath)[:-1]):
+        return True
+    # A bounded scan can start at scripts/ itself, leaving only the helper's
+    # name in project_parts. Keep that CLI root, while a marked checkout named
+    # scripts remains a project whose ordinary source must still be checked.
+    root = project_root(filepath)
+    if root.name.lower() in cli_dirs and not _has_marker(root):
         return True
     # Check for `if __name__ == "__main__":` or argparse usage in the AST
     for node in ast.walk(tree):

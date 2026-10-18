@@ -16,13 +16,20 @@ import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from common import EXCLUDE_DIRS, TS_EXTENSIONS, find_ts_files, is_test_file, warn_unparseable
+from common import (
+    TS_EXTENSIONS,
+    find_ts_files,
+    is_generated_file,
+    is_test_file,
+    walk_tree,
+    warn_unparseable,
+)
 from find_tsconfig_issues import load_jsonc
 from tsparse import TsFile, TsSyntaxError, parse_file
 
 # Tried in order when a specifier has no extension.
 _CANDIDATE_SUFFIXES = (
-    ".ts", ".tsx", ".mts", ".cts", ".d.ts",
+    ".ts", ".tsx", ".mts", ".cts", ".d.ts", ".d.mts", ".d.cts",
     "/index.ts", "/index.tsx", "/index.mts", "/index.cts",
 )
 
@@ -33,13 +40,35 @@ class Project:
     files: dict[Path, TsFile] = field(default_factory=dict)
     failed: dict[Path, str] = field(default_factory=dict)
     aliases: dict[str, list[Path]] = field(default_factory=dict)
+    generated: list[Path] = field(default_factory=list)
+
+    @property
+    def analyzable(self) -> dict[Path, TsFile]:
+        """`files` minus the tool-owned ones: every legitimate finding LOCATION.
+
+        A generated file stays in `files` because its imports, exports and graph
+        edges are real evidence — a runtime package imported only by a generated
+        API client is genuinely used, and a module a generated barrel re-exports
+        is genuinely referenced. What it is not is somewhere to report a defect:
+        nobody edits it, and the bug (if any) belongs to the generator.
+        """
+        owned = set(self.generated)
+        return {path: tsfile for path, tsfile in self.files.items() if path not in owned}
 
     @property
     def sources(self) -> list[Path]:
-        return [p for p in self.files if not is_test_file(p)]
+        return [p for p in self.analyzable if not is_test_file(p)]
 
     @property
     def tests(self) -> list[Path]:
+        """Every test file, generated ones included.
+
+        Tests are read as *evidence* — which modules they reach — never as a
+        place to locate a finding, and a generated test exercises what it
+        imports just as well as a hand-written one. Deriving this from
+        `analyzable` made a project whose only tests were generated look
+        untested, and raised the high-severity `no_tests_at_all` alarm.
+        """
         return [p for p in self.files if is_test_file(p)]
 
     def resolve(self, importer: Path, specifier: str) -> Path | None:
@@ -90,9 +119,9 @@ class Project:
 def _load_aliases(root: Path) -> dict[str, list[Path]]:
     """tsconfig `paths` as prefix -> directories, so `@app/x` resolves."""
     aliases: dict[str, list[Path]] = {}
-    configs = [p for p in root.rglob("tsconfig*.json")
-               if EXCLUDE_DIRS.isdisjoint(p.relative_to(root).parts)] if root.is_dir() else []
-    for config in sorted(configs, key=lambda p: len(p.relative_to(root).parts))[:5]:
+    configs = [p for p in walk_tree(root)
+               if p.name.startswith("tsconfig") and p.suffix == ".json"] if root.is_dir() else []
+    for config in sorted(configs, key=lambda p: (len(p.relative_to(root).parts), str(p))):
         data = load_jsonc(config) or {}
         options = data.get("compilerOptions") or {}
         if not isinstance(options, dict):
@@ -157,6 +186,12 @@ def _build_project(root: Path, quiet: bool) -> Project:
     project = Project(root=root, aliases=_load_aliases(root) if root.is_dir() else {})
     for path in find_ts_files(root):
         resolved = path.resolve()
+        # A generated file IS parsed into `files`: its imports and exports are
+        # whole-tree evidence, and dropping them made a package only a generated
+        # client imports look unused. `generated` is what keeps it out of
+        # `analyzable`, which is where findings may be located.
+        if is_generated_file(path):
+            project.generated.append(resolved)
         try:
             project.files[resolved] = parse_file(path)
         except TsSyntaxError as exc:
@@ -177,11 +212,11 @@ def read_package_json(root: Path) -> tuple[Path | None, dict]:
     """The nearest package.json and its parsed contents."""
     if root.is_file():
         root = root.parent
-    for candidate in [root, *sorted(root.rglob("package.json"), key=lambda p: len(p.parts))[:3]]:
-        manifest = candidate if candidate.name == "package.json" else candidate / "package.json"
+    candidates = [root / "package.json"] + sorted(
+        (p for p in walk_tree(root) if p.name == "package.json"),
+        key=lambda p: (len(p.relative_to(root).parts), str(p)))
+    for manifest in candidates:
         if not manifest.is_file():
-            continue
-        if not EXCLUDE_DIRS.isdisjoint(manifest.parts):
             continue
         try:
             return manifest, json.loads(manifest.read_text(encoding="utf-8-sig", errors="replace"))

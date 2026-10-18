@@ -10,6 +10,56 @@ Finds:
   - unused_dependency     : declared dependency never imported anywhere
   - unpinned_dependency   : requirements.txt entry with no version specifier
   - no_dependency_manifest: third-party imports exist but no manifest at all
+
+Deliberately NOT charged as missing:
+  - an optional import: one inside the body of a `try` whose `except` names
+    ImportError or ModuleNotFoundError and visibly degrades — its last
+    statement is `pass`, `continue`, a falsy `return`, a rebinding of the
+    guarded name (`x = None`, `x = fallback`, a fallback import of the same
+    name), or a warnings.warn / logging call. The code runs on without the
+    package, so it is optional by construction. When the try body imports
+    more than one third-party module (stdlib and relative imports aside), only
+    an import whose name a degrading handler rebinds — `x = None`, `x =
+    fallback`, or a fallback import — is optional. An optional site speaks only
+    for itself: another site of the same module that stops is still a lead, and
+    an unguarded one is still a finding. It still counts as a use of a declared
+    dependency (an extra). A
+    bare `except:` or `except Exception:` also catches the error but does not
+    say the import was meant to be optional, so it does not count — and an
+    `except ImportError:` placed after one never runs, so it does not count either.
+
+Reported as a candidate, not a finding:
+  - an undeclared module imported only under such a guard, where the guard
+    does not make it optional: no handler visibly degrades — it raises or exits
+    (how a script says a package is required, and also how an optional
+    feature's entry point reports a missing extra), or ends any other way the
+    detector cannot call a degrade (a helper that may exit, `return 1`,
+    argparse's error()) — or the try body imports other modules and the handler
+    replaces none of this one's names. An unrecognised handler costs a lead,
+    never silence. One residual: a repo with no manifest whose third-party
+    imports are all guarded this way gets one candidate per module, not the
+    no_dependency_manifest finding.
+  - an undeclared module every import of which follows, in its own file, a
+    sys.path addition (sys.path.insert/append/extend, `sys.path += [...]`,
+    site.addsitedir) whose directory the source cannot place inside the project:
+    one that resolves outside the repository (a relative entry is read from the
+    project root and from the file's own directory, the two working
+    directories that occur, and is inside if either is), or one that reads a function
+    parameter, os.environ/os.getenv, sys.argv, an argparse result (`args.x`
+    from parse_args() or parse_known_args()), or a name bound more than once.
+    A harness run under another program's interpreter imports that program's
+    modules this way, and no manifest here could declare them. A directory the
+    source does resolve inside the project explains nothing (every module there
+    is already first-party), nor does one spelled in a way the path reader cannot
+    follow but with none of those run-time sources in it, and a module-level
+    import is not served by an addition inside a function, which cannot have
+    run yet when the module loads.
+    Scope, stated plainly: one such addition demotes EVERY undeclared module
+    whose imports all come after it in that file, not only the modules the added
+    directory provides. That covers a production module that loads plugins from
+    $PLUGIN_DIR and then imports `requests`, and an ordinary lazy import in any
+    function below a `def add_dir(d): sys.path.append(d)` helper. The source
+    cannot say which names the directory serves, so all of them are leads.
 """
 
 import ast
@@ -21,7 +71,9 @@ import re
 from pathlib import Path
 from dataclasses import dataclass, asdict
 from collections import defaultdict
-from common import sort_findings, SEVERITY_ICONS, configure_output, find_python_files, warn_detector_error, warn_unparseable
+from import_sites import ImportSite, import_sites
+from common import (sort_findings, SEVERITY_ICONS, configure_output, find_python_files,
+                    first_party_modules, in_nested_repository, warn_detector_error, warn_unparseable)
 
 # tomllib is stdlib on 3.11+. On older interpreters we simply skip pyproject.toml
 # parsing rather than depend on a third-party backport (this skill is stdlib-only).
@@ -40,6 +92,39 @@ class CodeSmell:
     suggestion: str
     severity: str
     code_snippet: str = ""
+    # A scored defect by default; "candidate" for a lead the downstream merge
+    # must not score. A candidate carries no fix and names, in also_caused_by,
+    # the ways a healthy codebase produces the same observation.
+    kind: str = "finding"
+    also_caused_by: tuple[str, ...] = ()
+
+
+# Why a module imported only after its file puts an unreadable directory on
+# sys.path need not be a dependency this project should declare.
+_RUNTIME_PATH_REASONS = (
+    "the file runs inside another program's checkout or interpreter (a test harness, a plugin "
+    "host, a script driving a vendored tree) and imports that program's own modules from the "
+    "directory it puts on sys.path, which no manifest of this project could declare",
+    "the directory comes from a function argument, the environment, the command line or a name rebound as "
+    "the program runs, or resolves outside this repository, so only the machine the code runs on "
+    "shows what it provides",
+)
+
+
+# Why a module imported only under an ImportError guard that does not carry on
+# need not be a dependency this project should declare.
+_GUARD_REASONS = {
+    "exits": (
+        "the handler turns a missing optional extra into a clear error at the entry point that "
+        "needs it, and every other path through the program runs without the package",
+        "the package is installed by a step the project documents rather than declares (a plugin "
+        "host, a GPU stack, a system package), and the handler is that step's error message",
+    ),
+    "shared": (
+        "the imports in the try are one optional feature that the handler switches off as a whole, "
+        "through placeholders for some of the names or a flag such as `HAVE_X = False`",
+    ),
+}
 
 
 # ---------------------------------------------------------------------------
@@ -104,6 +189,8 @@ def _collect_requirements_files(root: Path):
     for req_file in sorted(root.rglob("requirements*.txt")):
         if ".venv" in req_file.parts or "node_modules" in req_file.parts:
             continue
+        if in_nested_repository(root, req_file):
+            continue  # another repository's manifest, not this project's
         entries = []
         try:
             text = req_file.read_text(encoding="utf-8", errors="replace")
@@ -183,12 +270,12 @@ def _collect_pyproject_deps(root: Path):
     return deps
 
 
-def _collect_imports(root: Path) -> dict[str, list[str]]:
+def _collect_imports(root: Path) -> dict[str, list[ImportSite]]:
     """
     Walk all Python files and collect top-level module imports.
-    Returns dict: module_name -> [filepath, ...]
+    Returns dict: module_name -> [ImportSite, ...]
     """
-    imports: dict[str, list[str]] = defaultdict(list)
+    imports: dict[str, list[ImportSite]] = defaultdict(list)
     for filepath in find_python_files(root):
         try:
             source = filepath.read_text(encoding="utf-8", errors="replace")
@@ -199,19 +286,13 @@ def _collect_imports(root: Path) -> dict[str, list[str]]:
         except Exception as exc:
             warn_detector_error(filepath, exc)
             continue
-        for node in ast.walk(tree):
-            if isinstance(node, ast.Import):
-                for alias in node.names:
-                    top = alias.name.split(".")[0]
-                    if top and top != "__future__":
-                        imports[top].append(str(filepath))
-            elif isinstance(node, ast.ImportFrom):
-                if node.level and node.level > 0:
-                    continue  # relative import
-                if node.module:
-                    top = node.module.split(".")[0]
-                    if top and top != "__future__":
-                        imports[top].append(str(filepath))
+        try:
+            sites = list(import_sites(tree, filepath, root))
+        except Exception as exc:  # one file the reader trips on must not sink the tree's report
+            warn_detector_error(filepath, exc)
+            continue
+        for top, site in sites:
+            imports[top].append(site)
     return imports
 
 
@@ -234,6 +315,11 @@ def _compute_local_packages(root: Path) -> frozenset:
       directory's name is a local top-level package.
     - Stems of all .py files sitting directly inside any "src" directory under
       root.
+    - The stem of every <name>.py and the name of every <name>/__init__.py
+      anywhere in the tree (outside venvs, node_modules and the rest of
+      common.EXCLUDE_DIRS). A script that puts `tests/models` on sys.path and
+      imports `sampler_case` is importing a file of this repository; nothing
+      can install it, so no manifest should declare it.
     """
     names: set[str] = set()
 
@@ -257,7 +343,7 @@ def _compute_local_packages(root: Path) -> frozenset:
     _skip = {".venv", "node_modules", "__pycache__"}
     for init_file in root.rglob("__init__.py"):
         # Skip ignored directories anywhere in the path
-        if any(part in _skip for part in init_file.parts):
+        if any(part in _skip for part in init_file.parts) or in_nested_repository(root, init_file):
             continue
         pkg_dir = init_file.parent
         # Walk up while the parent also has __init__.py (i.e. is still a pkg)
@@ -273,10 +359,26 @@ def _compute_local_packages(root: Path) -> frozenset:
         if any(part in _skip for part in src_candidate.parts):
             continue
         for p in src_candidate.iterdir():
-            if p.is_file() and p.suffix == ".py" and p.stem != "__init__":
+            if (p.is_file() and p.suffix == ".py" and p.stem != "__init__"
+                    and not in_nested_repository(root, p)):
                 names.add(p.stem)
 
+    # Any module or package that exists as a file in the repository is first-party.
+    names |= first_party_modules(root)
+
     return frozenset(names)
+
+
+def _resolves_beside(name: str, importer: Path) -> bool:
+    """True when `name` is a module or directory in the importing file's own directory."""
+    beside = importer.parent
+    return (beside / f"{name}.py").is_file() or (beside / name).is_dir()
+
+
+def _is_namespace_dir(directory: Path) -> bool:
+    """A directory of .py files with no __init__.py is an importable namespace
+    package (PEP 420) — `tests/` is the everyday example."""
+    return directory.is_dir() and any(p.suffix == ".py" for p in directory.iterdir())
 
 
 def _is_local(name: str, root: Path) -> bool:
@@ -287,10 +389,38 @@ def _is_local(name: str, root: Path) -> bool:
         or (root / name / "__init__.py").exists()
         or (root / "src" / f"{name}.py").exists()
         or (root / "src" / name / "__init__.py").exists()
+        or _is_namespace_dir(root / name)
+        or _is_namespace_dir(root / "src" / name)
     ):
         return True
     # Full package scan (cached)
     return name in _compute_local_packages(root)
+
+
+def _lead(mod: str, sites: list[ImportSite]) -> CodeSmell:
+    """The candidate for an undeclared module no import of which is plain: each
+    is guarded without being optional, or follows an opaque sys.path addition."""
+    first = min(sites, key=lambda s: (s.file, s.line))
+    if first.guard == "exits":
+        why = ("it is imported here inside a try whose ImportError handler raises or exits, which is "
+               "how a required dependency announces itself and also how an optional extra's entry "
+               "point reports that it is missing")
+    elif first.guard == "shared":
+        why = ("it is imported here in a try with other third-party imports, and the ImportError handler "
+               "rebinds none of its names, so it may be optional along with them or required and merely caught")
+    else:
+        why = (f"it is imported here after line {first.after_path} puts a directory on sys.path that "
+               f"the source cannot place inside this project, so it may be served from that directory")
+    return CodeSmell(
+        file=first.file,
+        line=first.line,
+        smell_type="missing_dependency",
+        description=f"Module '{mod}' is not declared in any dependency manifest, but {why}",
+        suggestion="",
+        severity="high",
+        kind="candidate",
+        also_caused_by=_GUARD_REASONS.get(first.guard, _RUNTIME_PATH_REASONS),
+    )
 
 
 def analyze(root: Path, ignore: set) -> list[CodeSmell]:
@@ -320,7 +450,7 @@ def analyze(root: Path, ignore: set) -> list[CodeSmell]:
     has_manifest = (
         bool(req_files)
         or bool(pyproject_deps)
-        or bool(list(root.rglob("requirements*.txt")))
+        or any(not in_nested_repository(root, p) for p in root.rglob("requirements*.txt"))
         or _pyproject_parses()
     )
 
@@ -375,18 +505,32 @@ def analyze(root: Path, ignore: set) -> list[CodeSmell]:
     # ------------------------------------------------------------------ #
     # 3. Classify imports as third-party
     # ------------------------------------------------------------------ #
-    third_party_imports: dict[str, list[str]] = {}
-    for mod, files in all_imports.items():
+    third_party_imports: dict[str, list[ImportSite]] = {}
+    for mod, sites in all_imports.items():
         if _is_stdlib(mod):
             continue
         if _is_local(mod, root):
             continue
-        third_party_imports[mod] = files
+        # pytest (and any script run from its own directory) puts the importing
+        # file's directory on sys.path, so `from test_chat import helper` in
+        # tests/ resolves to the file next door. No manifest declares that, and
+        # a tests/ directory needs no __init__.py for it to work.
+        sites = [s for s in sites if not _resolves_beside(mod, Path(s.file))]
+        # An optional import is one the code runs without: the package being
+        # absent is handled where it is imported, so no manifest owes it. It
+        # speaks only for itself: a site that stops, or follows an opaque
+        # sys.path addition, stays a lead, and a plain import stays a finding.
+        sites = [s for s in sites if s.guard != "optional"]
+        if sites:
+            third_party_imports[mod] = sites
 
     # ------------------------------------------------------------------ #
     # 4. No manifest at all
     # ------------------------------------------------------------------ #
-    if not has_manifest and third_party_imports:
+    # A module with no plain import is guarded without being optional, or comes
+    # after a sys.path addition the source cannot read: a lead, reported below.
+    unexplained = {mod for mod, sites in third_party_imports.items() if any(s.plain for s in sites)}
+    if not has_manifest and unexplained:
         if "no_dependency_manifest" not in ignore:
             issues.append(CodeSmell(
                 file=str(root),
@@ -394,7 +538,7 @@ def analyze(root: Path, ignore: set) -> list[CodeSmell]:
                 smell_type="no_dependency_manifest",
                 description=(
                     f"No requirements*.txt or pyproject.toml found, but "
-                    f"{len(third_party_imports)} third-party module(s) are imported"
+                    f"{len(unexplained)} third-party module(s) are imported"
                 ),
                 suggestion=(
                     "Add a pyproject.toml (or requirements.txt) declaring your "
@@ -408,7 +552,7 @@ def analyze(root: Path, ignore: set) -> list[CodeSmell]:
     # 5. missing_dependency: imported but not declared
     # ------------------------------------------------------------------ #
     if "missing_dependency" not in ignore:
-        for mod, files in sorted(third_party_imports.items()):
+        for mod, sites in sorted(third_party_imports.items()):
             norm_mod = _normalize(mod)
             # Check direct match
             if norm_mod in declared:
@@ -417,8 +561,11 @@ def analyze(root: Path, ignore: set) -> list[CodeSmell]:
             mapped = _IMPORT_TO_DIST.get(mod.lower())
             if mapped and _normalize(mapped) in declared:
                 continue
+            if mod not in unexplained:
+                issues.append(_lead(mod, sites))
+                continue
             # Not found — report once, pointing at the root
-            example_file = sorted(set(files))[0]
+            example_file = sorted({s.file for s in sites if s.plain})[0]
             issues.append(CodeSmell(
                 file=str(root),
                 line=1,
@@ -487,6 +634,17 @@ def analyze_tree(path: Path, ignore: set) -> list:
     return findings
 
 
+def to_record(issue: CodeSmell) -> dict:
+    """The JSON shape this detector emits, shared with the runner.
+
+    `kind` is always present, so a consumer never reads an absent key as a
+    classification; the reasons tuple serialises as a list.
+    """
+    record = asdict(issue)
+    record["also_caused_by"] = list(record["also_caused_by"])
+    return record
+
+
 def main():
     configure_output()
     parser = argparse.ArgumentParser(description="Detect dependency management issues in Python")
@@ -501,7 +659,7 @@ def main():
     sort_findings(all_issues)
 
     if args.format == "json":
-        print(json.dumps([asdict(i) for i in all_issues], indent=2))
+        print(json.dumps([to_record(i) for i in all_issues], indent=2))
     else:
         if not all_issues:
             print("✅ No dependency issues found!")
@@ -509,17 +667,27 @@ def main():
         by_type: dict[str, int] = defaultdict(int)
         for i in all_issues:
             by_type[i.smell_type] += 1
-        print(f"Found {len(all_issues)} dependency issue(s):\n\nSummary:")
+        # A candidate is a lead, not a defect, so it is counted apart.
+        leads = sum(1 for i in all_issues if i.kind == "candidate")
+        print(f"Found {len(all_issues) - leads} dependency issue(s), "
+              f"{leads} candidate(s):\n\nSummary:")
         for s, c in sorted(by_type.items(), key=lambda x: -x[1]):
             print(f"  {s}: {c}")
         print()
         icons = SEVERITY_ICONS
         for i in all_issues:
-            print(f"{icons[i.severity]} [{i.severity.upper()}] {i.file}:{i.line}")
+            # A severity icon on a lead reads as a verdict the evidence does not support.
+            marker = ("? [CANDIDATE]" if i.kind == "candidate"
+                      else f"{icons[i.severity]} [{i.severity.upper()}]")
+            print(f"{marker} {i.file}:{i.line}")
             print(f"   {i.smell_type}: {i.description}")
             if i.code_snippet:
                 print(f"   Code: {i.code_snippet}")
-            print(f"   → {i.suggestion}\n")
+            if i.suggestion:
+                print(f"   → {i.suggestion}")
+            for reason in i.also_caused_by:
+                print(f"   ? also caused by: {reason}")
+            print()
 
 
 if __name__ == "__main__":

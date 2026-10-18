@@ -41,7 +41,7 @@ import contextlib
 import subprocess
 from pathlib import Path
 from collections import defaultdict
-from common import EXCLUDE_DIRS, SEVERITY_ICONS, configure_output
+from common import EXCLUDE_DIRS, SEVERITY_ICONS, configure_output, in_nested_repository
 
 _ICON = SEVERITY_ICONS
 _MYPY_RE = re.compile(r"^(?P<file>[^:]+):(?P<line>\d+):(?:(?P<col>\d+):)?\s*(?P<level>error|note|warning):\s*(?P<msg>.*?)(?:\s+\[(?P<code>[\w-]+)\])?$")
@@ -204,7 +204,7 @@ def _requirements_files(path):
         return []
     found = []
     for p in root.rglob("requirements*.txt"):
-        if EXCLUDE_DIRS.isdisjoint(p.relative_to(root).parts):
+        if EXCLUDE_DIRS.isdisjoint(p.relative_to(root).parts) and not in_nested_repository(root, p):
             found.append(p)
     found.sort(key=lambda p: (len(p.relative_to(root).parts), str(p)))
     return found[:5]
@@ -253,7 +253,7 @@ def _coverage_data_dir(path):
     if (root / ".coverage").exists():
         return root
     for p in root.rglob(".coverage"):
-        if EXCLUDE_DIRS.isdisjoint(p.relative_to(root).parts):
+        if EXCLUDE_DIRS.isdisjoint(p.relative_to(root).parts) and not in_nested_repository(root, p):
             return p.parent
     return root
 

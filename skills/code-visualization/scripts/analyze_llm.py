@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """LLM Ops tab: model call sites, models in use, prompt lineage, mechanical gaps.
 
-Usage: python3 analyze_llm.py REPO_DIR --tabs-dir TABS_DIR
+Usage: python3 analyze_llm.py REPO_DIR --tabs-dir TABS_DIR [--root DIR ...]
 Emits: TABS_DIR/10-llm-ops.html and a JSON summary on stdout.
 
 Writes no fragment at all when the repo calls no model — the assembler drops
@@ -19,7 +19,8 @@ from pathlib import Path
 
 import llmops
 import resources
-from common import esc, walk_source, write_fragment
+from common import (ROOT_HELP, esc, in_roots, scope_roots, walk_source,
+                    write_fragment)
 
 GAP_LABELS = {
     "no-max-tokens": ("bad", "no max_tokens"),
@@ -36,13 +37,22 @@ def main() -> int:
     ap.add_argument("--tabs-dir", required=True)
     ap.add_argument("--exclude", default="",
                     help="comma-separated extra directory names to skip")
+    ap.add_argument("--root", action="append", default=[], help=ROOT_HELP)
     args = ap.parse_args()
     extra_exclude = {d.strip() for d in args.exclude.split(",") if d.strip()}
     repo = Path(args.repo).resolve()
+    try:
+        roots = scope_roots(repo, args.root)
+    except ValueError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
 
     files = dict(walk_source(repo, extra_exclude=extra_exclude))
-    refs = resources.scan(repo, files).refs
-    scan = llmops.scan(files, refs=refs)
+    # Loads are found over the whole repo, so a prompt file outside the roots
+    # still attributes to the call site inside them; only call sites in the
+    # roots are reported.
+    refs = [r for r in resources.scan(repo, files).refs if in_roots(r.src, roots)]
+    scan = llmops.scan({rel: p for rel, p in files.items() if in_roots(rel, roots)}, refs=refs)
 
     if not scan.sites and not scan.models:
         print(json.dumps({"note": "no LLM usage detected",
@@ -140,6 +150,7 @@ reader: is this deliberate here?</p>
     write_fragment(Path(args.tabs_dir), "10-llm-ops.html", "LLM Ops", body)
 
     summary = {
+        **({"roots": list(roots)} if roots else {}),
         "call_sites": len(scan.sites),
         "providers": providers,
         "models": scan.models,

@@ -553,7 +553,7 @@ def build(args, reports: list[dict], candidates: list[dict] | None = None,
         # reason a finding about it would be.
         candidates = [record for record in candidates if in_scope(record)]
 
-    findings, duplicates = common.dedupe(reports)
+    findings, duplicates = common.dedupe(reports, repo)
 
     # Per doctor, not the flat pool `load_reports` handed `main()` — that pool
     # is empty on the --merged path entirely (it is built only from
@@ -685,6 +685,7 @@ def build(args, reports: list[dict], candidates: list[dict] | None = None,
         "doctor_errors": doctor_errors,
         "completeness": completeness,
         "candidates_total": len(candidates),
+        "candidates_shown": min(len(candidates), args.candidate_limit),
     }
     if packages:
         meta["packages"] = packages
@@ -708,7 +709,8 @@ def build(args, reports: list[dict], candidates: list[dict] | None = None,
         "CAVEATS": render_caveats(errors_by_doctor, skipped_by_doctor, scored["unmapped_types"],
                                   scored["ungraded"], args.note, out_of_scope,
                                   relative_roots, duplicates),
-        "CANDIDATES": render_candidates(displayable_candidates(candidates, repo)),
+        "CANDIDATES": render_candidates(displayable_candidates(candidates, repo),
+                                        limit=args.candidate_limit),
         "COVERAGE": render_coverage(meta),
     })
 
@@ -812,6 +814,9 @@ def main(argv=None) -> int:
     parser.add_argument("--note", action="append", default=[],
                         help="an extra caveat to record; repeatable")
     parser.add_argument("--top", type=int, default=25, help="findings to list (default: 25)")
+    parser.add_argument("--candidate-limit", type=int, default=100,
+                        help="maximum candidate rows to render (default: 100); all candidates "
+                             "remain counted and never affect the grade")
     parser.add_argument("--loc", type=int, help="override the measured line count")
     parser.add_argument("--files", type=int, help="override the measured file count")
     parser.add_argument("--commit", default="", help="commit sha for the metadata")
@@ -833,6 +838,8 @@ def main(argv=None) -> int:
                         help="code-doctor's merged envelope (code-doctor-merge/1); "
                              "supplies doctors, coverage, candidates and completeness at once")
     args = parser.parse_args(argv)
+    if args.candidate_limit < 0:
+        parser.error("--candidate-limit must be non-negative")
 
     # `--findings` is deliberately optional. The documented answer for a Go or
     # Rust package is "codemap plus an ungraded health page", and there is no

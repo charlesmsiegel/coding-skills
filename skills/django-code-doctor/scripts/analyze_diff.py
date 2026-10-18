@@ -157,18 +157,34 @@ def render(findings, stats):
         lines.append("✅ No findings on the changed lines.")
         return "\n".join(lines)
 
+    # Counted as django_report.render counts them: a lead is not a defect, so it
+    # is named apart from the findings and kept out of the severity tally, which
+    # is a ranking of proven defects.
+    proven = [f for f in findings if f.get("kind") != "candidate"]
+    candidates = [f for f in findings if f.get("kind") == "candidate"]
     by_severity = defaultdict(int)
-    for f in findings:
+    for f in proven:
         by_severity[f["severity"]] += 1
-    lines.append(str(len(findings)) + " finding(s) on changed lines  (" +
+    lines.append(str(len(proven)) + " finding(s), " + str(len(candidates)) +
+                 " candidate(s) on changed lines  (" +
                  SEVERITY_ICONS["high"] + " " + str(by_severity["high"]) + "  " +
                  SEVERITY_ICONS["medium"] + " " + str(by_severity["medium"]) + "  " +
                  SEVERITY_ICONS["low"] + " " + str(by_severity["low"]) + ")\n")
     for f in findings[:200]:
-        lines.append(SEVERITY_ICONS[f["severity"]] + " [" + f["severity"].upper() + "] " +
+        # Marked as django_report.render marks it: a lead is not a defect, and a
+        # severity icon on one reads as a verdict the evidence does not support.
+        marker = ("? [CANDIDATE]" if f.get("kind") == "candidate"
+                  else SEVERITY_ICONS[f["severity"]] + " [" + f["severity"].upper() + "]")
+        lines.append(marker + " " +
                      str(f["file"]) + ":" + str(f["line"]) + "  " + f["smell_type"])
         lines.append("   " + f["description"])
-        lines.append("   → " + f["suggestion"])
+        # A candidate has no fix to print — an empty arrow reads as one that was
+        # forgotten. What it has is the benign readings the reader must rule out.
+        if f.get("suggestion"):
+            lines.append("   → " + f["suggestion"])
+        if f.get("kind") == "candidate":
+            for reason in f.get("also_caused_by") or []:
+                lines.append("   ? also caused by: " + reason)
     return "\n".join(lines)
 
 

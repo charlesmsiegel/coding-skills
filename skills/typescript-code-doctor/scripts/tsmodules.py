@@ -47,12 +47,16 @@ def extract_types(file: TsFile) -> None:
                 members = []
                 if body >= 0 and file.closer(body) >= 0:
                     members = _parse_type_members(file, body, file.closer(body))
+                # `end` is exclusive — the next statement's first token. The
+                # declaration's own last token is what `end` means on an
+                # interface or an enum, and what the type span must stop at.
+                last = max(end - 1, cursor)
                 file.types.append(TypeDecl(
                     kind="type", name=tokens[index + 1].value, line=token.line,
-                    start=start, end=end, is_exported="export" in words,
+                    start=start, end=last, is_exported="export" in words,
                     members=members, text=file.slice(cursor + 1, end),
                 ))
-                file.type_spans.append((start, end))
+                file.type_spans.append((start, last))
                 index = end
                 continue
         elif token.is_name("enum") and index + 1 < len(tokens) and tokens[index + 1].kind == "name":
@@ -109,7 +113,11 @@ def _parse_type_members(file: TsFile, open_index: int, close_index: int) -> list
                 type_text += ": " + extra
         members.append(TypeMember(name=name, type_text=type_text, line=token.line,
                                   optional=optional, readonly=readonly))
-        cursor = max(cursor, cursor)
+        # Without `;` or `,` separators the type ends at a line break, and the
+        # cursor already stands on the next member. Skipping "to the separator"
+        # from there consumed that member, so every other one went missing.
+        if cursor < close_index and file.tokens[cursor].line > file.tokens[cursor - 1].line:
+            continue
         while cursor < close_index and not file.tokens[cursor].is_op(";", ","):
             if file.tokens[cursor].kind == "op" and file.tokens[cursor].value in OPENERS:
                 cursor = file.skip_group(cursor)
@@ -178,7 +186,7 @@ def _parse_import(file: TsFile, index: int) -> Import:
             break
         if token.is_op("{"):
             close = file.closer(cursor)
-            record.names.extend(_named_bindings(file, cursor, close))
+            record.names.extend(_named_bindings(file, cursor, close, record.type_names, record.bindings))
             cursor = close + 1
             continue
         if token.is_op("*"):
@@ -194,18 +202,32 @@ def _parse_import(file: TsFile, index: int) -> Import:
     return record
 
 
-def _named_bindings(file: TsFile, open_index: int, close_index: int) -> list[str]:
-    """The local names bound by a `{ a, b as c }` clause."""
+def _named_bindings(file: TsFile, open_index: int, close_index: int,
+                    type_names: list[str] | None = None,
+                    bindings: dict[str, str] | None = None) -> list[str]:
+    """The local names bound by a `{ a, b as c, type D }` clause.
+
+    A name after an inline `type` modifier is also added to ``type_names``
+    when the caller passes that list.
+    """
     names: list[str] = []
     cursor = open_index + 1
+    inline_type = False
     while cursor < close_index:
         token = file.tokens[cursor]
-        if token.kind == "name" and not token.is_name("as", "type"):
-            local = token.value
+        if token.is_name("type") and cursor + 1 < close_index and file.tokens[cursor + 1].kind == "name":
+            inline_type = True  # the modifier, not a binding named `type`
+        elif token.kind == "name" and not token.is_name("as", "type"):
+            imported = local = token.value
             if cursor + 2 < close_index and file.tokens[cursor + 1].is_name("as"):
                 local = file.tokens[cursor + 2].value
                 cursor += 2
             names.append(local)
+            if bindings is not None:
+                bindings[local] = imported
+            if inline_type and type_names is not None:
+                type_names.append(local)
+            inline_type = False
         cursor += 1
     return names
 

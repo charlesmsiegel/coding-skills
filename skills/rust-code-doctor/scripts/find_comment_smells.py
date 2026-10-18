@@ -14,7 +14,23 @@ import re
 from common import Reporter, is_test_file, run_file_detector
 from rsparse import RsFile, is_doc_comment
 
-_MARKERS = re.compile(r"(?i)\b(todo|fixme|hack|xxx|wip|kludge|refactor me|remove this)\b")
+# A marker is a *tag*, not a word: it opens the comment (`// TODO rewrite`,
+# `// todo: later`) or is tagged anywhere with `:`/`(` (`// see TODO: budget`,
+# `// FIXME(alice)`). Inside prose the same letters are vocabulary — `evals todo`
+# names a subcommand, "the retry hack above" describes one, `\uXXXX` is escape
+# notation — and a bare word search reports every one.
+_MARKER_WORDS = "TODO|FIXME|HACK|XXX|WIP|KLUDGE|REFACTOR ME|REMOVE THIS"
+_MARKER_OPENS_COMMENT = re.compile(rf"^\W*({_MARKER_WORDS})\b(?P<tag>\s*[:(\-])?", re.IGNORECASE)
+_MARKER_TAGGED = re.compile(rf"\b({_MARKER_WORDS})\b(?=\s*[:(])")
+
+
+def task_marker(text: str) -> str | None:
+    """The marker this comment line carries, or None when it merely uses the word."""
+    opening = _MARKER_OPENS_COMMENT.match(text)
+    if opening and (opening.group(1).isupper() or opening.group("tag")):
+        return opening.group(1).upper()
+    tagged = _MARKER_TAGGED.search(text)
+    return tagged.group(1).upper() if tagged else None
 
 # Text that looks like Rust rather than prose.
 _CODE_SHAPES = (
@@ -68,11 +84,11 @@ def _report_run(file: RsFile, report: Reporter, lines: list) -> None:
 def _check_debt_markers(file: RsFile, report: Reporter) -> None:
     hits = []
     for comment in file.comments:
-        match = _MARKERS.search(comment.value)
-        if not match:
-            continue
-        text = " ".join(comment.value.strip("/!* \t").split())[:100]
-        hits.append((comment.line, match.group(1).upper(), text))
+        for offset, raw in enumerate(comment.value.splitlines()):
+            text = raw.strip().lstrip("/!*").strip()
+            marker = task_marker(text)
+            if marker:
+                hits.append((comment.line + offset, marker, " ".join(text.split())[:100]))
     if not hits:
         return
     if len(hits) >= 8:

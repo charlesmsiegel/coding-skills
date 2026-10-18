@@ -62,6 +62,13 @@ python "$SKILL/scripts/find_test_issues.py" .         # assertNumQueries, on_com
 python "$SKILL/scripts/find_version_issues.py" .      # what breaks on the way to the target — see below
 ```
 
+For a **health review**, add `--target-version <declared major.minor>` to
+`analyze_django.py`, for example `--target-version 5.2`. Its default target is
+the newest release in the upgrade table, so an untargeted run also asks whether
+the project is ready for that newer Django. Use that default or a newer explicit
+target for upgrade work, and label the target. Missing version evidence is a
+coverage gap, not permission to treat upgrade warnings as current breakage.
+
 Every detector takes `--format text|json` and `--ignore type1,type2`, emits
 🔴/🟡/🟢 severities, and produces the same flat findings shape as python-code-doctor —
 so any of them pipes straight into the bundled reporter:
@@ -75,6 +82,21 @@ python "$SKILL/scripts/analyze_django.py" . --format json \
 python-code-doctor is installed. `analyze_django.py` builds the project graph and
 parses each file **once**, sharing both with all fifteen detectors — which is most
 of the runtime on a large project.
+
+### Evidence limits
+
+Lazy ModelChoiceField querysets are standard Django configuration, not import-time
+snapshots. Inherited model display methods and ordering count as implementations.
+Reads during validation hooks and guarded reads are not evidence that validation
+was skipped. A `get_or_create()` call alone cannot prove a race: database uniqueness
+may make it safe, so unresolved cases are candidates. Likewise, `commit=False`
+without a visible `save_m2m()` is a candidate when the form's many-to-many fields
+and caller lifecycle cannot be established.
+
+Form-save checks follow the constructed form receiver, rather than confusing
+unrelated model saves with form saves. A missing explicit `is_valid()` call is a
+candidate, not proof that validation was bypassed: Django ModelForm saves trigger
+validation through `self.errors`, and custom saves can validate or avoid writes.
 
 ### The three findings to read first
 

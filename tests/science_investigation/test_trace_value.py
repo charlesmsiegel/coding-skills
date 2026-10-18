@@ -16,10 +16,10 @@ import pytest
 SCRIPT = Path(__file__).resolve().parents[2] / "skills" / "science-investigation" / "scripts" / "trace_value.py"
 
 
-def run(needle, root, *args) -> dict:
+def run(needle, root, *args, timeout=120) -> dict:
     result = subprocess.run(
         [sys.executable, str(SCRIPT), needle, str(root), "--format", "json", *args],
-        capture_output=True, text=True, timeout=120,
+        capture_output=True, text=True, timeout=timeout,
     )
     assert result.returncode == 0, result.stderr[-600:]
     return json.loads(result.stdout)
@@ -248,3 +248,73 @@ def test_an_empty_scan_is_not_an_absence_result(tmp_path):
     assert payload["counts"]["files_scanned"] == 0
     assert "Nothing to scan" in payload["headline"]
     assert "appears nowhere" not in payload["headline"]
+
+
+# ---- a real repository (hardy) ------------------------------------------------ #
+
+@pytest.mark.parametrize("field", [
+    "solve_rate: float | None",
+    "solve_rate: float | None = None",
+    "solve_rate: Optional[float] = None",
+])
+def test_a_field_annotation_is_a_declaration_not_a_definition(tmp_path, field):
+    """hardy declares `solve_rate` on a pydantic model and computes it in one place;
+    the tracer reported it defined independently in two."""
+    (tmp_path / "contracts.py").write_text(
+        "class TierAggregate(BaseModel):\n    n: int\n    " + field + "\n", encoding="utf-8"
+    )
+    (tmp_path / "scoreboard.py").write_text(
+        "agg = TierAggregate(n=n, solve_rate=len(solved) / n if n else None)\n", encoding="utf-8"
+    )
+    payload = run("solve_rate", tmp_path)
+    assert payload["counts"].get("definition") == 1
+    assert payload["counts"].get("declaration") == 1
+    assert "defined independently" not in payload["headline"]
+
+
+def test_a_typescript_interface_field_is_a_declaration(tmp_path):
+    (tmp_path / "types.ts").write_text("interface Agg {\n  solve_rate: number;\n}\n", encoding="utf-8")
+    assert run("solve_rate", tmp_path)["counts"].get("declaration") == 1
+
+
+@pytest.mark.parametrize("needle,line", [
+    ("solve_rate", "solve_rate: float = len(solved) / n"),
+    ("QUALITY_THRESHOLD", "QUALITY_THRESHOLD: float = 0.7"),
+    ("solve_rate", "const agg = {\n  solve_rate: solved / n,\n};"),
+])
+def test_an_annotation_or_key_with_a_value_is_still_a_definition(tmp_path, needle, line):
+    """Only a bare annotation, or one defaulting to null, declares without defining."""
+    (tmp_path / ("a.ts" if "const" in line else "a.py")).write_text(line + "\n", encoding="utf-8")
+    payload = run(needle, tmp_path)
+    assert payload["counts"].get("definition") == 1
+    assert not payload["counts"].get("declaration")
+
+
+def test_a_minified_bundle_is_not_traced_and_does_not_stall(tmp_path):
+    """Tracing a one-letter name through a committed bundle classified every
+    occurrence against its whole 145K-character line: 300 seconds."""
+    bundle = tmp_path / "assets" / "index-U_FZj3ND.js"
+    bundle.parent.mkdir()
+    bundle.write_text(("e=e+e;" * 20_000 + "\n") * 3, encoding="utf-8")
+    payload = run("e", tmp_path, timeout=60)
+    assert payload["candidates"] == []
+    assert payload["counts"]["files_skipped_generated"] == 1
+    assert "index-U_FZj3ND.js" in payload["caveat"]
+
+
+def test_the_same_value_in_hand_written_code_is_traced(tmp_path):
+    (tmp_path / "gate.js").write_text("if (score >= 0.7) {\n  ship();\n}\n", encoding="utf-8")
+    payload = run("0.7", tmp_path)
+    assert payload["counts"].get("comparison") == 1
+    assert payload["counts"]["files_skipped_generated"] == 0
+
+
+@pytest.mark.parametrize("name,body,kind", [
+    ("pick.ts", "const shown = full ? solve_rate : fallback;\n", "other"),
+    ("agg.js", "const agg = {\n  solve_rate: rate,\n};\n", "definition"),
+])
+def test_a_colon_that_is_not_an_annotation_is_not_a_declaration(tmp_path, name, body, kind):
+    """A ternary's `:` annotates nothing, and plain JavaScript has no annotations."""
+    (tmp_path / name).write_text(body, encoding="utf-8")
+    counts = run("solve_rate", tmp_path)["counts"]
+    assert counts.get(kind) == 1 and not counts.get("declaration")

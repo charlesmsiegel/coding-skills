@@ -774,3 +774,29 @@ def test_run_file_detector_crash_does_not_print_clean_message(common, repo, caps
     out = capsys.readouterr().out
     assert "no problems found" not in out.lower()
     assert "incomplete" in out.lower()
+
+
+def test_a_nested_git_checkout_is_not_walked(common, repo):
+    """A worktree (`.git` file) or a nested clone (`.git` directory) is another repository.
+
+    Its files are not this repo's: a secret or a merge marker in a sibling
+    worktree would otherwise be reported as committed here, once per copy.
+    """
+    repo.write("src/app.go", "package main\n")
+    repo.write(".worktrees/feature/.git", "gitdir: ../../.git/worktrees/feature\n")
+    repo.write(".worktrees/feature/src/app.go", "package main\n")
+    repo.write("sub/.git", "gitdir: /elsewhere\n")
+    repo.write("sub/deep/x.go", "package x\n")
+    repo.write("vendored/.git/HEAD", "ref: refs/heads/main\n")
+    repo.write("vendored/lib.go", "package lib\n")
+    walked = {p.relative_to(repo.path).as_posix() for p in common.walk_paths(repo.path)}
+    assert walked == {"src/app.go"}
+    assert {p.name for p in common.walk_files(repo.path, source_only=False)} == {"app.go"}
+
+
+def test_a_nested_checkout_scanned_directly_is_still_walked(common, repo):
+    """Only checkouts *below* the scan root are another repository."""
+    repo.write("sub/.git", "gitdir: /elsewhere\n")
+    repo.write("sub/deep/x.go", "package x\n")
+    walked = {p.relative_to(repo.path / "sub").as_posix() for p in common.walk_paths(repo.path / "sub")}
+    assert "deep/x.go" in walked

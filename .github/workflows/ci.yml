@@ -59,11 +59,16 @@ jobs:
                    resources.py llmops.py; do
             cmp "$CV/$f" "$PR/$f" || { echo "::error::$f has drifted between the two skills"; exit 1; }
           done
-          # assemble.py differs in exactly one line: the --label default. Four
-          # skills ship it — literature-survey and legal-survey assemble their
-          # reports with the same fragment protocol — so every copy is compared,
-          # not just two. A copy left out of this loop is a second assembler
-          # nobody knows they are maintaining.
+          # The renderers (sortable tables, force graph, treemap, Mermaid) are
+          # inlined by assemble.py into whatever shell it is given; each skill's
+          # template is its own theme, but what draws inside it is one file.
+          for f in renderers.css renderers.js; do
+            cmp "skills/code-visualization/assets/$f" "skills/pr-visualization/assets/$f" \
+              || { echo "::error::assets/$f has drifted between the two skills"; exit 1; }
+          done
+          # assemble.py differs in exactly one line: the --label default. Three
+          # skills ship it — literature-survey assembles its report with the same
+          # fragment protocol — so all three copies are compared, not just two.
           LS=skills/literature-survey/scripts
           LG=skills/legal-survey/scripts
           if ! diff <(sed 's/PULL REQUEST REVIEW/CODEBASE ATLAS/' "$PR/assemble.py") "$CV/assemble.py"; then

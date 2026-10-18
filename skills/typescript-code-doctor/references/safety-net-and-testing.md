@@ -48,16 +48,24 @@ The detector finds these mechanically; here is what to do about each.
 
 **No assertion.** Passes as long as nothing throws. That is a smoke test wearing a
 unit test's name. (Testing Library's `getBy*`/`findBy*` queries *do* assert, since
-they throw when nothing matches — those are fine.)
+they throw when nothing matches — those are fine. So does a helper in the same
+file that the test calls, such as a `checkAll(rows)` looping over `expect`; the
+detector follows those.)
 
-**Only `toBeDefined` / `toBeTruthy`.** Passes for almost any value. Assert the
-value.
+**Only `toBeDefined` / `toBeTruthy` / `toBeFalsy`.** Passes for almost any value.
+Assert the value. `toBeNull()` and `toBeUndefined()` are not in this list — each
+passes for exactly one value — and a `toBeTruthy()` on a `getBy*` result is
+redundant rather than weak, since the query already threw if nothing matched.
 
 **`expect(...).rejects` or `.resolves` without `await`.** The assertion never
 runs. The test passes unconditionally, forever. This is the worst one in the list
 because it looks the most correct.
 
-**An `async` test that never awaits.** Finishes before the thing it tests.
+**An `async` test that never awaits.** If the body starts a promise and drops it
+— a `.then(…)` holding the assertion, a `waitFor`, a `findBy*` — the test finishes
+before that promise settles, and whatever it checks lands after the verdict. If
+nothing in it produces a promise, the body runs to the end first and the `async`
+is only noise; the detector reports that at low severity.
 
 **`.only` committed.** The rest of the file is silently skipped and CI is green.
 
@@ -68,7 +76,9 @@ did). Mock what is slow, non-deterministic, or external; use the real thing for
 the rest.
 
 **`if` inside a test.** One path asserts nothing and you cannot tell from a green
-run which ran. Two tests.
+run which ran. Two tests. (An `if (…) throw` guard that narrows a fixture is not
+this: its other path fails the test. Neither is a conditional restore in a
+`finally`, which runs after the assertions.)
 
 **Assertions on mock call counts only.** `expect(save).toHaveBeenCalledTimes(1)`
 tells you a function ran. It does not tell you the system did the right thing.
@@ -84,9 +94,11 @@ Coverage is a **map of the untested**, not a score. Two questions it answers wel
 It answers "is this code correct" not at all: a suite of assertion-less tests hits
 100%.
 
-`find_untested_modules.py` answers a cheaper question — does *any* test import
-this module — which is enough to find the gaps before you start. Coverage
-(`run_external_tools.py --run-coverage`) answers the finer one.
+`find_untested_modules.py` answers a cheaper question — does *any* test reach
+this module, directly or through the modules it imports — which is enough to find
+the gaps before you start. Coverage (`run_external_tools.py --run-coverage`)
+answers the finer one: a page-level test reaches every component its page
+imports, but may never render the branch you are about to change.
 
 ## The order of operations
 

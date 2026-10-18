@@ -3,7 +3,12 @@
 Detect loops that can be simplified, via AST analysis.
 
 Finds:
-  - loop_to_comprehension : a loop whose only job is to append to a list
+  - loop_to_comprehension : a loop whose only job is to append to a list. Not a
+    loop that reads the list it builds (`if key not in seen: seen.append(key)`
+    de-duplicates, which no comprehension can say), and when the list already
+    holds something — assigned non-empty, appended to before the loop, a
+    parameter, or filled across an outer loop — the comprehension would clobber
+    it, so the advice is `.extend(<generator>)`.
   - string_concat_in_loop : building a string with += inside a loop (O(n^2))
   - manual_any_all        : a loop that sets a flag and breaks, i.e. any()/all()
 
@@ -75,12 +80,96 @@ def _append_target(stmt):
     return None
 
 
+def _scope_statements(scope):
+    """The statements of ``scope`` itself, not of functions or classes nested in it."""
+    stack = list(ast.iter_child_nodes(scope))
+    while stack:
+        node = stack.pop()
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda)):
+            continue
+        if isinstance(node, ast.stmt):
+            yield node
+        stack.extend(ast.iter_child_nodes(node))
+
+
+def _names(node) -> set:
+    return {n.id for n in ast.walk(node) if isinstance(n, ast.Name)} if node is not None else set()
+
+
+def _empty_list(value) -> bool:
+    return (isinstance(value, ast.List) and not value.elts) or (
+        isinstance(value, ast.Call) and isinstance(value.func, ast.Name)
+        and value.func.id == "list" and not value.args and not value.keywords)
+
+
+def _fills(stmt, name) -> bool:
+    """True when ``stmt`` adds to list ``name`` (append/extend/insert/+=)."""
+    for node in ast.walk(stmt):
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) \
+                and node.func.attr in ("append", "extend", "insert") \
+                and isinstance(node.func.value, ast.Name) and node.func.value.id == name:
+            return True
+        if isinstance(node, ast.AugAssign) and isinstance(node.target, ast.Name) \
+                and node.target.id == name:
+            return True
+    return False
+
+
 class LoopSimplificationDetector(ast.NodeVisitor):
     def __init__(self, filename, lines, ignore):
         self.filename = filename
         self.lines = lines
         self.ignore = ignore
         self.issues = []
+        # The innermost scope's statements and how many loops enclose the one
+        # being checked, so the advice can tell a fresh list from a running one.
+        self._scopes = []
+        self._loop_depth = [0]
+
+    def visit_Module(self, node):
+        self._scopes.append(node)
+        self.generic_visit(node)
+        self._scopes.pop()
+
+    def _visit_scope(self, node):
+        self._scopes.append(node)
+        self._loop_depth.append(0)
+        self.generic_visit(node)
+        self._loop_depth.pop()
+        self._scopes.pop()
+
+    visit_FunctionDef = visit_AsyncFunctionDef = visit_Lambda = _visit_scope
+
+    def _starts_empty(self, loop, name) -> bool:
+        """True when ``name`` was last bound to an empty list before ``loop``
+        in this scope, nothing filled it since, and no outer loop repeats it."""
+        if self._loop_depth[-1]:
+            return False
+        last_binding, filled_after = None, False
+        for stmt in _scope_statements(self._scopes[-1]):
+            if stmt is loop or stmt.lineno >= loop.lineno:
+                continue
+            targets = stmt.targets if isinstance(stmt, ast.Assign) else (
+                [stmt.target] if isinstance(stmt, ast.AnnAssign) else [])
+            if any(isinstance(t, ast.Name) and t.id == name for t in targets):
+                if last_binding is None or stmt.lineno > last_binding.lineno:
+                    last_binding = stmt
+        if last_binding is None or not _empty_list(last_binding.value):
+            return False
+        for stmt in _scope_statements(self._scopes[-1]):
+            if last_binding.lineno < stmt.lineno < loop.lineno \
+                    and not isinstance(stmt, (ast.For, ast.AsyncFor, ast.While, ast.If, ast.With,
+                                              ast.AsyncWith, ast.Try)) and _fills(stmt, name):
+                filled_after = True
+        return not filled_after
+
+    def _comprehension_advice(self, node, tgt, filtered):
+        form = f"[... for ... in ...{' if <cond>' if filtered else ''}]"
+        if self._starts_empty(node, tgt):
+            kind = "a filtered comprehension" if filtered else "a list comprehension"
+            return f"Replace with {kind}: {tgt} = {form}."
+        return (f"'{tgt}' already holds items (or gains them across an outer loop), so "
+                f"assigning a comprehension would drop them: {tgt}.extend({form[1:-1]}).")
 
     def _add(self, line, st, desc, sug, sev):
         if st in self.ignore:
@@ -90,21 +179,24 @@ class LoopSimplificationDetector(ast.NodeVisitor):
     def _check_loop(self, node):
         body = node.body
 
-        # loop_to_comprehension: body is a single append, or a single guarded append
+        # loop_to_comprehension: body is a single append, or a single guarded
+        # append — unless the loop reads the list it is building (a de-dup, a
+        # running window), which a comprehension cannot see while it builds.
         if len(body) == 1:
             stmt = body[0]
             tgt = _append_target(stmt)
-            if tgt is not None:
+            if tgt is not None and tgt not in _names(stmt.value.args[0]) | _names(node.iter):
                 self._add(node.lineno, "loop_to_comprehension",
                     f"This loop only appends to '{tgt}'",
-                    f"Replace with a list comprehension: {tgt} = [... for ... in ...].",
+                    self._comprehension_advice(node, tgt, filtered=False),
                     "medium")
             elif isinstance(stmt, ast.If) and not stmt.orelse and len(stmt.body) == 1:
                 tgt = _append_target(stmt.body[0])
-                if tgt is not None:
+                reads = _names(stmt.test) | _names(node.iter)
+                if tgt is not None and tgt not in reads | _names(stmt.body[0].value.args[0]):
                     self._add(node.lineno, "loop_to_comprehension",
                         f"This loop only conditionally appends to '{tgt}'",
-                        f"Replace with a filtered comprehension: {tgt} = [... for ... in ... if <cond>].",
+                        self._comprehension_advice(node, tgt, filtered=True),
                         "medium")
 
         # string_concat_in_loop + manual_any_all (scan same-loop scope)
@@ -142,11 +234,11 @@ class LoopSimplificationDetector(ast.NodeVisitor):
 
     def visit_For(self, node):
         self._check_loop(node)
+        self._loop_depth[-1] += 1
         self.generic_visit(node)
+        self._loop_depth[-1] -= 1
 
-    def visit_AsyncFor(self, node):
-        self._check_loop(node)
-        self.generic_visit(node)
+    visit_AsyncFor = visit_For
 
     def visit_While(self, node):
         # only the concat / any-all checks make sense for while loops
@@ -156,7 +248,9 @@ class LoopSimplificationDetector(ast.NodeVisitor):
                     f"String '{n.target.id}' is built with += inside a loop (quadratic time)",
                     "Append pieces to a list and ''.join(...) once after the loop.",
                     "medium")
+        self._loop_depth[-1] += 1
         self.generic_visit(node)
+        self._loop_depth[-1] -= 1
 
 
 def analyze_file(filepath: Path, ignore: set) -> list:

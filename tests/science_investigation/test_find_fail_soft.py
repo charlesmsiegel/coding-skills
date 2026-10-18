@@ -7,6 +7,8 @@ pin the "fine" side, because a scanner that flags every `except` is one nobody r
 """
 
 import json
+import random
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -16,10 +18,10 @@ import pytest
 SCRIPT = Path(__file__).resolve().parents[2] / "skills" / "science-investigation" / "scripts" / "find_fail_soft.py"
 
 
-def run(root, *args) -> dict:
+def run(root, *args, timeout=120) -> dict:
     result = subprocess.run(
         [sys.executable, str(SCRIPT), str(root), "--format", "json", *args],
-        capture_output=True, text=True, timeout=120,
+        capture_output=True, text=True, timeout=timeout,
     )
     assert result.returncode == 0, result.stderr[-600:]
     return json.loads(result.stdout)
@@ -597,3 +599,199 @@ def test_a_same_line_off_switch_still_settles_it(tmp_path):
         "a = call(prompt, do_sample=False, temperature=0.8)\n", encoding="utf-8"
     )
     assert not kinds(run(tmp_path), "nondeterminism")
+
+
+# ---- a real repository (hardy) ------------------------------------------------ #
+# Run from the root of a real project, the scanner never finished, and most of what
+# it did report was vocabulary: the word "command", the backend name "claude",
+# json's `allow_nan`, and every `digest[:12]`. Each fix below sits beside a test
+# that the shape it was meant to catch is still caught.
+
+def test_a_minified_bundle_is_not_mined_and_does_not_stall_the_scan(tmp_path):
+    """A committed Vite bundle held the string-body regex for 7+ CPU-minutes: an
+    unterminated quote before a run of backslashes backtracked exponentially."""
+    line = "p.catch(e=>{log('" + "\\\\" * 40 + "x" + ';b="\\\\q"' * 2000 + "})"
+    bundle = tmp_path / "static" / "assets" / "index-U_FZj3ND.js"
+    bundle.parent.mkdir(parents=True)
+    bundle.write_text((line + "\n") * 3, encoding="utf-8")
+    payload = run(tmp_path, timeout=60)
+    assert payload["candidates"] == []
+    # Named, not silently dropped: the reader sees what was not mined and why.
+    assert payload["counts"]["files_skipped_generated"] == 1
+    assert "index-U_FZj3ND.js" in payload["caveat"]
+
+
+def test_a_backslash_run_in_an_unterminated_string_does_not_stall_a_handler(tmp_path):
+    """The same backtracking, in a hand-written file the generated-file rule
+    does not skip — so the string handling itself has to be linear."""
+    (tmp_path / "s.js").write_text(
+        "function s(r) {\n"
+        "  try { return j(r); } catch (e) {\n"
+        "    log('" + "\\\\" * 40 + "x);\n"
+        "    return 0;\n"
+        "  }\n"
+        "}\n",
+        encoding="utf-8",
+    )
+    assert kinds(run(tmp_path, timeout=60), "error_becomes_zero")
+
+
+def test_string_bodies_are_stripped_exactly_as_the_unambiguous_regex_would(load_module):
+    """The loop replacing the regex exists for speed alone; it must give the
+    regex's answer, unterminated quotes included."""
+    fail_soft = load_module(SCRIPT.parent, "find_fail_soft")
+    pattern = re.compile(r"""(['"])(?:\\.|(?!\1)[^\\])*\1""")
+    rng = random.Random(7)
+    for _ in range(5000):
+        line = "".join(rng.choice("'\"\\ax") for _ in range(rng.randint(0, 14)))
+        assert fail_soft.strip_string_bodies(line) == pattern.sub(r"\1\1", line), line
+
+
+def test_a_throw_after_an_unterminated_quote_still_counts(tmp_path):
+    """An apostrophe inside a template literal is not a string the scanner knows,
+    and must not swallow the re-raise after it."""
+    (tmp_path / "m.js").write_text(
+        "function s(r) {\n"
+        "  try { return j(r); } catch (e) {\n"
+        "    log(`can't score`); throw e;\n"
+        "  }\n"
+        "}\n",
+        encoding="utf-8",
+    )
+    assert run(tmp_path)["candidates"] == []
+
+
+def test_a_long_run_of_escaped_quotes_does_not_stall_a_hand_written_module(tmp_path):
+    """Removing the ambiguity from the regex was not enough: it still restarted
+    at every escaped quote, quadratic in the run (8s at 32K characters)."""
+    long_line = "p.catch(() => log(\"" + '\\"' * 30_000 + "))"
+    (tmp_path / "m.js").write_text("// pad\n" * 400 + long_line + "\n", encoding="utf-8")
+    payload = run(tmp_path, timeout=30)
+    assert payload["counts"]["files_skipped_generated"] == 0
+
+
+def test_an_overlong_line_is_scanned_up_to_the_bound_and_says_so(tmp_path):
+    (tmp_path / "gen.json").write_text(
+        '{"temperature": 0.9, "pad": "' + "x" * 20_000 + '"}\n', encoding="utf-8"
+    )
+    payload = run(tmp_path)
+    assert kinds(payload, "nondeterminism")
+    assert payload["counts"]["lines_truncated"] == 1
+    assert "1 line(s)" in payload["caveat"]
+
+
+def test_one_long_constant_does_not_make_a_module_generated(tmp_path):
+    """The mean line length decides, not the longest line: an embedded blob in a
+    hand-written module must not hide the handler below it."""
+    (tmp_path / "s.py").write_text(
+        "BLOB = '" + "A" * 3000 + "'\n"
+        "def score(row):\n"
+        "    try:\n"
+        "        return judge(row)\n"
+        "    except Exception:\n"
+        "        return 0.0\n" + "# padding\n" * 10,
+        encoding="utf-8",
+    )
+    payload = run(tmp_path)
+    assert kinds(payload, "error_becomes_zero")
+    assert payload["counts"]["files_skipped_generated"] == 0
+
+
+def test_a_one_line_json_config_is_still_read(tmp_path):
+    """Generated-file skipping is for source. A long single-line JSON config is
+    still the configuration a run loads."""
+    (tmp_path / "gen.json").write_text(
+        '{"pad": "' + "x" * 800 + '", "temperature": 0.9}', encoding="utf-8"
+    )
+    assert kinds(run(tmp_path), "nondeterminism")
+
+
+@pytest.mark.parametrize("line", [
+    'assert outcome.kind == "command"',
+    'return Outcome("command", command=command, argument=argument)',
+    'accept.add_argument("--backend", choices=("claude", "codex"), default="claude")',
+    'event = {"kind": "claude.result", "payload": {}}',
+    'version = metadata.version("claude-agent-sdk")',
+    'parser.add_argument("--latex-command", help="command that compiles a LaTeX file")',
+    'def build(config, *, backend: str = "claude"):',
+    'source = "o1 = x  + y"',
+])
+def test_a_model_family_word_that_is_not_a_model_id_is_not_flagged(tmp_path, line):
+    """83 of hardy's 489 rows were the word "command" (Cohere's model family) and
+    174 were "claude" as a backend name or an event kind."""
+    (tmp_path / "m.py").write_text(line + "\n", encoding="utf-8")
+    assert not kinds(run(tmp_path), "unpinned_model")
+
+
+def test_a_bare_family_word_as_a_config_value_is_not_a_model_id(tmp_path):
+    (tmp_path / "config.yaml").write_text("backend: claude\nmode: command\n", encoding="utf-8")
+    assert not kinds(run(tmp_path), "unpinned_model")
+
+
+@pytest.mark.parametrize("name,body", [
+    ("call.py", 'client.complete(model="claude")\n'),
+    ("call.py", 'JUDGE_MODEL = "gpt-test"\n'),
+    ("call.py", 'parser.add_argument("--model", default="claude")\n'),
+    ("call.py", 'main(["prove", "--judge-model", "gpt-test", "Two equals two."])\n'),
+    ("call.py", 'FALLBACKS = ["claude-sonnet-4-5", "command-r-plus"]\n'),
+    ("call.py", 'llm = "llama3"\n'),
+    ("config.json", '{"model": "o1"}\n'),
+    ("config.yaml", "judge_model: command\n"),
+])
+def test_a_model_id_is_still_flagged_by_its_shape_or_its_key(tmp_path, name, body):
+    (tmp_path / name).write_text(body, encoding="utf-8")
+    assert kinds(run(tmp_path), "unpinned_model")
+
+
+@pytest.mark.parametrize("line", [
+    "line = json.dumps(event, allow_nan=False, ensure_ascii=False)",
+    "price: Decimal = Field(ge=0, allow_inf_nan=False)",
+    "shutil.rmtree(directory, ignore_errors=True)",
+])
+def test_a_library_strictness_argument_is_not_a_feature_flag(tmp_path, line):
+    """57 of hardy's 98 rows: json, pydantic and shutil keywords that say what a
+    call tolerates, not which method runs."""
+    (tmp_path / "m.py").write_text(line + "\n", encoding="utf-8")
+    assert not kinds(run(tmp_path), "default_off_flag")
+
+
+@pytest.mark.parametrize("line", [
+    "allow_reranker = False",
+    "ignore_reranker: true",
+    "client = Client(enable_cache=False)",
+    # The project's own setting, not one library call's keyword: still read.
+    "ignore_errors: true",
+])
+def test_a_project_switch_is_still_default_off(tmp_path, line):
+    (tmp_path / ("c.yaml" if ": " in line else "m.py")).write_text(line + "\n", encoding="utf-8")
+    assert kinds(run(tmp_path), "default_off_flag")
+
+
+@pytest.mark.parametrize("line", [
+    "short = hashlib.sha256(data).hexdigest()[:12]",
+    'log.info("detail %s", text[:200])',
+    'label = f"{record.digest[:12]} ({record.id})"',
+    "attempt_id = uuid4().hex[:8]",
+    'slug = re.sub("[^a-z]+", "-", title.lower()).strip("-")[:48]',
+    "known = artifact_sha256[:16]",
+])
+def test_a_string_slice_for_display_or_identity_is_not_a_cap(tmp_path, line):
+    """At least 95 of hardy's 291 rows sliced a digest or a message, which caps
+    nothing that is evaluated."""
+    (tmp_path / "m.py").write_text(line + "\n", encoding="utf-8")
+    assert not kinds(run(tmp_path), "silent_cap")
+
+
+@pytest.mark.parametrize("line", [
+    "for row in rows[:100]:",
+    'board["rows"] = board["rows"][:1]',
+    "examples = dataset[:500]",
+    "results = [score(e) for e in fixtures.ENTRIES[:2]]",
+    "batch = load_cases(path)[:50]",
+    "first = splits[0][:100]",
+    "domain = entry.msc[0][:2]",
+    "head = (rows if full else sample)[:20]",
+])
+def test_a_slice_of_a_collection_is_still_a_cap(tmp_path, line):
+    (tmp_path / "m.py").write_text(line + "\n", encoding="utf-8")
+    assert kinds(run(tmp_path), "silent_cap")

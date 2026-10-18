@@ -146,6 +146,16 @@ This is the single change that most often removes a whole class of runtime bug.
 When you see an interface where several fields are optional and only certain
 combinations are legal, this is the finding.
 
+The `default` is not the only way to get that check. A switch that is the last
+statement of a function whose declared return type excludes `undefined`, with
+every case returning, is already checked under `strictNullChecks` (or
+`noImplicitReturns`): a missing case makes the end of the function reachable,
+which is TS2366. Adding `default: throw new Error(…)` *there* removes the check
+rather than adding one — so `switch_without_default` stays quiet on that shape
+when the governing tsconfig enables either flag, and is otherwise a candidate:
+whether a missing `default` is a defect depends on the discriminant's type,
+which syntax cannot see.
+
 ## Enums
 
 `enum` is one of the few TypeScript features that emits runtime code, which puts
@@ -212,9 +222,10 @@ consumers extend, `type` for everything else, especially unions.
 | `explicit_any` | Is the shape genuinely unknown (→ `unknown` + narrow), or just unwritten (→ write it)? |
 | `as_any` | What error is this silencing? Fix that. |
 | `double_assertion` | The two types are unrelated. Which one is wrong? |
-| `type_assertion` | Is there a check next to it? If not, what makes this true? |
-| `non_null_assertion` | Which of the three cases above is it? |
+| `type_assertion` | Is there a check next to it? If not, what makes this true? Reported as a candidate: the record lists the benign readings to rule out before acting. |
+| `non_null_assertion` | Which of the three cases above is it? Reported `low` in a test file, where a wrong `!` throws and fails the test rather than the product. |
+| `definite_assignment_assertion` | `let x!: T` or a field `x!: T` — a promise that something the compiler cannot see assigns it. Is that a framework (the one legitimate use), or an `init()` the type should model? Reported as a candidate, and not at all in a test file, where capturing a Promise's resolver is the idiom. |
 | `ts_ignore` | Convert to `@ts-expect-error` with a reason; it then expires on its own. |
-| `all_optional_type` | Which combinations are actually legal? That is your union. |
+| `all_optional_type` | Which combinations are actually legal? That is your union. Reported as a candidate: the record lists the benign readings to rule out before acting. |
 | `unsafe_builtin_type` | What is the real signature/shape? |
 | `untyped_parameter` | Under `noImplicitAny` this is a build error, not a style note. |

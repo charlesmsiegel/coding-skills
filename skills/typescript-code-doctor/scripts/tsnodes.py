@@ -125,6 +125,11 @@ class Import:
     namespace_name: str = ""
     is_type_only: bool = False
     side_effect_only: bool = False
+    # Names bound by an inline `type` specifier: `B` in `import { a, type B }`.
+    # Each is already erased from the emitted import, like `import type`.
+    type_names: list[str] = field(default_factory=list)
+    # Local binding -> original export, before an `as` alias.
+    bindings: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass(slots=True)
@@ -148,6 +153,9 @@ class TsFile:
         self.tokens = tokenizer.tokens
         self.comments = tokenizer.comments
         self.jsx_text = tokenizer.jsx_text
+        self.substitutions = tokenizer.substitutions
+        self.jsx_spans = tokenizer.jsx_spans
+        self.jsx_attributes = tokenizer.jsx_attributes
         self.match = match_brackets(self.tokens)
 
         self.imports: list[Import] = []
@@ -187,6 +195,27 @@ class TsFile:
             return self.lines[line - 1].strip()[:width]
         return ""
 
+    def names(self, start: int = 0, stop: int | None = None):
+        """Every identifier the code in [start, stop) names, template substitutions included.
+
+        The code inside a template's `${...}` is not in the flat token list (the
+        literal is one token), so a question of the form "is this name read
+        anywhere" asks here rather than of `tokens`. A JSX attribute name is
+        left out: `<Row title={x} />` refers to no binding called `title`.
+        """
+        stop = len(self.tokens) if stop is None else min(stop, len(self.tokens))
+        for index in range(start, stop):
+            token = self.tokens[index]
+            if token.kind == "name":
+                if index not in self.jsx_attributes:
+                    yield token
+            elif token.kind == "template":
+                yield from (t for t in self.substitutions.get(index, ()) if t.kind == "name")
+
+    def is_jsx_attribute(self, index: int) -> bool:
+        """True for the name of a JSX attribute: `onDone` in `onDone={onDone}`."""
+        return index in self.jsx_attributes
+
     def closer(self, index: int) -> int:
         """The matching bracket for the token at ``index``, or -1."""
         return self.match.get(index, -1)
@@ -195,6 +224,18 @@ class TsFile:
         """Index just past the bracket group opening at ``index``."""
         end = self.match.get(index, -1)
         return end + 1 if end >= 0 else index + 1
+
+    def comments_between(self, open_index: int, close_index: int) -> list[Token]:
+        """Comments lying between two tokens, e.g. inside a `{ }` pair.
+
+        Comments are not in the token stream, so they are located by character
+        offset; the arguments are token indices and are converted here, once,
+        rather than compared against comment offsets by each caller.
+        """
+        if not (0 <= open_index < close_index < len(self.tokens)):
+            return []
+        low, high = self.tokens[open_index].end, self.tokens[close_index].start
+        return [c for c in self.comments if low <= c.start and c.end <= high]
 
     def enclosing_function(self, index: int) -> Func | None:
         found = None

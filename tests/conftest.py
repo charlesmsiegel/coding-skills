@@ -115,9 +115,10 @@ SHARED_NAMES = (
     "find_module_issues", "find_mutation_hazards", "find_naming_issues", "find_outdated_idioms",
     "find_overengineering", "find_resource_leaks", "find_security_issues",
     "find_test_smells", "find_type_gaps", "find_untested_modules",
-    "format_findings", "imports", "inject_masthead", "jvmdecl", "lint_fragments",
-    "llmops", "manifests", "resources", "rubric", "run_external_tools", "runner",
-    "search_sources", "snowball", "sources", "verify_citations",
+    "format_findings", "imports", "inject_masthead", "jvmdecl", "lint_fragments", "llmops",
+    "manifests", "resources", "rubric", "run_external_tools", "runner",
+    "search_sources", "signature_contracts", "snowball", "sources",
+    "verify_citations",
 )
 
 

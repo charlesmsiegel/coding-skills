@@ -162,21 +162,40 @@ with timer("operation"):
     do_work()
 ```
 
-## Lost tracebacks → exception chaining
+## Unstated cause → exception chaining
 
-`find_exception_issues.py` flags `raise` without `from` inside an `except`.
+`find_exception_issues.py` flags `raise` without `from` inside an `except`
+(`raise_without_from`, low severity — Ruff's B904).
+
+Nothing is lost without `from`: Python 3 chains implicitly, so the original is
+kept as `__context__` and the traceback prints both. What changes is what the
+traceback *says*. Without `from` it reads "During handling of the above exception,
+another exception occurred" — as if the handler itself crashed. With `from e` it
+reads "The above exception was the direct cause of the following exception", and
+code that inspects `__cause__` can find it. `from None` says the opposite on
+purpose: the original is noise, hide it.
 
 ```python
 # Before
 except ValueError:
-    raise ProcessingError("Invalid")        # original cause lost
+    raise ProcessingError("Invalid")        # cause kept only as implicit __context__
 
 # After
 except ValueError as e:
-    raise ProcessingError("Invalid") from e
+    raise ProcessingError("Invalid") from e  # stated: this is the cause
 ```
 
+A web framework's `HTTPException` is reported only as a candidate: the framework
+turns it into a response and never prints its chain, so the missing `from` has
+no effect anyone sees.
+
 ## Intentional ignore → `contextlib.suppress`
+
+`find_exception_issues.py` reports a narrow `try: ... except X: pass` as
+`suppressible_exception` (low; Ruff's SIM105) — an idiom item, not a defect: the
+narrow catch *is* the handling, and the rewrite changes no behaviour. It is only
+reported for the shape suppress rewrites exactly: one handler, no `else`, no
+`finally`.
 
 ```python
 # Before

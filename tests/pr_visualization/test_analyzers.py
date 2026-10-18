@@ -499,3 +499,76 @@ def test_no_coverage_artifact_means_no_coverage_key(repo, tabs, run_script):
     )
 
     assert "coverage" not in summary
+
+
+def test_diff_reports_the_authors_of_the_range(repo, tabs, run_script):
+    """The report header names who made the change: every author in the range,
+    most commits first, and an uncommitted diff has none."""
+    repo.write("src/core.py", BASE_CORE)
+    repo.commit("base")
+    repo.git("config", "user.name", "Ada Lovelace")
+    repo.write("src/core.py", CHANGED_CORE)
+    repo.commit("first change")
+    repo.write("src/extra.py", "def extra():\n    return 1\n")
+    repo.commit("second change")
+    repo.git("config", "user.name", "Grace Hopper")
+    repo.write("src/more.py", "def more():\n    return 2\n")
+    repo.commit("third change")
+
+    summary = json.loads(
+        run_script(SCRIPTS / "analyze_diff.py", repo.path, "--tabs-dir", tabs, "--base", "HEAD~3").stdout
+    )
+    assert summary["authors"] == [{"name": "Ada Lovelace", "commits": 2},
+                                  {"name": "Grace Hopper", "commits": 1}]
+    footprint = (tabs / "02-footprint.html").read_text(encoding="utf-8")
+    assert "Ada Lovelace" in footprint and "Grace Hopper" in footprint
+
+    repo.write("src/more.py", "def more():\n    return 3\n")
+    worktree = json.loads(
+        run_script(SCRIPTS / "analyze_diff.py", repo.path, "--tabs-dir", tabs,
+                   "--base", "HEAD", "--worktree").stdout
+    )
+    assert worktree["authors"] == []
+
+
+def test_worktree_review_of_a_branch_keeps_its_committed_authors(repo, tabs, run_script):
+    """`--worktree` on a feature branch diffs everything since the base, the
+    committed part included — and that part has authors. Initialising the
+    commit list to empty in worktree mode reported `authors: []` for the most
+    common way of reviewing one's own branch."""
+    repo.git("checkout", "-qb", "main")
+    repo.write("src/core.py", BASE_CORE)
+    repo.commit("base")
+    repo.git("checkout", "-qb", "feature")
+    repo.git("config", "user.name", "Ada Lovelace")
+    repo.write("src/core.py", CHANGED_CORE)
+    repo.commit("committed on the branch")
+    repo.write("src/extra.py", "def extra():\n    return 1\n")  # uncommitted
+
+    summary = json.loads(
+        run_script(SCRIPTS / "analyze_diff.py", repo.path, "--tabs-dir", tabs,
+                   "--base", "main", "--worktree").stdout
+    )
+    assert summary["authors"] == [{"name": "Ada Lovelace", "commits": 1}]
+    assert summary["commits"] == 1
+    assert {f["path"] for f in summary["risk_ordered_files"]} >= {"src/core.py", "src/extra.py"}
+
+
+def test_diff_breaks_an_author_tie_by_who_committed_first(repo, tabs, run_script):
+    """`git log` lists the range newest-first. Enumerating it in that order makes
+    "first appearance" mean the *last* commit, so a tie names the wrong author
+    first — the reviewer reads the change as having started with them."""
+    repo.write("src/core.py", BASE_CORE)
+    repo.commit("base")
+    repo.git("config", "user.name", "Ada Lovelace")
+    repo.write("src/core.py", CHANGED_CORE)
+    repo.commit("first change")
+    repo.git("config", "user.name", "Grace Hopper")
+    repo.write("src/more.py", "def more():\n    return 2\n")
+    repo.commit("second change")
+
+    summary = json.loads(
+        run_script(SCRIPTS / "analyze_diff.py", repo.path, "--tabs-dir", tabs, "--base", "HEAD~2").stdout
+    )
+    assert summary["authors"] == [{"name": "Ada Lovelace", "commits": 1},
+                                  {"name": "Grace Hopper", "commits": 1}]

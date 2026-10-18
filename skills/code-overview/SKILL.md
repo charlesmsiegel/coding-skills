@@ -89,6 +89,14 @@ python "$DOCTOR/scripts/merge_reports.py" \
   --out $WORK/merged.json --format json
 ```
 
+**Audit the project's declared Django version.** For a health review, pass
+`--target-version <declared major.minor>` to `django-code-doctor`'s
+`analyze_django.py`. Its default target is the newest release in its upgrade
+table; that is an upgrade-readiness question, not evidence that the installed
+project is broken. Use a newer target only when the user requested an upgrade,
+and name that target in the report. If no version can be established, state the
+gap rather than silently treating upgrade findings as current defects.
+
 **Not once per package directory.** This is the step that is easy to get wrong
 and expensive to get wrong, because the failure is silent. Pointed at
 `src/billing` instead, a doctor cannot see the repo's `pyproject.toml` or its
@@ -121,12 +129,19 @@ layer can prove.
 
 For each package in the map, with `ROOTS` its roots and `DOCS` its docs dir:
 
-**The atlas.** Run the full `code-visualization` workflow scoped to the package's
-roots, `--out <DOCS>/codemap.html`. **Pass `--exclude docs` to its analyzers** —
-otherwise a rebuild counts the previously-generated HTML as source, and a small
-package's inventory tab ends up describing its own documentation. Scale judgment
-tabs to size: a 400-line package may warrant the automated tabs only, and
-code-visualization's own proportion rule covers this.
+**The atlas.** Run the full `code-visualization` workflow from the repo root,
+scoped to the package's roots by passing each analyzer `--root <root>` once per
+root, `--out <DOCS>/codemap.html`. Point the analyzers at the repo, not at a root:
+they still read the rest of it for context (a root-level `go.mod` or
+`tsconfig.json`, the sibling package an import lands in), report only what is
+under the roots, and list the edges that leave them as `outside_roots`. Do not
+reach for `--exclude` to carve a package out — it matches directory names, so
+excluding a top-level `scripts` also drops `tests/scripts`. **Do pass
+`--exclude docs` to its analyzers** — otherwise a rebuild counts the
+previously-generated HTML as source, and a small package's inventory tab ends up
+describing its own documentation. Scale judgment tabs to size: a 400-line
+package may warrant the automated tabs only, and code-visualization's own
+proportion rule covers this.
 
 **The measurement audit.** Run `science-investigation`'s scripts **once from the
 repo root** — pointed at a package, `find_metrics.py` cannot see `evals/` and
@@ -147,7 +162,9 @@ that is the correct output.
 
 Pass `--template "$SKILL/assets/template.html"` to `code-visualization`'s
 `assemble.py` too. That one flag is what makes the five documents read as one
-artifact instead of three tools' output.
+artifact instead of three tools' output. It changes the look only: `assemble.py`
+inlines code-visualization's own renderers (graphs, treemaps, Mermaid, sortable
+tables) into whichever shell it is given.
 
 **The grade.** Pass the merged envelope from step 2; `build_health.py` partitions
 its findings and candidates by path, so each package's page carries only
@@ -205,6 +222,13 @@ one line, so an identity's count is the maximum any report gave it, not the sum.
 ungrades its *whole* rubric category — skipping `exception_issues` ungrades
 Correctness — because a partly-measured category can only miss findings, never
 invent them. That is correct behaviour, but it shrinks what the grade covers.
+
+**Candidate display is bounded, analysis is not.** `build_health.py` renders at
+most 100 candidate rows by default (`--candidate-limit N`). The Candidates tab
+states shown, total and omitted counts, and metadata records `candidates_shown`
+beside `candidates_total`. This does not change findings, grades or coverage.
+Retain the complete merged JSON when an audit needs every candidate location;
+raising the display limit is not required to preserve the audit evidence.
 
 **The summary.** Write a short HTML fragment first — what this package is, why it
 is shaped this way, what you noticed reading it — and pass it as `--intro-file`.

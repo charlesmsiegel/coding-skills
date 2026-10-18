@@ -9,7 +9,7 @@ are the leaks that show up as "it gets slower the longer you leave it open".
 """
 
 from common import Reporter, is_test_file, run_file_detector
-from tsparse import TsFile, iter_calls
+from tsparse import TsFile, imported_identity, iter_calls
 
 # acquire -> (release, what leaks, severity)
 PAIRS = {
@@ -35,6 +35,18 @@ RELEASE_ALIASES = {
 # React cleanup lives in the function an effect returns; a `return` inside a
 # useEffect callback is the release path.
 EFFECT_HOOKS = frozenset({"useEffect", "useLayoutEffect", "useInsertionEffect"})
+
+# `open` is the one acquire name that is also an everyday verb: a dialog's
+# `open()`, a drawer state setter, a viewer's `open(id)`. Only a file-system
+# `open` returns a handle that must be closed, so that is the only one counted:
+# called on an fs module (`fs.open`, `fs.promises.open`, `fsPromises.open`), or
+# bare when this file imports `open` from one.
+FS_MODULES = frozenset({"fs", "node:fs", "fs/promises", "node:fs/promises"})
+FS_OPEN_NAMES = {module + ".open" for module in FS_MODULES} | {"fs.promises.open", "node:fs.promises.open"}
+
+
+def _is_resource_call(file: TsFile, callee: str, method: str, paren: int) -> bool:
+    return method != "open" or imported_identity(file, callee, paren) in FS_OPEN_NAMES
 
 
 def _released_names(file: TsFile) -> set[str]:
@@ -77,7 +89,11 @@ def _check_pairs(file: TsFile, report: Reporter) -> None:
     released = _released_names(file)
     for paren, callee in iter_calls(file):
         method = callee.rsplit(".", 1)[-1]
+        if imported_identity(file, callee, paren) in FS_OPEN_NAMES:
+            method = "open"  # `import { open as openFile }` retains its resource contract
         if method not in PAIRS:
+            continue
+        if not _is_resource_call(file, callee, method, paren):
             continue
         release, cost, severity = PAIRS[method]
         aliases = RELEASE_ALIASES.get(release, {release})

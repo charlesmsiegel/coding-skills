@@ -134,12 +134,11 @@ def _scan(path, text):
                     + " attributes inside "
                     "the loop opened on line " + str(loop_line) + " — one query per row unless it "
                     "is prefetched",
-                    "select_related/prefetch_related '" + "__".join(relation_parts[:-1]) + "' on "
-                    "the queryset the view passes in.",
-                    "high",
-                    also_caused_by=(
+                    (
                         "the relation is already loaded by select_related() or prefetch_related()",
-                    )))
+                        "the queryset the view passes in is small enough that N+1 is not measurable",
+                    ),
+                    "high"))
 
         # ---- forms and CSRF ------------------------------------------------ #
         form_match = _FORM_OPEN_RE.search(line)

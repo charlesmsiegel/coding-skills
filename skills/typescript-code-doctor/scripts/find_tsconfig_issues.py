@@ -10,15 +10,21 @@ error in the language.
 
 Also the only detector here that reads JSON rather than TypeScript, so it
 carries its own JSONC reader: tsconfig files are full of comments and trailing
-commas that `json.loads` rejects.
+commas that `json.loads` rejects — and `compiler_options()`, which resolves the
+options that govern one source file, for the detectors whose verdict depends on
+a compiler flag (whether a missing `import type` changes the emitted code,
+whether the compiler already checks a switch for exhaustiveness).
 """
 
 import contextlib
+import fnmatch
+import functools
 import json
+import posixpath
 import re
 from pathlib import Path
 
-from common import EXCLUDE_DIRS, Finding, run_tree_detector
+from common import Finding, find_ts_files, project_root_of, run_tree_detector, walk_tree
 
 # option -> (severity, what it costs to leave it off)
 STRICT_FAMILY = {
@@ -101,6 +107,119 @@ def load_jsonc(path: Path) -> dict | None:
     return data if isinstance(data, dict) else None
 
 
+@functools.lru_cache(maxsize=None)
+def _resolved_options(config: Path, depth: int = 0) -> tuple[dict, bool] | None:
+    """(compilerOptions with `extends` merged in, whether the chain resolved fully).
+
+    A base is merged first and the config's own options override it, which is
+    tsc's order. A base this reader cannot find — a package under an absent
+    `node_modules`, a path that does not exist — leaves the result incomplete
+    rather than wrong: the flag says so, and a caller deciding on an option
+    that might be inherited treats it as unknown.
+    """
+    data = load_jsonc(config)
+    if data is None or depth > 8:
+        return None
+    options: dict = {}
+    complete = True
+    extends = data.get("extends")
+    bases = [extends] if isinstance(extends, str) else extends if isinstance(extends, list) else []
+    for base in bases:
+        base_path = _extended_config(config.parent, str(base))
+        inherited = _resolved_options(base_path, depth + 1) if base_path is not None else None
+        if inherited is None:
+            complete = False
+            continue
+        options.update(inherited[0])
+        complete = complete and inherited[1]
+    own = data.get("compilerOptions")
+    if isinstance(own, dict):
+        options.update(own)
+    return options, complete
+
+
+def _extended_config(directory: Path, spec: str) -> Path | None:
+    """The file an `extends` entry names: a relative path, or a package's config."""
+    candidates = []
+    if spec.startswith("."):
+        candidates = [directory / spec, directory / f"{spec}.json"]
+    else:
+        for ancestor in (directory, *directory.parents):
+            modules = ancestor / "node_modules" / spec
+            candidates += [modules, Path(f"{modules}.json"), modules / "tsconfig.json"]
+    return next((c.resolve() for c in candidates if c.is_file()), None)
+
+
+def _includes(config: Path, data: dict, filepath: Path) -> bool:
+    """Whether a referenced project's `include` (or `files`) covers ``filepath``."""
+    try:
+        relative = filepath.resolve().relative_to(config.parent.resolve()).as_posix()
+    except ValueError:
+        return False
+    files = data.get("files")
+    if isinstance(files, list) and any(posixpath.normpath(str(f)) == relative for f in files):
+        return True
+    include = data.get("include")
+    if not isinstance(include, list):
+        # Absent here: everything below by default, or an `include` inherited
+        # through `extends`, which this reader does not follow — so not a "no".
+        return not isinstance(files, list)
+    for pattern in include:
+        pattern = posixpath.normpath(str(pattern))
+        if pattern == "." or fnmatch.fnmatch(relative, pattern) or relative.startswith(pattern + "/"):
+            return True
+    return False
+
+
+def compiler_options(filepath: Path) -> dict | None:
+    """The compiler options that govern ``filepath``, or None when they cannot be known.
+
+    The nearest `tsconfig.json` at or above the file's directory, within its
+    project root, with `extends` merged. A solution-style config (one that
+    lists `references` and compiles nothing itself, as Vite's template does)
+    governs nothing: the referenced config whose `include` covers the file
+    does. None means "unknown" — no config, an unparseable one, or a base that
+    could not be found — and a detector that asks must not read it as "off".
+    """
+    root = project_root_of(filepath)
+    directory = filepath.resolve().parent
+    for candidate in (directory, *directory.parents):
+        config = candidate / "tsconfig.json"
+        if config.is_file():
+            break
+        if root is not None and candidate == root:
+            return None
+    else:
+        return None
+    data = load_jsonc(config)
+    if data is None:
+        return None
+    references = data.get("references")
+    if isinstance(references, list) and references and data.get("files") == []:
+        for reference in references:
+            target = config.parent / str(reference.get("path", "")) if isinstance(reference, dict) else None
+            if target is not None and target.is_dir():
+                target = target / "tsconfig.json"
+            referenced = load_jsonc(target) if target is not None and target.is_file() else None
+            if referenced is not None and _includes(target, referenced, filepath):
+                config = target.resolve()
+                break
+        else:
+            return None
+    elif not _includes(config, data, filepath):
+        return None  # tsc never compiles this file under that config
+    resolved = _resolved_options(config.resolve())
+    if resolved is None or not resolved[1]:
+        return None
+    return resolved[0]
+
+
+def strict_null_checks(options: dict) -> bool:
+    """Whether `strictNullChecks` is in effect: set itself, or implied by `strict`."""
+    explicit = options.get("strictNullChecks")
+    return explicit is True or (explicit is None and options.get("strict") is True)
+
+
 def _line_of(path: Path, option: str) -> int:
     # An unreadable file simply has no better line than 1 to point at; the
     # caller has already reported the real problem.
@@ -114,19 +233,14 @@ def _line_of(path: Path, option: str) -> int:
 def _configs(root: Path) -> list[Path]:
     if root.is_file():
         return [root] if root.name.startswith("tsconfig") else []
-    found = [p for p in root.rglob("tsconfig*.json")
-             if EXCLUDE_DIRS.isdisjoint(p.relative_to(root).parts)]
+    found = [p for p in walk_tree(root)
+             if p.name.startswith("tsconfig") and p.suffix == ".json"]
     found.sort(key=lambda p: (len(p.relative_to(root).parts), str(p)))
-    return found[:10]
+    return found
 
 
 def _has_typescript(root: Path) -> bool:
-    if root.is_file():
-        return root.suffix in (".ts", ".tsx")
-    for candidate in root.rglob("*.ts"):
-        if EXCLUDE_DIRS.isdisjoint(candidate.relative_to(root).parts):
-            return True
-    return False
+    return any(True for _ in find_ts_files(root))
 
 
 def _finding(path: Path, line: int, smell: str, description: str, suggestion: str, severity: str) -> Finding:

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Find debugging aids that were never taken back out: `debugger`, console noise,
-`alert`, and blanket lint suppressions.
+blocking dialogs nobody acts on, and blanket lint suppressions.
 
 A `debugger` statement in shipped code freezes the tab for anyone with devtools
 open. A blanket `eslint-disable` at the top of a file silently exempts every
@@ -12,7 +12,7 @@ most repositories.
 import re
 
 from common import Reporter, is_test_file, run_file_detector
-from tsparse import TsFile, iter_calls
+from tsparse import TsFile, iter_calls, statement_end, statement_start
 
 CONSOLE_NOISE = frozenset({"log", "debug", "trace", "dir", "table", "count", "time", "timeEnd", "group"})
 BROWSER_DIALOGS = frozenset({"alert", "confirm", "prompt"})
@@ -43,13 +43,44 @@ def _check_console(file: TsFile, report: Reporter) -> None:
                    "be switched off. Console output survives into production bundles.", "medium")
 
 
+def _result_used(file: TsFile, paren: int, callee: str) -> bool:
+    """True unless the call is a whole statement whose value nobody reads."""
+    head = paren - 1 - 2 * callee.count(".")
+    if statement_start(file, head) != head:
+        return True  # `if (!confirm(…))`, `const name = prompt(…)`, `return confirm(…)`
+    close = file.closer(paren)
+    end = statement_end(file, head)
+    return not (close + 1 == end or (close + 1 < len(file) and file.tokens[close + 1].is_op(";")))
+
+
 def _check_dialogs(file: TsFile, report: Reporter) -> None:
+    """Browser dialogs, by what the call is doing.
+
+    A `confirm()` or `prompt()` whose answer gates what happens next
+    (`if (!confirm("Delete?")) return`) is deliberate UI, not a leftover; that
+    it blocks the page is the reason it was chosen. One whose answer is thrown
+    away asks a question nobody reads — that is the leftover. A bare `alert()`
+    can be either a forgotten probe or an app's way of surfacing an error, so
+    it is a lead.
+    """
     for paren, callee in iter_calls(file):
-        if callee in BROWSER_DIALOGS or callee.startswith("window.") and callee.split(".")[-1] in BROWSER_DIALOGS:
-            report.add(file.tokens[paren].line, "browser_dialog",
-                       f"`{callee}(…)` blocks the whole page",
-                       "Use the application's own dialog. `alert`/`confirm` freeze the event loop "
-                       "and are unstyleable and untestable.", "medium")
+        method = callee.split(".")[-1]
+        if not (callee in BROWSER_DIALOGS or callee.startswith("window.") and method in BROWSER_DIALOGS):
+            continue
+        line = file.tokens[paren].line
+        if method == "alert":
+            report.candidate(line, "browser_dialog",
+                             f"`{callee}(…)` blocks the whole page",
+                             ("it is how this app deliberately surfaces an error or a "
+                              "confirmation, and it has no dialog component of its own",
+                              "the code is an internal tool or prototype where a blocking "
+                              "dialog is acceptable"),
+                             "low")
+        elif not _result_used(file, paren, callee):
+            report.add(line, "browser_dialog",
+                       f"`{callee}(…)` asks a question and discards the answer",
+                       "Delete it, or act on the answer. A blocking dialog nobody reads is a "
+                       "debugging aid left behind.", "medium")
 
 
 def _check_lint_suppressions(file: TsFile, report: Reporter) -> None:

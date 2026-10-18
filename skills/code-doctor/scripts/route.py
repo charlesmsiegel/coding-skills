@@ -20,6 +20,7 @@ Over-routing fabricates findings.
 from __future__ import annotations
 
 import argparse
+import ast
 import json
 import sys
 import tomllib
@@ -32,6 +33,7 @@ from common import (
     configure_output,
     fail_on_bad_path,
     read_text,
+    is_installed_skill,
     walk_files,
 )
 
@@ -132,6 +134,26 @@ def _package_json_dependencies(text: str) -> list[str]:
     return names
 
 
+def is_setup_script(path: Path) -> bool:
+    """Whether a file named `setup.py` is a packaging script.
+
+    The name alone is not evidence: `app/setup.py` holding a `setup` command
+    is a module of the package it sits in. A packaging script imports
+    setuptools or distutils to call their `setup()`.
+    """
+    try:
+        tree = ast.parse(read_text(path))
+    except (OSError, SyntaxError):
+        return False
+    return any(
+        (isinstance(node, ast.Import)
+         and any(alias.name.split(".")[0] in {"setuptools", "distutils"} for alias in node.names))
+        or (isinstance(node, ast.ImportFrom)
+            and node.level == 0 and (node.module or "").split(".")[0] in {"setuptools", "distutils"})
+        for node in ast.walk(tree)
+    )
+
+
 def _gather(root: Path) -> dict[str, list[Path]]:
     """One walk, classifying every file this router might use as evidence."""
     found: dict[str, list[Path]] = {
@@ -139,11 +161,14 @@ def _gather(root: Path) -> dict[str, list[Path]]:
         "package_json": [], "tsconfig": [], "manage_py": [], "python_source": [],
     }
     for path in walk_files(root, source_only=False):
+        if is_installed_skill(path.relative_to(root).parts):
+            continue
         name = path.name
         if name == "pyproject.toml":
             found["pyproject"].append(path)
         elif name == "setup.py":
-            found["setup_py"].append(path)
+            if is_setup_script(path):
+                found["setup_py"].append(path)
         elif name.startswith("requirements") and name.endswith(".txt"):
             found["requirements"].append(path)
         elif name == "package.json":
@@ -198,7 +223,7 @@ def _settings_with_installed_apps(manage_files: list[Path]) -> list[Path]:
     for manage in manage_files:
         for candidate in sorted(manage.parent.rglob("*.py")):
             relative = candidate.relative_to(manage.parent)
-            if any(part in EXCLUDE_DIRS for part in relative.parts):
+            if any(part in EXCLUDE_DIRS for part in relative.parts) or is_installed_skill(relative.parts):
                 continue
             if "INSTALLED_APPS" in _safe_read(candidate):
                 hits.append(candidate)

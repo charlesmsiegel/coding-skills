@@ -11,7 +11,7 @@ spot — the escape hatch is written down in the source.
 import re
 
 from common import Reporter, is_test_file, run_file_detector
-from tsparse import RESERVED, TsFile
+from tsparse import RESERVED, TsFile, is_definite_assignment
 
 # Types that accept more than the author means. `Function` accepts any callable
 # and returns `any`; the boxed wrappers are not the primitives; `{}` means
@@ -60,6 +60,8 @@ def _check_any(file: TsFile, report: Reporter, test: bool) -> None:
                        "Use `unknown` and narrow at the read site, or enumerate the keys "
                        "(`Record<'a' | 'b', T>`).", "high")
             continue
+        if _catch_binding_any(file, index) >= 0:
+            continue  # `catch (e: any)` is catch_typed_any's, the more specific claim
         container = "" if following is None else following.value
         report.add(token.line, "explicit_any",
                    f"Explicit `any`{' in a generic argument' if container == '>' else ''} — "
@@ -94,10 +96,14 @@ def _check_assertions(file: TsFile, report: Reporter, test: bool) -> None:
             # predicate is the sanctioned narrowing idiom — the assertion is
             # what the function exists to justify.
             continue
-        report.add(token.line, "type_assertion",
-                   f"Type assertion `as {nxt.value}` — asserted, not checked",
-                   "An assertion moves a compile-time error to runtime. Prefer a type guard, "
-                   "a discriminated union, or `satisfies` when you only want the literal checked.", "low")
+        report.candidate(token.line, "type_assertion",
+                         f"Type assertion `as {nxt.value}` — asserted, not checked",
+                         ("the value was just narrowed by a runtime check the compiler cannot follow",
+                          "the assertion sits at a serialization boundary — JSON.parse, a DOM "
+                          "lookup — where the shape is known by contract",
+                          "the assertion widens rather than narrows — `as const`, `as unknown` "
+                          "before a checked narrowing — and cannot hide a shape mismatch"),
+                         "low")
 
 
 def _in_type_guard(file: TsFile, index: int) -> bool:
@@ -106,7 +112,7 @@ def _in_type_guard(file: TsFile, index: int) -> bool:
     return func is not None and " is " in f" {func.return_type} "
 
 
-def _check_non_null(file: TsFile, report: Reporter) -> None:
+def _check_non_null(file: TsFile, report: Reporter, test: bool) -> None:
     for index, token in enumerate(file.tokens):
         if not token.is_op("!") or index == 0:
             continue
@@ -114,10 +120,27 @@ def _check_non_null(file: TsFile, report: Reporter) -> None:
         postfix = previous.kind in ("name", "num", "str", "template") or previous.is_op(")", "]")
         if not postfix or previous.is_name(*RESERVED - {"this", "super", "null", "undefined"}):
             continue
+        if is_definite_assignment(file, index):
+            # `let x!: T` is a different construct: it promises an assignment
+            # the compiler cannot see, not a value at a use site. In a test it
+            # is the idiom for capturing a Promise's resolver, so it is left out.
+            if not test:
+                report.candidate(token.line, "definite_assignment_assertion",
+                                 f"Definite-assignment assertion `{previous.value}!:` — the "
+                                 "compiler is told this is assigned before it is read",
+                                 ("a framework assigns the field — dependency injection, an ORM, "
+                                  "a view query — which is the one use the assertion exists for",
+                                  "the value is assigned inside a callback the compiler cannot "
+                                  "follow, such as a Promise executor handing out its resolver"),
+                                 "low")
+            continue
+        # In a test a wrong `!` throws and fails the test, which is the same
+        # lighter claim the other escape hatches make there.
         report.add(token.line, "non_null_assertion",
                    "Non-null assertion `!` — claims a value is present without checking",
                    "If it can be absent, handle it (`?.`, a guard, a default). If it truly cannot, "
-                   "make the type say so rather than overriding it at every use site.", "medium")
+                   "make the type say so rather than overriding it at every use site.",
+                   "low" if test else "medium")
 
 
 def _check_directives(file: TsFile, report: Reporter) -> None:
@@ -188,27 +211,46 @@ def _check_signatures(file: TsFile, report: Reporter) -> None:
                            "Annotate it. Without `noImplicitAny` this is silently `any`; with it, "
                            "the build breaks for every caller instead of here.", "medium")
         if not func.return_type and not _is_component(func) and func.has_body:
-            report.add(func.line, "missing_return_type",
-                       f"Exported {func.kind} `{func.qualname}` has no declared return type",
-                       "Declare it. An inferred return type is a contract nobody wrote down, and it "
-                       "changes silently when the body changes.", "low")
+            report.candidate(func.line, "missing_return_type",
+                             f"Exported {func.kind} `{func.qualname}` has no declared return type",
+                             ("the body returns one literal or one constructor call, so the "
+                              "inferred type is stable",
+                              "the project relies on inference by convention and reviews "
+                              "signature changes in diffs"),
+                             "low")
+
+
+def _catch_binding_any(file: TsFile, any_index: int) -> int:
+    """Index of the `catch` keyword when the `any` at ``any_index`` types its binding, else -1.
+
+    `catch (e: any)` exactly — not `.catch(cb)`, which is a method call. One
+    `any` token is one defect: _check_catch_clauses reports it as the specific
+    catch_typed_any, and _check_any skips it rather than charging it again as
+    explicit_any.
+    """
+    keyword = any_index - 4
+    if keyword < 0 or not file.tokens[keyword].is_name("catch"):
+        return -1
+    if keyword and file.tokens[keyword - 1].is_op(".", "?."):
+        return -1
+    opener, binding, colon = file.tokens[keyword + 1], file.tokens[keyword + 2], file.tokens[keyword + 3]
+    if opener.is_op("(") and binding.kind == "name" and colon.is_op(":"):
+        return keyword
+    return -1
 
 
 def _check_catch_clauses(file: TsFile, report: Reporter) -> None:
-    """`catch (e: any)` exactly — not `.catch(cb)`, which is a method call."""
     for index, token in enumerate(file.tokens):
-        if not token.is_name("catch") or index + 4 >= len(file):
+        if not token.is_name("any"):
             continue
-        if index and file.tokens[index - 1].is_op(".", "?."):
+        keyword = _catch_binding_any(file, index)
+        if keyword < 0:
             continue
-        if not file.tokens[index + 1].is_op("("):
-            continue
-        binding, colon, annotation = file.tokens[index + 2], file.tokens[index + 3], file.tokens[index + 4]
-        if binding.kind == "name" and colon.is_op(":") and annotation.is_name("any"):
-            report.add(token.line, "catch_typed_any",
-                       f"`catch ({binding.value}: any)` — the caught value is unchecked",
-                       "Type it `unknown` and narrow (`e instanceof Error`). A thrown value can be "
-                       "anything, so `any` here hides exactly the case that surprises you.", "medium")
+        binding = file.tokens[keyword + 2]
+        report.add(file.tokens[keyword].line, "catch_typed_any",
+                   f"`catch ({binding.value}: any)` — the caught value is unchecked",
+                   "Type it `unknown` and narrow (`e instanceof Error`). A thrown value can be "
+                   "anything, so `any` here hides exactly the case that surprises you.", "medium")
 
 
 def _check_optional_soup(file: TsFile, report: Reporter) -> None:
@@ -218,12 +260,14 @@ def _check_optional_soup(file: TsFile, report: Reporter) -> None:
             continue
         optional = [m for m in members if m.optional]
         if len(optional) / len(members) >= 0.8:
-            report.add(decl.line, "all_optional_type",
-                       f"`{decl.name}` has {len(optional)} of {len(members)} members optional — "
-                       "the type permits an empty object",
-                       "Split it into the states that actually occur (a discriminated union), or make "
-                       "the required fields required. A type where everything is optional checks nothing.",
-                       "medium")
+            report.candidate(decl.line, "all_optional_type",
+                             f"`{decl.name}` has {len(optional)} of {len(members)} members optional — "
+                             "the type permits an empty object",
+                             ("it is a partial-update or patch payload where every field is "
+                              "legitimately optional",
+                              "it is an options bag with a meaningful default for every member",
+                              "it mirrors an external schema that is genuinely all-optional"),
+                             "medium")
 
 
 def analyze(file: TsFile, ignore: set[str]) -> list:
@@ -233,7 +277,7 @@ def analyze(file: TsFile, ignore: set[str]) -> list:
     test = is_test_file(file.path)
     _check_any(file, report, test)
     _check_assertions(file, report, test)
-    _check_non_null(file, report)
+    _check_non_null(file, report, test)
     _check_directives(file, report)
     _check_builtin_types(file, report)
     _check_empty_object_type(file, report)

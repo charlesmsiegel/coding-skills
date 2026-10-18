@@ -1687,3 +1687,23 @@ def test_an_orphan_file_does_not_justify_a_dependency(tmp_path):
     unused = [f for f in findings
               if f["smell_type"] == "unused_dependency" and "anyhow" in f["description"]]
     assert unused, "an orphan file's import kept `anyhow` looking used"
+
+
+def test_marker_words_inside_prose_are_not_debt_markers(tmp_path):
+    """`todo` as the name of a subcommand, or `hack` in a sentence, is vocabulary.
+    A marker sits at the start of the comment or is tagged with `:`/`(`."""
+    target = write(tmp_path, {"lib.rs": """\
+// the key of a default run: `evals todo` then `evals run`
+// the retry hack above is what the old client did; keep it until v2 ships
+/* the grammar accepts \\uXXXX anywhere a basic character may appear */
+pub fn a() -> u32 { 1 }
+// TODO: handle the empty case
+// FIXME(alice) negative inputs
+// XXX this is fragile
+// see TODO: retry budget
+pub fn b() -> u32 { 2 }
+"""}) / "lib.rs"
+    lines = sorted(f["line"] for f in run_detector("find_comment_smells.py", target)
+                   if f["smell_type"] == "debt_marker")
+
+    assert lines == [5, 6, 7, 8]

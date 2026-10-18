@@ -93,7 +93,7 @@ it as a finding.
 
 | Finding | The judgment |
 |---|---|
-| `boolean_without_predicate_name` | Does `true` mean the obvious thing? If it needs a comment, rename it. |
+| `boolean_without_predicate_name` | A candidate: does `true` mean the obvious thing? If it needs a comment, rename it. Not reported: a snake_case member (it mirrors a wire format the code does not own), a DOM/ARIA boolean attribute (`open`, `checked`, `defaultOpen`, `expanded`), or a name that already states a fact (`galleryOpen`, `loading`, `editable`, `shadowed`, `pathExists`, `atDefault`). |
 | `hungarian_interface_prefix` | Drop `I`. |
 | `underscore_without_private` | Use the modifier. |
 | `shadows_browser_global` | Rename, or accept it with a comment if it is idiomatic in your framework. |

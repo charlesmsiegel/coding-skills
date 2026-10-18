@@ -33,7 +33,7 @@ import argparse
 import subprocess
 from pathlib import Path
 from collections import defaultdict, Counter
-from common import SEVERITY_ICONS, configure_output
+from common import SEVERITY_ICONS, configure_output, drop_aliased
 
 # Per-file detectors only. Each is meaningful on a single file and reports a line
 # within that file. Whole-repo detectors are excluded on purpose (see module docstring).
@@ -340,6 +340,7 @@ def collect(base, all_lines, scripts=None):
         if key not in seen:
             seen.add(key)
             unique.append(f)
+    unique = drop_aliased(unique)  # one defect two detectors name differently is listed once
     rank = {"high": 0, "medium": 1, "low": 2}
     unique.sort(key=lambda f: (rank.get(f.get("severity", "medium"), 1), str(f.get("file")), f.get("line", 0)))
     return files, unique
@@ -359,17 +360,30 @@ def print_text(files, findings, base):
     if not findings:
         print("✅ No findings on the changed lines.")
         return
+    # A candidate is a lead, not a defect: it is counted apart from the findings
+    # and kept out of the severity tally, which is a ranking of proven defects.
+    proven = [f for f in findings if f.get("kind") != "candidate"]
+    candidates = [f for f in findings if f.get("kind") == "candidate"]
     by_sev = defaultdict(int)
-    for f in findings:
+    for f in proven:
         by_sev[f.get("severity", "medium")] += 1
-    print(f"Findings on changed lines: {len(findings)}  "
+    print(f"On changed lines: {len(proven)} finding(s), {len(candidates)} candidate(s)  "
           f"({_ICON['high']} {by_sev['high']}  {_ICON['medium']} {by_sev['medium']}  {_ICON['low']} {by_sev['low']})\n")
     for f in findings:
         sev = f.get("severity", "medium")
-        print(f"{_ICON.get(sev, '')} [{sev.upper()}] {f.get('file', '?')}:{f.get('line', '?')}")
+        # Marked as django_report.render marks it: a lead is not a defect, and a
+        # severity icon on one reads as a verdict the evidence does not support.
+        marker = ("? [CANDIDATE]" if f.get("kind") == "candidate"
+                  else f"{_ICON.get(sev, '')} [{sev.upper()}]")
+        print(f"{marker} {f.get('file', '?')}:{f.get('line', '?')}")
         print(f"   {_type_of(f)}: {f.get('description', '')}")
+        # A candidate has no fix to print — an empty arrow reads as one that was
+        # forgotten. What it has is the benign readings the reader must rule out.
         if f.get("suggestion"):
             print(f"   → {f['suggestion']}")
+        if f.get("kind") == "candidate":
+            for reason in f.get("also_caused_by") or []:
+                print(f"   ? also caused by: {reason}")
         print()
 
 

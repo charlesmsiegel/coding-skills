@@ -320,19 +320,31 @@ def print_text(files, findings, base):
         print("   The compiler was not run: `cargo check` needs the whole crate. Run")
         print("   run_external_tools.py separately before calling the change clean.")
         return
+    # A candidate is a lead, not a defect: it is counted apart from the findings
+    # and kept out of the severity tally, which is a ranking of proven defects.
+    proven = [f for f in findings if f.get("kind") != "candidate"]
+    candidates = [f for f in findings if f.get("kind") == "candidate"]
     by_severity = defaultdict(int)
-    for finding in findings:
+    for finding in proven:
         by_severity[finding.get("severity", "medium")] += 1
-    print(f"Findings on changed lines: {len(findings)}  "
+    print(f"On changed lines: {len(proven)} finding(s), {len(candidates)} candidate(s)  "
           f"({_ICON['high']} {by_severity['high']}  {_ICON['medium']} {by_severity['medium']}  "
           f"{_ICON['low']} {by_severity['low']})\n")
     for finding in findings:
         severity = finding.get("severity", "medium")
-        print(f"{_ICON.get(severity, '')} [{severity.upper()}] "
-              f"{finding.get('file', '?')}:{finding.get('line', '?')}")
+        # Marked as django_report.render marks it: a lead is not a defect, and a
+        # severity icon on one reads as a verdict the evidence does not support.
+        marker = ("? [CANDIDATE]" if finding.get("kind") == "candidate"
+                  else f"{_ICON.get(severity, '')} [{severity.upper()}]")
+        print(f"{marker} {finding.get('file', '?')}:{finding.get('line', '?')}")
         print(f"   {finding.get('smell_type', 'issue')}: {finding.get('description', '')}")
+        # A candidate has no fix to print — an empty arrow reads as one that was
+        # forgotten. What it has is the benign readings the reader must rule out.
         if finding.get("suggestion"):
             print(f"   → {finding['suggestion']}")
+        if finding.get("kind") == "candidate":
+            for reason in finding.get("also_caused_by") or []:
+                print(f"   ? also caused by: {reason}")
         print()
 
 

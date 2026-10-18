@@ -83,3 +83,23 @@ def test_no_script_writes_to_the_tree_it_audits(project, script, extra):
     run(script, extra, project)
     after = {p: p.stat().st_mtime_ns for p in project.rglob("*") if p.is_file()}
     assert before == after
+
+
+@pytest.mark.parametrize("script,extra", INVOCATIONS)
+def test_every_script_runs_in_isolated_mode(project, script, extra, tmp_path):
+    """`python -I` leaves the script's own directory off sys.path — the mode to
+    use on an untrusted checkout — and `import common` failed before a line ran."""
+    result = subprocess.run(
+        [sys.executable, "-I", str(SCRIPTS / script), *extra, str(project), "--format", "json"],
+        capture_output=True, text=True, timeout=120, cwd=tmp_path,
+    )
+    assert result.returncode == 0, result.stderr[-600:]
+    assert json.loads(result.stdout)["tool"] == script.removesuffix(".py")
+
+
+def test_the_document_builder_runs_in_isolated_mode(tmp_path):
+    result = subprocess.run(
+        [sys.executable, "-I", str(SCRIPTS / "build_measurement.py"), "--help"],
+        capture_output=True, text=True, timeout=120, cwd=tmp_path,
+    )
+    assert result.returncode == 0, result.stderr[-600:]

@@ -63,7 +63,11 @@ can't raise, `hasattr`/`getattr(..., default)` guarding attributes that always e
 `**kwargs` catch-alls that are never read (`find_ai_scaffolding.py` flags the last).
 Each check reads as caution; together they bury the actual logic and silence the
 typos a real signature would have caught. Strip guards that defend against the
-impossible.
+impossible. The `**kwargs` check skips the signatures somebody else chose: a
+function handed over by reference (a callback, a `monkeypatch.setattr`
+replacement), a method on a class with a base (an override), a `*args, **kwargs`
+adapter that uses neither, and the explicit `**_ignored` — dropping the catch-all
+from any of those breaks the caller rather than catching its typo.
 
 ### Superfluous abstraction for a simple ask
 Asked for a function, AI delivers a class with a factory and a config dataclass;
@@ -92,13 +96,20 @@ Delete the narration; demand a reason where a reason is owed.
 that return `None`/`{}`/`[]` on error instead of raising. It *looks* robust and is the
 opposite: it converts a loud, debuggable failure into a silent wrong answer.
 `find_exception_issues.py` (swallowed_exception) flags the broad-catch-and-discard
-shapes; in review, insist errors are either handled meaningfully or propagated.
+shapes; in review, insist errors are either handled meaningfully or propagated. A
+broad catch the repo's Ruff gate already suppresses *with a stated reason*
+(`# noqa: BLE001 -- the caller reads None as unreadable`) is reported as a
+candidate: someone adjudicated that line and wrote down why — check the reason
+holds rather than re-litigating the catch. A bare `# noqa: BLE001` states nothing
+and stays a finding.
 
 ### Tests that can't fail
 Generated tests over-mock (asserting the code calls the mocks the test set up — i.e.
 pinning the implementation, not the behavior), assert nothing, or assert the vacuous
-(`assert True`, `assertIsNotNone(result)` as the sole check). `find_test_smells.py`
-catches assertion-less, over-mocked, and trivial-assertion tests. A green AI test
+(`assert True`, `assert x == x`, or `assertIsNotNone(result)` as the sole check on a
+call that never returns None). `find_test_smells.py` catches assertion-less,
+over-mocked, and trivial-assertion tests; the not-None case is yours to judge, since
+it fails whenever None comes back and is a real check on anything typed `Optional`. A green AI test
 suite is **not** evidence of correctness until you've confirmed the tests would fail
 on a wrong answer — change a return value and watch a test go red. If none do, the
 suite is theater.

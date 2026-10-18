@@ -29,6 +29,21 @@ def run_detector(script: str, target: Path, *extra: str) -> list[dict]:
     return json.loads(result.stdout)
 
 
+def run_detector_text(script: str, target: Path, *extra: str) -> str:
+    """One detector's human-readable output — the other half of every CLI."""
+    result = subprocess.run(
+        [sys.executable, str(SCRIPTS_DIR / script), str(target), *extra],
+        capture_output=True, text=True, timeout=120,
+    )
+    assert result.returncode == 0, f"{script} exited {result.returncode}: {result.stderr[:500]}"
+    return result.stdout
+
+
+def arrow_only_lines(output: str) -> list[str]:
+    """Lines whose whole content is the suggestion arrow — a fix that is not there."""
+    return [line for line in output.splitlines() if line.strip() == "→"]
+
+
 def smell_types(findings: list[dict]) -> set[str]:
     return {f["smell_type"] for f in findings}
 
@@ -155,6 +170,8 @@ CASES = [
                 "    return a\n"
                 "def g(b: Any) -> Any:\n"
                 "    return b\n"
+                "def h(c) -> int:\n"
+                "    return c\n"
                 "x = 1  # type: ignore\n"
             )
         },
@@ -476,12 +493,14 @@ def test_open_closed_in_finally_is_not_a_leak(tmp_path):
     assert "unmanaged_open" not in smell_types(run_detector("find_resource_leaks.py", tmp_path))
 
 
-def test_assert_in_nested_helper_does_not_count_as_test_assertion(tmp_path):
+def test_assert_in_an_unused_nested_helper_does_not_count_as_test_assertion(tmp_path):
+    # A nested helper the test calls does assert for it (test_fp_py_tests_hygiene);
+    # one it only defines never runs.
     (tmp_path / "test_sample.py").write_text(
         "def test_a():\n"
         "    def helper():\n"
         "        assert False\n"
-        "    helper()\n"
+        "    return None\n"
     )
     assert "test_without_assertion" in smell_types(run_detector("find_test_smells.py", tmp_path))
 
@@ -531,6 +550,47 @@ def test_dotted_test_import_does_not_bless_same_stem_module(tmp_path):
     untested_files = {f["file"] for f in findings if f["smell_type"] == "untested_module"}
     assert any(ends_with_path(f, "pkg2/util.py") for f in untested_files)
     assert not any(ends_with_path(f, "pkg1/util.py") for f in untested_files)
+
+
+def test_a_name_reexported_through_another_module_tests_the_module_defining_it(tmp_path):
+    """`from pkg import build_server` hands the test server.py's function when
+    pkg/__init__.py re-exports it, so server.py is tested. Relative, absolute and
+    aliased re-exports count, as do star imports (honouring `__all__`) and a plain
+    module that re-binds a name. A module the imported module merely uses, and a
+    name `__all__` leaves out of a star import, do not."""
+    files = {
+        "src/pkg/__init__.py": (
+            "from .server import build_server\n"
+            "from pkg.client import connect as open_connection\n"
+            "from .stars import *\n"
+            "from .internal import helper\n"
+            "__all__ = ['build_server', 'open_connection', 'shine']\n"
+        ),
+        "src/pkg/server.py": "def build_server():\n    return 1\n",
+        "src/pkg/client.py": "def connect():\n    return 2\n",
+        "src/pkg/stars.py": "__all__ = ['shine']\ndef shine():\n    return 3\ndef hidden():\n    return 4\n",
+        "src/pkg/internal.py": "def helper():\n    return 5\n",
+        "src/pkg/facade.py": (
+            "from pkg.layout import read_header\n"
+            "from pkg.engine import run\n"
+            "def wrap():\n    return run()\n"
+        ),
+        "src/pkg/layout.py": "def read_header():\n    return 6\n",
+        "src/pkg/engine.py": "def run():\n    return 7\n",
+        "src/pkg/sub/__init__.py": "from .deep import *\n",
+        "src/pkg/sub/deep.py": "def dive():\n    return 8\n",
+        "src/pkg/untouched.py": "def lonely():\n    return 9\n",
+        "tests/test_server.py": "from pkg import build_server, open_connection\n",
+        "tests/test_star.py": "from pkg import *\nfrom pkg.sub import *\n",
+        "tests/test_facade.py": "from pkg.facade import read_header, wrap\n",
+    }
+    for name, text in files.items():
+        (tmp_path / name).parent.mkdir(parents=True, exist_ok=True)
+        (tmp_path / name).write_text(text)
+    untested = sorted(Path(f["file"]).relative_to(tmp_path).as_posix()
+                      for f in run_detector("find_untested_modules.py", tmp_path)
+                      if f["smell_type"] == "untested_module")
+    assert untested == ["src/pkg/engine.py", "src/pkg/internal.py", "src/pkg/untouched.py"]
 
 
 def _git(repo: Path, *args: str) -> None:
@@ -619,6 +679,25 @@ def test_a_dynamic_pragma_is_a_candidate_not_an_injection_finding(tmp_path):
 
     assert [f["kind"] for f in findings] == ["candidate"]
     assert "PRAGMA" in findings[0]["description"]
+    assert findings[0]["also_caused_by"], "a candidate names how healthy code produces it"
+    assert not findings[0]["suggestion"], "a candidate carries what to confirm, not a fix"
+
+
+def test_a_pragma_candidates_text_output_shows_reasons_not_an_empty_fix(tmp_path):
+    """The human-readable half of the same record: no fix to print, reasons to print."""
+    (tmp_path / "sample.py").write_text(
+        "def describe(conn, table):\n"
+        '    return conn.execute(f"PRAGMA table_info({table})").fetchall()\n'
+    )
+    output = run_detector_text("find_security_issues.py", tmp_path)
+
+    assert "? also caused by:" in output
+    assert not arrow_only_lines(output), "a candidate rendered a fix arrow with nothing after it"
+    # A severity rank on a lead reads as a verdict the evidence does not support.
+    assert "[CANDIDATE]" in output
+    assert "[HIGH]" not in output
+    assert "0 finding(s), 1 candidate(s)" in output, \
+        "the header still counts the lead as a security issue found"
 
 
 @pytest.mark.parametrize("statement", [
@@ -636,7 +715,8 @@ def test_a_dynamic_query_is_still_a_scored_finding(tmp_path, statement):
                 if f["smell_type"] == "sql_injection"]
 
     assert len(findings) == 1
-    assert "kind" not in findings[0], "a scored defect carries no kind key at all"
+    assert findings[0]["kind"] == "finding"
+    assert not findings[0].get("also_caused_by")
 
 
 def test_weak_hash_usedforsecurity_false_not_flagged(tmp_path):
@@ -2042,7 +2122,8 @@ def test_exitstack_advice_names_the_actual_receiver(tmp_path):
     )
     findings = [f for f in run_detector("find_pattern_issues.py", tmp_path)
                 if f["smell_type"] == "try_finally_close"]
-    assert findings and "conn.disconnect" in findings[0]["suggestion"]
+    # A candidate carries no fix; its description names the with-form instead.
+    assert findings and "conn.disconnect" in findings[0]["description"]
 
 
 def test_analyze_diff_keeps_cross_definition_finding_on_unchanged_anchor(tmp_path):
@@ -2335,6 +2416,70 @@ def test_field_reset_to_none_is_temporary(tmp_path):
     )
 
 
+_CARRIED_FIELDS = (
+    "class Slot:\n"
+    "    def __init__(self):\n"
+    "        self._prompter = None\n"
+    "        self._prompter_key = None\n"
+    "\n"
+    "    def image_prompter(self, settings):\n"
+    "        key = (settings.dir, settings.device)\n"
+    "        if self._prompter is None or self._prompter_key != key:\n"
+    "            self._prompter, self._prompter_key = build(key), key\n"
+    "        return self._prompter\n"
+    "\n"
+    "class Tally:\n"
+    "    def __init__(self):\n"
+    "        self._total = None\n"
+    "\n"
+    "    def add(self, value):\n"
+    "        self._total = merge(self._total, value)\n"
+    "        log(self._total)\n"
+    "\n"
+    "class Job:\n"
+    "    def __init__(self):\n"
+    "        self.scratch = None  # fires\n"
+    "\n"
+    "    def run(self, items):\n"
+    "        self.scratch = prepare(items)\n"
+    "        log(self.scratch)\n"
+    "\n"
+    "class Guarded:\n"
+    "    def __init__(self):\n"
+    "        self.buffer = None  # fires\n"
+    "\n"
+    "    def parse(self, text):\n"
+    "        if self.buffer is not None:\n"
+    "            raise RuntimeError('re-entered')\n"
+    "        self.buffer = text.split()\n"
+    "        log(self.buffer)\n"
+    "        self.buffer = None\n"
+    "\n"
+    "class Walker:\n"
+    "    def __init__(self):\n"
+    "        self.previous = None  # fires\n"
+    "\n"
+    "    def walk(self, items):\n"
+    "        for item in items:\n"
+    "            if self.previous is not None:\n"
+    "                compare(self.previous, item)\n"
+    "            self.previous = item\n"
+)
+
+
+def test_a_field_read_before_it_is_written_carries_state_between_calls(tmp_path):
+    """`image_prompter` compares `_prompter_key` with the new key before it stores
+    it, so the read can only see what an earlier call left: the key of what is
+    cached. A field read before it is written persists by design and is not a
+    temporary field. Scratch written then read is still one, as is a field reset
+    to None after use, and a read inside a loop proves nothing (it may see the
+    same call's previous iteration)."""
+    (tmp_path / "sample.py").write_text(_CARRIED_FIELDS)
+    temporary = sorted(f["line"] for f in run_detector("find_design_smells.py", tmp_path)
+                       if f["smell_type"] == "temporary_field")
+    assert temporary == _lines_marked(_CARRIED_FIELDS)
+
+
 def test_empty_subclass_of_registering_base_is_not_lazy(tmp_path):
     (tmp_path / "sample.py").write_text(
         "class Plugin:\n"
@@ -2589,6 +2734,34 @@ def test_unnamed_threshold_is_still_a_magic_number(tmp_path):
     assert "magic_number" in smell_types(run_detector("find_code_smells.py", tmp_path))
 
 
+_CONSTANT_DEFINITIONS = (
+    "MEGAPIXEL = 1_000_000\n"
+    "MAX_UPLOAD_PIXELS = 50 * MEGAPIXEL\n"
+    "RULE = '=' * 78\n"
+    "PAG_BLOCKS: tuple[int, ...] = tuple(range(8, 16))\n"
+    "LOW, HIGH = 3 * 7, 5 * 9\n"
+    "if WINDOWS:\n"
+    "    _MAX_PATH = 260 - 13\n"
+    "class Limits:\n"
+    "    WEEK = 7 * 86400\n"
+    "ratio = scale * 41  # fires\n"
+    "HANDLER = lambda n: n * 43  # fires\n"
+    "def area(width):\n"
+    "    SIDE = width * 47  # fires\n"
+    "    return SIDE * 53  # fires\n"
+)
+
+
+def test_a_literal_in_a_constants_definition_is_not_a_magic_number(tmp_path):
+    """`MAX_UPLOAD_PIXELS = 50 * MEGAPIXEL` is where 50 gets its name, just as
+    `TIMEOUT = 30` is; a compound value does not make the literal anonymous. A
+    lowercase module variable, a lambda body and a function's locals still are."""
+    (tmp_path / "sample.py").write_text(_CONSTANT_DEFINITIONS)
+    magic = sorted({f["line"] for f in run_detector("find_code_smells.py", tmp_path)
+                    if f["smell_type"] == "magic_number"})
+    assert magic == _lines_marked(_CONSTANT_DEFINITIONS)
+
+
 def test_declared_dataclass_is_not_a_data_class_smell(tmp_path):
     (tmp_path / "sample.py").write_text(
         "from dataclasses import dataclass\n"
@@ -2755,6 +2928,57 @@ def test_simple_function_has_no_complexity_findings(tmp_path):
         "    return first + second\n"
     )
     assert run_detector("analyze_complexity.py", tmp_path) == []
+
+
+def _cyclomatic(tmp_path, name: str, source: str) -> dict[str, int]:
+    """Function name -> reported cyclomatic complexity, for those over the threshold."""
+    (tmp_path / name).write_text(source)
+    return {r["name"]: r["value"] for r in run_detector("analyze_complexity.py", tmp_path)
+            if r["issue_type"] == "cyclomatic_complexity"}
+
+
+def test_asserts_are_not_decision_points(tmp_path):
+    """A test that checks twelve things has one path through it. An assert either
+    holds or ends the function, and `assert a and b` says what `assert a; assert b`
+    does, so nothing inside an assert counts toward cyclomatic complexity."""
+    checks = "".join(f"    assert job.images[{n}] == expected[{n}]\n" for n in range(9))
+    source = (
+        "def test_the_detailer_saves_beside_the_original(job, expected):\n"
+        "    run(job)\n"
+        + checks +
+        "    assert job.height % 16 == 0 and job.width % 16 == 0 or job.empty\n"
+        "    assert all(key.startswith('vision.') for key in job.keys)\n"
+        "    assert {key: value for key, value in job.items()} == expected\n"
+    )
+    assert _cyclomatic(tmp_path, "test_detailer.py", source) == {}
+
+
+def test_branches_beside_an_assert_still_count(tmp_path):
+    """if, elif, for, while, each except, and/or and a comprehension are decision
+    points wherever they sit; an assert in the same function adds nothing."""
+    source = (
+        "def route(items, flag, other):\n"
+        "    total = 0\n"
+        "    if flag:\n"
+        "        total += 1\n"
+        "    elif other:\n"
+        "        total -= 1\n"
+        "    for item in items:\n"
+        "        while item > 0:\n"
+        "            item -= 1\n"
+        "    try:\n"
+        "        total += len(items)\n"
+        "    except TypeError:\n"
+        "        pass\n"
+        "    except ValueError:\n"
+        "        pass\n"
+        "    if flag and other or total:\n"
+        "        total += 1\n"
+        "    evens = [item for item in items]\n"
+        "    assert total and evens\n"
+        "    return total, evens\n"
+    )
+    assert _cyclomatic(tmp_path, "router.py", source) == {"route": 11}
 
 
 # ---- find_boolean_params -------------------------------------------------- #
@@ -3037,8 +3261,8 @@ def test_ready_import_suppression_requires_django_provenance_and_direct_method(t
 # `kind: "candidate"` and the graders downstream keep them out of the score.
 
 
-def kinds_by_name(findings: list[dict], issue_type: str) -> dict[str, str | None]:
-    return {f["name"]: f.get("kind") for f in findings if f["issue_type"] == issue_type}
+def kinds_by_name(findings: list[dict], issue_type: str) -> dict[str, str]:
+    return {f["name"]: f["kind"] for f in findings if f["issue_type"] == issue_type}
 
 
 def test_a_public_module_level_name_is_a_candidate_not_a_finding(tmp_path):
@@ -3059,7 +3283,7 @@ def test_an_unused_import_stays_a_finding(tmp_path):
     """The one dead-code claim a single file *can* prove: nothing here uses it."""
     (tmp_path / "sample.py").write_text("import os\n")
 
-    assert kinds_by_name(run_detector("find_dead_code.py", tmp_path), "unused_import") == {"os": None}
+    assert kinds_by_name(run_detector("find_dead_code.py", tmp_path), "unused_import") == {"os": "finding"}
 
 
 def test_dunder_all_re_export_is_neither_a_finding_nor_a_lead(tmp_path):
@@ -3149,11 +3373,11 @@ def test_only_a_free_function_owns_its_signature(tmp_path):
         "        return used\n"
         "    return callback\n"
     )
-    kinds = {(f["name"], f["line"]): f.get("kind")
+    kinds = {(f["name"], f["line"]): f["kind"]
              for f in run_detector("find_dead_code.py", tmp_path)
              if f["issue_type"] == "unused_parameter"}
 
-    assert kinds == {("spare", 1): None, ("spare", 5): "candidate", ("spare", 9): "candidate"}
+    assert kinds == {("spare", 1): "finding", ("spare", 5): "candidate", ("spare", 9): "candidate"}
 
 
 # ---- find_duplicates ------------------------------------------------------ #
@@ -3500,6 +3724,76 @@ def test_abstraction_with_two_implementations_is_earned(tmp_path):
     assert run_detector("find_overengineering.py", tmp_path) == []
 
 
+_WRAPPERS = (
+    "class Prompter:\n"
+    "    def __init__(self, encoder):\n"
+    "        self.encoder = encoder\n"
+    "        self._key: tuple | None = None\n"
+    "        self._loaded: object | None = None\n"
+    "\n"
+    "    def adapter(self, path):\n"
+    "        if self._key != path:\n"
+    "            self._key, self._loaded = path, load(path)\n"
+    "        return self._loaded\n"
+    "\n"
+    "    def conditioning(self, images):\n"
+    "        return self.encoder.encode(images)\n"
+    "\n"
+    "    def nulls(self):\n"
+    "        return self.encoder.encode([gray()])\n"
+    "\n"
+    "    def release(self):\n"
+    "        self._key, self._loaded = None, None\n"
+    "        self.encoder.release()\n"
+    "\n"
+    "class Remembering:\n"
+    "    def __init__(self, client):\n"
+    "        self.client = client\n"
+    "\n"
+    "    def get(self, key):\n"
+    "        self.last = key\n"
+    "        return self.client.get(key)\n"
+    "\n"
+    "    def put(self, key, value):\n"
+    "        return self.client.put(key, value)\n"
+    "\n"
+    "    def delete(self, key):\n"
+    "        return self.client.delete(key)\n"
+    "\n"
+    "class Wrapper:  # fires\n"
+    "    def __init__(self, client):\n"
+    "        self.client = client\n"
+    "\n"
+    "    def get(self, key):\n"
+    "        return self.client.get(key)\n"
+    "\n"
+    "    def put(self, key, value):\n"
+    "        return self.client.put(key, value)\n"
+    "\n"
+    "class AnnotatedWrapper:  # fires\n"
+    "    def __init__(self, client):\n"
+    "        self.client: Client = client\n"
+    "\n"
+    "    def get(self, key):\n"
+    "        return self.client.get(key)\n"
+    "\n"
+    "    def put(self, key, value):\n"
+    "        return self.client.put(key, value)\n"
+)
+
+
+def test_a_class_with_state_of_its_own_is_not_a_thin_wrapper(tmp_path):
+    """anima-ui's `ImagePrompter` stores its encoder plus the key and the adapter
+    it caches; the annotated `self._key: ... = None` was invisible, so it read as
+    a wrapper of `encoder`. Every store on self counts, in any method and any
+    assignment form, and a class keeping state of its own is not a thin wrapper.
+    A class whose only state is the object it forwards to still is."""
+    (tmp_path / "sample.py").write_text(_WRAPPERS)
+    wrappers = sorted(r["line"] for r in run_detector("find_overengineering.py", tmp_path)
+                      if r["issue_type"] == "thin_wrapper")
+    assert wrappers == _lines_marked(_WRAPPERS)
+
+
 # ---- find_parameter_objects ----------------------------------------------- #
 
 
@@ -3713,5 +4007,2371 @@ def test_analyze_all_counts_candidates_and_lists_them_separately(tmp_path):
     )
 
 
+def test_the_candidates_section_prints_reasons_instead_of_an_empty_fix(tmp_path):
+    """A candidate has no fix, so the report must not print an empty arrow for one.
+
+    What the reader needs under that heading is the benign explanations to rule
+    out, which is the only thing the record carries in place of a fix.
+    """
+    (tmp_path / "db.py").write_text(
+        "def describe(conn, table):\n"
+        '    return conn.execute(f"PRAGMA table_info({table})").fetchall()\n'
+    )
+
+    text = subprocess.run(
+        [sys.executable, str(SCRIPTS_DIR / "analyze_all.py"), str(tmp_path),
+         "--skip-duplicates"],
+        capture_output=True, text=True, timeout=300, check=True).stdout
+    _, _, candidates = text.partition("❓ CANDIDATES")
+
+    assert "? also caused by:" in candidates
+    assert not arrow_only_lines(text), "a candidate rendered a fix arrow with nothing after it"
+
+
 # run_external_tools lives in tests/python_code_doctor/test_external_tools.py —
 # it needs stub-executable fixtures the rest of these detectors have no use for.
+
+
+# --------------------------------------------------------------------------- #
+# False positives triaged against a real project (hardy's health-triage): each
+# case below is a shape the detector once scored as a defect and must not.
+# --------------------------------------------------------------------------- #
+
+
+def test_future_import_is_never_an_unused_import(tmp_path):
+    """`from __future__ import annotations` is a compiler directive, not a name."""
+    (tmp_path / "sample.py").write_text(
+        "from __future__ import annotations\n"
+        "\n"
+        "def f(x: int) -> int:\n"
+        "    return x\n"
+    )
+
+    assert kinds_by_name(run_detector("find_dead_code.py", tmp_path), "unused_import") == {}
+
+
+def test_explicit_name_as_name_alias_declares_a_re_export(tmp_path):
+    """`from m import x as x` / `import m as m` is the typed re-export convention.
+
+    PEP 484 says the redundant alias marks a public re-export, and a facade
+    module full of them is the classic shape. A plain alias is still checked.
+    """
+    (tmp_path / "facade.py").write_text(
+        "from backends import Macaulay2Backend as Macaulay2Backend\n"
+        "from backends import _Sentinel as _Sentinel\n"
+        "import helpers as helpers\n"
+        "from backends import Other as Renamed\n"
+        "import json\n"
+    )
+
+    assert kinds_by_name(run_detector("find_dead_code.py", tmp_path), "unused_import") \
+        == {"Renamed": "finding", "json": "finding"}
+
+
+def test_a_free_function_handed_out_as_a_value_is_a_callback(tmp_path):
+    """A function registered by name has its signature dictated by the registry.
+
+    `Command("help", handle_help)` passes the function as a value; whoever
+    calls it later decides the arguments. That makes an unused parameter a
+    lead, not a defect — same as a nested callback. A decorated free function
+    is the same situation (the decorator is the caller). Only a free function
+    the file itself calls directly still owns its signature.
+    """
+    (tmp_path / "handlers.py").write_text(
+        "import functools\n"
+        "\n"
+        "def handle_help(ui, argument, state):\n"
+        "    return state\n"
+        "\n"
+        "@functools.lru_cache\n"
+        "def cached(key, spare):\n"
+        "    return key\n"
+        "\n"
+        "def standalone(used, spare):\n"
+        "    return used\n"
+        "\n"
+        "def build_registry(Command):\n"
+        "    standalone(1, 2)\n"
+        "    return [Command('help', handle_help)]\n"
+    )
+    kinds = {(f['name'], f['line']): f['kind']
+             for f in run_detector("find_dead_code.py", tmp_path)
+             if f["issue_type"] == "unused_parameter"}
+
+    assert kinds == {
+        ("ui", 3): "candidate", ("argument", 3): "candidate",
+        ("spare", 7): "candidate",
+        ("spare", 10): "finding",
+    }
+
+
+def test_a_stub_body_has_no_unused_parameters(tmp_path):
+    """A Protocol method, an abstract stub, a `raise NotImplementedError`: the
+    parameters are the whole point and the body is deliberately empty."""
+    (tmp_path / "ports.py").write_text(
+        "from typing import Protocol\n"
+        "\n"
+        "class Ui(Protocol):\n"
+        "    def pressed(self, frame, number) -> None:\n"
+        "        ...\n"
+        "\n"
+        "    def render(self, frame) -> None:\n"
+        "        \"\"\"Draw the frame.\"\"\"\n"
+        "\n"
+        "def later(frame, number):\n"
+        "    raise NotImplementedError\n"
+    )
+
+    assert kinds_by_name(run_detector("find_dead_code.py", tmp_path), "unused_parameter") == {}
+
+
+def _duplicate_pair(tmp_path, body_a: str, body_b: str) -> list[dict]:
+    (tmp_path / "one.py").write_text(body_a)
+    (tmp_path / "two.py").write_text(body_b)
+    return run_detector("find_duplicates.py", tmp_path)
+
+
+def test_a_block_nested_inside_a_duplicate_is_not_a_second_duplicate(tmp_path):
+    """Two identical functions contain identical loops which contain identical
+    ifs. That is one duplicate, not three: the nested groups are the same copy
+    seen at smaller granularity."""
+    body = (
+        "def split(text, opener, closer):\n"
+        "    depth = 0\n"
+        "    for index, char in enumerate(text):\n"
+        "        if char == opener:\n"
+        "            depth += 1\n"
+        "        elif char == closer:\n"
+        "            depth -= 1\n"
+        "        if depth == 0 and char == closer:\n"
+        "            return text[:index], text[index + 1:]\n"
+        "    return text, ''\n"
+    )
+    findings = _duplicate_pair(tmp_path, body, body.replace("split", "cut"))
+
+    assert len(findings) == 1, [f["description"] for f in findings]
+    assert findings[0]["occurrences"][0]["type"] == "function"
+
+
+_SUMMED = (
+    "    total = 0\n"
+    "    for item in items:\n"
+    "        if item.ok:\n"
+    "            total += item.weight * scale\n"
+    "        else:\n"
+    "            total -= item.weight\n"
+    "    return total * factor + offset\n"
+)
+
+
+def test_a_marked_upstream_copy_is_not_a_member_of_the_projects_duplication(tmp_path):
+    """Two project functions with the same body are one duplicate of two copies;
+    two upstream originals marked verbatim beside them do not make it four (and
+    `high`): they are a group of their own. A group that takes a project copy and
+    a marked one to make is kept whole and anchored at the marked copy, so
+    analyze_all withholds it and counts it as not charged."""
+    (tmp_path / "pkg").mkdir()
+    (tmp_path / "pkg" / "a_upstream.py").write_text(
+        "# doctor: verbatim-upstream lib/weights.py\n"
+        "def upstream_sum(items, scale, factor, offset):\n" + _SUMMED
+        + "\ndef upstream_mean(values, scale, factor, offset):\n"
+        + _SUMMED.replace("items", "values").replace("total", "acc"))
+    (tmp_path / "pkg" / "b_one.py").write_text("def weigh(items, scale, factor, offset):\n" + _SUMMED)
+    (tmp_path / "pkg" / "c_two.py").write_text("def measure(items, scale, factor, offset):\n" + _SUMMED)
+    (tmp_path / "pkg" / "d_three.py").write_text(
+        "def tally(values, scale, factor, offset):\n"
+        + _SUMMED.replace("items", "values").replace("total", "acc").replace("item.ok", "item.live"))
+
+    clamped = (
+        "    out = []\n"
+        "    for row in rows:\n"
+        "        value = max(low, min(high, row))\n"
+        "        if value % step:\n"
+        "            value -= value % step\n"
+        "        out.append(value)\n"
+        "    return out\n"
+    )
+    (tmp_path / "pkg" / "e_ported.py").write_text("def clamp_all(rows, low, high, step):\n" + clamped)
+    (tmp_path / "pkg" / "f_upstream.py").write_text(
+        "# doctor: verbatim-upstream lib/clamp.py\n"
+        "def upstream_clamp(rows, low, high, step):\n" + clamped)
+
+    def members(record):
+        return sorted(Path(o["file"]).name for o in record["occurrences"])
+
+    records = run_detector("find_duplicates.py", tmp_path)
+    groups = sorted((members(r), r["kind"], r["severity"]) for r in records)
+    assert groups == [(["a_upstream.py", "a_upstream.py"], "candidate", "medium"),
+                      (["b_one.py", "c_two.py"], "candidate", "medium"),
+                      (["e_ported.py", "f_upstream.py"], "candidate", "medium")]
+    # Two copies are below the rule of three. Body partitioning still anchors
+    # upstream groups at a marked occurrence, regardless of filesystem order.
+    anchors = {tuple(members(r)): Path(r["file"]).name for r in records}
+    assert anchors[("a_upstream.py", "a_upstream.py")] == "a_upstream.py"
+    assert anchors[("b_one.py", "c_two.py")] == "b_one.py"
+    assert anchors[("e_ported.py", "f_upstream.py")] == "f_upstream.py"
+
+    report = json.loads(subprocess.run(
+        [sys.executable, str(SCRIPTS_DIR / "analyze_all.py"), str(tmp_path), "--format", "json"],
+        capture_output=True, text=True, timeout=300, check=True).stdout)
+    charged = [members(r) for r in report["categories"]["duplicates"]["issues"]]
+    assert charged == [["b_one.py", "c_two.py"]]
+    withheld = {Path(f).name: entry["by_category"].get("duplicates")
+                for f, entry in report["meta"]["not_charged"].items()}
+    assert withheld == {"a_upstream.py": 1, "f_upstream.py": 1}
+
+
+def test_a_duplicate_group_is_anchored_at_its_first_copy_in_path_order(load_module):
+    """Group identity must not depend on the filesystem's traversal order."""
+    duplicates = load_module(SCRIPTS_DIR, "find_duplicates")
+
+    def block(file, line):
+        return {"file": file, "line": line, "end_line": line + 6, "name": "f", "type": "function",
+                "preview": "", "lines": 6, "exact_hash": "same"}
+
+    walked = [block("pkg/c_two.py", 1), block("pkg/b_one.py", 9), block("pkg/b_one.py", 1)]
+    (group,) = duplicates._group(walked, "exact_hash", exact=True)
+
+    assert [(o["file"], o["line"]) for o in group.occurrences] == [
+        ("pkg/b_one.py", 1), ("pkg/b_one.py", 9), ("pkg/c_two.py", 1)]
+
+
+def test_docstrings_do_not_count_toward_duplicate_size(tmp_path):
+    """A one-expression body under a long docstring is not a 9-line duplicate."""
+    doc = '    """One line.\n\n    Two.\n\n    Three.\n\n    Four.\n    """\n'
+    one = f"def normalise(text):\n{doc}    return ' '.join(text.split())\n"
+    two = f"def collapse(label):\n{doc}    return ' '.join(label.split())\n"
+
+    assert _duplicate_pair(tmp_path, one, two) == []
+
+
+def test_reported_duplicate_size_is_executable_lines(tmp_path):
+    body = "\n".join(f"    v{i} = x + {i}" for i in range(6)) + "\n    return v5\n"
+    one = f"def first(x):\n    '''doc\n\n    more doc\n\n    still doc\n    '''\n{body}"
+    two = f"def second(y):\n{body.replace('x', 'y')}"
+    findings = _duplicate_pair(tmp_path, one, two)
+
+    assert len(findings) == 1
+    assert findings[0]["lines"] == 8, findings[0]
+
+
+def test_blocks_that_differ_only_in_literals_are_a_candidate(tmp_path):
+    """`_digest("environment", x)` and `_digest("procedure", x)` have one shape and
+    two meanings; the literal is the meaning. Erasing it finds a lead, not a defect.
+    Identical up to renaming stays a finding."""
+    def make(tag: str, name: str) -> str:
+        return (
+            f"def {name}(payload):\n"
+            f"    header = build_header({tag!r}, payload)\n"
+            f"    body = encode(payload, header)\n"
+            f"    checksum = digest(body)\n"
+            f"    trailer = build_trailer({tag!r}, checksum)\n"
+            f"    return header + body + trailer\n"
+        )
+    # Three identical copies: two would be below the rule of three, which is a
+    # candidate for a different reason than the one this test is about.
+    (tmp_path / "same.py").write_text(make("environment", "environment_digest")
+                                      + "\n" + make("environment", "environment_copy")
+                                      + "\n" + make("environment", "environment_again"))
+    (tmp_path / "other.py").write_text(make("procedure", "procedure_digest"))
+    findings = run_detector("find_duplicates.py", tmp_path)
+    by_kind = {f["kind"]: sorted(o["name"] for o in f["occurrences"]) for f in findings}
+
+    assert by_kind == {
+        "finding": ["environment_again", "environment_copy", "environment_digest"],
+        "candidate": ["environment_again", "environment_copy", "environment_digest",
+                      "procedure_digest"],
+    }
+    lead = next(f for f in findings if f["kind"] == "candidate")
+    assert "literal" in lead["description"]
+
+
+def test_marker_words_inside_prose_are_not_task_markers(tmp_path):
+    """TODO in the name of an implemented command, BUG in an explanation, XXX in
+    escape notation, Debug in a log title: vocabulary, not deferred work."""
+    (tmp_path / "sample.py").write_text(
+        "# the key of a *default* run: `evals todo` then `evals run --max-turns 40`\n"
+        "# `todo` exists to report the key a run launched now would carry\n"
+        "# shape of the bug this module exists to end.\n"
+        "# Observed verbatim from M2 (CI run 30167266358, \"Debug M2 raw stdout\")\n"
+        "#: character goes out as `\\uXXXX`, which the grammar accepts anywhere\n"
+        "# Deprecated fields are dropped before hashing so old boards still pool.\n"
+        "x = 1\n"
+    )
+
+    assert run_detector("find_comment_smells.py", tmp_path) == []
+
+
+def test_task_markers_are_recognised_where_people_actually_put_them(tmp_path):
+    (tmp_path / "sample.py").write_text(
+        "# TODO: rewrite this parser\n"
+        "# FIXME(alice) negative inputs\n"
+        "# XXX this is a hack\n"
+        "# todo: lowercase but tagged\n"
+        "# -- HACK --\n"
+        "# see TODO: the retry budget below\n"
+        "x = 1\n"
+    )
+    lines = sorted(f["line"] for f in run_detector("find_comment_smells.py", tmp_path)
+                   if f["smell_type"] == "todo_comment")
+
+    assert lines == [1, 2, 3, 4, 5, 6]
+
+
+def test_sibling_test_modules_importing_each_other_are_not_missing_dependencies(tmp_path):
+    """pytest puts a test file's directory on sys.path, so `from test_chat import
+    helper` resolves to the file next door — a `tests/` directory needs no
+    __init__.py and no entry in pyproject.toml for that. pytest itself is a
+    declared dev extra: the subject here is sibling resolution, not tooling."""
+    (tmp_path / "pyproject.toml").write_text(
+        '[project]\nname = "x"\nversion = "0"\ndependencies = []\n'
+        '[project.optional-dependencies]\ndev = ["pytest"]\n'
+    )
+    tests = tmp_path / "tests"
+    tests.mkdir()
+    (tests / "conftest.py").write_text("import pytest\n")
+    (tests / "workspace_helpers.py").write_text("def make():\n    return 1\n")
+    (tests / "test_chat.py").write_text("from workspace_helpers import make\n\ndef helper():\n    return make()\n")
+    (tests / "test_audit.py").write_text(
+        "from test_chat import helper\n"
+        "from tests.workspace_helpers import make\n"
+        "import requests\n"
+    )
+    missing = sorted(f["description"].split("'")[1]
+                     for f in run_detector("find_dependency_issues.py", tmp_path)
+                     if f["smell_type"] == "missing_dependency")
+
+    assert missing == ["requests"]
+
+
+def test_dead_code_candidates_carry_reasons_and_findings_carry_fixes(tmp_path):
+    (tmp_path / "sample.py").write_text(
+        "import os\n\n"
+        "def helper():\n    return 1\n"
+    )
+    records = run_detector("find_dead_code.py", tmp_path)
+    by_type = {r["issue_type"]: r for r in records}
+    assert by_type["unused_import"]["kind"] == "finding"
+    assert by_type["unused_import"]["suggestion"]
+    assert by_type["unused_function"]["kind"] == "candidate"
+    assert by_type["unused_function"]["also_caused_by"]
+    assert not by_type["unused_function"].get("suggestion")
+
+
+def test_inexact_duplicates_are_candidates_with_reasons(tmp_path):
+    body = "def {name}(items):\n    out = []\n    for item in items:\n        if item.kind == '{tag}':\n            out.append(item.value * 2)\n        else:\n            out.append(item.value)\n    return out\n"
+    (tmp_path / "a.py").write_text(body.format(name="first", tag="alpha"))
+    (tmp_path / "b.py").write_text(body.format(name="second", tag="beta"))
+    records = [r for r in run_detector("find_duplicates.py", tmp_path)
+               if r["smell_type"] == "duplicate_code"]
+    assert records, "two blocks with one shape and different literals"
+    assert all(r["kind"] == "candidate" for r in records)
+    assert all(r["also_caused_by"] and not r["suggestion"] for r in records)
+
+
+def test_the_diff_lens_marks_a_candidate_as_a_lead_not_a_ranked_defect(tmp_path):
+    """A dynamic `PRAGMA` on a changed line is a candidate, and the lens must say so.
+
+    A severity icon on a lead reads as a verdict the syntax never proved, and a
+    bare arrow reads as a fix that was forgotten. What the record has instead is
+    the benign readings the reader must rule out first.
+    """
+    _git(tmp_path, "init", "-q")
+    target = tmp_path / "mod.py"
+    target.write_text("BASE = 1\n")
+    _git(tmp_path, "add", "-A")
+    _git(tmp_path, "commit", "-qm", "base")
+    target.write_text(
+        "BASE = 1\n"
+        "def describe(conn, table):\n"
+        '    return conn.execute(f"PRAGMA table_info({table})").fetchall()\n'
+    )
+    _git(tmp_path, "add", "-A")
+
+    result = subprocess.run(
+        [sys.executable, str(SCRIPTS_DIR / "analyze_diff.py"), "HEAD"],
+        cwd=tmp_path, capture_output=True, text=True, timeout=300,
+    )
+    assert result.returncode == 0, result.stderr[:500]
+    output = result.stdout
+    assert "sql_injection" in output, "the fixture must reach the renderer"
+
+    assert "[CANDIDATE]" in output
+    assert "? also caused by:" in output
+    marked = [line for line in output.splitlines() if "[CANDIDATE]" in line]
+    assert marked and not any(icon in line for line in marked for icon in "🔴🟡🟢"), \
+        "a candidate was given a severity icon it did not earn"
+    assert not arrow_only_lines(output), \
+        "a candidate rendered a fix arrow with nothing after it"
+    assert "candidate(s)" in output, "the count line still calls every record a finding"
+
+
+# --------------------------------------------------------------------------- #
+# False positives triaged against a real project (a diffusion-model web app):
+# each case below is a shape a detector scored as a defect and must not, paired
+# with the true positive the narrowed rule must keep reporting.
+# --------------------------------------------------------------------------- #
+
+
+def _lines_marked(text: str, marker: str = "# fires") -> list[int]:
+    """The 1-based lines of a fixture whose source ends with ``marker``."""
+    return [n for n, line in enumerate(text.splitlines(), 1) if line.rstrip().endswith(marker)]
+
+
+def test_a_literal_in_a_test_file_is_fixture_data_not_a_magic_number(tmp_path):
+    """In a test a number is an input or an expected value; naming it buys nothing."""
+    tests = tmp_path / "tests"
+    tests.mkdir()
+    (tests / "test_area.py").write_text("def test_area():\n    assert area(7, 9) == 63\n")
+    (tests / "helpers.py").write_text("def make():\n    return resize(17, 33)\n")
+    (tmp_path / "conftest.py").write_text("def value():\n    return scale(37)\n")
+    (tmp_path / "widget_test.py").write_text("def check():\n    return scale(41)\n")
+    (tmp_path / "app.py").write_text("def area(width):\n    return width * 7\n")
+
+    magic = [(Path(f["file"]).name, f["line"])
+             for f in run_detector("find_code_smells.py", tmp_path)
+             if f["smell_type"] == "magic_number"]
+
+    assert magic == [("app.py", 2)], "production code still has its magic number reported"
+
+
+def test_explicit_return_none_is_the_consistent_form_pep8_asks_for(tmp_path):
+    """PEP 8: when any return has a value, a no-value return says `return None`."""
+    (tmp_path / "sample.py").write_text(
+        "def crop_box(box):\n"
+        "    if box is None:\n"
+        "        return None\n"
+        "    return (box[0], box[1])\n"
+        "\n"
+        "def install(module):\n"
+        "    def hook(v):\n"
+        "        if v is None:\n"
+        "            return None\n"
+        "        return v.reshape(2)\n"
+        "    return hook\n"
+    )
+    assert "inconsistent_returns" not in smell_types(run_detector("find_return_issues.py", tmp_path))
+
+
+def test_a_bare_return_beside_a_value_is_still_inconsistent(tmp_path):
+    (tmp_path / "sample.py").write_text(
+        "def lookup(d, k):\n"
+        "    if k not in d:\n"
+        "        return None\n"
+        "    if not d[k]:\n"
+        "        return\n"
+        "    return d[k]\n"
+    )
+    found = [f for f in run_detector("find_return_issues.py", tmp_path)
+             if f["smell_type"] == "inconsistent_returns"]
+
+    assert [f["line"] for f in found] == [1]
+    assert "return None" in found[0]["suggestion"], "the fix is the explicit spelling"
+
+
+# The statements below are all safe: every interpolated name is assembled from
+# string literals in the function that executes it (or is a module constant
+# bound once). Shapes copied from a real tag-autocomplete module.
+_LITERAL_DERIVED_SQL = r'''
+TABLE = "events"
+
+
+def counts(connection):
+    return {
+        name: connection.execute(f"SELECT COUNT(*) FROM {name}").fetchone()[0]
+        for name in ("tags", "neighbours", "aliases")
+    }
+
+
+def by_names(connection, wanted, category):
+    placeholders = ",".join("?" * len(wanted))
+    clause, params = ("AND category = ?", [category]) if category is not None else ("", [])
+    return connection.execute(
+        f"SELECT * FROM tags WHERE name IN ({placeholders}) {clause}", [*wanted, *params])
+
+
+def search(connection, words, category):
+    word_clause = "".join(" AND name LIKE ? ESCAPE '\\'" for _ in words)
+    loose_clause = f" OR (1=1{word_clause})" if words else ""
+    direct_clause = "AND category = ?" if category is not None else ""
+    return connection.execute(
+        f"SELECT * FROM tags WHERE (name LIKE ?{loose_clause}) {direct_clause}", [])
+
+
+def batched(connection, seeds, candidates):
+    seed_slots = ",".join("?" * len(seeds))
+    for start in range(0, len(candidates), 10):
+        chunk = candidates[start:start + 10]
+        candidate_slots = ",".join("?" * len(chunk))
+        connection.execute(
+            f"SELECT 1 FROM n WHERE tag IN ({seed_slots}) AND other IN ({candidate_slots})",
+            [*seeds, *chunk])
+
+
+def from_module_constant(connection):
+    return connection.execute("SELECT * FROM " + TABLE)
+
+
+def formatted(connection, ascending):
+    order = "ASC" if ascending else "DESC"
+    return connection.execute("SELECT * FROM t ORDER BY id {}".format(order))
+
+
+def in_a_loop(connection):
+    for table in ["a", "b"]:
+        connection.execute(f"DELETE FROM {table}")
+
+
+def accumulated(connection, flag):
+    sql = "SELECT * FROM t"
+    if flag:
+        sql += " WHERE a = ?"
+    return connection.execute(f"{sql} LIMIT 5")
+
+
+def outer(connection):
+    clause = "AND a = ?"
+
+    def inner():
+        return connection.execute(f"SELECT * FROM t WHERE 1=1 {clause}")
+    return inner
+'''
+
+# Each `# fires` line must still be reported: one binding of an interpolated
+# name is not literal-derived, or the name resolves somewhere this check cannot
+# prove (a parameter, a call, a global another function rebinds).
+_UNPROVEN_SQL = r'''
+TABLE = "events"
+TABLE = input()
+
+
+def param(connection, user_input):
+    return connection.execute(f"SELECT * FROM t WHERE name = '{user_input}'")  # fires
+
+
+def one_bad_binding(connection, user_input, flag):
+    clause = "AND a = ?"
+    if flag:
+        clause = user_input
+    return connection.execute(f"SELECT * FROM t WHERE 1=1 {clause}")  # fires
+
+
+def iterating_input(connection, tables):
+    for table in tables:
+        connection.execute(f"DELETE FROM {table}")  # fires
+
+
+def joined_input(connection, columns):
+    cols = ",".join(c for c in columns)
+    return connection.execute(f"SELECT {cols} FROM t")  # fires
+
+
+def rebound_module_name(connection):
+    return connection.execute("SELECT * FROM " + TABLE)  # fires
+
+
+def unpacked_from_a_call(connection):
+    clause, params = build()
+    return connection.execute(f"SELECT * FROM t {clause}", params)  # fires
+
+
+def repeated_input(connection, user_input):
+    return connection.execute(f"SELECT * FROM t {user_input * 2}")  # fires
+
+
+def declared_global(connection):
+    global CLAUSE
+    CLAUSE = "x"
+    return connection.execute(f"SELECT {CLAUSE}")  # fires
+
+
+def comprehension_variable_does_not_leak(connection):
+    names = [name for name in ("a", "b")]
+    return connection.execute(f"SELECT * FROM {name}", names)  # fires
+
+
+def formatted_input(connection, order):
+    return connection.execute("SELECT * FROM t ORDER BY {}".format(order))  # fires
+
+
+def concatenated_input(connection, where):
+    return connection.execute("SELECT * FROM t WHERE " + where)  # fires
+'''
+
+
+def test_sql_built_only_from_string_literals_is_not_injection(tmp_path):
+    (tmp_path / "tags.py").write_text(_LITERAL_DERIVED_SQL)
+    found = [(f["line"], f["kind"]) for f in run_detector("find_security_issues.py", tmp_path)
+             if f["smell_type"] == "sql_injection"]
+    assert found == []
+
+
+def test_sql_interpolating_anything_unproven_is_still_injection(tmp_path):
+    (tmp_path / "queries.py").write_text(_UNPROVEN_SQL)
+    found = sorted((f["line"], f["kind"]) for f in run_detector("find_security_issues.py", tmp_path)
+                   if f["smell_type"] == "sql_injection")
+    assert found == [(line, "finding") for line in _lines_marked(_UNPROVEN_SQL)]
+
+
+def test_a_pragma_over_a_literal_table_name_is_not_even_a_lead(tmp_path):
+    (tmp_path / "db.py").write_text(
+        "def describe(conn):\n"
+        "    for table in ('tags', 'aliases'):\n"
+        '        conn.execute(f"PRAGMA table_info({table})")\n'
+    )
+    assert "sql_injection" not in smell_types(run_detector("find_security_issues.py", tmp_path))
+
+
+def _cycles(tmp_path) -> list[str]:
+    return sorted(f["description"] for f in run_detector("find_import_cycles.py", tmp_path)
+                  if f["smell_type"] == "circular_import")
+
+
+def test_a_type_checking_import_never_runs_so_it_closes_no_cycle(tmp_path):
+    pkg = tmp_path / "pkg"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_text("")
+    (pkg / "grid.py").write_text(
+        "from typing import TYPE_CHECKING\n"
+        "\n"
+        "if TYPE_CHECKING:\n"
+        "    from pkg.service import Request\n"
+        "\n"
+        "def expand(request: 'Request'):\n"
+        "    return request\n"
+    )
+    (pkg / "service.py").write_text("from pkg import grid\n")
+    (pkg / "a.py").write_text("import typing\n\nif typing.TYPE_CHECKING:\n    from pkg import b\n")
+    (pkg / "b.py").write_text("from pkg import a\n")
+
+    assert _cycles(tmp_path) == []
+
+
+def test_a_runtime_import_still_closes_a_cycle_even_when_deferred(tmp_path):
+    """A lazy import inside a function is a cycle worked around, not removed —
+    and the `else` of a TYPE_CHECKING guard is exactly the branch that runs."""
+    pkg = tmp_path / "pkg"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_text("")
+    (pkg / "upscale.py").write_text("from pkg.vae import decode\n")
+    (pkg / "vae.py").write_text("def decode():\n    from pkg.upscale import upscale\n    return upscale\n")
+    (pkg / "c.py").write_text(
+        "from typing import TYPE_CHECKING\n"
+        "\n"
+        "if TYPE_CHECKING:\n"
+        "    pass\n"
+        "else:\n"
+        "    from pkg import d\n"
+    )
+    (pkg / "d.py").write_text("from pkg import c\n")
+
+    assert _cycles(tmp_path) == [
+        "Import cycle detected: pkg.c → pkg.d → pkg.c",
+        "Import cycle detected: pkg.upscale → pkg.vae → pkg.upscale",
+    ]
+
+
+def test_a_module_is_not_an_object_a_method_can_envy(tmp_path):
+    """`torch.cat` is a call into a library; there is no class to move the method to."""
+    (tmp_path / "sample.py").write_text(
+        "import torch\n"
+        "import numpy as np\n"
+        "from torch.nn import functional as F\n"
+        "\n"
+        "class Rope:\n"
+        "    def __init__(self):\n"
+        "        self.dim = 4\n"
+        "\n"
+        "    def forward(self, x):\n"
+        "        a = torch.arange(3)\n"
+        "        b = torch.cat([a, a])\n"
+        "        c = np.zeros(3) + np.ones(3) + np.eye(3)\n"
+        "        return F.pad(b, 1) + F.relu(c) + F.gelu(c) + torch.ones(1)\n"
+    )
+    assert "feature_envy" not in issue_types(run_detector("find_coupling_issues.py", tmp_path))
+
+
+def test_feature_envy_is_reported_at_the_envious_method_and_names_it(tmp_path):
+    (tmp_path / "sample.py").write_text(
+        "import json\n"
+        "\n"
+        "class Invoice:\n"
+        "    def __init__(self):\n"
+        "        self.total = 0\n"
+        "\n"
+        "    def label(self):\n"
+        "        return str(self.total)\n"
+        "\n"
+        "    def ship(self, order):\n"
+        "        return order.street + order.city + order.zip_code + order.country\n"
+        "\n"
+        "    def encode(self, json):\n"
+        "        return json.first + json.second + json.third\n"
+    )
+    envy = [f for f in run_detector("find_coupling_issues.py", tmp_path)
+            if f["issue_type"] == "feature_envy"]
+
+    assert [f["line"] for f in envy] == [10, 13], \
+        "reported at each def, and a parameter shadowing an imported module is an object"
+    assert "ship" in envy[0]["description"]
+    assert "encode" in envy[1]["description"]
+
+
+def test_a_type_narrowing_assert_is_a_candidate_not_a_validation_finding(tmp_path):
+    """`assert x is not None` narrows an Optional for the checker and documents an
+    invariant of the caller; `-O` stripping it changes no validation."""
+    (tmp_path / "service.py").write_text(
+        "def run(job):\n"
+        "    spec = job.spec\n"
+        "    assert spec is not None  # _execute only routes here when it is set\n"
+        "    assert isinstance(spec, dict)\n"
+        "    assert len(spec) > 0\n"
+        "    assert spec is not None and spec.ready\n"
+        "    return spec\n"
+    )
+    records = {r["line"]: r for r in run_detector("find_exception_issues.py", tmp_path)
+               if r["smell_type"] == "assert_for_validation"}
+
+    assert {line: r["kind"] for line, r in records.items()} == {
+        3: "candidate", 4: "candidate", 5: "candidate", 6: "candidate"}
+    assert records[3]["also_caused_by"] and not records[3]["suggestion"]
+    assert records[5]["also_caused_by"] and not records[5]["suggestion"]
+
+    output = run_detector_text("find_exception_issues.py", tmp_path)
+    assert "[CANDIDATE]" in output and "? also caused by:" in output
+    assert not arrow_only_lines(output), "a candidate rendered a fix arrow with nothing after it"
+
+
+@pytest.mark.parametrize("text", [
+    "a very long replacement ", "exchange_meter", "changemenot", "the replace_mentions",
+])
+def test_a_placeholder_word_inside_another_word_is_not_a_placeholder(tmp_path, text):
+    (tmp_path / "sample.py").write_text(f"LABEL = {text!r} * 20\n")
+    assert "placeholder_value" not in smell_types(run_detector("find_ai_scaffolding.py", tmp_path))
+
+
+@pytest.mark.parametrize("text", [
+    "REPLACE_ME", "token: changeme", "<change_me>", "api_key_replaceme", "replace_me-later",
+])
+def test_a_placeholder_token_is_still_a_placeholder(tmp_path, text):
+    (tmp_path / "sample.py").write_text(f"LABEL = {text!r}\n")
+    assert "placeholder_value" in smell_types(run_detector("find_ai_scaffolding.py", tmp_path))
+
+
+_KWARGS = r'''
+import remote
+
+
+def boom(*_args, **_kwargs):
+    raise RuntimeError("x")
+
+
+def model(x, sigma, **_kwargs):
+    return x * sigma
+
+
+class Base:
+    def call(self, method, **kwargs):
+        return send(method, **kwargs)
+
+
+class Fake(Base):
+    def call(self, method, **kwargs):
+        return method
+
+
+class Grandchild(Fake):
+    def call(self, method, **kwargs):
+        return 1
+
+
+class Unrelated:
+    def call(self, method, **kwargs):  # fires
+        return method
+
+
+class Child(Base):
+    def other(self, **kwargs):  # fires
+        return 1
+
+
+class Remote(remote.Base):
+    def call(self, **kwargs):  # unresolved external signature contract
+        return 1
+
+
+def plain(a, **kwargs):  # fires
+    return a
+'''
+
+
+def test_unused_kwargs_spares_deliberate_and_inherited_catch_alls(tmp_path):
+    """`**_kwargs` says "unused on purpose"; an override must keep its base's
+    signature. An unresolved external base also leaves the signature a contract."""
+    (tmp_path / "sample.py").write_text(_KWARGS)
+    lines = sorted(f["line"] for f in run_detector("find_ai_scaffolding.py", tmp_path)
+                   if f["smell_type"] == "unused_kwargs")
+    assert lines == _lines_marked(_KWARGS)
+
+
+def test_a_class_nested_in_a_class_body_is_named_for_the_api_it_fakes(tmp_path):
+    """`vae.config.latents_mean`: the lowercase class is an attribute namespace."""
+    source = (
+        "class FakeVae:\n"
+        "    class config:\n"
+        "        latents_mean = 0\n"
+        "\n"
+        "def test_shifted():\n"
+        "    class Shifted(FakeVae):\n"
+        "        class config:\n"
+        "            latents_mean = 1\n"
+        "    return Shifted\n"
+        "\n"
+        "class http_client:  # fires\n"
+        "    pass\n"
+        "\n"
+        "def factory():\n"
+        "    class local_thing:  # fires\n"
+        "        pass\n"
+        "    return local_thing\n"
+    )
+    (tmp_path / "sample.py").write_text(source)
+    lines = sorted(f["line"] for f in run_detector("find_naming_issues.py", tmp_path)
+                   if f["smell_type"] == "non_pascal_case_class")
+    assert lines == _lines_marked(source)
+
+
+def test_a_skip_guard_is_not_logic_in_a_test(tmp_path):
+    source = (
+        "import pytest\n"
+        "\n"
+        "def test_fixtures_match(tmp_path):\n"
+        "    if not tmp_path.exists():\n"
+        "        pytest.skip('no interpreter')\n"
+        "    if broken():\n"
+        "        pytest.xfail('known')\n"
+        "        return\n"
+        "    torch = pytest.importorskip('torch')\n"
+        "    assert compute(torch) == 3\n"
+        "\n"
+        "def test_branches():\n"
+        "    if flag():  # fires\n"
+        "        pytest.skip('x')\n"
+        "    else:\n"
+        "        value = 2\n"
+        "    assert value == 2\n"
+        "\n"
+        "def test_guard_then_more():\n"
+        "    if flag():  # fires\n"
+        "        pytest.skip('x')\n"
+        "        cleanup()\n"
+        "    assert compute() == 1\n"
+    )
+    (tmp_path / "test_sample.py").write_text(source)
+    lines = sorted(f["line"] for f in run_detector("find_test_smells.py", tmp_path)
+                   if f["smell_type"] == "logic_in_test")
+    assert lines == _lines_marked(source)
+
+
+def test_a_deferred_heavy_import_is_a_candidate_not_a_defect(tmp_path):
+    """`import torch` inside main() keeps `--help` from paying for torch."""
+    source = (
+        "def main():\n"
+        "    import torch  # lead\n"
+        "    from transformers import AutoModel  # lead\n"
+        "    import torch.nn.functional as F  # lead\n"
+        "    import json  # fires\n"
+        "    import os, torch  # fires\n"
+        "    from .models import vae  # fires\n"
+        "    return torch, AutoModel, F, json, os, vae\n"
+    )
+    (tmp_path / "cli.py").write_text(source)
+    records = {r["line"]: r for r in run_detector("find_local_imports.py", tmp_path)
+               if r["smell_type"] == "local_import"}
+
+    assert sorted(line for line, r in records.items() if r["kind"] == "candidate") == \
+        _lines_marked(source, "# lead")
+    assert sorted(line for line, r in records.items() if r["kind"] == "finding") == \
+        _lines_marked(source)
+    lead = records[2]
+    assert lead["also_caused_by"] and not lead["suggestion"]
+    assert "heavy" not in records[5]["suggestion"], \
+        "a required dependency must not be told to hide behind try/except ImportError"
+
+    output = run_detector_text("find_local_imports.py", tmp_path)
+    assert "[CANDIDATE]" in output and "? also caused by:" in output
+    assert not arrow_only_lines(output), "a candidate rendered a fix arrow with nothing after it"
+
+
+@pytest.mark.parametrize("setup", [
+    "sys.path.insert(0, str(Path(__file__).resolve().parent))\n",
+    "if str(Path(__file__).resolve().parent) not in sys.path:\n"
+    "    sys.path.insert(0, str(Path(__file__).resolve().parent))\n",
+])
+def test_putting_a_scripts_own_directory_on_sys_path_is_not_code_above_imports(tmp_path, setup):
+    """Under `python -I` a script must put its own directory back on sys.path
+    before importing a sibling, and nowhere but above that import will do. Ruff's
+    E402 and pycodestyle's both allow it; this one reported it as a defect."""
+    (tmp_path / "tool.py").write_text(
+        "import sys\nfrom pathlib import Path\n\n" + setup + "\nfrom sibling import helper\n\nhelper()\n"
+    )
+    assert not [r for r in run_detector("find_local_imports.py", tmp_path)
+                if r["smell_type"] == "import_not_at_top"]
+
+
+@pytest.mark.parametrize("setup", [
+    "x = 1\n",
+    "if DEBUG:\n    print('debug')\n",
+    "if DEBUG:\n    sys.path.insert(0, 'x')\n    configure()\n",
+    "if DEBUG:\n    sys.path.insert(0, 'x')\nelse:\n    configure()\n",
+])
+def test_other_code_above_an_import_is_still_import_not_at_top(tmp_path, setup):
+    (tmp_path / "tool.py").write_text("import sys\n\n" + setup + "\nimport json\n\njson.dumps(sys.argv)\n")
+    rows = [r for r in run_detector("find_local_imports.py", tmp_path) if r["smell_type"] == "import_not_at_top"]
+    assert rows and rows[0]["kind"] == "finding"
+
+
+def test_new_candidates_satisfy_the_schema_in_the_aggregate_report(tmp_path):
+    (tmp_path / "service.py").write_text(
+        "def run(spec):\n"
+        "    import torch\n"
+        "    assert spec is not None\n"
+        "    return torch.zeros(spec)\n"
+    )
+    report = json.loads(subprocess.run(
+        [sys.executable, str(SCRIPTS_DIR / "analyze_all.py"), str(tmp_path),
+         "--format", "json", "--skip-duplicates"],
+        capture_output=True, text=True, timeout=300, check=True).stdout)
+
+    assert "records_rejected" not in report["meta"], report["meta"].get("records_rejected")
+    kinds = {(r.get("smell_type"), r["kind"])
+             for category in ("exception_issues", "local_imports")
+             for r in report["categories"][category]["issues"]}
+    assert kinds == {("assert_for_validation", "candidate"), ("local_import", "candidate")}
+
+
+def test_a_module_that_lives_in_the_repository_is_first_party(tmp_path):
+    """A script that puts a test helper's directory on sys.path imports it by bare
+    name. The file is right there in the tree; no manifest should declare it."""
+    (tmp_path / "pyproject.toml").write_text(
+        '[project]\nname = "x"\nversion = "0"\ndependencies = []\n')
+    (tmp_path / "tests" / "models").mkdir(parents=True)
+    (tmp_path / "tests" / "models" / "sampler_case.py").write_text("CASES = []\n")
+    (tmp_path / "tools" / "vendored" / "helperpkg").mkdir(parents=True)
+    (tmp_path / "tools" / "vendored" / "helperpkg" / "__init__.py").write_text("")
+    site = tmp_path / ".venv" / "lib" / "site-packages" / "requests"
+    site.mkdir(parents=True)
+    (site / "__init__.py").write_text("")
+    (tmp_path / "node_modules" / "x").mkdir(parents=True)
+    (tmp_path / "node_modules" / "x" / "leftpad.py").write_text("")
+    (tmp_path / "scripts").mkdir()
+    (tmp_path / "scripts" / "generate.py").write_text(
+        "import sys\n"
+        "sys.path.insert(0, 'tests/models')\n"
+        "import sampler_case\n"
+        "import helperpkg\n"
+        "import requests\n"
+        "import leftpad\n"
+    )
+    missing = sorted(f["description"].split("'")[1]
+                     for f in run_detector("find_dependency_issues.py", tmp_path)
+                     if f["smell_type"] == "missing_dependency")
+
+    assert missing == ["leftpad", "requests"], "a venv or node_modules copy is not first-party"
+
+
+def test_a_comment_that_only_looks_numeric_leaks_no_syntax_warning(tmp_path):
+    """`500ing` parses as a numeric literal glued to `in`: CPython warns about the
+    comment text it was handed, and the warning used to land in the report."""
+    (tmp_path / "sample.py").write_text(
+        "# makes an empty PUT name the file instead of 500ing.\n"
+        "x = 1\n"
+    )
+    result = subprocess.run(
+        [sys.executable, "-W", "always", str(SCRIPTS_DIR / "find_comment_smells.py"),
+         str(tmp_path), "--format", "json"],
+        capture_output=True, text=True, timeout=120,
+    )
+    assert result.returncode == 0, result.stderr[:500]
+    assert "invalid decimal literal" not in result.stderr, result.stderr[:500]
+    assert json.loads(result.stdout) == []
+
+
+def test_imports_deferred_into_a_cli_subcommand_are_candidates(tmp_path):
+    """A Typer/click command defers its own dependencies so `--help` and the other
+    subcommands do not pay for them. A plain helper doing the same stays a finding."""
+    source = (
+        "import click\n"
+        "import typer\n"
+        "\n"
+        "app = typer.Typer()\n"
+        "\n"
+        "@app.command()\n"
+        "def serve(port: int = 8000):\n"
+        "    import uvicorn  # lead\n"
+        "    from pkg.api import create_app  # lead\n"
+        "    uvicorn.run(create_app(), port=port)\n"
+        "\n"
+        "@app.callback()\n"
+        "def main():\n"
+        "    import logging  # lead\n"
+        "    return logging\n"
+        "\n"
+        "@click.command()\n"
+        "def verify():\n"
+        "    from pkg.pipeline import load  # lead\n"
+        "    return load()\n"
+        "\n"
+        "@click.group\n"
+        "def cli():\n"
+        "    import json  # lead\n"
+        "    return json\n"
+        "\n"
+        "@cli.command\n"
+        "def sub():\n"
+        "    def inner():\n"
+        "        import os  # lead\n"
+        "        return os\n"
+        "    return inner\n"
+        "\n"
+        "def helper():\n"
+        "    from pkg.api import create_app  # fires\n"
+        "    return create_app\n"
+        "\n"
+        "@router.get('/x')\n"
+        "def route():\n"
+        "    import json  # fires\n"
+        "    return json\n"
+    )
+    (tmp_path / "cli.py").write_text(source)
+    records = {r["line"]: r for r in run_detector("find_local_imports.py", tmp_path)
+               if r["smell_type"] == "local_import"}
+
+    assert sorted(line for line, r in records.items() if r["kind"] == "candidate") == \
+        _lines_marked(source, "# lead")
+    assert sorted(line for line, r in records.items() if r["kind"] == "finding") == \
+        _lines_marked(source)
+    assert any("--help" in reason for reason in records[8]["also_caused_by"])
+
+
+_REGISTERED_CONFIG = (
+    "from diffusers import configuration_utils\n"
+    "from diffusers.configuration_utils import ConfigMixin, register_to_config\n"
+    "\n"
+    "class Model(ConfigMixin):\n"
+    "    @register_to_config\n"
+    "    def __init__(self, a, b, c, d, e, f, g, h):\n"
+    "        self.a = a\n"
+    "\n"
+    "class Other(ConfigMixin):\n"
+    "    @configuration_utils.register_to_config\n"
+    "    def __init__(self, a, b, c, d, e, f, g, h):\n"
+    "        self.a = a\n"
+    "\n"
+    "    def forward(self, a, b, c, d, e, f, g, h):  # fires\n"
+    "        return a\n"
+    "\n"
+    "class Plain:\n"
+    "    def __init__(self, a, b, c, d, e, f, g, h):  # fires\n"
+    "        self.a = a\n"
+    "\n"
+    "@register_to_config\n"
+    "def build(a, b, c, d, e, f, g, h):  # fires\n"
+    "    return a\n"
+)
+
+
+@pytest.mark.parametrize("script,finding_type,key", [
+    ("analyze_complexity.py", "parameter_count", "issue_type"),
+])
+def test_a_register_to_config_init_keeps_its_flat_keyword_arguments(tmp_path, script,
+                                                                    finding_type, key):
+    """diffusers' ConfigMixin serialises the config from those flat keyword
+    arguments: grouping them into a dataclass breaks from_pretrained/save_pretrained."""
+    (tmp_path / "model.py").write_text(_REGISTERED_CONFIG)
+    lines = sorted(f["line"] for f in run_detector(script, tmp_path) if f.get(key) == finding_type)
+    assert lines == _lines_marked(_REGISTERED_CONFIG)
+
+
+def test_a_nested_repository_is_not_analysed_as_part_of_the_project(tmp_path):
+    """A git worktree checked out under the project (`.worktrees/ui/.git` is a file)
+    is another copy of a repository; its code, manifests and imports are not this one's."""
+    (tmp_path / "pyproject.toml").write_text(
+        '[project]\nname = "x"\nversion = "0"\ndependencies = []\n')
+    (tmp_path / "app.py").write_text("def area(width):\n    return width * 7\n")
+    worktree = tmp_path / ".worktrees" / "ui"
+    worktree.mkdir(parents=True)
+    (worktree / ".git").write_text("gitdir: /elsewhere/.git/worktrees/ui\n")
+    (worktree / "app.py").write_text("import requests\n\ndef area(width):\n    return width * 7\n")
+    (worktree / "requirements.txt").write_text("leftpadpy\n")
+
+    magic = [f["file"] for f in run_detector("find_code_smells.py", tmp_path)
+             if f["smell_type"] == "magic_number"]
+    assert [Path(f).relative_to(tmp_path).as_posix() for f in magic] == ["app.py"]
+    assert run_detector("find_dependency_issues.py", tmp_path) == [], \
+        "the worktree's import and its unpinned requirement are not this project's"
+
+
+_CLI_COMMANDS = (
+    "import click\n"
+    "import typer\n"
+    "\n"
+    "app = typer.Typer()\n"
+    "\n"
+    "@app.command()\n"
+    "def render(a, b, c, d, e, f, g, h):\n"
+    "    return a\n"
+    "\n"
+    "@app.callback()\n"
+    "def main(a, b, c, d, e, f, g, h):\n"
+    "    return a\n"
+    "\n"
+    "@click.command()\n"
+    "@click.option('--a')\n"
+    "def legacy(a, b, c, d, e, f, g, h):\n"
+    "    return a\n"
+    "\n"
+    "def helper(a, b, c, d, e, f, g, h):  # fires\n"
+    "    return a\n"
+    "\n"
+    "@app.something_else()\n"
+    "def decorated(a, b, c, d, e, f, g, h):  # fires\n"
+    "    return a\n"
+)
+
+
+@pytest.mark.parametrize("script,finding_type,key", [
+    ("analyze_complexity.py", "parameter_count", "issue_type"),
+])
+def test_a_cli_commands_parameters_are_its_flags(tmp_path, script, finding_type, key):
+    """A typer/click command declares one parameter per command-line option; the
+    framework builds the CLI from that signature, so its length is the interface's
+    size rather than a function that wants a parameter object. A plain helper with
+    the same signature still fires."""
+    (tmp_path / "cli.py").write_text(_CLI_COMMANDS)
+    lines = sorted(f["line"] for f in run_detector(script, tmp_path) if f.get(key) == finding_type)
+    assert lines == _lines_marked(_CLI_COMMANDS)
+
+
+# --------------------------------------------------------------------------- #
+# Coupling metrics, re-graded against the refactored project: what a method is,
+# what counts as the object's own state, and what delegation actually looks like.
+# --------------------------------------------------------------------------- #
+
+
+def _coupling(tmp_path, source: str, issue_type: str) -> list[dict]:
+    (tmp_path / "sample.py").write_text(source)
+    return [r for r in run_detector("find_coupling_issues.py", tmp_path) if r["issue_type"] == issue_type]
+
+
+def test_a_function_nested_in_a_method_belongs_to_that_method(tmp_path):
+    """A closure is not a method of the class; what it reads, its method reads."""
+    source = (
+        "class Service:\n"
+        "    def __init__(self):\n"
+        "        self.jobs = []\n"
+        "\n"
+        "    def execute(self, job):\n"
+        "        def on_step(progress):\n"
+        "            return progress.step + progress.total + progress.eta + progress.done\n"
+        "        self.jobs.append(job)\n"
+        "        return on_step\n"
+        "\n"
+        "    def clear(self):\n"
+        "        self.jobs.clear()\n"
+    )
+    (tmp_path / "sample.py").write_text(source)
+    records = run_detector("find_coupling_issues.py", tmp_path)
+
+    assert not any(r["name"].endswith("on_step") for r in records), records
+    envy = [(r["name"], r["line"]) for r in records if r["issue_type"] == "feature_envy"]
+    assert envy == [("Service.execute", 5)], "the closure's accesses still count, as its method's"
+
+
+_COHESIVE = (
+    "from dataclasses import dataclass, field\n"
+    "\n"
+    "class Resolver:\n"
+    "    def __init__(self, settings):\n"
+    "        self._settings = settings\n"
+    "\n"
+    "    def lora_path(self, name):\n"
+    "        return self._settings().loras_dir + name\n"
+    "\n"
+    "    def lora_specs(self, job):\n"
+    "        return [self.lora_path(n) for n in job.names]\n"
+    "\n"
+    "    def sweep_control(self, name):\n"
+    "        return self._settings().loras_dir + name\n"
+    "\n"
+    "    def selected_styles(self, job):\n"
+    "        return self._settings().styles\n"
+    "\n"
+    "    def prompt_state(self, job):\n"
+    "        return job.prompt\n"
+    "\n"
+    "    def assembled(self, job):\n"
+    "        return self.prompt_state(job), self.selected_styles(job)\n"
+    "\n"
+    "    def doubled(self, x):\n"
+    "        return x * 2\n"
+    "\n"
+    "    @property\n"
+    "    def root(self):\n"
+    "        return self._settings().root\n"
+    "\n"
+    "    def describe(self):\n"
+    "        return self.root\n"
+    "\n"
+    "@dataclass\n"
+    "class Job:\n"
+    "    request: object\n"
+    "    status: str = 'queued'\n"
+    "    notes: list = field(default_factory=list)\n"
+    "\n"
+    "    def note(self, text):\n"
+    "        self.notes.append(text)\n"
+    "\n"
+    "    def finish(self):\n"
+    "        self.status = 'done'\n"
+    "        self.note('finished')\n"
+    "\n"
+    "    def summary(self):\n"
+    "        return (self.request, self.status)\n"
+)
+
+
+def test_lcom4_sees_a_class_held_together_by_shared_state_and_sibling_calls(tmp_path):
+    """Every method reads `self._settings` or calls a sibling that does; a method that
+    uses no state at all is a static-method candidate, not evidence the class splits."""
+    assert _coupling(tmp_path, _COHESIVE, "low_cohesion") == []
+
+
+def test_lcom4_reports_disjoint_method_groups_and_names_them(tmp_path):
+    two = (
+        "class Mixed:\n"
+        "    def __init__(self):\n"
+        "        self.path = ''\n"
+        "        self.rows = []\n"
+        "        self.socket = None\n"
+        "\n"
+        "    def save(self):\n"
+        "        write(self.path, self.rows)\n"
+        "\n"
+        "    def load(self):\n"
+        "        self.rows = read(self.path)\n"
+        "\n"
+        "    def connect(self):\n"
+        "        self.socket = open_socket()\n"
+        "\n"
+        "    def send(self, data):\n"
+        "        self.socket.send(data)\n"
+    )
+    [record] = _coupling(tmp_path, two, "low_cohesion")
+    assert record["line"] == 1 and record["severity"] == "medium"
+    assert "2 groups" in record["description"]
+    assert "{save, load} and {connect, send}" in record["description"]
+
+    three = two + (
+        "\n"
+        "    def tick(self):\n"
+        "        self.clock += 1\n"
+    )
+    [record] = _coupling(tmp_path, three, "low_cohesion")
+    assert record["severity"] == "high"
+    assert "{save, load}, {connect, send} and {tick}" in record["description"]
+
+
+def test_a_local_taken_from_self_is_the_objects_own_data(tmp_path):
+    source = (
+        "class Board:\n"
+        "    def __init__(self):\n"
+        "        self._jobs = {}\n"
+        "        self.ctx = None\n"
+        "        self.job = None\n"
+        "\n"
+        "    def _settings(self):\n"
+        "        return self.ctx.settings\n"
+        "\n"
+        "    def resolve(self):\n"
+        "        settings = self._settings()\n"
+        "        return settings.a + settings.b + settings.c + settings.d\n"
+        "\n"
+        "    def persist(self):\n"
+        "        for job in self._jobs.values():\n"
+        "            write(job.id, job.status, job.request, job.started)\n"
+        "\n"
+        "    def evict(self):\n"
+        "        return [job.id for job in self._jobs.values() if job.done and job.old and job.stale]\n"
+        "\n"
+        "    def run(self):\n"
+        "        ctx, job = self.ctx, self.job\n"
+        "        return ctx.a + ctx.b + ctx.c + job.x + job.y + job.z\n"
+        "\n"
+        "    def request_of(self):\n"
+        "        request = self.job.request\n"
+        "        return request.a + request.b + request.c\n"
+        "\n"
+        "    def envious(self, order):  # fires\n"
+        "        return order.street + order.city + order.zip + order.country + order.state + self.ctx\n"
+    )
+    envy = [(r["line"], r["description"].split("'")[3]) for r in _coupling(tmp_path, source, "feature_envy")]
+    assert envy == [(line, "order") for line in _lines_marked(source)]
+
+
+def test_middle_man_is_a_class_whose_public_methods_only_forward(tmp_path):
+    """Reading your arguments is not delegation; a method that is nothing but
+    `return self.inner.x(...)` is."""
+    source = (
+        "class Writer:\n"
+        "    def __init__(self, root):\n"
+        "        self.root = root\n"
+        "\n"
+        "    def path(self, job):\n"
+        "        return job.dir + job.name + job.ext + job.stamp + self.root\n"
+        "\n"
+        "    def chunk(self, job, request):\n"
+        "        return [request.a, request.b, request.c, job.x, job.y]\n"
+        "\n"
+        "    def size(self, request):\n"
+        "        return request.w * request.h * request.d * request.e\n"
+        "\n"
+        "class HalfProxy:\n"
+        "    def __init__(self, inner):\n"
+        "        self._inner = inner\n"
+        "\n"
+        "    def get(self, key):\n"
+        "        return self._inner.get(key)\n"
+        "\n"
+        "    def put(self, key, value):\n"
+        "        self._inner.put(key, value)\n"
+        "\n"
+        "    def run(self):\n"
+        "        return self._run()\n"
+        "\n"
+        "    def _run(self):\n"
+        "        return self._inner\n"
+        "\n"
+        "    def total(self):\n"
+        "        return sum(self._inner.values()) + 1\n"
+        "\n"
+        "class Proxy:  # fires\n"
+        "    def __init__(self, inner):\n"
+        "        self._inner = inner\n"
+        "\n"
+        "    def get(self, key):\n"
+        "        return self._inner.get(key)\n"
+        "\n"
+        "    def put(self, key, value):\n"
+        "        self._inner.put(key, value)\n"
+        "\n"
+        "    def delete(self, key):\n"
+        "        \"\"\"Forward.\"\"\"\n"
+        "        return self._inner.delete(key)\n"
+        "\n"
+        "    def keys(self):\n"
+        "        return self._inner.keys()\n"
+    )
+    found = _coupling(tmp_path, source, "middle_man")
+    assert [r["line"] for r in found] == _lines_marked(source)
+    assert "self._inner" in found[0]["description"] and "4 of 4" in found[0]["description"]
+
+
+def test_a_lambda_parameter_is_not_the_loop_variable_it_shares_a_name_with(tmp_path):
+    """`job` here is three variables in three scopes. Two iterate self's jobs (one
+    through `sorted(...)`); the lambda's reads are two, under the threshold."""
+    source = (
+        "class Board:\n"
+        "    def __init__(self):\n"
+        "        self._jobs = {}\n"
+        "\n"
+        "    def evict(self):\n"
+        "        finished = sorted(\n"
+        "            (job for job in self._jobs.values() if job.done),\n"
+        "            key=lambda job: job.finished_at or job.queued_at,\n"
+        "        )\n"
+        "        for job in finished[:3]:\n"
+        "            del self._jobs[job.id]\n"
+        "\n"
+        "    def rank(self, jobs):  # fires\n"
+        "        return sorted(jobs, key=lambda job: job.a + job.b + job.c + job.d)\n"
+    )
+    envy = [r["line"] for r in _coupling(tmp_path, source, "feature_envy")]
+    assert envy == _lines_marked(source)
+
+
+def test_a_records_declared_fields_are_one_piece_of_state(tmp_path):
+    """A dataclass or pydantic model is one value: its generated init, repr, eq and
+    validation use every field together, so views over different fields do not split
+    it. State the record does not declare still can."""
+    source = (
+        "from dataclasses import dataclass\n"
+        "from pydantic import BaseModel\n"
+        "\n"
+        "@dataclass(frozen=True)\n"
+        "class Style:\n"
+        "    name: str\n"
+        "    prompt: str = ''\n"
+        "    source: str = 'saved'\n"
+        "\n"
+        "    @property\n"
+        "    def editable(self):\n"
+        "        return self.source == 'saved'\n"
+        "\n"
+        "    @property\n"
+        "    def wraps(self):\n"
+        "        return '{}' in self.prompt\n"
+        "\n"
+        "class Settings(BaseModel):\n"
+        "    dtype: str = 'bf16'\n"
+        "    host: str = ''\n"
+        "\n"
+        "    def torch_dtype(self):\n"
+        "        return self.dtype\n"
+        "\n"
+        "    def url(self):\n"
+        "        return self.host\n"
+        "\n"
+        "@dataclass\n"
+        "class Cached:  # fires\n"
+        "    path: str\n"
+        "\n"
+        "    def load(self):\n"
+        "        return read(self.path)\n"
+        "\n"
+        "    def remember(self, value):\n"
+        "        self._memo = value\n"
+        "\n"
+        "    def recall(self):\n"
+        "        return self._memo\n"
+    )
+    found = _coupling(tmp_path, source, "low_cohesion")
+    assert [r["line"] for r in found] == _lines_marked(source)
+    assert "{load} and {remember, recall}" in found[0]["description"]
+
+
+def test_a_test_double_is_shaped_by_the_interface_it_fakes(tmp_path):
+    """A recording fake answers each method of the real object from its own list."""
+    tests = tmp_path / "tests"
+    tests.mkdir()
+    (tests / "test_service.py").write_text(
+        "class RecordingPipeline:\n"
+        "    def __init__(self):\n"
+        "        self.calls = []\n"
+        "        self.prepared = []\n"
+        "\n"
+        "    def __call__(self, prompt):\n"
+        "        self.calls.append(prompt)\n"
+        "\n"
+        "    def prepare_conditioning(self, prompt):\n"
+        "        self.prepared.append(prompt)\n"
+    )
+    assert [r for r in run_detector("find_coupling_issues.py", tmp_path)
+            if r["issue_type"] == "low_cohesion"] == []
+
+
+def test_a_test_module_of_many_cases_is_not_a_god_module(tmp_path):
+    """Each test is an independent case, not a responsibility: 45 of them do not
+    make a module do too much. Size in lines still counts, in tests as anywhere."""
+    cases = "".join(f"def test_case_{i}():\n    assert f({i}) == {i}\n\n" for i in range(45))
+    tests = tmp_path / "tests"
+    tests.mkdir()
+    (tests / "test_api.py").write_text(cases)
+    (tests / "test_huge.py").write_text("def test_long():\n" + "    x = 1\n" * 801)
+    (tmp_path / "helpers.py").write_text(cases.replace("def test_", "def helper_"))
+
+    found = {Path(r["file"]).name: r["description"]
+             for r in run_detector("find_import_cycles.py", tmp_path) if r["smell_type"] == "god_module"}
+
+    assert set(found) == {"helpers.py", "test_huge.py"}
+    assert "45 top-level definitions" in found["helpers.py"]
+    assert "source lines" in found["test_huge.py"] and "definitions" not in found["test_huge.py"]
+
+
+def test_fixture_requests_are_dependency_injection_not_a_data_clump(tmp_path):
+    """`def test_x(service, settings, swept)` asks pytest for three fixtures; the
+    names recur because the tests share fixtures, not because they want an object."""
+    tests = tmp_path / "tests"
+    tests.mkdir()
+    (tests / "test_service.py").write_text(
+        "import pytest\n"
+        "\n"
+        "@pytest.fixture\n"
+        "def swept(service, settings, tmp_path):\n"
+        "    return 1\n"
+        "\n"
+        "@pytest.fixture(scope='module')\n"
+        "def other(service, settings, swept):\n"
+        "    return 2\n"
+        "\n"
+        "def test_a(service, settings, swept):\n"
+        "    assert service\n"
+        "\n"
+        "def test_b(service, settings, swept):\n"
+        "    assert settings\n"
+        "\n"
+        "class TestGroup:\n"
+        "    def test_c(self, service, settings, swept):\n"
+        "        assert swept\n"
+        "\n"
+        "def make(width, height, depth):\n"
+        "    return width\n"
+        "\n"
+        "def grow(width, height, depth):\n"
+        "    return height\n"
+        "\n"
+        "def shrink(width, height, depth):\n"
+        "    return depth\n"
+    )
+    (tmp_path / "shapes.py").write_text("def area(width, height, depth):\n    return depth\n")
+
+    clumps = [(Path(r["file"]).name, r["description"]) for r in run_detector("find_parameter_objects.py", tmp_path)]
+    assert len(clumps) == 1, clumps
+    assert clumps[0][0] == "test_service.py" and "['depth', 'height', 'width']" in clumps[0][1] \
+        and "in 3 functions" in clumps[0][1], "plain test helpers still clump among themselves"
+
+
+def test_cli_flags_and_a_fakes_signature_are_not_boolean_flag_smells(tmp_path):
+    """A typer command's booleans are its `--reload` / `--no-aliases` flags; a fake
+    tokenizer's keyword flags are the real tokenizer's. Neither signature is free."""
+    cli = (
+        "import typer\n"
+        "\n"
+        "app = typer.Typer()\n"
+        "\n"
+        "@app.command()\n"
+        "def serve(port: int = 8000, reload: bool = False):\n"
+        "    return port\n"
+        "\n"
+        "@app.command()\n"
+        "def tags_build(aliases: bool = True, gelbooru: bool = False, skip_neighbours: bool = False):\n"
+        "    return aliases\n"
+        "\n"
+        "def helper(path, force=False):  # fires\n"
+        "    return path\n"
+    )
+    fake = (
+        "class FakeTokenizer:\n"
+        "    def __call__(self, text, add_special_tokens=True, return_offsets_mapping=False,\n"
+        "                 truncation=False):\n"
+        "        return text\n"
+        "\n"
+        "def build(text, strict=False, verbose=False):  # fires\n"
+        "    return text\n"
+    )
+    (tmp_path / "cli.py").write_text(cli)
+    (tmp_path / "tests").mkdir()
+    (tmp_path / "tests" / "test_text_encoder.py").write_text(fake)
+
+    found = sorted((Path(r["file"]).name, r["line"], r["smell_type"])
+                   for r in run_detector("find_boolean_params.py", tmp_path))
+    assert found == [
+        ("cli.py", _lines_marked(cli)[0], "boolean_positional_param"),
+        ("test_text_encoder.py", _lines_marked(fake)[0], "boolean_positional_param"),
+        ("test_text_encoder.py", _lines_marked(fake)[0], "boolean_positional_param"),
+        ("test_text_encoder.py", _lines_marked(fake)[0], "multiple_boolean_flags"),
+    ]
+
+
+_SIGNATURES = (
+    "def seven(a, b, c, d, e, f, g):\n"
+    "    return a\n"
+    "\n"
+    "def eight(a, b, c, d, e, f, g, *rest):\n"
+    "    return a\n"
+    "\n"
+    "def ten(a, b, c, d, e, f, g, h, i, j):\n"
+    "    return a\n"
+)
+
+
+def test_canonical_parameter_count_owns_signature_severity(tmp_path):
+    """Only the canonical rule counts positional and named parameter thresholds."""
+    (tmp_path / "sigs.py").write_text(_SIGNATURES)
+    complexity = {r["line"]: r["severity"] for r in run_detector("analyze_complexity.py", tmp_path)
+                  if r["issue_type"] == "parameter_count"}
+    smells = {r["line"]: r["severity"] for r in run_detector("find_code_smells.py", tmp_path)
+              if r["smell_type"] == "long_parameter_list"}
+    assert complexity == {1: "low", 4: "medium", 7: "high"}
+    assert smells == {}
+
+
+def test_one_too_long_signature_is_one_finding_in_the_report(tmp_path):
+    (tmp_path / "sigs.py").write_text(_SIGNATURES)
+
+    def records(*extra):
+        report = json.loads(subprocess.run(
+            [sys.executable, str(SCRIPTS_DIR / "analyze_all.py"), str(tmp_path),
+             "--format", "json", "--skip-duplicates", *extra],
+            capture_output=True, text=True, timeout=300, check=True).stdout)
+        return sorted((r["line"], r.get("issue_type") or r.get("smell_type"), r["severity"])
+                      for category in ("complexity", "code_smells")
+                      if category in report["categories"]
+                      for r in report["categories"][category]["issues"]
+                      if (r.get("issue_type") or r.get("smell_type")) in ("parameter_count", "long_parameter_list"))
+
+    assert records() == [(1, "parameter_count", "low"), (4, "parameter_count", "medium"),
+                         (7, "parameter_count", "high")]
+    assert records("--skip", "complexity") == [], "skipping the canonical owner skips its rule"
+
+
+def test_the_diff_lens_lists_one_too_long_signature_once(tmp_path):
+    _git(tmp_path, "init", "-q")
+    target = tmp_path / "mod.py"
+    target.write_text("BASE = 1\n")
+    _git(tmp_path, "add", "-A")
+    _git(tmp_path, "commit", "-qm", "base")
+    target.write_text("BASE = 1\n" + _SIGNATURES)
+    _git(tmp_path, "add", "-A")
+
+    result = subprocess.run(
+        [sys.executable, str(SCRIPTS_DIR / "analyze_diff.py"), "HEAD", "--format", "json"],
+        cwd=tmp_path, capture_output=True, text=True, timeout=300,
+    )
+    assert result.returncode == 0, result.stderr[:500]
+    signature = sorted((r["line"], r.get("issue_type") or r.get("smell_type"))
+                       for r in json.loads(result.stdout)
+                       if (r.get("issue_type") or r.get("smell_type"))
+                       in ("parameter_count", "long_parameter_list"))
+    assert signature == [(2, "parameter_count"), (5, "parameter_count"), (8, "parameter_count")]
+
+
+# --------------------------------------------------------------------------- #
+# Round three: envy that cannot be acted on, contracts that look like clumps,
+# and signatures a framework dictates.
+# --------------------------------------------------------------------------- #
+
+_EXTERNAL_ENVY = r'''
+import os
+import re
+from pathlib import Path
+
+import torch
+from torch import Tensor, nn
+
+from mypkg.jobs import Job
+
+_TRAILING = re.compile(r"(\d+)$")
+
+
+class Model:
+    def __init__(self):
+        self.scale = 1
+        self.texts = []
+
+    def forward(self, x: Tensor):
+        return x.view(1) + x.float() + x.sum() + x.mean() + self.scale
+
+    def delta(self, params: dict[str, Tensor], target):
+        param = params[target]
+        return param.detach() + param.clone() + param.data + self.scale
+
+    def weight(self):
+        explicit = _TRAILING.match(self.texts[-1]) if self.texts else None
+        return explicit.group(1) + explicit.start() + explicit.end()
+
+    def walk(self, root):
+        entries = list(os.scandir(root))
+        for entry in entries:
+            print(entry.name, entry.path, entry.is_dir(), self.scale)
+
+    def label(self, name: str, path: Path):
+        return name.upper() + name.lower() + name.strip() + path.stem + path.name + path.suffix
+
+    def maybe(self, x: "Tensor | None", p: nn.Parameter):
+        return x.a + x.b + x.c + p.a + p.b + p.c
+
+    def first_party(self, job: Job):  # fires
+        return job.id + job.seed + job.request + self.scale
+
+    def unknown(self, thing):  # fires
+        return thing.a + thing.b + thing.c
+
+    def local_class(self, spec: "Spec"):  # fires
+        return spec.a + spec.b + spec.c
+
+
+class Spec:
+    pass
+'''
+
+
+def test_envy_of_a_library_or_builtin_type_is_not_reported(tmp_path):
+    """The remedy for envy is to move the method onto the envied class, and nobody
+    can move a method onto torch.Tensor, re.Match, os.DirEntry, Path or str."""
+    (tmp_path / "pyproject.toml").write_text('[project]\nname = "x"\nversion = "0"\n')
+    (tmp_path / "mypkg").mkdir()
+    (tmp_path / "mypkg" / "__init__.py").write_text("")
+    (tmp_path / "mypkg" / "jobs.py").write_text("class Job:\n    pass\n")
+    (tmp_path / "model.py").write_text(_EXTERNAL_ENVY)
+
+    envy = sorted(r["line"] for r in run_detector("find_coupling_issues.py", tmp_path)
+                  if r["issue_type"] == "feature_envy")
+    assert envy == _lines_marked(_EXTERNAL_ENVY)
+
+
+def test_one_methods_implementations_are_a_contract_not_a_data_clump(tmp_path):
+    """`advance(self, i, x, denoised)` on a Protocol and its three solvers is one
+    signature implemented four times. Same-named methods count once; constructors
+    do not, and neither do free functions."""
+    (tmp_path / "solvers.py").write_text(
+        "from typing import Protocol\n"
+        "\n"
+        "class Solver(Protocol):\n"
+        "    def advance(self, i, x, denoised): ...\n"
+        "\n"
+        "class Euler:\n"
+        "    def advance(self, i, x, denoised):\n"
+        "        return x\n"
+        "\n"
+        "class Heun:\n"
+        "    def advance(self, i, x, denoised):\n"
+        "        return x + denoised\n"
+        "\n"
+        "class Dpm:\n"
+        "    def advance(self, i, x, denoised):\n"
+        "        return denoised\n"
+        "\n"
+        "    def _higher_stages(self, i, x, denoised):\n"
+        "        return i\n"
+    )
+    (tmp_path / "net.py").write_text(
+        "def connect(host, port, timeout):\n"
+        "    return host\n"
+        "\n"
+        "def ping(host, port, timeout):\n"
+        "    return port\n"
+        "\n"
+        "def close_conn(host, port, timeout):\n"
+        "    return timeout\n"
+    )
+    (tmp_path / "clients.py").write_text(
+        "class Http:\n"
+        "    def __init__(self, url, retries, backoff):\n"
+        "        self.url = url\n"
+        "\n"
+        "class Grpc:\n"
+        "    def __init__(self, url, retries, backoff):\n"
+        "        self.url = url\n"
+        "\n"
+        "class Ws:\n"
+        "    def __init__(self, url, retries, backoff):\n"
+        "        self.url = url\n"
+    )
+    clumps = sorted(r["description"].split(" appear")[0]
+                    for r in run_detector("find_parameter_objects.py", tmp_path))
+    assert clumps == ["Parameters ['backoff', 'retries', 'url']",
+                      "Parameters ['host', 'port', 'timeout']"]
+
+
+def test_code_marked_verbatim_upstream_is_not_a_member_of_the_projects_clumps(tmp_path):
+    """A marked copy keeps upstream's signatures, so it cannot make up the numbers
+    for a clump charged to the project's code: two project functions and one
+    upstream FinalLayer are not three, and that clump is reported at the marked
+    member, where analyze_all withholds and counts it. A clump that stands on the
+    project's own functions is reported without the marked one, and a clump
+    wholly inside marked code is reported there."""
+    (tmp_path / "pkg").mkdir()
+    (tmp_path / "tests").mkdir()
+    (tmp_path / "pkg" / "model.py").write_text(
+        "def project(x, emb, adaln, scale):\n    return x\n"
+        "\n"
+        "def modulate(x, emb, adaln, shift):\n    return x\n"
+    )
+    (tmp_path / "pkg" / "net.py").write_text(
+        "def connect(host, port, timeout):\n    return host\n"
+        "\n"
+        "def ping(host, port, timeout):\n    return port\n"
+        "\n"
+        "def close_conn(host, port, timeout):\n    return timeout\n"
+        "\n"
+        "# doctor: verbatim-upstream urllib3 connection.py\n"
+        "def upstream_connect(host, port, timeout):\n    return host\n"
+    )
+    (tmp_path / "tests" / "test_reference.py").write_text(
+        "# doctor: verbatim-upstream ComfyUI comfy/ldm/cosmos/predict2.py (FinalLayer)\n"
+        "class UpstreamFinalLayer:\n"
+        "    def forward(self, x, emb, adaln):\n"
+        "        return x\n"
+    )
+    (tmp_path / "tests" / "attention_reference.py").write_text(
+        "# doctor: verbatim-upstream ComfyUI comfy/ldm/modules/attention.py\n"
+        "def attention_basic(q, k, v):\n    return q\n"
+        "\n"
+        "def attention_split(q, k, v):\n    return k\n"
+        "\n"
+        "def attention_sub_quad(q, k, v):\n    return v\n"
+    )
+    clumps = sorted((Path(r["file"]).relative_to(tmp_path).as_posix(), r["description"].split(":")[0])
+                    for r in run_detector("find_parameter_objects.py", tmp_path))
+    assert clumps == [
+        ("pkg/net.py", "Parameters ['host', 'port', 'timeout'] appear together in 3 functions"),
+        ("tests/attention_reference.py", "Parameters ['k', 'q', 'v'] appear together in 3 functions"),
+        ("tests/test_reference.py", "Parameters ['adaln', 'emb', 'x'] appear together in 3 functions"),
+    ]
+
+    report = json.loads(subprocess.run(
+        [sys.executable, str(SCRIPTS_DIR / "analyze_all.py"), str(tmp_path),
+         "--format", "json", "--skip-duplicates"],
+        capture_output=True, text=True, timeout=300, check=True).stdout)
+    charged = [Path(r["file"]).name for r in report["categories"]["parameter_objects"]["issues"]]
+    assert charged == ["net.py"]
+    withheld = {Path(f).name: entry["by_category"] for f, entry in report["meta"]["not_charged"].items()}
+    assert withheld["attention_reference.py"].get("parameter_objects") == 1
+    assert withheld["test_reference.py"].get("parameter_objects") == 1
+
+
+def test_test_doubles_and_test_functions_do_not_make_up_a_production_clump(tmp_path):
+    """Closures handed in as the input-patch hook take `(block_index, target, x)`
+    because `InputPatch.__call__` does: they are that signature again, not four
+    more functions passing loose values. A test's `watch(block_index, block, out,
+    emb, cross_input)` is not a copy of either production hook, but a test
+    function never makes up the numbers for a clump charged to production code:
+    `after` and `after_block` are two, not three. Production code's own clump and
+    test helpers sharing a group among themselves are still reported."""
+    (tmp_path / "pkg").mkdir()
+    (tmp_path / "tests").mkdir()
+    (tmp_path / "pkg" / "hooks.py").write_text(
+        "class InputPatch:\n"
+        "    def __call__(self, block_index, target, x):\n"
+        "        return x\n"
+        "\n"
+        "def after(block, out, emb, cross_input):\n    return out\n"
+        "\n"
+        "def after_block(block_index, block, x, emb, cross_input):\n    return x\n"
+    )
+    (tmp_path / "pkg" / "net.py").write_text(
+        "def connect(host, port, timeout):\n    return host\n"
+        "\n"
+        "def ping(host, port, timeout):\n    return port\n"
+        "\n"
+        "def close_conn(host, port, timeout):\n    return timeout\n"
+    )
+    (tmp_path / "tests" / "test_patch.py").write_text(
+        "def _zero(block_index, target, x):\n    return x * 0\n"
+        "\n"
+        "def test_identity(dit):\n"
+        "    def identity(block_index, target, x):\n        return x\n"
+        "    def watch(block_index, target, x):\n        return x\n"
+        "    def patch(block_index, target, x):\n        return x + 1\n"
+        "    dit(identity, watch, patch, _zero)\n"
+        "\n"
+        "def test_blocks(model):\n"
+        "    def watch(block_index, block, out, emb, cross_input):\n        return out\n"
+        "    model(watch)\n"
+    )
+    (tmp_path / "tests" / "helpers.py").write_text(
+        "def dit_inputs(batch, height, width, seed):\n    return batch\n"
+        "\n"
+        "def latents(batch, height, width):\n    return height\n"
+        "\n"
+        "def picture(batch, height, width, mode):\n    return width\n"
+    )
+    clumps = sorted((Path(r["file"]).relative_to(tmp_path).as_posix(), r["description"].split(":")[0])
+                    for r in run_detector("find_parameter_objects.py", tmp_path))
+    assert clumps == [
+        ("pkg/net.py", "Parameters ['host', 'port', 'timeout'] appear together in 3 functions"),
+        ("tests/helpers.py", "Parameters ['batch', 'height', 'width'] appear together in 3 functions"),
+    ]
+
+
+_FRAMEWORK_HOOKS = (
+    "import torch.nn as nn\n"
+    "from pydantic_settings import BaseSettings\n"
+    "\n"
+    "SOURCES = 'settings_cls, init_settings, env_settings, dotenv_settings, file_secret_settings'\n"
+    "\n"
+    "class Settings(BaseSettings):\n"
+    "    @classmethod\n"
+    "    def settings_customise_sources(cls, settings_cls, init_settings, env_settings,\n"
+    "                                   dotenv_settings, file_secret_settings):\n"
+    "        return (init_settings,)\n"
+    "\n"
+    "    def reload(self, a, b, c, d, e, f):  # fires\n"
+    "        return a\n"
+    "\n"
+    "class Other(BaseSettings):\n"
+    "    def settings_customise_sources(self, a, b, c, d, e, f):  # fires\n"
+    "        return a\n"
+    "\n"
+    "class Local:\n"
+    "    pass\n"
+    "\n"
+    "class Mine(Local):\n"
+    "    def settings_customise_sources(cls, settings_cls, init_settings, env_settings, dotenv_settings, file_secret_settings, extra_source):  # fires: count\n"
+    "        return ()\n"
+    "\n"
+    "def settings_customise_sources(cls, settings_cls, init_settings, env_settings, dotenv_settings, file_secret_settings):  # fires: count\n"
+    "    return ()\n"
+    "\n"
+    "class Block(nn.Module):\n"
+    "    def forward(self, x, mask, context, scale, shift, gate):  # fires\n"
+    "        return x\n"
+)
+
+
+@pytest.mark.parametrize("script,finding_type,key", [
+    ("analyze_complexity.py", "parameter_count", "issue_type"),
+])
+def test_a_framework_hook_override_keeps_the_frameworks_signature(tmp_path, script,
+                                                                  finding_type, key):
+    """pydantic-settings calls `settings_customise_sources` with exactly these five
+    sources. A forward() on an nn.Module is the author's own signature, so it fires.
+    (`# fires: count` marks six-parameter defs, under long_parameter_list's limit.)"""
+    (tmp_path / "config.py").write_text(_FRAMEWORK_HOOKS)
+    lines = sorted(f["line"] for f in run_detector(script, tmp_path) if f.get(key) == finding_type)
+    expected = _lines_marked(_FRAMEWORK_HOOKS)
+    if finding_type == "parameter_count":
+        expected = sorted(expected + _lines_marked(_FRAMEWORK_HOOKS, "# fires: count"))
+    assert lines == expected
+
+
+_COPIED_SIGNATURES = {
+    "pkg/pipeline.py": (
+        "class Pipeline:\n"
+        "    def __call__(self, params, generator=None, output_type='pil',  # fires\n"
+        "                 callback=None, conditioning=None, strength=1.0):\n"
+        "        return params\n"
+        "\n"
+        "def blend(a, b, c, d, e, f, g):  # fires\n"
+        "    return a\n"
+    ),
+    "pkg/proxy.py": (
+        "class Proxy:\n"
+        "    def __call__(self, params, generator, output_type, callback, conditioning, strength, **kwargs):  # fires\n"
+        "        return params\n"
+    ),
+    "tests/test_jobs.py": (
+        "class _Recording:\n"
+        "    def __call__(self, params, generator, output_type='pil', callback=None, conditioning=None, strength=1.0, **_):\n"
+        "        return params\n"
+        "\n"
+        "def test_the_hook_sees_every_call(install):\n"
+        "    def record(params, generator, output_type, callback, conditioning, strength):\n"
+        "        return params\n"
+        "    install(record)\n"
+        "\n"
+        "def mix(a, b, c, d, e, f, g):  # fires\n"
+        "    return a\n"
+        "\n"
+        "class _Builder:\n"
+        "    def build(self, recipe, size, seed, steps, scale, name):  # fires\n"
+        "        return a\n"
+        "\n"
+        "class _Renamed:\n"
+        "    def __call__(self, params, generator, seed, steps, width, height):  # fires\n"
+        "        return params\n"
+        "\n"
+        "def spread(params, generator, output_type, a, b, c, d):  # fires\n"
+        "    return params\n"
+    ),
+}
+
+
+@pytest.mark.parametrize("script,finding_type,key", [
+    ("analyze_complexity.py", "parameter_count", "issue_type"),
+])
+def test_a_test_double_copying_a_production_signature_is_not_charged_for_it(tmp_path, script,
+                                                                            finding_type, key):
+    """A fake pipeline's `__call__` takes what the real `Pipeline.__call__` takes,
+    because the code under test calls it that way, and so does a closure handed
+    in as a hook, whatever it is called; the length is reported once, at the
+    real definition. A test class's own method, a fake whose parameters are not
+    all the real one's, one whose parameters come from two different functions,
+    a module-level helper (the tests call it; it is not handed to the code under
+    test), and a production class copying another's signature are still charged."""
+    for name, text in _COPIED_SIGNATURES.items():
+        (tmp_path / name).parent.mkdir(parents=True, exist_ok=True)
+        (tmp_path / name).write_text(text)
+    found = sorted((Path(f["file"]).relative_to(tmp_path).as_posix(), f["line"])
+                   for f in run_detector(script, tmp_path) if f.get(key) == finding_type)
+    assert found == sorted((name, line) for name, text in _COPIED_SIGNATURES.items()
+                           for line in _lines_marked(text))
+
+
+_CONSTRUCTOR_ENVY = (
+    "class Adapter:\n"
+    "    def __init__(self, geometry):\n"
+    "        self.dim = geometry.dim\n"
+    "        self.heads = geometry.heads\n"
+    "        self.layers = geometry.layers\n"
+    "        self.width = geometry.width + geometry.depth + geometry.ratio\n"
+    "\n"
+    "    @classmethod\n"
+    "    def from_config(cls, config):\n"
+    "        return cls(config.a, config.b, config.c, config.d)\n"
+    "\n"
+    "    @classmethod\n"
+    "    def from_text(cls, config):  # fires\n"
+    "        return build(config.a, config.b, config.c, config.d)\n"
+    "\n"
+    "    def configure(self, geometry):  # fires\n"
+    "        return (geometry.a + geometry.b + geometry.c + geometry.d + geometry.e + geometry.f\n"
+    "                + geometry.g + geometry.h + geometry.i + geometry.j + geometry.k + geometry.l\n"
+    "                + self.x + self.y)\n"
+    "\n"
+    "class Loaded:\n"
+    "    def __init__(self, path):  # fires\n"
+    "        config = load(path)\n"
+    "        self.a = config.a + config.b + config.c + config.d\n"
+    "\n"
+    "    def size(self):\n"
+    "        return self.a\n"
+)
+
+
+def test_a_constructor_reading_the_configuration_it_was_handed_is_not_envy(tmp_path):
+    """Building yourself from a parameter object is what the parameter object is for;
+    moving `__init__` onto it is not a remedy."""
+    envy = sorted(r["line"] for r in _coupling(tmp_path, _CONSTRUCTOR_ENVY, "feature_envy"))
+    assert envy == _lines_marked(_CONSTRUCTOR_ENVY)
+
+
+# --------------------------------------------------------------------------- #
+# Round four: where a project is checked out says nothing about its files.
+# --------------------------------------------------------------------------- #
+
+_LOCATED_PROJECT = {
+    "pyproject.toml": '[project]\nname = "app"\nversion = "0"\ndependencies = []\n',
+    "src/app/__init__.py": "",
+    "src/app/core.py": (
+        "class Order:\n"
+        "    def __init__(self):\n"
+        "        self.total = 0\n"
+        "\n"
+        "    def ship(self, parcel):\n"
+        "        return parcel.street + parcel.city + parcel.zip + parcel.country\n"
+        "\n"
+        "    def label(self):\n"
+        "        return str(self.total)\n"
+        "\n"
+        "def area(width, strict=False):\n"
+        "    assert width > 0\n"
+        "    print(width)\n"
+        "    return width * 7 + other._secret\n"
+    ),
+    "tests/test_misc.py": (
+        "def test_numbers():\n"
+        "    for value in provided_values():\n"
+        "        assert value * 3\n"
+    ),
+}
+
+
+def _write_project(base: Path) -> Path:
+    for rel, content in _LOCATED_PROJECT.items():
+        target = base / rel
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(content)
+    return base
+
+
+def _report_below(root: Path, records) -> list:
+    """Records with the checkout's location taken out, comparable across locations."""
+    out = []
+    for r in records:
+        r = dict(r)
+        path = Path(r["file"])
+        r["file"] = (path.relative_to(root) if path.is_absolute() else path).as_posix()
+        r["description"] = str(r.get("description", "")).replace(str(root), "<root>")
+        out.append(json.dumps(r, sort_keys=True))
+    return sorted(out)
+
+
+_LOCATION_SENSITIVE = [
+    "find_code_smells.py", "find_boolean_params.py", "find_coupling_issues.py",
+    "find_design_smells.py", "find_exception_issues.py", "find_missing_docstrings.py",
+    "find_type_gaps.py", "find_test_smells.py", "find_debug_leftovers.py",
+    "find_untested_modules.py", "find_dead_code.py",
+]
+
+
+@pytest.mark.parametrize("script", _LOCATION_SENSITIVE)
+def test_a_detector_reports_the_same_project_wherever_it_is_checked_out(tmp_path, script):
+    neutral = _write_project(tmp_path / "work" / "app")
+    under_tests = _write_project(tmp_path / "tests" / "app")
+    under_scripts = _write_project(tmp_path / "scripts" / "app")
+
+    expected = _report_below(neutral, run_detector(script, neutral))
+    assert expected, f"{script} must find something in the fixture for this test to mean anything"
+    for checkout in (under_tests, under_scripts):
+        assert _report_below(checkout, run_detector(script, checkout)) == expected, checkout
+
+
+def test_the_aggregate_report_is_the_same_wherever_the_project_is_checked_out(tmp_path):
+    """Through the runner's worker pool too: workers learn the root as a parameter."""
+    def categories(root: Path) -> dict:
+        report = json.loads(subprocess.run(
+            [sys.executable, str(SCRIPTS_DIR / "analyze_all.py"), str(root),
+             "--format", "json", "--skip-duplicates", "--jobs", "2"],
+            capture_output=True, text=True, timeout=300, check=True).stdout)
+        return {c: _report_below(root, v["issues"]) for c, v in report["categories"].items()}
+
+    neutral = categories(_write_project(tmp_path / "work" / "app"))
+    assert any("magic_number" in r and "src/app/core.py" in r for r in neutral["code_smells"])
+    assert any("tests/test_misc.py" in r for r in neutral["test_smells"]), \
+        "a real tests/ directory inside the project is still test code"
+    assert categories(_write_project(tmp_path / "tests" / "app")) == neutral
+    assert categories(_write_project(tmp_path / "scripts" / "app")) == neutral
+
+
+# --------------------------------------------------------------------------- #
+# Round five: code copied verbatim from upstream, test doubles, exact-type
+# assertions, and imports that are slow because of what they import.
+# --------------------------------------------------------------------------- #
+
+_PORTED = (
+    "import pickle\n"
+    "\n"
+    "# doctor: verbatim-upstream ComfyUI comfy/utils.py\n"
+    "def upstream_resize(image, width, height, crop, method, antialias, mode):\n"
+    "    return image * 37\n"
+    "\n"
+    "def own(image, width, height, crop, method, antialias, mode):  # charged\n"
+    "    return image * 41\n"
+    "\n"
+    "# doctor: verbatim-upstream\n"
+    "def unsourced(a, b, c, d, e, f, g):  # charged\n"
+    "    return a * 43\n"
+    "\n"
+    "class Wrapper:\n"
+    "    # doctor: verbatim-upstream ComfyUI comfy/ldm/modules/attention.py\n"
+    "    def forward(self, x, transformer_options={}):\n"
+    "        return pickle.loads(x)  # charged: security still runs\n"
+)
+
+_REFERENCE = (
+    '"""ComfyUI\'s LLLite, reconstructed statement for statement."""\n'
+    "# doctor: verbatim-upstream ComfyUI comfy/ldm/anima/lllite.py\n"
+    "import os\n"
+    "\n"
+    "def forward(x, a, b, c, d, e, f):\n"
+    "    return x * 99\n"
+    "\n"
+    "def run(cmd):\n"
+    "    os.system(cmd)  # charged: security still runs\n"
+)
+
+
+def test_code_marked_verbatim_upstream_is_not_charged_but_is_accounted_for(tmp_path):
+    """Parity tests rebuild upstream code unchanged so a diff against it stays
+    readable; simplifying it would defeat that. The author opts in per file or per
+    definition, names the source, and every record not charged is counted."""
+    (tmp_path / "pkg").mkdir()
+    (tmp_path / "pkg" / "ported.py").write_text(_PORTED)
+    (tmp_path / "pkg" / "reference.py").write_text(_REFERENCE)
+
+    report = json.loads(subprocess.run(
+        [sys.executable, str(SCRIPTS_DIR / "analyze_all.py"), str(tmp_path),
+         "--format", "json", "--skip-duplicates"],
+        capture_output=True, text=True, timeout=300, check=True).stdout)
+    assert "records_rejected" not in report["meta"], report["meta"].get("records_rejected")
+
+    def rows(name):
+        return {(category, r["line"], r.get("smell_type") or r.get("issue_type") or r.get("pattern_type"))
+                for category, v in report["categories"].items() if category != "verbatim_upstream"
+                for r in v["issues"] if Path(r["file"]).name == name}
+
+    still_charged = {"security", "untested_modules", "exception_issues", "mutation_hazards",
+                     "resource_leaks", "global_state", "import_cycles", "debug_leftovers",
+                     "dependency_issues", "duplicate_definitions", "unawaited_coroutines"}
+    ported = rows("ported.py")
+    marked = set(range(4, 6)) | set(range(16, 18))  # upstream_resize and Wrapper.forward
+    assert not {r for r in ported if r[1] in marked and r[0] not in still_charged}, ported
+    assert ("complexity", 7, "parameter_count") in ported, "unmarked code is still charged"
+    assert ("complexity", 11, "parameter_count") in ported, "a marker naming no source exempts nothing"
+    assert ("security", 17, "unsafe_deserialization") in ported, "security runs inside marked code"
+
+    reference = rows("reference.py")
+    assert {category for category, _, _ in reference} <= still_charged, reference
+    assert ("security", 9, "shell_injection") in reference
+
+    upstream = {(Path(r["file"]).name, r["kind"], r["smell_type"]): r
+                for r in report["categories"]["verbatim_upstream"]["issues"]}
+    for name, source in (("ported.py", "comfy/utils.py"), ("reference.py", "lllite.py")):
+        lead = upstream[(name, "candidate", "verbatim_upstream_duplicate")]
+        assert "not charged" in lead["description"] and source in lead["description"]
+        assert lead["also_caused_by"] and not lead["suggestion"]
+    ignored = upstream[("ported.py", "finding", "upstream_annotation_ignored")]
+    assert ignored["line"] == _lines_marked(_PORTED, "# doctor: verbatim-upstream")[0]
+    assert set(report["meta"]["not_charged"]) == {
+        str(tmp_path / "pkg" / "ported.py"), str(tmp_path / "pkg" / "reference.py")}
+
+    text = subprocess.run(
+        [sys.executable, str(SCRIPTS_DIR / "analyze_all.py"), str(tmp_path), "--skip-duplicates"],
+        capture_output=True, text=True, timeout=300, check=True).stdout
+    assert "not charged" in text
+
+
+_RECORDING_FAKE = (
+    "class RecordingPipeline:\n"
+    "    def __init__(self):\n"
+    "        self.calls = []\n"
+    "\n"
+    "    def __call__(self, params):\n"
+    "        self.calls.append((params.prompt, params.seed, params.steps, params.width, params.height))\n"
+    "\n"
+    "    def reset(self):\n"
+    "        self.calls.clear()\n"
+)
+
+
+def test_a_recording_fake_reads_the_argument_it_records(tmp_path):
+    """A fake that records its argument reads that argument; that is not envy of
+    the argument's class. The same class outside tests is still reported."""
+    (tmp_path / "tests").mkdir()
+    (tmp_path / "tests" / "fakes.py").write_text(_RECORDING_FAKE)
+    (tmp_path / "pipeline.py").write_text(_RECORDING_FAKE)
+    envy = [Path(r["file"]).name for r in run_detector("find_coupling_issues.py", tmp_path)
+            if r["issue_type"] == "feature_envy"]
+    assert envy == ["pipeline.py"]
+
+
+def test_nonetype_and_an_exact_type_assertion_are_not_type_comparisons(tmp_path):
+    """`type(None)` names NoneType; it tests no object's type. In a test,
+    `assert type(x) is float` pins the exact type on purpose, which isinstance
+    would not. Equality comparisons remain visible outside test assertions."""
+    source = (
+        "def optional_inner(annotation, get_args):\n"
+        "    return [a for a in get_args(annotation) if a is not type(None)]\n"
+        "\n"
+        "def kind(x, Foo):\n"
+        "    if type(x) == Foo:  # fires\n"
+        "        return 1\n"
+        "    assert type(x) is Foo\n"
+        "    return 0\n"
+    )
+    test = (
+        "def test_strength_is_a_float(spec):\n"
+        "    assert type(spec.strength) is float\n"
+        "    if type(spec.strength) == float:  # fires\n"
+        "        assert spec\n"
+    )
+    (tmp_path / "config.py").write_text(source)
+    (tmp_path / "test_prompting.py").write_text(test)
+    found = sorted((Path(r["file"]).name, r["line"]) for r in run_detector("find_code_smells.py", tmp_path)
+                   if r["smell_type"] == "type_comparison")
+    assert found == sorted([("config.py", n) for n in _lines_marked(source)]
+                           + [("test_prompting.py", n) for n in _lines_marked(test)])
+
+
+_CHECKPOINTS = (
+    "def load():\n"
+    "    from pkg.models.loading import load_pipeline  # lead\n"
+    "    return load_pipeline\n"
+    "\n"
+    "def serve():\n"
+    "    from pkg.api import app  # lead\n"
+    "    return app\n"
+    "\n"
+    "def relative():\n"
+    "    from .models import loading  # lead\n"
+    "    return loading\n"
+    "\n"
+    "def weights():\n"
+    "    from safetensors.torch import load_file  # lead\n"
+    "    return load_file\n"
+    "\n"
+    "def light():\n"
+    "    from pkg.models.light import parse  # fires\n"
+    "    return parse\n"
+    "\n"
+    "def lazy():\n"
+    "    from pkg.lazy_heavy import encode  # fires\n"
+    "    return encode\n"
+    "\n"
+    "def typed():\n"
+    "    from pkg.typed import Shape  # fires\n"
+    "    return Shape\n"
+)
+
+
+def test_deferring_a_first_party_module_that_loads_torch_is_a_heavy_import(tmp_path):
+    """`from pkg.models.loading import ...` costs what loading.py imports at module
+    level — torch — so deferring it is the same startup choice as deferring torch."""
+    (tmp_path / "pyproject.toml").write_text('[project]\nname = "pkg"\nversion = "0"\n')
+    files = {
+        "pkg/__init__.py": "",
+        "pkg/models/__init__.py": "",
+        "pkg/models/loading.py": "import torch\n\ndef load_pipeline():\n    return torch\n",
+        "pkg/models/light.py": "import json\n\ndef parse(text):\n    return json.loads(text)\n",
+        "pkg/api.py": "from pkg.models import loading\n\napp = loading\n",
+        "pkg/lazy_heavy.py": "def encode():\n    import torch\n    return torch\n",
+        "pkg/typed.py": ("from typing import TYPE_CHECKING\n\nif TYPE_CHECKING:\n    import torch\n\n"
+                         "Shape = tuple\n"),
+        "pkg/checkpoints.py": _CHECKPOINTS,
+    }
+    for rel, content in files.items():
+        (tmp_path / rel).parent.mkdir(parents=True, exist_ok=True)
+        (tmp_path / rel).write_text(content)
+
+    records = {r["line"]: r for r in run_detector("find_local_imports.py", tmp_path)
+               if r["smell_type"] == "local_import" and Path(r["file"]).name == "checkpoints.py"}
+    assert sorted(n for n, r in records.items() if r["kind"] == "candidate") == \
+        _lines_marked(_CHECKPOINTS, "# lead")
+    assert sorted(n for n, r in records.items() if r["kind"] == "finding") == _lines_marked(_CHECKPOINTS)
+    assert "torch" in records[_lines_marked(_CHECKPOINTS, "# lead")[1]]["description"], \
+        "the record says which heavy package makes the module slow, and through what"
+
+
+_COMMAND_HELPERS = (
+    "import typer\n"
+    "\n"
+    "app = typer.Typer()\n"
+    "\n"
+    "@app.command()\n"
+    "def download():\n"
+    "    _fetch_adapter()\n"
+    "\n"
+    "def _fetch_adapter():\n"
+    "    from pkg.light import fetch  # lead\n"
+    "    _unpack()\n"
+    "    return fetch\n"
+    "\n"
+    "def _unpack():\n"
+    "    import json  # lead\n"
+    "    return json\n"
+    "\n"
+    "def _shared():\n"
+    "    import csv  # fires\n"
+    "    return csv\n"
+    "\n"
+    "@app.command()\n"
+    "def export():\n"
+    "    return _shared()\n"
+    "\n"
+    "def report():\n"
+    "    return _shared()\n"
+    "\n"
+    "def _uncalled():\n"
+    "    import gzip  # fires\n"
+    "    return gzip\n"
+    "\n"
+    "def _passed_around():\n"
+    "    import zlib  # fires\n"
+    "    return zlib\n"
+    "\n"
+    "@app.command()\n"
+    "def compress():\n"
+    "    return run(_passed_around)\n"
+    "\n"
+    "def public_helper():\n"
+    "    import bz2  # fires\n"
+    "    return bz2\n"
+    "\n"
+    "@app.command()\n"
+    "def bz():\n"
+    "    return public_helper()\n"
+)
+
+
+def test_a_helper_only_cli_commands_call_defers_like_a_command(tmp_path):
+    """`_download_ip_adapter` exists only to split the `download` command, so its
+    deferred imports keep `--help` fast exactly as the command's own do. A helper
+    anything else calls, uses as a value, or could be imported elsewhere is not one."""
+    (tmp_path / "cli.py").write_text(_COMMAND_HELPERS)
+    records = {r["line"]: r["kind"] for r in run_detector("find_local_imports.py", tmp_path)
+               if r["smell_type"] == "local_import"}
+    assert sorted(n for n, k in records.items() if k == "candidate") == \
+        _lines_marked(_COMMAND_HELPERS, "# lead")
+    assert sorted(n for n, k in records.items() if k == "finding") == _lines_marked(_COMMAND_HELPERS)

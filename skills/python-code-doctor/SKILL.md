@@ -60,6 +60,47 @@ python "$SKILL/scripts/analyze_all.py" . --jobs 1          # one process
 python "$SKILL/scripts/analyze_all.py" . --skip duplicates # drop the slowest category
 ```
 
+## Project boundaries and evidence
+
+Installed skills under `.codex/skills`, `.claude/skills`, `.kiro/skills`, and
+`.agents/skills` are tooling, not application source. Source walks omit those
+payloads while retaining neighboring agent configuration; explicitly scanning a
+skill still works. The raw doctor's wider credential scan still inspects installed
+payloads for credentials; source exclusions do not hide secrets from that scan.
+
+A mutable class declaration alone is a candidate: framework configuration and
+read-only registries share that shape. A demonstrated instance mutation of
+unshadowed shared state is a finding. Quoted constant SQL identifiers are also
+candidates, since identifiers cannot be passed as query parameters; ordinary
+interpolated SQL values remain findings.
+
+Direct literal assignments to named attributes, like named local assignments,
+already explain the value's role; arithmetic and comparison thresholds still need
+review. Required unittest and Django lifecycle names are exempt from snake-case
+checks only on proven imported framework bases. Plain classes, custom camelCase
+methods and unresolved inheritance retain the normal naming checks.
+
+Declarative Django model, form and admin classes inherit behavior; proven built-in
+bases are not data-container refactoring targets. When other inherited behavior
+cannot be resolved, a data-only local declaration is a candidate without a
+dataclass replacement recommendation. Plain classes retain the normal check.
+Immediate `Meta` classes on proven Django Model/ModelForm parents are configuration;
+the same name on unrelated or unresolved parents grants no exemption.
+
+Protocol methods such as context-manager and iterator hooks, and ordinary private
+methods, count as behavior when checking for data-only classes. Initializers alone
+still leave a data-container finding. Cohesion groups declared fields through
+resolved first-party Pydantic ancestry; unresolved or unrelated bases retain their
+normal evidence. Pydantic private attributes stay separate from validated model
+fields; underscore-prefixed dataclass fields remain part of their record.
+
+An `__import__` call whose arguments are all source literals keeps a
+`literal_import` design finding about its hidden dependency. Unresolved arguments,
+including starred argument expansion, retain the security finding. Cross-file
+parameter clumps are attributed to the file holding the most members (ties use
+path order), while their occurrence list remains complete. Upstream-marked clumps
+keep their upstream anchor so attribution cannot change whether they are charged.
+
 ## Workflow
 
 **Cleaning up a whole poorly-written repo from cold?** The steps below assume the
@@ -108,7 +149,7 @@ python "$SKILL/scripts/analyze_all.py" . --format json > report.json
 # Complexity & structure
 python "$SKILL/scripts/analyze_complexity.py" .         # Cyclomatic/cognitive complexity, nesting, size
 python "$SKILL/scripts/find_duplicates.py" .            # AST-normalized duplicate blocks
-python "$SKILL/scripts/find_coupling_issues.py" .       # Feature envy, low cohesion (LCOM), message chains, middle man
+python "$SKILL/scripts/find_coupling_issues.py" .       # Feature envy, low cohesion (LCOM4), message chains, middle man
 
 # Smells, dead code, over-engineering
 python "$SKILL/scripts/find_code_smells.py" .           # Mutable defaults, bare excepts, magic numbers, god classes
@@ -119,14 +160,14 @@ python "$SKILL/scripts/find_unpythonic.py" .            # range(len), == True/No
 
 # Correctness bugs (these find real bugs, not style)
 python "$SKILL/scripts/find_mutation_hazards.py" .      # Mutable class attrs, modify-during-iteration, mutated defaults
-python "$SKILL/scripts/find_exception_issues.py" .      # raise-without-from, unreachable except, BaseException, assert-validation
+python "$SKILL/scripts/find_exception_issues.py" .      # Swallowed errors, unreachable except, BaseException traps, assert-validation, raise-without-from
 python "$SKILL/scripts/find_global_state.py" .          # Mutated module globals, global-rebinding functions
 python "$SKILL/scripts/find_resource_leaks.py" .        # open()/socket/tempfile not used as a context manager (fd leaks)
 python "$SKILL/scripts/find_security_issues.py" .       # eval/exec, shell=True, unsafe yaml/pickle, weak hash, hardcoded secrets
 
 # Architecture & repo structure (cross-file)
 python "$SKILL/scripts/find_import_cycles.py" .         # Circular imports, god modules, wildcard imports, logic in __init__
-python "$SKILL/scripts/find_dependency_issues.py" .     # Missing/unused/unpinned third-party deps vs. the manifest
+python "$SKILL/scripts/find_dependency_issues.py" .     # Missing/unused/unpinned third-party deps vs. the manifest (an `except ImportError` that visibly degrades = optional, not missing)
 
 # Safety net (build this BEFORE refactoring — see references/safety-net-and-testing.md)
 python "$SKILL/scripts/find_untested_modules.py" .      # Source modules no test references; "no tests in repo" alarm
@@ -175,7 +216,26 @@ at a time and the evidence is elsewhere:
 |---|---|
 | `unused_function` / `unused_class` on a public name | any other module may import it |
 | `unused_parameter` on a method or a nested callback | the base class or the caller that receives it dictates the signature |
-| `sql_injection` on a `PRAGMA` statement | PRAGMA accepts no bound parameters, so a dynamic identifier has no parameterized spelling |
+| `assert_for_validation` on `assert x is not None` / `assert isinstance(...)` | that shape usually narrows a type for the checker and records an invariant the caller guarantees |
+| `local_import` of a slow-to-import package (torch, transformers, ...) or inside a CLI command | deferral to keep startup and `--help` fast is the usual reason, and only the author knows |
+| `missing_dependency` on a module imported only inside `try`/`except ImportError` where no handler visibly degrades (it raises, exits, or ends any other way), or where the `try` imports several third-party modules (stdlib and relative imports aside) and the degrading handler rebinds none of this one's names (`x = None`, `x = fallback`, a fallback import) | `except ImportError: sys.exit("pip install x")` is how a script says x is required, and also how an optional extra's entry point reports it is missing; only a handler whose last statement visibly degrades (`pass`, `continue`, a falsy `return`, `x = None` / `x = fallback` / a fallback import of the same name, a `warnings.warn` or logging call) makes the import optional; anything else, from `die()` to `return 1`, is a lead |
+| `missing_dependency` on a module imported only after its file puts a directory on `sys.path` that the source cannot place inside the repo: it resolves outside the repo (a relative entry such as Sphinx's `abspath('..')` is read from both the repo root and the file's own directory, and is inside if either is), or reads a function parameter, `os.environ`/`os.getenv`, `sys.argv`, an argparse result (`args.x` from `parse_args()`) or a name bound more than once | a harness run under another program's interpreter imports that program's modules from the directory it adds; only the machine it runs on shows what is there. A path the source resolves inside the repo (under any import alias of `os.path`/`pathlib`), one it cannot follow but that reads none of those run-time sources, and an import in a file that never touches `sys.path` stay findings. **Scope:** one such addition demotes every undeclared module imported only after it in that file, not just what the directory provides: a plugin loader's own `import requests`, or a lazy import in any function below a `def add_dir(d): sys.path.append(d)` helper. Confirm each |
+| `unused_parameter` on a method, a nested callback, or a function some module hands out as a value | the base class or the caller that receives it dictates the signature |
+| `unused_import` of an absolute import in a package's `__init__.py` | the import makes the name a package attribute another module may read (a relative import there is never reported) |
+| `sql_injection` in a schema identifier position or `PRAGMA`, on proven quoted constant identifiers, or in a test | identifiers cannot be bound; test code may construct its own values. Confirm the origin and interpolation position. CREATE data queries containing SELECT or VALUES keep the ordinary data-interpolation finding |
+| `swallowed_exception` / `catches_baseexception` under a reasoned `# noqa: BLE001 -- why` | the repo's own lint gate adjudicated the line; the reason is what to check, and a bare noqa stays a finding |
+| `global_rebind` under a reasoned `# noqa: PLW0603 -- why` | an at-fork or install-once hook has no caller to return a value to |
+| `mutable_class_attribute` that nothing in the module mutates | a read-only table shared on purpose looks the same; only another module's code can show a mutation |
+| `raise_without_from` on an `HTTPException` | the framework renders it as a response and never prints the chain |
+| `assert_for_validation` outside a public function's argument check | an invariant or type narrowing holds under `-O` too; only the call sites show whether input reaches it |
+| `feature_envy`, `try_finally_close` | whether the receiver is a strategy's context, or a context manager, is decided where its class is defined |
+| `thin_wrapper` when methods access one stored object but do more than transparently forward | that object can hold state whose aggregation, validation, or transformation is the class's own policy; the record names the method bodies to inspect |
+| `temporary_field` on a public field populated and read in one method, with no reset or only an initial reset | a result or status may remain meaningful to external consumers after the writer returns; private scratch and later reset lifecycles stay findings |
+
+Others are candidates because the file states a reason the detector cannot
+weigh — a reasoned `# noqa: E402`, a docstring documenting an import order, two
+copies of a block (below the rule of three), keyword-only flags, one short
+type switch. Each record's `also_caused_by` names the readings to rule out.
 
 Confirm one before acting on it — deleting a "dead" public function on a
 single-file verdict deletes live code. `format_findings.py` files candidates as
@@ -183,6 +243,28 @@ single-file verdict deletes live code. `format_findings.py` files candidates as
 `summary.total_candidates` and lists them under their own heading; and
 **code-overview excludes them from a code-health score**, so a candidate never
 costs a grade.
+
+**Code copied verbatim from another project.** A parity test that rebuilds
+upstream code unchanged, so a diff against it stays readable, cannot be
+simplified without defeating its purpose. The author can mark it:
+
+```python
+# doctor: verbatim-upstream ComfyUI comfy/ldm/anima/lllite.py
+```
+
+On its own line before the module's first statement, the marker covers the
+whole file. Directly above a `def` or `class` (or its decorators), it covers
+that definition. **It is only for code copied verbatim from another project,
+and it must name that source** — never a way to quiet the doctor on code
+written here. `analyze_all.py` then does not charge the marked code for
+complexity, design, hygiene or duplication; correctness and security detectors
+still report inside it. Marked code also never counts toward a duplicate group
+or a data clump charged to unmarked code: those are judged on the project's
+own copies and signatures. Nothing is hidden. Each marked file gets a
+`verbatim_upstream` candidate counting the records not charged, the same count
+is in `meta.not_charged`, and a marker that names no source, or sits above no
+definition, exempts nothing and is reported as a finding.
+`grep -rn "doctor: verbatim-upstream"` lists every opt-in.
 
 ## Use the repo's own tools when they exist
 
@@ -307,7 +389,7 @@ Keep `SKILL.md` lean; pull in depth only when a review needs it.
 | Same function/class defined twice; `<<<<<<<` markers | Remove the duplicate / resolve the conflict (the later def silently wins) |
 | Coroutine called without `await` | `await` it (or wrap in `asyncio.create_task`/`gather`) |
 | `except Exception: pass` / `print(e)` then continue | Handle and re-raise, or catch a narrow type — don't swallow |
-| Test that asserts nothing or only `assert True`/`assertIsNotNone` | Assert the actual expected value/behavior |
+| Test that asserts nothing, only `assert True`, or only not-None on a value never None | Assert the actual expected value/behavior |
 
 ## When NOT to simplify
 
@@ -327,7 +409,10 @@ docstrings (`D`), missing annotations (`ANN`), and security (`S`/bandit). Depend
 advisories and line coverage are not a linter's job at all — those come from pip-audit
 and coverage through `run_external_tools.py`. If the repo
 already runs those Ruff rules, disable the matching detector via `--ignore` (or drop
-its whole category with `analyze_all.py --skip`) to avoid double-reporting — or
+its whole category with `analyze_all.py --skip`) to avoid double-reporting. Where
+they overlap, a suppression with its reason written down — `# noqa: A002 -- the
+HTTP parameter is named id` — is read as a reviewed decision: `find_naming_issues.py`
+reports that shadow as a candidate, not a finding; a bare `# noqa` changes nothing. Or,
 better, run the real tools with
 `run_external_tools.py` (above) and lean on the detectors only for what the tools
 don't cover. The unique value here is the **bug-finding and design detectors**
@@ -336,3 +421,11 @@ unawaited coroutines, data clumps, coupling, duplication), the **repo-level chec
 (dependency hygiene, untested-module and test-smell detection that scaffold a safety
 net), the **AI-code tells** (scaffolding, duplicate definitions, fake robustness),
 plus the **judgment guides** — which no linter provides.
+
+Where a detector mirrors a Ruff rule the repo already enforces, a suppression of
+that rule **with a stated reason** — `# noqa: BLE001 -- the caller reads None as
+unreadable`, on the flagged line or a comment line directly below it — is read as
+the repo's own adjudication: the record becomes a candidate, and the reason is
+what to check. A bare `# noqa: BLE001` says nothing and stays a finding. The
+detectors that read it: `swallowed_exception` and `catches_baseexception` (BLE001),
+and `global_rebind` (PLW0603, on the `global` statement).

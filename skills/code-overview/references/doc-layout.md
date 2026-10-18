@@ -142,6 +142,7 @@ Root-scope `packages[]` rows carry `generated: false` when a package has no
 health page — the documented "codemap only" answer. Those rows stay in the table
 rather than being dropped, so a roll-up missing a whole package cannot look
 complete.
+| `candidates_total`, `candidates_shown` | all unscored leads and the bounded number rendered in the Candidates tab; omitted rows never affect grades or coverage |
 | `top_findings[]` | the worst N, with repo-relative paths |
 | `packages[]` | root scope only: one row per package, with its grade |
 
@@ -293,3 +294,17 @@ Pass `--exclude docs` to the `code-visualization` analyzers. Without it, a
 rebuild counts the previously-generated HTML as source: a small package's own
 `docs/codemap.html` can be 90% of its measured lines, and the inventory tab then
 describes the documentation rather than the code.
+
+Scope a package's atlas with `--root`, once per entry in its `roots`, and point
+the analyzers at the repo root rather than at a root:
+
+```bash
+python "$CV/scripts/analyze_deps.py" <repo> --tabs-dir $TABS --exclude docs \
+  --root src/billing --root tests/billing
+```
+
+Only files under the roots are reported, but the whole repo is still read for
+context, so a root-level manifest still governs resolution and an import into a
+sibling package resolves — it is listed under `outside_roots`, not drawn, and
+not counted as an unresolved gap. `--exclude` cannot do this job: it matches
+directory names, so excluding a top-level `scripts` also drops `tests/scripts`.

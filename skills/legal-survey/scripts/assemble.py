@@ -18,12 +18,44 @@ Fragments are assembled in filename order. A fragment whose body is empty
 --title/--label/--meta/--subtitle are HTML-escaped. --footer is injected as
 raw HTML (it legitimately carries entities and links) — escape it yourself if
 it ever contains untrusted text.
+
+Renderers
+---------
+A skill that ships assets/renderers.css and assets/renderers.js (sortable
+tables, force graph, treemap, Mermaid) has them inlined into the page whatever
+--template names: the shell decides the look, never whether the graphs draw.
+A skill that ships neither gets its shell unchanged.
 """
 import argparse
 import html
 import re
 import sys
 from pathlib import Path
+
+
+ASSETS = Path(__file__).resolve().parent.parent / "assets"
+
+
+def with_renderers(shell: str) -> str:
+    """The page shell with this skill's renderers inlined, if it ships any.
+
+    They live once, in assets/renderers.{css,js}, rather than inside the
+    default template: a caller that passes its own shell (code-overview does,
+    so its five documents read as one) would otherwise get an atlas whose
+    graphs never draw and whose diagrams stay Mermaid source.
+    """
+    css, js = ASSETS / "renderers.css", ASSETS / "renderers.js"
+    if not (css.is_file() and js.is_file()):
+        return shell
+    style = f'<style id="atlas-renderers-css">\n{css.read_text(encoding="utf-8")}</style>\n'
+    script = f'<script id="atlas-renderers">\n{js.read_text(encoding="utf-8")}</script>\n'
+    head = shell.lower().find("</head>")
+    if head < 0:
+        script, style = style + script, ""
+    else:
+        shell = shell[:head] + style + shell[head:]
+    body = shell.lower().rfind("</body>")
+    return shell + script if body < 0 else shell[:body] + script + shell[body:]
 
 
 def slug_id(name: str) -> str:
@@ -41,7 +73,7 @@ def main() -> int:
     ap.add_argument("--subtitle", default="")
     ap.add_argument("--meta", default="")
     ap.add_argument("--footer", default="")
-    ap.add_argument("--template", default=str(Path(__file__).resolve().parent.parent / "assets" / "template.html"))
+    ap.add_argument("--template", default=str(ASSETS / "template.html"))
     args = ap.parse_args()
 
     tabs_dir = Path(args.tabs_dir)
@@ -76,7 +108,7 @@ def main() -> int:
             f'<section class="panel{active}" id="{tid}" role="tabpanel">\n{body}\n</section>'
         )
 
-    tpl = Path(args.template).read_text(encoding="utf-8")
+    tpl = with_renderers(Path(args.template).read_text(encoding="utf-8"))
     out_html = (
         tpl.replace("<!--DOC_TITLE-->", html.escape(args.title))
         .replace("<!--DOC_LABEL-->", html.escape(args.label))

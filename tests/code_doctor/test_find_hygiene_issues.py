@@ -64,18 +64,56 @@ def test_commented_out_code_is_a_candidate_with_reasons(repo, run_script):
 
 
 def test_url_scheme_inside_a_string_is_not_mistaken_for_the_comment_opener(repo, run_script):
-    """Literals are blanked before comment prefixes are matched.
-
-    The `//` inside the URL string must not be what triggers this: blanking
-    removes it, so the `;` statement separator is what's found instead. No
-    prefix is unambiguous without a parser, so `;` still yields a candidate —
-    just not one manufactured out of misreading the URL's own `//`.
-    """
+    """Neither the URL's own `//` nor the `;` separating two statements makes
+    this line a comment: it is live code from its first token, and commented-out
+    code is a line somebody disabled."""
     repo.write("app.go", 'package main\nurl := "https://example.com/a"; doWork()\n')
     result = run_script(SCRIPT, repo.path, "--format", "json")
-    record = records_of(result, "commented_out_code")[0]
-    assert record["kind"] == "candidate"
-    assert record["suggestion"] == ""
+    assert "commented_out_code" not in types_in(result)
+
+
+def test_a_prefix_mid_line_is_not_commented_out_code(repo, run_script):
+    """`;` inside a for header and a CSS declaration, `--` as a decrement:
+    each was read as a comment opener and the rest of the line as its code."""
+    repo.write("loop.ts", "for (let i = 1; i <= 40; i++) {\n  n--;\n}\n")
+    repo.write("site.css", ".list > li:last-child { border-bottom: 0; }\n")
+    result = run_script(SCRIPT, repo.path, "--format", "json")
+    assert "commented_out_code" not in types_in(result)
+
+
+def test_flush_prefixes_that_open_something_else_are_not_comments(repo, run_script):
+    """At the start of a line, `--name:` is a CSS custom property, `#id {` a CSS
+    selector and `#include` a preprocessor directive — none is a comment."""
+    repo.write("theme.css", ":root {\n  --accent: #0a6;\n}\n#main {\n  color: red;\n}\n")
+    repo.write("main.c", "#include <stdio.h>\n#define SQUARE(x) ((x) * (x))\n")
+    result = run_script(SCRIPT, repo.path, "--format", "json")
+    assert "commented_out_code" not in types_in(result)
+
+
+def test_documentation_comments_and_prose_asides_are_not_code(repo, run_script):
+    """A doc comment's example is an example, and prose puts a space before
+    its parenthesis — "every route (see the docstring)" is not a call."""
+    repo.write("lib.rs", "/// let x = compute(1, 2);\nfn compute() {}\n")
+    repo.write("guard.py", "#: How the client is spelled at every route (see the docstring)\n"
+                           "CLIENT = 'client'\n"
+                           "# Sized well past any real banner (a handful of rows)\n"
+                           "CAP = 9\n"
+                           "# Each root uniquifies `slugify(name)` against itself, per ruling 6(c)\n"
+                           "ROOTS = ()\n"
+                           "# a direct caller of validate() sees instead of a ClimateError\n"
+                           "ERRORS = ()\n")
+    result = run_script(SCRIPT, repo.path, "--format", "json")
+    assert "commented_out_code" not in types_in(result)
+
+
+def test_disabled_lines_are_still_candidates_in_each_comment_style(repo, run_script):
+    """The narrowing must not lose the thing it exists for."""
+    repo.write("a.py", "def f():\n    # result = compute(1, 2)\n    return 1\n")
+    repo.write("b.sql", "-- SELECT name FROM users WHERE id = 1;\nSELECT 1;\n")
+    repo.write("c.ts", "    // if (ready) { start(); }\nexport {};\n")
+    result = run_script(SCRIPT, repo.path, "--format", "json")
+    flagged = {Path(r["file"]).name for r in records_of(result, "commented_out_code")}
+    assert flagged == {"a.py", "b.sql", "c.ts"}
 
 
 def test_prose_is_not_scanned_for_commented_out_code(repo, run_script):
@@ -208,3 +246,36 @@ def test_merge_marker_in_a_utf16_file_is_still_detected(repo, run_script):
     (repo.path / "app.txt").write_bytes(content.encode("utf-16"))
     result = run_script(SCRIPT, repo.path, "--format", "json")
     assert "merge_conflict_marker" in types_in(result)
+
+
+def test_a_minified_bundle_does_not_stall_the_scan(repo, run_script):
+    """Backslash runs inside an unterminated quote used to backtrack
+    exponentially in the string-literal blanker; one committed Vite bundle
+    held the whole detector past a ten-minute timeout."""
+    line = "var a='" + "\\\\" * 40 + "x" + ";b=\"\\\\q\"" * 2000
+    repo.write("static/assets/index-U_FZj3ND.js", (line + "\n") * 3)
+    result = run_script(SCRIPT, repo.path, "--format", "json")
+    payload = json.loads(result.stdout)
+    assert payload["findings"] == []
+    # Read for merge markers only, and the report says so.
+    assert "index-U_FZj3ND.js" in payload["completeness"]["generated_files_skipped"]
+
+
+def test_a_todo_comment_on_an_ordinary_line_is_still_inventoried(repo, run_script):
+    repo.write("app.py", "x = 1  # TODO: name this\n")
+    result = run_script(SCRIPT, repo.path, "--format", "json")
+    assert "todo_inventory" in types_in(result)
+
+
+def test_a_prose_template_is_not_held_to_code_line_lengths(repo, run_script):
+    """`chat.md.j2` is Markdown with Jinja in it; its paragraphs are lines."""
+    repo.write("prompts/chat.md.j2", "{{ intro }}\n\n" + "A long paragraph of prose. " * 40 + "\n")
+    repo.write("templates/notice.txt.jinja", "Dear {{ name }}, " + "word " * 120 + "\n")
+    result = run_script(SCRIPT, repo.path, "--format", "json")
+    assert "oversized_line" not in types_in(result)
+
+
+def test_a_template_of_code_is_still_source(repo, run_script):
+    repo.write("gen/module.py.j2", "x = " + "1 + " * 120 + "1\n")
+    result = run_script(SCRIPT, repo.path, "--format", "json")
+    assert "oversized_line" in types_in(result)

@@ -29,7 +29,27 @@ _PROSE_SHAPES = re.compile(
     r"^\s*(?:[A-Z][a-z]+\s+){2,}|^\s*(?:e\.g\.|i\.e\.|NOTE|Note:|see |See )|^\s*[-*+]\s|`"
 )
 
-_MARKER = re.compile(r"\b(TODO|FIXME|HACK|XXX|WORKAROUND|KLUDGE)\b[:\s]*(.{0,90})", re.IGNORECASE)
+# A marker is a *tag*, not a word: it opens the comment (`// TODO rewrite`,
+# `// todo: later`) or is tagged anywhere with `:`/`(` (`// see TODO: budget`,
+# `// FIXME(alice)`). Inside prose the same letters are vocabulary — `evals todo`
+# names a command, "the retry hack above" describes one, `\uXXXX` is escape
+# notation — and a bare word search reports every one.
+_MARKER_WORDS = "TODO|FIXME|HACK|XXX|WORKAROUND|KLUDGE"
+_MARKER_OPENS_COMMENT = re.compile(rf"^\W*({_MARKER_WORDS})\b(?P<tag>\s*[:(\-])?", re.IGNORECASE)
+_MARKER_TAGGED = re.compile(rf"\b({_MARKER_WORDS})\b(?=\s*[:(])")
+
+
+def task_marker(text: str) -> tuple[str, str] | None:
+    """(marker, note) when the comment carries a marker; None when it merely uses the word."""
+    opening = _MARKER_OPENS_COMMENT.match(text)
+    if opening and (opening.group(1).isupper() or opening.group("tag")):
+        match = opening
+    else:
+        match = _MARKER_TAGGED.search(text)
+        if not match:
+            return None
+    note = text[match.end(1):].lstrip(":- \t").strip()
+    return match.group(1).upper(), note[:90]
 _TYPED_JSDOC = re.compile(r"@(?:param|returns?|type|prop(?:erty)?)\s*\{")
 _ESLINT = re.compile(r"eslint-|@ts-|prettier-ignore|istanbul ignore|c8 ignore|@jsx|<reference")
 
@@ -82,10 +102,10 @@ def _check_commented_code(file: TsFile, report: Reporter) -> None:
 def _check_markers(file: TsFile, report: Reporter) -> None:
     for comment in file.comments:
         for line, text in _comment_lines(comment):
-            match = _MARKER.search(text)
-            if not match:
+            found = task_marker(text)
+            if not found:
                 continue
-            marker, note = match.group(1).upper(), match.group(2).strip()
+            marker, note = found
             severity = "medium" if marker in ("FIXME", "HACK", "XXX", "KLUDGE") else "low"
             report.add(line, "todo_marker",
                        f"{marker}: {note or '(no explanation)'}",

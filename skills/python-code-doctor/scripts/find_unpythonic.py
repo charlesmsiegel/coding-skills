@@ -129,8 +129,9 @@ class UnpythonicDetector(ast.NodeVisitor):
         self.generic_visit(node)
 
     # Exception-swallowing (bare/narrow `except: pass`) is detected by
-    # find_exception_issues.py (swallowed_exception) — the dedicated owner —
-    # so it is intentionally not duplicated here.
+    # find_exception_issues.py (swallowed_exception for a broad catch,
+    # suppressible_exception for a narrow one) — the dedicated owner — so it is
+    # intentionally not duplicated here.
     #
     # `x = x + y` is deliberately NOT rewritten to `x += y`: for lists and
     # arrays += mutates in place through every alias, so the "cleanup" changes

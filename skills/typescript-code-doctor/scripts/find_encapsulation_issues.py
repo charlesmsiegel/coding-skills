@@ -18,6 +18,30 @@ CHAIN_ROOT_ALLOWLIST = frozenset({
     "process", "window", "document", "globalThis", "React", "it", "test", "expect",
 })
 CHAIN_DEPTH = 4
+# Methods of the built-in values a chain of data ends in — arrays, strings,
+# numbers, maps and sets. `detail.meta.tags.map(…)` walks a data shape and then
+# asks the array to map itself; the call is not one more object the caller is
+# coupled to, so it does not count towards the depth. The doctor's references
+# are explicit that walking a plain data shape is not this smell.
+BUILTIN_VALUE_METHODS = frozenset({
+    # Array
+    "map", "filter", "find", "findIndex", "findLast", "findLastIndex", "some", "every",
+    "includes", "indexOf", "lastIndexOf", "join", "slice", "concat", "flat", "flatMap",
+    "reduce", "reduceRight", "forEach", "at", "sort", "toSorted", "reverse", "toReversed",
+    "push", "pop", "shift", "unshift", "splice", "fill",
+    # String
+    "trim", "trimStart", "trimEnd", "split", "toUpperCase", "toLowerCase", "startsWith",
+    "endsWith", "replace", "replaceAll", "match", "matchAll", "padStart", "padEnd",
+    "charAt", "charCodeAt", "codePointAt", "substring", "localeCompare", "normalize",
+    "repeat", "toLocaleUpperCase", "toLocaleLowerCase",
+    # Number, Date, Object
+    "toFixed", "toPrecision", "toLocaleString", "toString", "valueOf", "toISOString",
+    "getTime", "toLocaleDateString", "toLocaleTimeString",
+    # Map, Set
+    "get", "set", "has", "delete", "clear", "add", "entries", "keys", "values",
+})
+# A React ref's `.current` is the ref's contents, not an object of its own.
+TRANSPARENT_MEMBERS = frozenset({"current"})
 
 MUTATING_METHODS = frozenset({"push", "pop", "shift", "unshift", "splice", "sort", "reverse",
                               "fill", "copyWithin", "set", "delete", "clear", "add"})
@@ -45,11 +69,13 @@ def _check_class_fields(file: TsFile, report: Reporter) -> None:
         for prop in klass.props:
             if prop.accessibility in ("private", "protected") or prop.readonly or prop.is_static:
                 continue
-            report.add(prop.line, "public_mutable_field",
-                       f"`{klass.name}.{prop.name}` is public and mutable — any caller can set it",
-                       "Mark it `private` (or `readonly` when it is set once in the constructor). A "
-                       "public field is an invariant nobody can defend, and every write site becomes "
-                       "part of the class's contract.", "medium")
+            report.candidate(prop.line, "public_mutable_field",
+                             f"`{klass.name}.{prop.name}` is public and mutable — any caller can set it",
+                             ("the class is a plain data holder — a DTO, a config — whose fields "
+                              "are meant to be set by callers",
+                              "the field is mutated only through a framework: an ORM entity, a form model",
+                              "the field is assigned once during builder-style initialization"),
+                             "medium")
         for prop in klass.props:
             if prop.readonly or prop.is_static or prop.name not in assigned:
                 continue
@@ -173,6 +199,11 @@ def _check_message_chains(file: TsFile, report: Reporter) -> None:
         if len(parts) < CHAIN_DEPTH or parts[0] in CHAIN_ROOT_ALLOWLIST:
             continue
         if parts[0] == "this":
+            continue
+        coupled = [part for part in parts if part not in TRANSPARENT_MEMBERS]
+        if coupled[-1] in BUILTIN_VALUE_METHODS:
+            coupled = coupled[:-1]
+        if len(coupled) < CHAIN_DEPTH:
             continue
         report.add(file.tokens[paren].line, "message_chain",
                    f"`{callee}(…)` walks {len(parts) - 1} objects deep",

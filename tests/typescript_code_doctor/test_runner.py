@@ -198,3 +198,128 @@ def test_a_dead_worker_falls_back_instead_of_crashing(ts_modules, project, monke
     results = runner.run_detectors(
         str(project), [("code_smells", "find_code_smells")], [], jobs=4)
     assert results["code_smells"], "fell back to nothing — a dead pool read as a clean repo"
+
+
+def test_candidates_are_counted_separately_and_kept_out_of_the_high_list(tmp_path, load_module, capsys):
+    """A candidate is a lead, not a defect: it has its own count and its own
+    heading, and never appears under HIGH SEVERITY ISSUES."""
+    module = load_module(SCRIPTS_DIR, "analyze_all")
+    report = {
+        "meta": {"analyzed_path": str(tmp_path), "timestamp": "t",
+                 "analyzers_run": ["types"], "analyzers_skipped": [], "analyzer_errors": {}},
+        "summary": {"total_issues": 2, "total_candidates": 1,
+                    "by_severity": {"high": 2, "medium": 0, "low": 0},
+                    "by_category": {"types": 2}},
+        "categories": {"types": {"count": 2, "issues": [
+            {"file": "a.ts", "line": 1, "smell_type": "as_any", "description": "a defect",
+             "suggestion": "fix it", "severity": "high", "kind": "finding", "category": "types"},
+            {"file": "a.ts", "line": 2, "smell_type": "type_assertion", "description": "a lead",
+             "suggestion": "", "severity": "high", "kind": "candidate", "category": "types",
+             "also_caused_by": ["the value was narrowed by a runtime check"]},
+        ]}},
+    }
+    module.print_text_report(report)
+    out = capsys.readouterr().out
+    high_block = out[out.index("HIGH SEVERITY ISSUES"):out.index("CANDIDATES")]
+    assert "a defect" in high_block and "a lead" not in high_block
+    assert "a lead" in out[out.index("CANDIDATES"):]
+    assert "Total issues found: 2" in out
+    assert "of which 1 are candidates" in out, \
+        "the summary line claimed the candidates were excluded from the total"
+
+
+def test_generate_report_counts_candidates_and_rejects_invalid_records(project, load_module, monkeypatch):
+    """The report hop re-validates every record. A candidate with no benign
+    explanation is dropped and named, never silently counted as a finding."""
+    module = load_module(SCRIPTS_DIR, "analyze_all")
+
+    def fake_run_detectors(path, file_specs, tree_specs, jobs=None, stats=None):
+        return {"types": [
+            {"file": "a.ts", "line": 1, "smell_type": "as_any", "description": "d",
+             "suggestion": "fix", "severity": "high", "kind": "finding",
+             "also_caused_by": [], "code_snippet": "", "related_lines": []},
+            {"file": "a.ts", "line": 2, "smell_type": "type_assertion", "description": "d",
+             "suggestion": "", "severity": "low", "kind": "candidate",
+             "also_caused_by": ["benign"], "code_snippet": "", "related_lines": []},
+            {"file": "a.ts", "line": 3, "smell_type": "bogus", "description": "d",
+             "suggestion": "", "severity": "low", "kind": "candidate",
+             "also_caused_by": [], "code_snippet": "", "related_lines": []},
+        ]}
+
+    monkeypatch.setattr(module, "run_detectors", fake_run_detectors)
+    monkeypatch.setattr(module, "ANALYZERS", [("types", "find_type_gaps", "Types", module.FILE)])
+    report = module.generate_report(str(project))
+    assert report["summary"]["total_issues"] == 2
+    assert report["summary"]["total_candidates"] == 1
+    assert "bogus" in report["meta"]["records_rejected"]["types"]
+    # A detector emitting contract-invalid records is a broken detector, and
+    # analyzer_errors is what code-overview's coverage logic reads — so the
+    # category is graded as ungraded rather than as clean.
+    assert "did not satisfy" in report["meta"]["analyzer_errors"]["types"]
+
+
+def test_a_candidate_only_category_earns_no_recommendation(tmp_path, load_module, capsys):
+    """RECOMMENDATIONS tells the reader to change code. A category whose only
+    record is an unverified lead has not earned an instruction."""
+    module = load_module(SCRIPTS_DIR, "analyze_all")
+    report = {
+        "meta": {"analyzed_path": str(tmp_path), "timestamp": "t",
+                 "analyzers_run": ["type_gaps"], "analyzers_skipped": [], "analyzer_errors": {}},
+        "summary": {"total_issues": 1, "total_candidates": 1,
+                    "by_severity": {"high": 0, "medium": 0, "low": 1},
+                    "by_category": {"type_gaps": 1}},
+        "categories": {"type_gaps": {"count": 1, "issues": [
+            {"file": "a.ts", "line": 2, "smell_type": "type_assertion", "description": "a lead",
+             "suggestion": "", "severity": "low", "kind": "candidate", "category": "type_gaps",
+             "also_caused_by": ["the value was narrowed by a runtime check"]},
+        ]}},
+    }
+    module.print_text_report(report)
+    out = capsys.readouterr().out
+    assert module.RECOMMENDATIONS["type_gaps"] not in out, \
+        "a lead bought advice about a defect nothing found"
+
+
+def test_the_report_hop_keeps_a_record_carrying_an_extra_key(project, load_module, monkeypatch):
+    """The hop validates the contract's fields; a detector that also attaches
+    something of its own has not broken the contract. Dropping the record loses
+    a real finding over a key the validator simply did not know about."""
+    module = load_module(SCRIPTS_DIR, "analyze_all")
+
+    def fake_run_detectors(path, file_specs, tree_specs, jobs=None, stats=None):
+        return {"types": [
+            {"file": "a.ts", "line": 1, "smell_type": "as_any", "description": "d",
+             "suggestion": "fix", "severity": "high", "kind": "finding",
+             "also_caused_by": [], "code_snippet": "", "related_lines": [], "lines": 5},
+        ]}
+
+    monkeypatch.setattr(module, "run_detectors", fake_run_detectors)
+    monkeypatch.setattr(module, "ANALYZERS", [("types", "find_type_gaps", "Types", module.FILE)])
+    report = module.generate_report(str(project))
+    assert [i["smell_type"] for i in report["categories"]["types"]["issues"]] == ["as_any"]
+    assert not report["meta"].get("records_rejected")
+
+
+@pytest.mark.parametrize("jobs", [1, 3])
+def test_the_aggregate_run_counts_the_generated_files_it_skipped(ts_runner, project, jobs):
+    """The standalone detectors say on stderr how many generated files they
+    skipped; the pooled runner filtered them in silence, so an aggregate scan
+    of a tree of generated sources read as a clean one."""
+    (project / "src" / "gen.ts").write_text("// @generated by a tool\n" + DIRTY, encoding="utf-8")
+    stats: dict = {}
+    results = ts_runner.run_detectors(
+        str(project), [("smells", "find_code_smells")], [], jobs=jobs, stats=stats)
+
+    assert stats["generated_files_skipped"] == 1
+    assert not [r for r in results["smells"] if r["file"].endswith("gen.ts")]
+
+
+def test_the_report_carries_and_prints_the_generated_file_count(project, load_module, capsys):
+    (project / "src" / "gen.ts").write_text("// @generated by a tool\n" + DIRTY, encoding="utf-8")
+    module = load_module(SCRIPTS_DIR, "analyze_all")
+    report = module.generate_report(str(project), jobs=1)
+
+    assert report["meta"]["generated_files_skipped"] == 1
+    capsys.readouterr()
+    module.print_text_report(report)
+    assert "1 generated file(s) skipped" in capsys.readouterr().out

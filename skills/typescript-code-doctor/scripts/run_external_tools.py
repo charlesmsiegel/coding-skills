@@ -32,15 +32,17 @@ Usage:
 """
 
 import argparse
+import contextlib
 import json
 import os
 import re
 import shutil
 import subprocess
+import sys
 from collections import defaultdict
 from pathlib import Path
 
-from common import EXCLUDE_DIRS, SEVERITY_ICONS, configure_output
+from common import SEVERITY_ICONS, configure_output, walk_tree
 
 _ICON = SEVERITY_ICONS
 _TSC_LINE = re.compile(
@@ -223,7 +225,30 @@ def run_knip(inv, root):
     return findings
 
 
+_LOCKFILES = ("package-lock.json", "npm-shrinkwrap.json", "yarn.lock", "pnpm-lock.yaml")
+
+
+def _workspace_root(root: Path) -> Path:
+    """The directory whose lockfile governs ``root``.
+
+    `_project_root` stops at the nearest package.json, which for a workspace
+    member is the member's own — and the lockfile that names the package
+    manager sits at the monorepo root, by design. Choosing the manager there
+    picked npm for a pnpm or Yarn workspace and ran the audit from the child
+    directory, where "every workspace, recursively" covers one package. The
+    walk stops at the first `.git` met (inclusive): a lockfile above the
+    checkout belongs to something else.
+    """
+    for candidate in [root, *root.parents]:
+        if any((candidate / name).is_file() for name in _LOCKFILES):
+            return candidate
+        if (candidate / ".git").exists():
+            break
+    return root
+
+
 def _package_manager(root: Path) -> str:
+    root = _workspace_root(root)
     if (root / "pnpm-lock.yaml").is_file():
         return "pnpm"
     if (root / "yarn.lock").is_file():
@@ -231,41 +256,123 @@ def _package_manager(root: Path) -> str:
     return "npm"
 
 
-def run_audit(inv, root):
-    """Known advisories against the installed dependency tree."""
+def _audit_argv(root: Path) -> tuple[str, list[str]] | None:
+    """The manager the lockfile names, and the audit command for *that* manager.
+
+    Resolved independently of the `npm` binary: a pnpm project is audited by
+    pnpm, a yarn project by yarn, and when that executable is not installed
+    the audit is reported missing rather than run under a different manager
+    and labelled as this one.
+    """
+    root = _workspace_root(root)
     manager = _package_manager(root)
-    if manager == "yarn":
-        argv = [*inv, "npm", "audit", "--json"]
-    else:
-        argv = [*inv, "audit", "--json"]
+    inv = _invocation(root, manager)
+    if inv is None:
+        return None
+    if manager == "yarn" and _is_yarn_berry(root):
+        # Berry's default scope is the active workspace's DIRECT dependencies.
+        # A whole-project report cannot call that "audited": `--all` takes in
+        # every workspace and `--recursive` the transitive tree, which is where
+        # most advisories live.
+        return manager, [*inv, "npm", "audit", "--all", "--recursive", "--json"]
+    return manager, [*inv, "audit", "--json"]
+
+
+def _is_yarn_berry(root: Path) -> bool:
+    """True for Yarn 2+, whose audit is `yarn npm audit` — classic's is `yarn audit`.
+
+    `.yarnrc.yml` is Berry's own config file, but a repo pinned through Corepack
+    need not ship one: `package.json`'s `packageManager` field is then the only
+    thing that names the major. Reading only the file ran classic's subcommand on
+    Berry, where it does not exist, and the audit came back as a tool error.
+    """
+    if (root / ".yarnrc.yml").is_file():
+        return True
+    try:
+        package = json.loads((root / "package.json").read_text(
+            encoding="utf-8-sig", errors="replace"))
+    except (OSError, json.JSONDecodeError):
+        return False
+    pinned = package.get("packageManager")
+    if not isinstance(pinned, str) or not pinned.startswith("yarn@"):
+        return False
+    major = pinned[len("yarn@"):].lstrip("^~=v").split(".", 1)[0]
+    return major.isdigit() and int(major) >= 2
+
+
+def run_audit(_inv, root):
+    """Known advisories against the installed dependency tree."""
+    resolved = _audit_argv(root)
+    if resolved is None:
+        manager = _package_manager(root)
+        return [_tool_error(f"{manager}-audit", root, None, f"{manager} is not installed")]
+    manager, argv = resolved
+    root = _workspace_root(root)  # audit where the lockfile is, not in one member
     returncode, out, err = _run(argv, root, timeout=600)
     if returncode is None or not (out or "").strip():
         return [_tool_error(f"{manager}-audit", root, returncode, err or out)]
-    manifest = root / "package.json"
-    findings = []
-    try:
-        data = json.loads(out)
-    except json.JSONDecodeError:
-        # yarn emits newline-delimited JSON; take the advisory objects out of it.
-        for line in out.splitlines():
-            try:
-                record = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            advisory = (record.get("data") or {}).get("advisory")
-            if advisory:
-                findings.append(_advisory_finding(manager, manifest, advisory.get("module_name"),
-                                                  advisory.get("severity"), advisory.get("title", ""),
-                                                  advisory.get("url", "")))
-        return findings or [_tool_error(f"{manager}-audit", root, returncode, "unparseable output")]
+    findings = _parse_audit(manager, root / "package.json", out)
+    if findings is None:
+        return [_tool_error(f"{manager}-audit", root, returncode, "unparseable output")]
+    return findings
 
-    for name, entry in (data.get("vulnerabilities") or {}).items():
-        via = entry.get("via") or []
-        titles = [v.get("title", "") for v in via if isinstance(v, dict)]
-        urls = [v.get("url", "") for v in via if isinstance(v, dict)]
-        findings.append(_advisory_finding(manager, manifest, name, entry.get("severity"),
-                                          titles[0] if titles else "known advisory",
-                                          urls[0] if urls else ""))
+
+def _parse_audit(manager, manifest, out) -> list[dict] | None:
+    """The advisories in whichever shape this manager writes; None if it is not JSON.
+
+    There are four shapes, and reading only npm's made a pnpm audit full of
+    advisories come back empty — which the report then showed as clean:
+
+    - npm 7+: one object, `vulnerabilities` keyed by package name.
+    - pnpm, and Yarn 2/3: npm 6's shape — one object, `advisories` keyed by
+      advisory id, the package named in `module_name`.
+    - Yarn 1: one object per line, each advisory under `data.advisory` in that
+      npm 6 form (plus an `auditSummary` line, which is not an advisory).
+    - Yarn 4: one object per line, `{"value": <package>, "children": {"ID",
+      "Issue", "URL", "Severity", ...}}`.
+
+    An output that parses but holds no advisory is a clean audit, not an
+    unparseable one: Yarn 1's summary-only output is what "nothing found" looks
+    like there.
+    """
+    try:
+        documents = [json.loads(out)]
+    except json.JSONDecodeError:
+        documents = []
+        for line in out.splitlines():
+            with contextlib.suppress(json.JSONDecodeError):
+                documents.append(json.loads(line))
+        if not documents:
+            return None
+
+    findings = []
+
+    def npm6_advisory(advisory):
+        findings.append(_advisory_finding(manager, manifest, advisory.get("module_name"),
+                                          advisory.get("severity"), advisory.get("title", ""),
+                                          advisory.get("url", "")))
+
+    for document in documents:
+        if not isinstance(document, dict):
+            continue
+        for name, entry in (document.get("vulnerabilities") or {}).items():       # npm 7+
+            via = entry.get("via") or []
+            titles = [v.get("title", "") for v in via if isinstance(v, dict)]
+            urls = [v.get("url", "") for v in via if isinstance(v, dict)]
+            findings.append(_advisory_finding(manager, manifest, name, entry.get("severity"),
+                                              titles[0] if titles else "known advisory",
+                                              urls[0] if urls else ""))
+        for advisory in (document.get("advisories") or {}).values():             # pnpm, Yarn 2/3
+            if isinstance(advisory, dict):
+                npm6_advisory(advisory)
+        data = document.get("data")                                              # Yarn 1
+        if isinstance(data, dict) and isinstance(data.get("advisory"), dict):
+            npm6_advisory(data["advisory"])
+        children = document.get("children")                                      # Yarn 4
+        if isinstance(children, dict) and "Severity" in children and "value" in document:
+            findings.append(_advisory_finding(manager, manifest, document["value"],
+                                              children.get("Severity"), children.get("Issue", ""),
+                                              children.get("URL", "")))
     return findings
 
 
@@ -284,8 +391,8 @@ def _coverage_files(root: Path):
         candidate = root / name
         if candidate.is_file():
             return candidate
-    for candidate in root.rglob("coverage-final.json"):
-        if EXCLUDE_DIRS.isdisjoint(set(candidate.relative_to(root).parts) - {"coverage"}):
+    for candidate in walk_tree(root, keep={"coverage"}):
+        if candidate.name == "coverage-final.json":
             return candidate
     return None
 
@@ -332,7 +439,7 @@ TOOLS = {
     "prettier": ("prettier", run_prettier, ["--write", "."]),
     "madge":    ("madge", run_madge, None),
     "knip":     ("knip", run_knip, None),
-    "npm":      ("npm (ships with node)", run_audit, None),
+    "audit":    ("the package manager named by the lockfile", run_audit, None),
     "coverage": ("vitest/jest with coverage enabled", run_coverage, None),
 }
 
@@ -378,6 +485,12 @@ def main():
 
     root = _project_root(Path(args.path).resolve())
     wanted = set(args.tools.split(",")) if args.tools else set(TOOLS)
+    # A name this script does not have is dropped, but never in silence: asking
+    # for a tool that never ran and being told nothing is how an unrun check
+    # reads as a passing one.
+    unknown = sorted(wanted - set(TOOLS))
+    if unknown:
+        print("⚠️  unknown tool(s) ignored: " + ", ".join(unknown), file=sys.stderr)
     wanted = {name for name in wanted if name in TOOLS}
 
     available, missing = {}, []
@@ -386,6 +499,15 @@ def main():
             continue
         if name == "coverage":
             available[name] = []  # a reader over files on disk, not an executable
+            continue
+        if name == "audit":
+            resolved = _audit_argv(root)
+            if resolved:
+                available[name] = resolved[1]
+            else:
+                manager = _package_manager(root)
+                missing.append({"name": name, "install": f"install {manager} (it is not on PATH "
+                                                          f"or in node_modules/.bin)"})
             continue
         inv = _invocation(root, name)
         if inv:

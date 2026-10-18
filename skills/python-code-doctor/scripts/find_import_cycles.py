@@ -3,8 +3,13 @@
 Detect import-graph structural problems across a Python project.
 
 Analyzes the whole directory tree and flags:
-  - circular_import : a cycle in the intra-project import graph (HIGH)
-  - god_module      : a file that is too large or has too many top-level defs (MEDIUM)
+  - circular_import : a cycle in the intra-project import graph (HIGH). An
+                      import under `if TYPE_CHECKING:` never executes, so it
+                      is no edge; a deferred import inside a function does
+                      execute, so it is one (the cycle is worked around, not gone).
+  - god_module      : a file that is too large or has too many top-level defs (MEDIUM).
+                      A test module's definitions are its cases, not
+                      responsibilities, so only its size in lines counts.
   - wildcard_import : a `from x import *` statement (MEDIUM)
   - logic_in_init   : function/class definitions inside __init__.py (LOW)
 """
@@ -17,7 +22,7 @@ from dataclasses import dataclass, asdict
 from typing import Dict, List, Set, Optional
 from collections import defaultdict
 from common import (sort_findings, SEVERITY_ICONS, configure_output, find_python_files,
-                    warn_detector_error, warn_unparseable)
+                    is_test_file, warn_detector_error, warn_unparseable)
 
 
 @dataclass
@@ -185,6 +190,82 @@ def _resolve_relative_import(
 # Import extraction
 # ---------------------------------------------------------------------------
 
+def _stable_type_aliases(tree):
+    """Only trust unshadowed, direct module imports of typing's sentinel.
+
+    Rebindings anywhere (including parameters and nested definitions) invalidate
+    the name conservatively, so a lookalike guard never hides a runtime edge.
+    """
+    flags, modules = {}, {}
+    imports = defaultdict(int)
+    rebound = set()
+    wildcard = False
+    top_level = set(getattr(tree, "body", ()))
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                name = alias.asname or alias.name.split(".")[0]
+                imports[name] += 1
+                if node in top_level and alias.name in {"typing", "typing_extensions"}:
+                    modules[name] = node.lineno
+        elif isinstance(node, ast.ImportFrom):
+            for alias in node.names:
+                name = alias.asname or alias.name
+                imports[name] += 1
+                if alias.name == "*":
+                    wildcard = True
+                if (node in top_level and node.level == 0
+                        and node.module in {"typing", "typing_extensions"} and alias.name == "TYPE_CHECKING"):
+                    flags[name] = node.lineno
+        elif isinstance(node, ast.Name) and isinstance(node.ctx, (ast.Store, ast.Del)):
+            rebound.add(node.id)
+        elif isinstance(node, ast.arg):
+            rebound.add(node.arg)
+        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            rebound.add(node.name)
+        elif isinstance(node, ast.ExceptHandler) and node.name:
+            rebound.add(node.name)
+        elif isinstance(node, (ast.MatchAs, ast.MatchStar)) and node.name:
+            rebound.add(node.name)
+        elif (isinstance(node, ast.Attribute) and node.attr == "TYPE_CHECKING"
+              and isinstance(node.value, ast.Name) and isinstance(node.ctx, (ast.Store, ast.Del))):
+            rebound.add(node.value.id)
+    return tuple({name: line for name, line in aliases.items()
+                  if not wildcard and name not in rebound and imports[name] == 1}
+                 for aliases in (flags, modules))
+
+
+def _runtime_imports(tree):
+    """Visit imports except branches proven to run only during type checking."""
+    flags, modules = _stable_type_aliases(tree)
+
+    def guard_value(test):
+        if isinstance(test, ast.Name) and flags.get(test.id, test.lineno) < test.lineno:
+            return False
+        if (isinstance(test, ast.Attribute) and test.attr == "TYPE_CHECKING"
+                and isinstance(test.value, ast.Name)
+                and modules.get(test.value.id, test.lineno) < test.lineno):
+            return False
+        if isinstance(test, ast.UnaryOp) and isinstance(test.op, ast.Not):
+            value = guard_value(test.operand)
+            return not value if value is not None else None
+        return None
+
+    stack = [tree]
+    while stack:
+        node = stack.pop()
+        if isinstance(node, (ast.Import, ast.ImportFrom)):
+            yield node
+        elif isinstance(node, ast.If):
+            value = guard_value(node.test)
+            if value is not None:
+                stack.extend(reversed(node.body if value else node.orelse))
+            else:
+                stack.extend(reversed(list(ast.iter_child_nodes(node))))
+        else:
+            stack.extend(reversed(list(ast.iter_child_nodes(node))))
+
+
 def _collect_imported_modules(
     tree: ast.AST,
     file_path: Path,
@@ -192,12 +273,12 @@ def _collect_imported_modules(
     mod_map: Dict[Path, str],
     name_to_path: Dict[str, Path],
 ) -> List[str]:
-    """Return list of project module names imported by this file."""
+    """Return project modules imported outside proven type-only branches."""
     imported: List[str] = []
     # The package-boundary-derived module name for this file (may be None if unmapped)
     file_mod_name: Optional[str] = mod_map.get(file_path.resolve())
 
-    for node in ast.walk(tree):
+    for node in _runtime_imports(tree):
         if isinstance(node, ast.Import):
             for alias in node.names:
                 name = alias.name
@@ -318,7 +399,8 @@ def _find_sccs(graph: Dict[str, Set[str]]) -> List[List[str]]:
 # Per-file smell detectors
 # ---------------------------------------------------------------------------
 
-def _check_god_module(tree: ast.AST, filepath: Path, lines: List[str], ignore: Set[str]) -> Optional[CodeSmell]:
+def _check_god_module(tree: ast.AST, filepath: Path, lines: List[str], ignore: Set[str],
+                      in_tests: bool = False) -> Optional[CodeSmell]:
     if "god_module" in ignore:
         return None
     source_lines = sum(1 for ln in lines if ln.strip() and not ln.strip().startswith("#"))
@@ -329,7 +411,7 @@ def _check_god_module(tree: ast.AST, filepath: Path, lines: List[str], ignore: S
     reasons = []
     if source_lines > 800:
         reasons.append(f"{source_lines} source lines")
-    if top_defs > 40:
+    if top_defs > 40 and not in_tests:  # forty test cases are forty cases
         reasons.append(f"{top_defs} top-level definitions")
     if not reasons:
         return None
@@ -415,7 +497,7 @@ def analyze(root: Path, ignore: Set[str]) -> List[CodeSmell]:
     for fp_abs, tree in trees.items():
         fp = Path(fp_abs)
         lines = file_lines[fp_abs]
-        gm = _check_god_module(tree, fp, lines, ignore)
+        gm = _check_god_module(tree, fp, lines, ignore, is_test_file(fp))
         if gm:
             issues.append(gm)
         issues.extend(_check_wildcard_imports(tree, fp, lines, ignore))

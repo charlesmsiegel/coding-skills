@@ -15,7 +15,8 @@ import sys
 from pathlib import Path
 
 from common import (Reporter, ScanPathError, build_parser, committed_or_staged_text,
-                    configure_output, coverage_gaps, emit, fail_on_bad_path, parse_ignore,
+                    configure_output, coverage_gaps, emit, fail_on_bad_path, looks_minified,
+                    parse_ignore,
                     read_text, tracked_paths, walk_files, warn_detector_error,
                     warn_unreadable)
 
@@ -54,11 +55,47 @@ DOCUMENTED_EXAMPLES = frozenset({
 SECRET_NAME = re.compile(
     r"\b(\w*(?:secret|passwd|password|token|apikey|api_key|access_key|private_key)\w*)\b"
     r"\s*[:=]\s*"
-    r"""(?:['"]([^'"]{16,})['"]|([^\s'"#;,]{16,}))""",
+    r"""(?:['"]([^'"]{16,})['"]|([^\s'"`#;,]{16,})|`([^`]{16,})`)""",
     re.IGNORECASE,
 )
 
 MIN_ENTROPY_BITS = 3.5
+
+# An unquoted value is a literal in `.env` and YAML, and an expression in code:
+# `token = revision.current(cid)`, `max_tokens=budget.max_output_tokens)`,
+# `token: ++req.current.token`. Its entropy is the entropy of some identifiers,
+# not of a credential. A bracket of any kind, a leading operator, or a dotted
+# chain of names marks the expression; a real credential has none of them
+# (a JWT's dots separate base64 segments starting `eyJ`, and it is matched as a
+# credential pattern before this rule is reached).
+_EXPRESSION_VALUE = re.compile(r"[()\[\]{}]|^[+\-!~*&]|^[A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)+$")
+# Languages in which the right-hand side of `=` or `:` is an *expression*.
+# There a credential is a string literal, and an unquoted value is code —
+# `tokens = _fields(event)`, `reserve_tokens = config.RESERVE`,
+# `const TOKEN_RE = /…/g` — whose punctuation reads as entropy. Everywhere
+# else (.env, YAML, INI, shell, Dockerfiles, unknown extensions) a bare value
+# is the literal itself, so the bare form keeps its recall there.
+EXPRESSION_LANGUAGE_SUFFIXES = frozenset({
+    ".py", ".pyi", ".js", ".jsx", ".mjs", ".cjs", ".ts", ".tsx", ".mts", ".cts",
+    ".java", ".kt", ".kts", ".scala", ".groovy", ".go", ".rs", ".rb", ".php",
+    ".cs", ".fs", ".swift", ".dart", ".c", ".h", ".cc", ".cpp", ".cxx", ".hpp",
+    ".m", ".mm", ".lua", ".vue", ".svelte", ".ex", ".exs", ".jl", ".zig",
+})
+
+BACKTICK_LITERAL_SUFFIXES = frozenset({
+    ".go", ".js", ".jsx", ".mjs", ".cjs", ".ts", ".tsx", ".mts", ".cts",
+    ".vue", ".svelte",
+})
+
+
+def _is_source_literal(match: re.Match, suffix: str) -> bool:
+    if match.group(2):
+        return True
+    value = match.group(4)
+    # Go raw strings have no interpolation; JS templates with interpolation
+    # compute a value rather than spelling out a credential.
+    return (value is not None and suffix in BACKTICK_LITERAL_SUFFIXES
+            and (suffix == ".go" or "${" not in value))
 
 # also_caused_by prose, shared between the private-key and cloud-credential
 # paths since the underlying tracking states (and the reasoning behind them)
@@ -210,6 +247,15 @@ def _uncertain_reasons(verdict: str) -> tuple[str, ...]:
 def analyze(path: Path, text: str, report: Reporter, tracked_here: bool | None = None,
            get_committed_text=lambda: None) -> None:
     lines = text.splitlines()
+    # The name heuristic asks what a person typed beside a secret-shaped
+    # variable. In code only a quoted value is a literal; in a bundler's output
+    # nobody typed anything, and `tokens=` recurs hundreds of times per line.
+    # Key material and recognisable credentials are matched regardless.
+    suffix = path.suffix.lower()
+    bare_values_are_literals = suffix not in EXPRESSION_LANGUAGE_SUFFIXES
+    # Long config values are still configuration, including short secrets on
+    # other lines of the same file. Only source expressions may be bundled.
+    check_names = bare_values_are_literals or not looks_minified(text)
     for index, line in enumerate(lines):
         number = index + 1
         key_match = KEY_BLOCK.search(line)
@@ -268,9 +314,15 @@ def analyze(path: Path, text: str, report: Reporter, tracked_here: bool | None =
                     severity="high", snippet=value[:12] + "…",
                 )
 
-        assignment = SECRET_NAME.search(line)
+        if not check_names:
+            continue
+        # The first secret-shaped name on a line may be an expression the
+        # rules below set aside; a quoted literal later on the same line
+        # (`call(token=t, api_secret="…")`) is still owed its candidate.
+        assignment = next((match for match in SECRET_NAME.finditer(line)
+                           if _is_source_literal(match, suffix) or bare_values_are_literals), None)
         if assignment:
-            group_index = 2 if assignment.group(2) else 3
+            group_index = 2 if assignment.group(2) else (4 if assignment.group(4) else 3)
             value = assignment.group(group_index)
             value_span = assignment.span(group_index)
             # Suppress only when this candidate would restate a credential
@@ -279,7 +331,9 @@ def analyze(path: Path, text: str, report: Reporter, tracked_here: bool | None =
             # deserves its own candidate.
             overlaps_reported = any(value_span[0] < end and start < value_span[1]
                                     for start, end in credential_spans)
-            if not overlaps_reported and shannon_entropy(value) >= MIN_ENTROPY_BITS:
+            is_expression = group_index == 3 and _EXPRESSION_VALUE.search(value)
+            if (not overlaps_reported and not is_expression
+                    and shannon_entropy(value) >= MIN_ENTROPY_BITS):
                 report.candidate(
                     number, "hardcoded_secret_assignment",
                     f"High-entropy value assigned to `{assignment.group(1)}`",
@@ -290,7 +344,6 @@ def analyze(path: Path, text: str, report: Reporter, tracked_here: bool | None =
                     ],
                     severity="high", snippet=assignment.group(1) + " = …",
                 )
-
 
 def main() -> int:
     configure_output()
