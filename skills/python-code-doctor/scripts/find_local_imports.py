@@ -94,26 +94,28 @@ _CLI_REASONS = (
     "the subcommand's dependency is an optional extra the other commands must work without",
 )
 
-def _package(path: Path) -> tuple[list, Path]:
+@functools.lru_cache(maxsize=None)
+def _package(path: Path) -> tuple[tuple[str, ...], Path]:
     """A module file's package parts, and the directory its top-level package sits in."""
     parts, directory = [], path.parent
     while (directory / "__init__.py").exists() and directory.parent != directory:
         parts.insert(0, directory.name)
         directory = directory.parent
-    return parts, directory
+    return tuple(parts), directory
 
 
-def _module_file(dotted: str, bases) -> Path | None:
+@functools.lru_cache(maxsize=None)
+def _module_file(dotted: str, bases: tuple[Path, ...]) -> Path | None:
     parts = [p for p in dotted.split(".") if p]
     if not parts:
         return None
     for base in bases:
         module = base.joinpath(*parts[:-1], parts[-1] + ".py")
         if module.is_file():
-            return module
+            return module.resolve()
         package = base.joinpath(*parts, "__init__.py")
         if package.is_file():
-            return package
+            return package.resolve()
     return None
 
 
@@ -152,6 +154,7 @@ def _module_level_imports(tree):
                 stack.extend(handler.body)
 
 
+@functools.lru_cache(maxsize=None)
 def _bases(path: Path) -> tuple:
     """Where an absolute first-party module name is looked up from ``path``."""
     _, package_base = _package(path)
@@ -166,10 +169,23 @@ def _heavy_chain(node, path: Path, seen: frozenset = frozenset()) -> str | None:
             return dotted.split(".")[0]
         target = _module_file(dotted, _bases(path))
         if target is not None:
-            chain = _load_cost(str(target.resolve()), seen)
+            chain = _load_cost(str(target), seen)
             if chain:
                 return f"{dotted} → {chain}"
     return None
+
+
+@functools.lru_cache(maxsize=None)
+def _imports_in(path_str: str) -> tuple:
+    """Read each module once; traversal still keeps its own cycle/depth context."""
+    path = Path(path_str)
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            tree = ast.parse(path.read_text(encoding="utf-8", errors="replace"))
+    except (OSError, SyntaxError, ValueError):
+        return ()
+    return tuple(_module_level_imports(tree))
 
 
 @functools.lru_cache(maxsize=None)
@@ -177,17 +193,13 @@ def _load_cost(path_str: str, seen: frozenset = frozenset()) -> str | None:
     """The chain by which loading this module file imports a heavy package, or None.
 
     Followed through first-party modules to _MAX_LOAD_DEPTH; a cycle stops.
+    Module evidence is cached independently: converging paths must not reread
+    the same files for every distinct visited set. Answers retain that context.
     """
     if path_str in seen or len(seen) >= _MAX_LOAD_DEPTH:
         return None
     path = Path(path_str)
-    try:
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore")
-            tree = ast.parse(path.read_text(encoding="utf-8", errors="replace"))
-    except (OSError, SyntaxError, ValueError):
-        return None
-    for node in _module_level_imports(tree):
+    for node in _imports_in(path_str):
         chain = _heavy_chain(node, path, seen | {path_str})
         if chain:
             return chain

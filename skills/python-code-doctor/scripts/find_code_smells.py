@@ -29,6 +29,11 @@ from common import framework_hook_overrides, is_test_file, sort_findings, cached
 # Callables whose first positional argument is an HTTP status code.
 _STATUS_CALLEES = frozenset({"HTTPException", "HTTPError", "abort"})
 _HTTP_STATUS = range(100, 600)
+_BEHAVIOR_PROTOCOLS = frozenset({
+    '__enter__', '__exit__', '__aenter__', '__aexit__',
+    '__iter__', '__next__', '__aiter__', '__anext__', '__call__',
+    '__getitem__', '__setitem__', '__delitem__', '__contains__',
+})
 
 
 def _callee_name(call: ast.Call) -> str | None:
@@ -455,7 +460,9 @@ class CodeSmellDetector(ast.NodeVisitor):
                                     attributes.add(target.attr)
         
         # God class
-        non_dunder = [m for m in methods if not m.startswith('_')]
+        behavior_methods = [m for m in methods
+                            if not (m.startswith('__') and m.endswith('__'))
+                            or m in _BEHAVIOR_PROTOCOLS]
         if len(methods) > 15 and len(attributes) > 10:
             self._add(node.lineno, "god_class",
                 f"Class {node.name} has {len(methods)} methods and {len(attributes)} attributes",
@@ -499,7 +506,7 @@ class CodeSmellDetector(ast.NodeVisitor):
             # sibling classes and classes inside methods receive no contract.
             self._framework_meta_nodes.update(child for child in node.body
                                               if isinstance(child, ast.ClassDef) and child.name == "Meta")
-        if (len(attributes) > 3 and len(non_dunder) == 0 and not is_declared_data
+        if (len(attributes) > 3 and not behavior_methods and not is_declared_data
                 and not has_framework_behavior and node not in self._framework_meta_nodes):
             inherited_behavior_unknown = any(not (isinstance(base, ast.Name) and base.id == "object"
                                                   and self._object_is_builtin)
