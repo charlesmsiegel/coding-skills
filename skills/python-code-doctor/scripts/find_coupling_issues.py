@@ -598,6 +598,21 @@ def _read_method(func, module_names: set, types: "_ExternalTypes | None" = None)
     return method
 
 
+def _behavior_names(methods: dict, name: str, seen: frozenset = frozenset()):
+    """A behavior keeps the state it reaches through a presentation protocol.
+
+    The protocol itself is not a responsibility, but delegating a save's state
+    access to it does not make that save stateless. A normal caller can also
+    coordinate real behaviors through the representation that calls them.
+    """
+    for touched in methods[name].self_names:
+        if touched in _REPRESENTATIONS and touched in methods:
+            if touched not in seen:
+                yield from _behavior_names(methods, touched, seen | {touched})
+        else:
+            yield touched
+
+
 def _groups(methods: dict, fields: set = frozenset()) -> list[list[str]]:
     """LCOM4: connected components of the methods that touch instance state.
 
@@ -624,7 +639,7 @@ def _groups(methods: dict, fields: set = frozenset()) -> list[list[str]]:
     linked = set()
     holders = defaultdict(list)
     for name in names:
-        for touched in methods[name].self_names:
+        for touched in _behavior_names(methods, name):
             if touched in parent and touched != name:
                 union(name, touched)
                 linked.update((name, touched))
