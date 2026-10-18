@@ -1,6 +1,6 @@
 # coding-skills
 
-Sixteen agentic skills for AI-assisted software work, plus seven Claude Code
+Seventeen agentic skills for AI-assisted software work, plus seven Claude Code
 output styles that change how the agent talks while it uses them.
 
 The skills pair **deterministic detectors** — stdlib-only scripts that parse the
