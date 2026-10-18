@@ -56,7 +56,12 @@ class _ExternalTypes:
         self.scope_inventories = {tree: _Derivation(tree, None)}
         self.global_scopes: dict[str, set] = defaultdict(set)
         self.nonlocal_scopes: dict[str, set] = defaultdict(set)
+        self.attribute_writes: set[tuple] = set()
         for node in ast.walk(tree):
+            if isinstance(node, ast.Attribute) and isinstance(node.ctx, (ast.Store, ast.Del)):
+                path = self._attribute_path(node)
+                if path is not None:
+                    self.attribute_writes.add(path)
             if isinstance(node, ast.Import):
                 for alias in node.names:
                     self.imports[alias.asname or alias.name.split(".")[0]] = alias.name.split(".")[0]
@@ -173,7 +178,14 @@ class _ExternalTypes:
             if self._nonlocal_owner(scope, name) is owner:
                 writer = self._inventory(scope)
                 scope_id = writer.global_scope if isinstance(scope, ast.ClassDef) else id(scope)
-                values.extend(writer.nonlocal_writes.get((scope_id, name), []))
+                # A plain class's exact `nonlocal name; name = name` changes
+                # neither cell nor value. Its RHS is absent from the method's
+                # parent map, so do not turn this no-op into an unknown/cycle.
+                # A custom class namespace can override LOAD_CLASSDEREF.
+                plain = not isinstance(scope, ast.ClassDef) or not (scope.bases or scope.keywords or scope.decorator_list)
+                values.extend(value for value in writer.nonlocal_writes.get((scope_id, name), [])
+                              if not (plain and isinstance(value, ast.Name) and value.id == name
+                                      and self._identity_assignment(value, name)))
         return values
 
     def _lexical_binding(self, expression, name):
@@ -316,17 +328,32 @@ class _ExternalTypes:
         return bool(values) and all(isinstance(v, ast.arg) and v.annotation is not None
                                     and self._item_annotation(v.annotation, index) for v in values)
 
+    @staticmethod
+    def _attribute_path(expression):
+        names = []
+        while isinstance(expression, ast.Attribute):
+            names.append(expression.attr)
+            expression = expression.value
+        return (expression.id, *reversed(names)) if isinstance(expression, ast.Name) else None
+
     def _pattern_class_root(self, expression) -> bool:
         """Every identity alias must ground in an actual external import.
 
         Resolve each RHS in its own source scope, not the pattern's scope.
         Iteration keeps flat, long alias chains off the Python call stack;
         cycles, extracted data and any possible foreign replacement decline.
+        This all-writes proof does not order match flows or certify unpacked
+        aliases; unknowns remain ungraded feature-envy candidates.
         """
         pending = [(expression, False)]
         active, proven = set(), set()
         while pending:
             current, leaving = pending.pop()
+            # An imported module root cannot certify a visibly replaced member.
+            # Check each qualified alias RHS too; no module execution is inferred.
+            path = self._attribute_path(current)
+            if path and any(path[:end] in self.attribute_writes for end in range(2, len(path) + 1)):
+                return False
             root = self._root_name(current)
             if root is None:
                 return False

@@ -1305,3 +1305,110 @@ def test_class_nonlocal_receiver_writes_reach_the_existing_identity_proof(detect
     entry.payload = "original"
     assert entry.save() == ("replacement" if replaced else "original")
     assert [row.metric_value for row in findings(detector, tmp_path, source, "low_cohesion")] == ([] if replaced else [2])
+
+
+@pytest.mark.parametrize("builtin", ["str", "repr"])
+@pytest.mark.parametrize("binding", ["same", "replacement", "custom_namespace"])
+def test_plain_class_same_cell_nonlocal_writes_preserve_receiver_identity(detector, tmp_path, builtin, binding):
+    source = textwrap.dedent(f"""
+        class Replacement:
+            def __{builtin}__(self):
+                return "replacement"
+        class Meta(type):
+            @classmethod
+            def __prepare__(mcls, name, bases):
+                return {{"self": Replacement()}}
+        class Entry:
+            def measure(self):
+                return self.metrics
+            def save(self):
+                class Configure{"(metaclass=Meta)" if binding == "custom_namespace" else ""}:
+                    nonlocal self
+                    {"self = Replacement()" if binding == "replacement" else "self = self"}
+                return {builtin}(self)
+            def __{builtin}__(self):
+                return self.payload
+    """)
+    namespace = {}
+    exec(source, namespace)
+    entry = namespace["Entry"]()
+    entry.payload = "original"
+    assert entry.save() == ("original" if binding == "same" else "replacement")
+    assert [row.metric_value for row in findings(detector, tmp_path, source, "low_cohesion")] == (
+        [2] if binding == "same" else [])
+
+
+@pytest.mark.parametrize("binding", ["same", "replacement", "custom_namespace"])
+def test_plain_class_same_cell_nonlocal_type_write_keeps_grounded_import(detector, tmp_path, binding):
+    source = textwrap.dedent(f"""
+        class Payload:
+            numerator=1
+            denominator=2
+            real=3
+        class Meta(type):
+            @classmethod
+            def __prepare__(mcls, name, bases):
+                return {{"Kind": Payload}}
+        def make():
+            from fractions import Fraction as Kind
+            class Configure{"(metaclass=Meta)" if binding == "custom_namespace" else ""}:
+                nonlocal Kind
+                {"Kind = Payload" if binding == "replacement" else "Kind = Kind"}
+            class Entry:
+                def measure(self):
+                    return self.metrics
+                def save(self, value):
+                    match value:
+                        case Kind() as item:
+                            return item.numerator + item.denominator + item.real
+            return Entry
+        Entry = make()
+    """)
+    namespace = {}
+    exec(source, namespace)
+    foreign = binding != "same"
+    value = namespace["Payload"]() if foreign else Fraction(3, 2)
+    assert namespace["Entry"]().save(value) == (6 if foreign else 6.5)
+    assert [row.metric_value for row in findings(detector, tmp_path, source, "feature_envy")] == (
+        [3] if foreign else [])
+
+
+@pytest.mark.parametrize("binding", ["untouched", "replace", "alias", "different_attribute", "deleted"])
+def test_explicit_qualified_pattern_member_writes_refuse_external_proof(
+        detector, tmp_path, monkeypatch, binding):
+    library = types.ModuleType("realm_pattern")
+    library.Kind = Fraction
+    monkeypatch.setitem(sys.modules, "realm_pattern", library)
+    statement = {
+        "untouched": "",
+        "replace": "library.Kind = Payload",
+        "alias": "library.Kind = Payload\nKind = library.Kind",
+        "different_attribute": "library.Other = Payload",
+        "deleted": "del library.Kind",
+    }[binding]
+    source = textwrap.dedent("""
+        import realm_pattern as library
+        class Payload:
+            numerator=1
+            denominator=2
+            real=3
+    """) + statement + "\n" + textwrap.dedent("""
+        class Entry:
+            def measure(self):
+                return self.metrics
+            def save(self, value):
+                match value:
+                    case PATTERN() as item:
+                        return item.numerator + item.denominator + item.real
+    """).replace("PATTERN", "Kind" if binding == "alias" else "library.Kind")
+    namespace = {}
+    exec(source, namespace)
+    foreign = binding in {"replace", "alias", "deleted"}
+    if binding == "deleted":
+        with pytest.raises(AttributeError):
+            namespace["Entry"]().save(Fraction(3, 2))
+    else:
+        value = namespace["Payload"]() if foreign else Fraction(3, 2)
+        assert namespace["Entry"]().save(value) == (6 if foreign else 6.5)
+    assert [row.metric_value for row in findings(detector, tmp_path, source, "feature_envy")] == (
+        [3] if foreign else [])
