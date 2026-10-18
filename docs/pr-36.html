@@ -176,8 +176,8 @@ table.sortable thead th.desc::after{content:"↓";opacity:1;color:var(--accent)}
 <header class="doc">
   <div class="doc-label">PULL REQUEST REVIEW</div>
   <h1 class="doc-title">coding-skills #36 review</h1>
-  <p class="doc-sub">Keep representations from distorting behavioral cohesion</p>
-  <div class="doc-meta">Reviewed against a5258d5; full integration CI required</div>
+  <p class="doc-sub">Keep representations and implicit dispatch from distorting behavioral cohesion</p>
+  <div class="doc-meta">Reviewed against current main; full integration CI required</div>
 </header>
 <nav class="tabs" role="tablist"><button role="tab" data-tab="summary" aria-selected="true" aria-controls="summary">Summary</button>
 <button role="tab" data-tab="footprint" aria-selected="false" aria-controls="footprint">Footprint</button>
@@ -187,7 +187,7 @@ table.sortable thead th.desc::after{content:"↓";opacity:1;color:var(--accent)}
 <button role="tab" data-tab="review-walkthrough" aria-selected="false" aria-controls="review-walkthrough">Review Walkthrough</button></nav>
 <main><section class="panel active" id="summary" role="tabpanel">
 
-<div class="card hero"><h2>Merge: representations no longer distort behavioral cohesion</h2><p>Charles Siegel's change excludes __repr__ and __str__ from the responsibility graph, preventing a display of an identity field from splitting a cohesive class or a display of every field from concealing independent behaviors. Actual behavior delegated through a representation still reaches its fields and methods.</p><p>Bugfix: <code>skills/python-code-doctor/scripts/find_coupling_issues.py:111</code> and <code>skills/python-code-doctor/scripts/find_coupling_issues.py:616</code>. The implementation matches the PR title; other coupling checks still inspect representation methods.</p></div>
+<div class="card hero"><h2>Merge: representations no longer distort behavioral cohesion</h2><p>Charles Siegel's change excludes __repr__ and __str__ from the responsibility graph, preventing a display of an identity field from splitting a cohesive class or a display of every field from concealing independent behaviors. Actual behavior delegated through a representation still reaches its fields and methods.</p><p>Bugfix: <code>skills/python-code-doctor/scripts/find_coupling_issues.py:111</code> and <code>skills/python-code-doctor/scripts/find_coupling_issues.py:624</code>. The implementation matches the PR title; other coupling checks still inspect representation methods.</p></div>
 </section>
 <section class="panel" id="footprint" role="tabpanel">
 
@@ -280,11 +280,11 @@ inherit the new content with nothing in the diff to review. Resource edges are f
  A --> C[After: only behavioral vertices]
  C --> D[Expand explicit delegation through representations]
  D --> E[Compute connected responsibilities]
-</pre></div></div><p>Expansion retains transitive state, including cycles with a visited set: <code>skills/python-code-doctor/scripts/find_coupling_issues.py:601</code>. No external calls, new configuration, or public signature changes.</p></div>
+</pre></div></div><p>Expansion retains transitive state, including cycles with a visited set: <code>skills/python-code-doctor/scripts/find_coupling_issues.py:609</code>. No external calls, new configuration, or public signature changes.</p></div>
 </section>
 <section class="panel" id="review-walkthrough" role="tabpanel">
 
-<div class="card hero"><h2>Ready to merge after combined CI</h2><p>No blocking issue found. The former false split and false bridge are covered separately; non-representation protocols retain behavioral meaning. Direct delegation through representations remains stateful, including cyclic delegation and coordinating multiple behaviors.</p><p>Evidence: <code>tests/python_code_doctor/test_representation_cohesion.py:25</code>, <code>tests/python_code_doctor/test_representation_cohesion.py:50</code>, <code>tests/python_code_doctor/test_representation_cohesion.py:158</code>, <code>tests/python_code_doctor/test_representation_cohesion.py:208</code>, <code>tests/python_code_doctor/test_representation_cohesion.py:228</code>.</p><p>Validation: 23 focused representation cases and Ruff passed. After merging current main, 89 representation/behavior-evidence cases passed. A broader local run passed 462 cases but hit three pre-existing Windows Unicode-output assumptions; full Linux CI on the integrated tree remains required.</p><p>Automated caller matching is textual and has no import resolution; runtime/reflection calls can be missed. Resource edges are textual references, not proof of runtime loading. Semantic review of the changed graph and its callers supplements those heuristic tabs.</p></div>
+<div class="card hero"><h2>Ready to merge after combined CI</h2><p>A reported implicit-dispatch defect was reproduced and fixed: str(self) and repr(self) now retain the caller's reachable state; shadowed names are not interpreted as builtins. No remaining blocking issue found. The former false split and false bridge are covered separately; non-representation protocols retain behavioral meaning. Direct delegation through representations remains stateful, including cyclic delegation and coordinating multiple behaviors.</p><p>Evidence: <code>tests/python_code_doctor/test_representation_cohesion.py:25</code>, <code>tests/python_code_doctor/test_representation_cohesion.py:50</code>, <code>tests/python_code_doctor/test_representation_cohesion.py:158</code>, <code>tests/python_code_doctor/test_representation_cohesion.py:208</code>, <code>tests/python_code_doctor/test_representation_cohesion.py:228</code>.</p><p>Validation: 23 focused representation cases and Ruff passed. After merging current main, 95 representation/behavior-evidence cases passed, including six dispatch and shadowing regressions (two failed before the correction). A broader local run passed 462 cases but hit three pre-existing Windows Unicode-output assumptions; full Linux CI on the integrated tree remains required.</p><p>Automated caller matching is textual and has no import resolution; runtime/reflection calls can be missed. Resource edges are textual references, not proof of runtime loading. Semantic review of the changed graph and its callers supplements those heuristic tabs.</p></div>
 </section></main>
 <footer class="doc"></footer>
 <script>

@@ -241,3 +241,36 @@ def test_behavior_coordinating_groups_through_a_representation_can_join_them(det
                 return str((self.left(), self.right()))
     """)
     assert cohesion(detector, tmp_path, source) == []
+
+
+@pytest.mark.parametrize("builtin,protocol", [("str", "__str__"), ("repr", "__repr__")])
+def test_builtin_representation_dispatch_preserves_behavioral_state(detector, tmp_path, builtin, protocol):
+    source = textwrap.dedent(f"""
+        class Split:
+            def measure(self):
+                return len(self.metrics)
+            def save(self):
+                return {builtin}(self)
+            def {protocol}(self):
+                return self.payload
+    """)
+    [record] = cohesion(detector, tmp_path, source)
+    assert record.metric_value == 2
+    assert "{measure} and {save}" in record.description
+
+
+@pytest.mark.parametrize("builtin,protocol", [("str", "__str__"), ("repr", "__repr__")])
+@pytest.mark.parametrize("shadow", ["parameter", "module"])
+def test_shadowed_representation_names_do_not_invent_state(detector, tmp_path, builtin, protocol, shadow):
+    parameter = ", " + builtin if shadow == "parameter" else ""
+    prefix = f"{builtin} = lambda obj: 'constant'\n" if shadow == "module" else ""
+    source = prefix + textwrap.dedent(f"""
+        class Entry:
+            def measure(self):
+                return len(self.metrics)
+            def save(self{parameter}):
+                return {builtin}(self)
+            def {protocol}(self):
+                return self.payload
+    """)
+    assert cohesion(detector, tmp_path, source) == []

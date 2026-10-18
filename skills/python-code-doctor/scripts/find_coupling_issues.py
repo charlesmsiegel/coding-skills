@@ -569,8 +569,16 @@ def _read_method(func, module_names: set, types: "_ExternalTypes | None" = None)
                                      func.args.vararg, func.args.kwarg] if a is not None}
     method.constructs = _constructs(func, receiver)
     method.validates = _is_validator(func)
+    shadowed = (types.imports.keys() | types.defined | types.module_values.keys()) if types else set()
     called = {id(node.func) for node in _method_nodes(func.body) if isinstance(node, ast.Call)}
     for node in _method_nodes(func.body):
+        if (receiver is not None and isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Name) and node.func.id in {"str", "repr"}
+                and node.func.id not in shadowed and derivation.resolve(node.func) is None
+                and len(node.args) == 1 and not node.keywords
+                and isinstance(node.args[0], ast.Name)
+                and derivation.resolve(node.args[0]) == derivation.receiver_key):
+            method.self_names.append(f"__{node.func.id}__")
         if not isinstance(node, ast.Attribute):
             continue
         base = node.value
