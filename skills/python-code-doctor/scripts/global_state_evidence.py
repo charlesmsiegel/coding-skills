@@ -9,40 +9,20 @@ Finding severity, reporting and the CLI belong to find_global_state instead.
 
 import ast
 from collections import defaultdict
-from dataclasses import dataclass
 
 import global_state_scopes as scopes
 import global_state_execution as execution
-
-
-_LOCK_FACTORIES = {"Lock", "RLock"}
-
-
-@dataclass(frozen=True)
-class _Mutex:
-    factory: str
-    identity: tuple[int, int]
-
-
-@dataclass(frozen=True)
-class _Factory:
-    name: str
-    # A direct import captures the attribute's current object. Replacing that
-    # module attribute later does not change the saved factory (or its aliases).
-    imported_at: tuple[int, int] | None = None
-    # sys.modules replacement affects subsequent imports, not a module/factory
-    # object captured by an earlier import and copied to another stable alias.
-    module_at: tuple[int, int] | None = None
+import global_state_mutexes as mutexes
 
 
 _UNKNOWN_ORIGINS = frozenset({("unknown", "")})
 _ATTRIBUTE_BUILTINS = {"setattr": 3, "delattr": 2}
 _ITERATOR_CONSUMERS = {"list", "tuple", "set", "dict", "sum", "any", "all", "min", "max", "sorted", "next"}
 _LAZY_CALLBACKS = {"map", "filter"}
-_BUILTINS = set(_ATTRIBUTE_BUILTINS) | _ITERATOR_CONSUMERS | _LAZY_CALLBACKS | {"vars", "iter", "getattr"}
+_BUILTINS = set(_ATTRIBUTE_BUILTINS) | _ITERATOR_CONSUMERS | _LAZY_CALLBACKS | {"vars", "iter", "getattr", "globals"}
 _MUTEX_OPERATIONS = {"release": "release", "__exit__": "release", "acquire": "acquire", "__enter__": "acquire"}
 _LAZY_KINDS = {"generator", "deferred", "callback_iterator", "uncertain_iterator"}
-_NAMESPACE_KEYS = {"threading": _LOCK_FACTORIES, "imports": {"threading"}}
+_NAMESPACE_KEYS = {"threading": mutexes.LOCK_FACTORIES, "imports": {"threading"}, "builtins": {"__import__"}, "globals": {"*"}}
 # In a proven threading namespace, setdefault cannot replace the present factory.
 # The imports namespace need not contain threading yet, so it differs below.
 # Other methods must be known readers or the receiver can lose its factory.
@@ -121,8 +101,10 @@ class _LockInterference(ast.NodeVisitor):
         if isinstance(value, ast.GeneratorExp):
             return frozenset({("generator", value)})
         if isinstance(value, ast.Attribute) and value.attr == "__dict__":
-            if ("module", "threading") in self._origins(value.value):
-                return frozenset({("namespace", "threading")})
+            namespaces = frozenset(("namespace", name) for kind, name in self._origins(value.value)
+                                   if kind == "module" and name in {"threading", "builtins"})
+            if namespaces:
+                return namespaces
         if isinstance(value, ast.Attribute) and value.attr == "modules" and ("module", "sys") in self._origins(value.value):
             return frozenset({("namespace", "imports")})
         if isinstance(value, ast.Attribute):
@@ -289,12 +271,15 @@ class _LockInterference(ast.NodeVisitor):
 
     def visit_Attribute(self, node):
         self.visit(node.value)
-        if isinstance(node.ctx, (ast.Store, ast.Del)) and node.attr in _LOCK_FACTORIES:
+        if isinstance(node.ctx, (ast.Store, ast.Del)) and node.attr in mutexes.LOCK_FACTORIES:
             if ("module", "threading") in self._origins(node.value):
                 self.replaced.add((node.attr, self._effect_position(node)))
         if (isinstance(node.ctx, (ast.Store, ast.Del)) and node.attr == "modules"
                 and ("module", "sys") in self._origins(node.value)):
             self._replace_namespace("imports", {"threading"}, node)
+        if (isinstance(node.ctx, (ast.Store, ast.Del)) and node.attr == "__import__"
+                and ("module", "builtins") in self._origins(node.value)):
+            self._replace_namespace("builtins", {"__import__"}, node)
 
     def visit_Subscript(self, node):
         self.visit(node.value)
@@ -310,7 +295,8 @@ class _LockInterference(ast.NodeVisitor):
         if isinstance(node.ctx, (ast.Store, ast.Del)):
             for kind, name in namespace:
                 if kind == "namespace":
-                    keys = {node.slice.value} & _NAMESPACE_KEYS[name] if isinstance(node.slice, ast.Constant) else _NAMESPACE_KEYS[name]
+                    keys = ({node.slice.value} if name == "globals" else {node.slice.value} & _NAMESPACE_KEYS[name]
+                            ) if isinstance(node.slice, ast.Constant) else _NAMESPACE_KEYS[name]
                     self._replace_namespace(name, keys, node)
 
     def visit_Call(self, node):
@@ -344,14 +330,17 @@ class _LockInterference(ast.NodeVisitor):
             incoming = {"callback": actual[0]}
             incoming.update((f"input{index}", value) for index, value in enumerate(actual[1:]))
             for index, value in enumerate(node.args[1:]):
-                elements = (frozenset().union(*(self.contexts.get(item, self._origins(item)) for item in value.elts))
-                            if isinstance(value, (ast.Tuple, ast.List)) and value.elts else _UNKNOWN_ORIGINS)
-                incoming[f"element{index}"] = elements
+                incoming[f"element{index}"] = self._iterable_elements(value)
             previous = self.iterator_calls.get(node)
             self.iterator_calls[node] = _merged_origins(previous, incoming) if previous else incoming
             self.expression_origins[node] = frozenset({("callback_iterator", node)})
-        if ("builtin", "vars") in callee and len(actual) == 1 and ("module", "threading") in actual[0]:
-            self.expression_origins[node] = frozenset({("namespace", "threading")})
+        if ("builtin", "vars") in callee and len(actual) == 1:
+            namespaces = frozenset(("namespace", name) for kind, name in actual[0]
+                                   if kind == "module" and name in {"threading", "builtins"})
+            if namespaces:
+                self.expression_origins[node] = namespaces
+        if ("builtin", "globals") in callee and not actual and not keywords:
+            self.expression_origins[node] = frozenset({("namespace", "globals")})
         if (("builtin", "getattr") in callee and len(actual) in {2, 3}
                 and isinstance(node.args[1], ast.Constant) and node.args[1].value in _MUTEX_OPERATIONS):
             operation = _MUTEX_OPERATIONS[node.args[1].value]
@@ -363,16 +352,12 @@ class _LockInterference(ast.NodeVisitor):
         if any(("builtin", name) in callee for name in _ITERATOR_CONSUMERS):
             if actual:
                 self._consume_values(node, actual[0])
-                callback = keywords.get("key", frozenset())
-                if (any(("builtin", name) in callee for name in {"sorted", "min", "max"})
-                        and any(kind == "callable" for kind, _ in callback)):
-                    value = node.args[0]
-                    if len(actual) > 1:
-                        elements = frozenset().union(*actual)
-                    else:
-                        elements = (frozenset().union(*(self.contexts.get(item, self._origins(item)) for item in value.elts))
-                                    if isinstance(value, (ast.Tuple, ast.List)) and value.elts else _UNKNOWN_ORIGINS)
-                    self._apply_callbacks(node, callback, [elements])
+            key = next((keyword.value for keyword in node.keywords if keyword.arg == "key"), None)
+            if (any(("builtin", name) in callee for name in {"sorted", "min", "max"}) and key is not None
+                    and not (isinstance(key, ast.Constant) and key.value is None)):
+                elements = (frozenset().union(*actual) if len(actual) > 1 else
+                            self._iterable_elements(node.args[0]) if actual else _UNKNOWN_ORIGINS)
+                self._apply_callbacks(node, keywords["key"], [elements])
         elif ("builtin", "iter") in callee:
             if len(actual) == 1 and not keywords and not any(isinstance(arg, ast.Starred) for arg in node.args):
                 self.expression_origins[node] = actual[0]
@@ -393,20 +378,27 @@ class _LockInterference(ast.NodeVisitor):
         if any(("builtin", name) in callee and len(node.args) == arity for name, arity in _ATTRIBUTE_BUILTINS.items()):
             attribute = node.args[1]
             if ("module", "threading") in actual[0] and isinstance(attribute, ast.Constant):
-                if isinstance(attribute.value, str) and attribute.value in _LOCK_FACTORIES:
+                if isinstance(attribute.value, str) and attribute.value in mutexes.LOCK_FACTORIES:
                     self.replaced.add((attribute.value, self._effect_position(node)))
             if ("module", "sys") in actual[0] and isinstance(attribute, ast.Constant) and attribute.value == "modules":
                 self._replace_namespace("imports", {"threading"}, node)
+            if ("module", "builtins") in actual[0] and isinstance(attribute, ast.Constant) and attribute.value == "__import__":
+                self._replace_namespace("builtins", {"__import__"}, node)
+
+    def _iterable_elements(self, value):
+        return (frozenset().union(*(self.contexts.get(item, self._origins(item)) for item in value.elts))
+                if isinstance(value, (ast.Tuple, ast.List)) and value.elts else _UNKNOWN_ORIGINS)
 
     def _replace_namespace(self, namespace, keys, node):
-        effects = {"@threading-import"} if namespace == "imports" and keys else keys
+        effects = ({"@threading-import"} if namespace in {"imports", "builtins"} and keys else
+                   {"@global:" + key for key in keys if isinstance(key, str)} if namespace == "globals" else keys)
         self.replaced.update((name, self._effect_position(node)) for name in effects)
 
     def _namespace_write_keys(self, namespace, operation, args, keywords):
         affected = _NAMESPACE_KEYS[namespace]
         if operation in {"pop", "setdefault", "__delitem__", "__setitem__"}:
             if args and isinstance(args[0], ast.Constant):
-                return {args[0].value} & affected
+                return {args[0].value} if namespace == "globals" else {args[0].value} & affected
             return affected
         if operation not in {"update", "__ior__", "__init__"}:
             return affected
@@ -418,7 +410,7 @@ class _LockInterference(ast.NodeVisitor):
             if not isinstance(value, ast.Dict) or any(not isinstance(key, ast.Constant) for key in value.keys):
                 return affected
             keys.update(key.value for key in value.keys)
-        return keys & affected
+        return keys if namespace == "globals" else keys & affected
 
     def _escape_deferred(self, origins):
         if any(kind in _LAZY_KINDS for kind, _ in origins):
@@ -443,6 +435,11 @@ class _LockInterference(ast.NodeVisitor):
             # A returned closure's cells are not modeled after its owner exits.
             # Retain uncertainty until invocation rather than inventing origins.
             self.returned_origins |= {("uncertain_callable", node)}
+        # Possible returned operations keep their canonical receiver. Unknown
+        # paths remain unknown: this does not prove a returned context manager.
+        operations = frozenset((kind, value) for kind, value in origins if kind in {"guard", "release", "acquire"})
+        if operations:
+            self.returned_origins |= operations | _UNKNOWN_ORIGINS
         values = frozenset((kind, value) for kind, value in origins if kind in _LAZY_KINDS)
         if values:
             # Creation/return does not consume a body. Its escaped closure and
@@ -594,11 +591,37 @@ class _LockInterference(ast.NodeVisitor):
                     self._set(pattern.rest, _UNKNOWN_ORIGINS)
             if isinstance(case.pattern, ast.MatchAs) and case.pattern.name:
                 self._set(case.pattern.name, subject)
+            self._bind_pattern(case.pattern, node.subject)
             if case.guard:
                 self.visit(case.guard)
             self._body(case.body)
             outcomes.append(self.bindings)
         self.bindings = _merged_origins(*outcomes)
+
+    def _bind_pattern(self, pattern, value):
+        if isinstance(pattern, ast.MatchAs):
+            if pattern.name:
+                self._set(pattern.name, self.contexts.get(value, self._origins(value)))
+            if pattern.pattern is not None:
+                self._bind_pattern(pattern.pattern, value)
+        elif (isinstance(pattern, ast.MatchSequence) and isinstance(value, (ast.Tuple, ast.List))
+              and len(pattern.patterns) == len(value.elts) and not any(isinstance(item, ast.Starred) for item in value.elts)):
+            for member, item in zip(pattern.patterns, value.elts):
+                self._bind_pattern(member, item)
+        elif isinstance(pattern, ast.MatchMapping) and isinstance(value, ast.Dict):
+            for key, member in zip(pattern.keys, pattern.patterns):
+                selected = scopes.literal_index_values(value, key)
+                if selected is not None and selected[1]:
+                    self._bind_pattern(member, selected[0][0])
+                else:
+                    self._decline_pattern(value)
+        else:
+            self._decline_pattern(value)
+
+    def _decline_pattern(self, value):
+        if any(kind == "guard" for part in ast.walk(value)
+               for kind, _ in self.contexts.get(part, self._origins(part))):
+            self._decline_mutex_proof()
 
     def visit_FunctionDef(self, node):
         self._record_callable(node)
@@ -800,122 +823,11 @@ def _lock_interference(tree, threading_modules, lock_names, contexts, builtin_or
     return replaced, released
 
 
-def _module_names(stmt):
-    """Direct assignment/import targets understood by the module identity proof."""
-    if isinstance(stmt, (ast.Import, ast.ImportFrom)):
-        return [(alias.asname or alias.name).split(".")[0] for alias in stmt.names]
-    targets = stmt.targets if isinstance(stmt, ast.Assign) else [stmt.target] if isinstance(stmt, ast.AnnAssign) else []
-    return [target.id for target in targets if isinstance(target, ast.Name)]
-
-
-def _module_aliases(tree, known, stable):
-    """Propagate direct, stable module aliases without conflating spellings.
-
-    A chain assignment creates one object, and a later `alias = name` retains
-    that identity. Only propagate a binding after its statement executes: a
-    wildcard may supply an earlier object with the same spelling. Other
-    assignment shapes remain outside this bounded proof.
-    """
-    visible = {}
-    for stmt in tree.body:
-        value = stmt.value if isinstance(stmt, (ast.Assign, ast.AnnAssign)) else None
-        names = _module_names(stmt)
-        if isinstance(value, ast.Name) and value.id in visible:
-            visible.update((name, visible[value.id]) for name in names if name in stable)
-        visible.update((name, known[name]) for name in names if name in known)
-    return visible
-
-
-def _argument_free_call(node):
-    """Only explicit empty unpackings are also provably argument-free."""
-    return (all(isinstance(arg, ast.Starred) and isinstance(arg.value, (ast.List, ast.Tuple)) and not arg.value.elts
-                for arg in node.args)
-            and all(keyword.arg is None and isinstance(keyword.value, ast.Dict) and not keyword.value.keys
-                    for keyword in node.keywords))
-
-
-def _module_locks(tree, contexts, skipped) -> dict:
-    """Stable names bound once to an imported threading Lock/RLock constructor.
-
-    A global declaration anywhere keeps a name out of this bounded proof: it
-    permits a later call to replace the object the name originally identified.
-    """
-    # An unknown export can replace a factory alias, the threading module or
-    # an already-created guard. Without resolving that surface none is stable.
-    last_wildcard = max(((node.lineno, node.col_offset) for node in scopes.module_scope_nodes(tree)
-                         if isinstance(node, ast.ImportFrom) and any(a.name == "*" for a in node.names)), default=(0, 0))
-    bindings = scopes.module_bindings(tree)
-    global_names = {name for node in ast.walk(tree) if isinstance(node, ast.Global) for name in node.names}
-    stable = {name for name, count in bindings.items() if count == 1} - global_names
-    threading_modules, lock_factories, builtin_origins = {}, {}, {}
-    for stmt in tree.body:
-        if (stmt.lineno, stmt.col_offset) <= last_wildcard:
-            continue
-        if isinstance(stmt, ast.Import):
-            for alias in stmt.names:
-                if alias.name == "threading":
-                    threading_modules[alias.asname or "threading"] = (stmt.lineno, stmt.col_offset)
-                elif alias.name in {"builtins", "sys"}:
-                    builtin_origins[alias.asname or alias.name] = frozenset({("module", alias.name)})
-        elif isinstance(stmt, ast.ImportFrom) and stmt.module == "threading" and stmt.level == 0:
-            for alias in stmt.names:
-                if alias.name in _LOCK_FACTORIES:
-                    position = (stmt.lineno, stmt.col_offset)
-                    lock_factories[alias.asname or alias.name] = _Factory(alias.name, position, position)
-        elif isinstance(stmt, ast.ImportFrom) and stmt.module == "builtins" and stmt.level == 0:
-            for alias in stmt.names:
-                if alias.name in _BUILTINS:
-                    builtin_origins[alias.asname or alias.name] = frozenset({("builtin", alias.name)})
-        elif isinstance(stmt, ast.ImportFrom) and stmt.module == "sys" and stmt.level == 0:
-            for alias in stmt.names:
-                if alias.name == "modules":
-                    builtin_origins[alias.asname or alias.name] = frozenset({("namespace", "imports")})
-    threading_modules = {name: position for name, position in threading_modules.items() if name in stable}
-    lock_factories = {name: factory for name, factory in lock_factories.items() if name in stable}
-    threading_modules = _module_aliases(tree, threading_modules, stable)
-    lock_factories = _module_aliases(tree, lock_factories, stable)
-    builtin_origins = _module_aliases(tree, {name: origin for name, origin in builtin_origins.items() if name in stable}, stable)
-    bound_at = {name: (stmt.lineno, stmt.col_offset) for stmt in tree.body for name in _module_names(stmt)}
-    locks = {}
-    for stmt in tree.body:
-        if (stmt.lineno, stmt.col_offset) <= last_wildcard:
-            continue
-        value = stmt.value if isinstance(stmt, (ast.Assign, ast.AnnAssign)) else None
-        if not isinstance(value, ast.Call):
-            continue
-        func = value.func
-        position = (stmt.lineno, stmt.col_offset)
-        is_lock = (
-            (isinstance(func, ast.Name) and func.id in lock_factories and bound_at[func.id] < position)
-            or (isinstance(func, ast.Attribute) and func.attr in _LOCK_FACTORIES
-                and isinstance(func.value, ast.Name) and func.value.id in threading_modules
-                and bound_at[func.value.id] < position)
-        )
-        if not is_lock:
-            continue
-        targets = stmt.targets if isinstance(stmt, ast.Assign) else [stmt.target]
-        origin = (_Factory(func.attr, module_at=threading_modules[func.value.id])
-                  if isinstance(func, ast.Attribute) else lock_factories[func.id])
-        if origin.name == "Lock" and not _argument_free_call(value):
-            continue
-        mutex = _Mutex(origin.name, (value.lineno, value.col_offset))
-        locks.update((t.id, (origin, mutex)) for t in targets if isinstance(t, ast.Name) and t.id in stable)
-    locks = _module_aliases(tree, locks, stable)
-    replaced, released = _lock_interference(tree, threading_modules, set(locks), contexts, builtin_origins, skipped)
-    released_identities = {locks[name][1].identity for name in released}
-    return {name: mutex for name, (origin, mutex) in locks.items()
-            if mutex.identity not in released_identities
-            and not any(factory == "@threading-import" and (origin.module_at is None or position < origin.module_at)
-                        for factory, position in replaced)
-            and not any(factory == origin.name and (origin.imported_at is None or position < origin.imported_at)
-                        for factory, position in replaced)}
-
-
 def mutation_guards(tree, candidate_names):
     """Return validated module mutexes and held identities per direct write."""
     contexts = {}
     skipped = scopes.deferred_expressions(tree)
-    locks = _module_locks(tree, contexts, skipped)
+    locks = mutexes.module_locks(tree, contexts, skipped, _BUILTINS, _lock_interference)
     # Lexical with evidence cannot certify a plain mutex that may already have
     # been acquired manually. Its call may succeed even in nonblocking mode.
     prior = set()

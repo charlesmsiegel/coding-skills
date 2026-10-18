@@ -15,6 +15,7 @@ _MUTATING_METHODS = {
     "append", "extend", "insert", "remove", "pop", "clear", "sort", "reverse",
     "add", "discard", "update", "setdefault", "popitem",
     "difference_update", "intersection_update", "symmetric_difference_update",
+    "subtract", "move_to_end",
     "appendleft", "popleft", "extendleft", "rotate",
 }
 
