@@ -9,10 +9,10 @@ globals) rather than every module constant.
 Finds:
   - mutated_global : a module-level mutable value (list/dict/set/...) that is
                      mutated at runtime from inside a function. High, unless
-                     every mutation happens inside `with <module-level Lock>:` —
-                     a lock-guarded registry or memo is the factory-with-a-cache
-                     shape, safe under threads, and keeps only the
-                     process-wide-state cost (medium).
+                     every detected direct write holds one common, stable
+                     module-level threading Lock/RLock. That is a candidate:
+                     a process registry or memo has the same shape, and this
+                     file cannot establish a lifecycle or reader defect.
   - global_rebind  : a function that uses the `global` statement to reassign
                      module-level variables — one record per function, naming
                      every name it rebinds. A `global` line suppressed with
@@ -30,7 +30,7 @@ import json
 import argparse
 from pathlib import Path
 from dataclasses import dataclass, asdict
-from collections import defaultdict
+from collections import Counter, defaultdict
 from common import (sort_findings, cached_parse, SEVERITY_ICONS, configure_output, find_python_files,
                     reasoned_noqa, warn_detector_error, warn_unparseable)
 
@@ -113,27 +113,122 @@ def _mutates_name(node, names):
 
 
 def _guarded_nodes(stmts, locks):
-    """Same-scope nodes paired with whether they run inside `with <lock>:`.
+    """Same-scope nodes paired with the known module locks held at each node.
 
     `locks` names the module-level Lock/RLock objects. A nested function is
     its own scope and its own walk: it runs whenever it is called, which need
     not be while the lock that surrounds its definition is held.
     """
-    stack = [(s, False) for s in stmts if not isinstance(s, _SCOPE_BOUNDARIES)]
+    stack = [(s, frozenset()) for s in stmts if not isinstance(s, _SCOPE_BOUNDARIES)]
     while stack:
         node, held = stack.pop()
         yield node, held
-        if isinstance(node, (ast.With, ast.AsyncWith)) and any(
-                isinstance(item.context_expr, ast.Name) and item.context_expr.id in locks
-                for item in node.items):
-            held = True
+        if isinstance(node, ast.With):
+            # Context expressions are evaluated before their own __enter__,
+            # in order: the first expression is not protected by a later lock.
+            children = []
+            for item in node.items:
+                children.append((item.context_expr, held))
+                if isinstance(item.context_expr, ast.Name) and item.context_expr.id in locks:
+                    held = held | {item.context_expr.id}
+                if item.optional_vars:
+                    children.append((item.optional_vars, held))
+            children.extend((stmt, held) for stmt in node.body)
+            stack.extend(reversed(children))
+            continue
         for child in ast.iter_child_nodes(node):
             if not isinstance(child, _SCOPE_BOUNDARIES):
                 stack.append((child, held))
 
 
+def _module_scope_nodes(tree):
+    """Nodes evaluated in the module's scope, including definition inputs.
+
+    Bodies of functions and classes have their own namespace. Defaults,
+    decorators and bases still run here, where a walrus can replace a lock.
+    """
+    stack = list(tree.body)
+    while stack:
+        node = stack.pop()
+        yield node
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            stack.extend(node.decorator_list)
+            if isinstance(node, ast.ClassDef):
+                stack.extend(node.bases)
+                stack.extend(k.value for k in node.keywords)
+            else:
+                stack.extend(ast.iter_child_nodes(node.args))
+                if node.returns:
+                    stack.append(node.returns)
+            continue
+        if isinstance(node, ast.Lambda):
+            stack.extend(node.args.defaults)
+            stack.extend(v for v in node.args.kw_defaults if v is not None)
+            continue
+        if isinstance(node, ast.AnnAssign) and node.value is None:
+            stack.append(node.annotation)   # a bare annotation assigns no value
+            continue
+        if isinstance(node, ast.comprehension):
+            stack.extend([node.iter] + list(node.ifs))
+            continue
+        stack.extend(ast.iter_child_nodes(node))
+
+
+def _module_bindings(tree) -> Counter:
+    """Count bindings and deletes of module names, excluding same-named locals."""
+    bound = Counter()
+    for node in _module_scope_nodes(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            bound[node.name] += 1
+        elif isinstance(node, ast.Name) and isinstance(node.ctx, (ast.Store, ast.Del)):
+            bound[node.id] += 1
+        elif isinstance(node, (ast.Import, ast.ImportFrom)):
+            bound.update((a.asname or a.name).split(".")[0] for a in node.names if a.name != "*")
+        elif isinstance(node, ast.ExceptHandler) and node.name:
+            bound[node.name] += 1
+        elif isinstance(node, (ast.MatchAs, ast.MatchStar)) and node.name:
+            bound[node.name] += 1
+        elif isinstance(node, ast.MatchMapping) and node.rest:
+            bound[node.rest] += 1
+    return bound
+
+
+def _lock_interference(tree, threading_modules, lock_names):
+    """Visible constructor replacements and manual releases defeat the with proof.
+
+    Use the same lexical bindings as the mutation reader: releasing a caller's
+    same-named parameter says nothing about the module's guard.
+    """
+    scopes = [(_module_scope_nodes(tree), frozenset())]
+    for fn, enclosing in _function_scopes(tree):
+        global_names = {name for node in _same_scope_nodes(fn.body)
+                        if isinstance(node, ast.Global) for name in node.names}
+        local = (_bound_names(fn) | enclosing) - global_names
+        scopes.append((_same_scope_nodes(fn.body), local))
+    replaced, released = set(), set()
+    for nodes, local in scopes:
+        for node in nodes:
+            if isinstance(node, ast.Attribute) and isinstance(node.ctx, (ast.Store, ast.Del)):
+                if (isinstance(node.value, ast.Name) and node.value.id in threading_modules - local
+                        and node.attr in _LOCK_FACTORIES):
+                    replaced.add((node.value.id, node.attr))
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
+                func = node.func
+                if (isinstance(func.value, ast.Name) and func.value.id in lock_names - local
+                        and func.attr in {"release", "__exit__"}):
+                    released.add(func.value.id)
+    return replaced, released
+
+
 def _module_locks(tree) -> set:
-    """Module-level names bound to `threading.Lock()` / `threading.RLock()`."""
+    """Stable names bound once to an imported threading Lock/RLock constructor.
+
+    A global declaration anywhere keeps a name out of this bounded proof: it
+    permits a later call to replace the object the name originally identified.
+    """
+    bindings = _module_bindings(tree)
+    global_names = {name for node in ast.walk(tree) if isinstance(node, ast.Global) for name in node.names}
+    stable = {name for name, count in bindings.items() if count == 1} - global_names
     threading_modules, lock_factories = set(), set()
     for stmt in tree.body:
         if isinstance(stmt, ast.Import):
@@ -144,7 +239,9 @@ def _module_locks(tree) -> set:
             for alias in stmt.names:
                 if alias.name in _LOCK_FACTORIES:
                     lock_factories.add(alias.asname or alias.name)
-    locks = set()
+    threading_modules &= stable
+    lock_factories &= stable
+    locks = {}
     for stmt in tree.body:
         value = stmt.value if isinstance(stmt, (ast.Assign, ast.AnnAssign)) else None
         if not isinstance(value, ast.Call):
@@ -158,8 +255,12 @@ def _module_locks(tree) -> set:
         if not is_lock:
             continue
         targets = stmt.targets if isinstance(stmt, ast.Assign) else [stmt.target]
-        locks.update(t.id for t in targets if isinstance(t, ast.Name))
-    return locks
+        origin = (func.value.id, func.attr) if isinstance(func, ast.Attribute) else None
+        locks.update((t.id, origin) for t in targets if isinstance(t, ast.Name) and t.id in stable)
+    if not locks:
+        return set()
+    replaced, released = _lock_interference(tree, threading_modules, set(locks))
+    return {name for name, origin in locks.items() if name not in released and origin not in replaced}
 
 
 def _bound_names(fn) -> set:
@@ -240,7 +341,7 @@ def detect(tree, filename, lines, ignore):
 
     # Pass 2: scan every function for `global` rebinds and mutations of candidates
     locks = _module_locks(tree)
-    guarded = defaultdict(list)     # name -> [held a module lock?] per mutation site
+    guarded = defaultdict(list)     # name -> [stable module lock names held] per mutation site
     candidate_names = set(candidates)
     for fn, enclosing in _function_scopes(tree):
         body = list(_same_scope_nodes(fn.body))
@@ -285,14 +386,16 @@ def detect(tree, filename, lines, ignore):
                 guarded[m].append(held)
 
     for nm in sorted(guarded):
-        if all(guarded[nm]):
+        common_locks = set.intersection(*(set(held) for held in guarded[nm]))
+        if common_locks:
             add(candidates[nm], "mutated_global",
-                f"Module-level mutable '{nm}' is shared global state mutated at runtime, always under a "
-                "module-level lock",
-                "The lock makes the mutation thread-safe; what remains is process-wide state every test and "
-                "forked worker inherits. Keep it behind one accessor and give tests a reset, or move it with "
-                "its lock into an object the caller owns.",
-                "medium")
+                f"Every detected direct mutation of module-level mutable '{nm}' holds the same stable "
+                f"module lock ({', '.join(sorted(common_locks))})",
+                "", "medium", also_caused_by=(
+                    "an intentional process-wide registry or memo whose direct writes share one threading Lock/RLock",
+                    "reads, mutations through aliases, external consumers and fork/reset lifecycle are not proved "
+                    "by this file-level write check",
+                ))
         else:
             add(candidates[nm], "mutated_global",
                 f"Module-level mutable '{nm}' is shared global state that is mutated at runtime",
