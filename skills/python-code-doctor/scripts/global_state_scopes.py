@@ -1,7 +1,7 @@
 """Pure lexical inventories and definition-time AST boundaries.
 
 Function closures retain enclosing function names and exclude class namespaces.
-Postponed annotation roots are data; defaults and decorators remain executable.
+Postponed annotations and type aliases stay deferred; defaults/decorators execute.
 The effect reader consumes these inventories without duplicating Python scope
 rules, while finding policy stays in the detector.
 """
@@ -9,19 +9,22 @@ rules, while finding policy stays in the detector.
 import ast
 from collections import Counter
 
+_TYPE_ALIAS = getattr(ast, "TypeAlias", ())
 
-def postponed_annotations(tree):
+
+def deferred_expressions(tree):
+    """Roots stored for later evaluation rather than run by their statement."""
+    roots = {value for node in ast.walk(tree) if isinstance(node, _TYPE_ALIAS)
+             for value in [node.value] + node.type_params}
     if not any(isinstance(node, ast.ImportFrom) and node.module == "__future__"
                and any(alias.name == "annotations" for alias in node.names) for node in tree.body):
-        return frozenset()
-    roots = set()
+        return roots
     for node in ast.walk(tree):
         if isinstance(node, (ast.arg, ast.AnnAssign)) and node.annotation is not None:
             roots.add(node.annotation)
         elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.returns is not None:
             roots.add(node.returns)
     return roots
-
 
 
 def definition_inputs(node):
@@ -33,7 +36,6 @@ def definition_inputs(node):
     return (getattr(node, "decorator_list", []) + list(args.defaults) + [value for value in args.kw_defaults if value is not None]
             + [arg.annotation for arg in params if arg.annotation is not None]
             + ([node.returns] if getattr(node, "returns", None) is not None else []))
-
 
 
 def callable_bound_names(node):
@@ -48,12 +50,10 @@ def callable_bound_names(node):
     return names
 
 
-
 def callable_is_deferred(node):
     body = [node.body] if isinstance(node, ast.Lambda) else node.body
     return isinstance(node, ast.AsyncFunctionDef) or any(isinstance(item, (ast.Yield, ast.YieldFrom))
                for item in module_scope_nodes(ast.Module(body=body, type_ignores=[])))
-
 
 
 def module_scope_nodes(tree, *, include_class_bodies=False, skipped=frozenset()):
@@ -68,6 +68,9 @@ def module_scope_nodes(tree, *, include_class_bodies=False, skipped=frozenset())
         if node in skipped:
             continue
         yield node
+        if isinstance(node, _TYPE_ALIAS):
+            stack.append(node.name)
+            continue
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
             stack.extend(node.decorator_list)
             if isinstance(node, ast.ClassDef):
@@ -95,7 +98,6 @@ def module_scope_nodes(tree, *, include_class_bodies=False, skipped=frozenset())
         stack.extend(ast.iter_child_nodes(node))
 
 
-
 def module_bindings(tree) -> Counter:
     """Count bindings and deletes of module names, excluding same-named locals."""
     bound = Counter()
@@ -115,7 +117,6 @@ def module_bindings(tree) -> Counter:
     return bound
 
 
-
 def bound_names(fn) -> set:
     """Names a function binds in its own scope — its locals, as Python decides
     them: parameters, assignment and loop targets, `as` names, imports, and the
@@ -130,6 +131,9 @@ def bound_names(fn) -> set:
     stack = [s for s in fn.body]
     while stack:
         node = stack.pop()
+        if isinstance(node, _TYPE_ALIAS):
+            stack.append(node.name)
+            continue
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
             bound.add(node.name)     # the name is local; the body is another scope
             stack.extend(definition_inputs(node))
@@ -158,7 +162,6 @@ def bound_names(fn) -> set:
             continue
         stack.extend(ast.iter_child_nodes(node))
     return bound - declared_global
-
 
 
 def function_scopes(tree):

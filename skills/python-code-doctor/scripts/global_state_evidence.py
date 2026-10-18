@@ -243,7 +243,7 @@ class _LockInterference(ast.NodeVisitor):
         if isinstance(value, ast.Name):
             missing = _UNKNOWN_ORIGINS if value.id in self.local_names else _UNKNOWN_ORIGINS | {("global", value.id)}
             return self._scoped_origins(value.id, self.bindings.get(value.id, missing))
-        if isinstance(value, (ast.IfExp, ast.NamedExpr, ast.Call)):
+        if isinstance(value, (ast.IfExp, ast.BoolOp, ast.NamedExpr, ast.Call)):
             return self.expression_origins.get(value, _UNKNOWN_ORIGINS)
         if isinstance(value, ast.Lambda):
             return frozenset({("callable", value)})
@@ -252,6 +252,9 @@ class _LockInterference(ast.NodeVisitor):
         if isinstance(value, ast.Attribute) and value.attr == "__dict__":
             if ("module", "threading") in self._origins(value.value):
                 return frozenset({("namespace", "threading")})
+        if isinstance(value, ast.Attribute) and value.attr == "update":
+            if ("namespace", "threading") in self._origins(value.value):
+                return frozenset({("namespace_update", "threading")})
         if isinstance(value, ast.Attribute) and value.attr in {"release", "__exit__", "acquire", "__enter__"}:
             operation = "release" if value.attr in {"release", "__exit__"} else "acquire"
             origins = frozenset((operation, name) for kind, name in self._origins(value.value) if kind == "guard")
@@ -421,11 +424,24 @@ class _LockInterference(ast.NodeVisitor):
         if any(kind == "acquire" for kind, _ in callee):
             self.contexts[node] = self.contexts.get(node, frozenset()) | self.held
         self.released.update(name for kind, name in callee if kind == "release")
+        if ("namespace_update", "threading") in callee:
+            self.replaced.update((name, (node.lineno, node.col_offset)) for name in self._namespace_update_keys(node))
         if any(("builtin", name) in callee and len(node.args) == arity for name, arity in _ATTRIBUTE_BUILTINS.items()):
             attribute = node.args[1]
             if ("module", "threading") in actual[0] and isinstance(attribute, ast.Constant):
                 if isinstance(attribute.value, str) and attribute.value in _LOCK_FACTORIES:
                     self.replaced.add((attribute.value, (node.lineno, node.col_offset)))
+
+    def _namespace_update_keys(self, node):
+        keys = {keyword.arg for keyword in node.keywords}
+        if None in keys or len(node.args) > 1:
+            return _LOCK_FACTORIES
+        if node.args:
+            value = node.args[0]
+            if not isinstance(value, ast.Dict) or any(not isinstance(key, ast.Constant) for key in value.keys):
+                return _LOCK_FACTORIES
+            keys.update(key.value for key in value.keys)
+        return keys & _LOCK_FACTORIES
 
     def visit_If(self, node):
         self.visit(node.test)
@@ -442,6 +458,28 @@ class _LockInterference(ast.NodeVisitor):
             outcomes.append(self.bindings)
         self.bindings = _merged_origins(*outcomes)
         self.expression_origins[node] = origins
+
+    def visit_BoolOp(self, node):
+        self.expression_origins[node] = self._conditional_steps(node.values[:1], node.values[1:])
+
+    def visit_Compare(self, node):
+        self._conditional_steps([node.left] + node.comparators[:1], node.comparators[1:])
+
+    def visit_Assert(self, node):
+        # Assertions may be disabled; the message only runs on failure.
+        self._conditional_steps([], [node.test] + ([node.msg] if node.msg is not None else []))
+
+    def _conditional_steps(self, mandatory, conditional):
+        origins = frozenset()
+        for value in mandatory:
+            self.visit(value)
+            origins |= self._origins(value)
+        for value in conditional:
+            skipped = dict(self.bindings)
+            self.visit(value)
+            origins |= self._origins(value)
+            self.bindings = _merged_origins(skipped, self.bindings)
+        return origins
 
     def visit_While(self, node):
         self._loop(node, dict(self.bindings))
@@ -546,6 +584,9 @@ class _LockInterference(ast.NodeVisitor):
         self._set(node.name, frozenset({("callable", node)}))
 
     visit_AsyncFunctionDef = visit_FunctionDef
+
+    def visit_TypeAlias(self, node):
+        self._bind(node.name)
 
     def visit_Lambda(self, node):
         self._record_callable(node)
@@ -676,7 +717,7 @@ def _lock_interference(tree, threading_modules, lock_names, contexts, builtin_or
                    for node in scopes.module_scope_nodes(tree))
     stable = {name for name, count in bindings.items() if count == 1} - module_globals
     for name, origins in module.bindings.items():
-        if name in stable and any(kind in {"callable", "release", "acquire", "guard", "generator", "deferred"} for kind, _ in origins):
+        if name in stable and any(kind in {"callable", "release", "acquire", "guard", "generator", "deferred", "namespace_update"} for kind, _ in origins):
             known[name] = origins
     for builtin in _BUILTINS:
         if builtin not in bindings and builtin not in module_globals and not wildcard:
@@ -797,7 +838,7 @@ def _module_locks(tree, contexts, skipped) -> dict:
 def mutation_guards(tree, candidate_names):
     """Return validated module mutexes and held identities per direct write."""
     contexts = {}
-    skipped = scopes.postponed_annotations(tree)
+    skipped = scopes.deferred_expressions(tree)
     locks = _module_locks(tree, contexts, skipped)
     # Lexical with evidence cannot certify a plain mutex that may already have
     # been acquired manually. Its call may succeed even in nonblocking mode.
