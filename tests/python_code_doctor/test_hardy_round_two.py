@@ -133,3 +133,27 @@ def test_literal_import_is_scored_as_design(load_module):
     rubric = load_module(SCRIPTS.parents[1] / 'code-overview/scripts', 'rubric')
     assert rubric.categorize({'smell_type': 'literal_import', 'category': 'security'}) == ('design', True)
     assert rubric.categorize({'smell_type': 'unsafe_deserialization', 'category': 'security'}) == ('security', True)
+
+
+@pytest.mark.parametrize('base', ['Protocol[T]', 'typing.Protocol[T]'])
+def test_generic_protocol_methods_are_contracts(run_script, tmp_path, base):
+    records = detect(run_script, tmp_path, 'find_ai_scaffolding.py',
+                     'import typing\nfrom typing import Protocol, TypeVar\nT = TypeVar("T")\n'
+                     f'class Contract({base}):\n    def run(self, value: T) -> T: ...\n')
+    assert not any(record['smell_type'] == 'empty_stub' for record in records)
+
+
+def test_generic_concrete_class_keeps_stub_finding(run_script, tmp_path):
+    records = detect(run_script, tmp_path, 'find_ai_scaffolding.py',
+                     'from typing import Generic, TypeVar\nT = TypeVar("T")\n'
+                     'class Worker(Generic[T]):\n    def run(self, value: T) -> T: ...\n')
+    assert any(record['smell_type'] == 'empty_stub' for record in records)
+
+
+def test_nested_function_in_generic_protocol_keeps_stub_finding(run_script, tmp_path):
+    records = detect(run_script, tmp_path, 'find_ai_scaffolding.py',
+                     'from typing import Protocol, TypeVar\nT = TypeVar("T")\n'
+                     'class Contract(Protocol[T]):\n    def run(self, value: T) -> T:\n'
+                     '        def missing(): ...\n        return missing()\n')
+    stubs = [record for record in records if record['smell_type'] == 'empty_stub']
+    assert len(stubs) == 1 and 'missing' in stubs[0]['description']
