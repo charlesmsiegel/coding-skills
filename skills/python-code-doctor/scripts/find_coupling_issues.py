@@ -23,7 +23,6 @@ import argparse
 from pathlib import Path
 from dataclasses import dataclass, asdict, field
 from collections import Counter, defaultdict
-from ast_scopes import walk_same_scope
 from common import first_party_modules, is_test_file, project_root, sort_findings, cached_parse, SEVERITY_ICONS, configure_output, find_python_files, warn_detector_error, warn_unparseable
 from find_mutation_hazards import ClassFamilyResolver
 
@@ -145,13 +144,13 @@ def _method_nodes(nodes):
     A nested class is skipped: it is analysed as a class of its own.
     """
     for node in nodes:
+        yield node
         if isinstance(node, ast.ClassDef):
             continue
-        yield node
         yield from _method_nodes(ast.iter_child_nodes(node))
 
 
-_SCOPES = (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda,
+_SCOPES = (ast.Module, ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda,
            ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp)
 _COMPREHENSIONS = (ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp)
 # Builtins whose result is made of their first argument's elements.
@@ -256,7 +255,7 @@ class _Derivation:
         elif isinstance(node, (ast.Global, ast.Nonlocal)):
             for name in node.names:
                 self._bind(scope, name, _FOREIGN)
-        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
             self._bind(self._scope_of(node), node.name, _FOREIGN)
 
     def resolve(self, name_node):
@@ -331,14 +330,10 @@ class _ExternalTypes:
         self.filename = filename
         self._first_party = None
         self.imports: dict[str, str | None] = {}  # local name -> top-level module (None: relative)
-        self.module_imports = {
-            alias.asname or alias.name.split(".")[0]
-            for node in walk_same_scope(getattr(tree, "body", []))
-            if isinstance(node, (ast.Import, ast.ImportFrom))
-            for alias in node.names
-        }
         self.defined: set = set()
         self.module_values: dict[str, list] = defaultdict(list)
+        self.parents = {child: parent for parent in ast.walk(tree) for child in ast.iter_child_nodes(parent)}
+        self.scope_bindings = {tree: _Derivation(tree, None).bindings}
         for node in ast.walk(tree):
             if isinstance(node, ast.Import):
                 for alias in node.names:
@@ -370,6 +365,28 @@ class _ExternalTypes:
         if name in self.imports:
             return self._external_module(self.imports[name])
         return name not in self.defined and name not in self.module_values and name in _BUILTIN_TYPES
+
+    def representation_builtin(self, expression, derivation):
+        """A bare builtin dispatch, with the same lexical binding inventory.
+
+        Local/enclosing/module converters and unknown star imports cannot
+        manufacture representation edges. Class attributes do not participate
+        in an ordinary method's free-name lookup.
+        """
+        if not isinstance(expression, ast.Name) or expression.id not in {"str", "repr"}:
+            return None
+        if derivation.resolve(expression) is not None:
+            return None
+        current = self.parents.get(expression)
+        while current is not None:
+            if isinstance(current, _SCOPES):
+                if current not in self.scope_bindings:
+                    self.scope_bindings[current] = _Derivation(current, None).bindings
+                bindings = self.scope_bindings[current]
+                if (id(current), expression.id) in bindings or (id(current), "*") in bindings:
+                    return None
+            current = self.parents.get(current)
+        return "__str__" if expression.id == "str" else "__repr__"
 
     @staticmethod
     def _root_name(expr):
@@ -576,16 +593,15 @@ def _read_method(func, module_names: set, types: "_ExternalTypes | None" = None)
                                      func.args.vararg, func.args.kwarg] if a is not None}
     method.constructs = _constructs(func, receiver)
     method.validates = _is_validator(func)
-    shadowed = (types.module_imports | types.defined | types.module_values.keys()) if types else set()
     called = {id(node.func) for node in _method_nodes(func.body) if isinstance(node, ast.Call)}
     for node in _method_nodes(func.body):
-        if (receiver is not None and isinstance(node, ast.Call)
-                and isinstance(node.func, ast.Name) and node.func.id in {"str", "repr"}
-                and node.func.id not in shadowed and derivation.resolve(node.func) is None
-                and len(node.args) == 1 and not node.keywords
-                and isinstance(node.args[0], ast.Name)
-                and derivation.resolve(node.args[0]) == derivation.receiver_key):
-            method.self_names.append(f"__{node.func.id}__")
+        if (types is not None and isinstance(node, ast.Call) and len(node.args) == 1 and not node.keywords
+                and isinstance(node.args[0], ast.Name) and derivation.receiver_key is not None
+                and derivation.resolve(node.args[0]) == derivation.receiver_key
+                and not any(_name_of(dec) == "classmethod" for dec in func.decorator_list)):
+            representation = types.representation_builtin(node.func, derivation)
+            if representation is not None:
+                method.self_names.append(representation)
         if not isinstance(node, ast.Attribute):
             continue
         base = node.value
