@@ -218,6 +218,7 @@ class _LockInterference(ast.NodeVisitor):
         origins = self._origins(node.value)
         for target in node.targets:
             if isinstance(target, (ast.Tuple, ast.List)):
+                self._consume_values(node, origins)
                 self._assign_literal(target, node.value)
                 continue
             # The constructor reader already proved these stable module seeds.
@@ -407,6 +408,15 @@ class _LockInterference(ast.NodeVisitor):
             self.visit(node.value)
             self._return_deferred(self._origins(node.value), node)
 
+    def visit_Starred(self, node):
+        self.visit(node.value)
+        if isinstance(node.ctx, ast.Load):
+            self._consume_values(node, self._origins(node.value))
+
+    def visit_YieldFrom(self, node):
+        self.visit(node.value)
+        self._consume_values(node, self._origins(node.value))
+
     def _return_deferred(self, origins, node):
         values = frozenset((kind, value) for kind, value in origins if kind in _LAZY_KINDS)
         if values:
@@ -435,7 +445,14 @@ class _LockInterference(ast.NodeVisitor):
         self.expression_origins[node] = self._conditional_steps(node.values[:1], node.values[1:])
 
     def visit_Compare(self, node):
-        self._conditional_steps([node.left] + node.comparators[:1], node.comparators[1:])
+        self.visit(node.left)
+        for index, (operation, value) in enumerate(zip(node.ops, node.comparators)):
+            skipped = dict(self.bindings)
+            self.visit(value)
+            if isinstance(operation, (ast.In, ast.NotIn)):
+                self._consume_values(value, self._origins(value))
+            if index:
+                self.bindings = _merged_origins(skipped, self.bindings)
 
     def visit_Assert(self, node):
         # Assertions may be disabled; the message only runs on failure.

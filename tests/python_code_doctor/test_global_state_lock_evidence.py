@@ -24,6 +24,26 @@ def mutations(detector, source):
             if r.smell_type == "mutated_global"]
 
 
+@pytest.mark.parametrize("consumer", ["[*values]", "first, *rest = values", "yield from values",
+                                     "None in values", "None not in values"])
+@pytest.mark.parametrize("protected", [False, True])
+def test_implicit_iterator_consumers_preserve_direct_write_evidence(detector, consumer, protected):
+    indent = "        " if protected else "    "
+    source = ("from threading import Lock\n_guard = Lock()\nregistry = {}\n"
+              "def put(key):\n    with _guard:\n        registry[key] = 1\n"
+              "        values = (registry.pop(item) for item in (key,))\n" + indent + consumer + "\n")
+    namespace = {}
+    exec(source, namespace)
+    result = namespace["put"]("entry")
+    if consumer.startswith("yield"):
+        list(result)
+    assert namespace["registry"] == {}
+
+    found = mutations(detector, source)
+    expected = "candidate" if protected and not consumer.startswith("yield") else "finding"
+    assert len(found) == 1 and found[0].kind == expected
+
+
 @pytest.mark.parametrize("expression, expected", [
     ("(_guard,)[0]", "finding"),
     ("[_guard][0]", "finding"),
