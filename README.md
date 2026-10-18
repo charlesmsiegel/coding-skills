@@ -162,6 +162,23 @@ mechanical.
   masthead number is computed by `corpus_stats.py` from the manifest, the notes
   and the snowball state — a hand-typed count would be an unverified claim in the
   one place whose job is to establish the report's numbers can be trusted.
+- **[legal-survey](skills/legal-survey)** — literature-survey's shape pointed at
+  a legal question, which turns out to need a different discipline rather than a
+  different vocabulary. Discovery across CourtListener, the Federal Register,
+  eCFR, OpenAlex and Crossref, with UK and EU sources pluggable. Two failures it
+  exists to prevent, and each gets its own mechanical check. **The fabricated
+  citation**: `verify_authorities.py` re-resolves every pincite against a
+  hash-pinned manifest *and* requires each archived case to contain its own
+  reporter citation, so a real file cannot stand in for an invented cite. **Bad
+  law**: `check_treatment.py` walks the open citation graph for every case and
+  the gate refuses a claim resting on overruled authority unless the claim says
+  why. That check is emphatically **not a citator** — no Shepard's, no KeyCite —
+  and the masthead carries the qualifier as part of the figure, because "no
+  negative signal found" and "validated" are different claims. Three things the
+  type system enforces that prose cannot: a selected authority must say whether
+  it *binds the named forum*, an archived statute must carry the version date it
+  was read at, and a holding is a `Claim` while dicta is a `Dictum` — a separate
+  type that may not carry locators, so it cannot be dressed as a holding.
   Rate-limited, `robots.txt`-respecting, and paywalls are recorded as gaps rather
   than circumvented.
 - **[science-investigation](skills/science-investigation)** — audits whether a
@@ -265,11 +282,13 @@ graphs. Two files differ on purpose and are NOT synced: `assets/template.html`
 (each skill has its own theme around the same placeholders and tab contract)
 and `references/llm-tabs.md` (different tab sets).
 
-literature-survey ships a `common.py` of its own that is **not** a copy of
-anybody's: same filename, entirely different subject (HTTP transport, the corpus
-records, the reporter). It is the reason its masthead goes in through
+literature-survey and legal-survey each ship a `common.py` of their own that is
+**not** a copy of anybody's: same filename, entirely different subject (HTTP
+transport, the corpus records, the reporter) — and different from each other,
+because a legal corpus records weight, currency and treatment that a scholarly
+one has no use for. They are the reason both mastheads go in through
 `inject_masthead.py` at a marker rather than through a raw-HTML flag on
-`assemble.py` — a flag one skill needs is how three copies of a file start to
+`assemble.py` — a flag one skill needs is how four copies of a file start to
 drift.
 
 django-code-doctor ships its own copies of python-code-doctor's `common.py` and
