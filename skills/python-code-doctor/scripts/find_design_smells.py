@@ -37,7 +37,7 @@ import argparse
 from pathlib import Path
 from dataclasses import dataclass, asdict
 from collections import defaultdict
-from ast_scopes import (_reads_before_writing, body_kind, decorator_names, is_dotted_name, is_dunder, local_bindings,
+from ast_scopes import (_only_initial_resets, _reads_before_writing, body_kind, decorator_names, is_dotted_name, is_dunder, local_bindings,
                         walk_loop_level, walk_same_scope)
 from common import (is_test_file, sort_findings, cached_parse, SEVERITY_ICONS, configure_output, find_python_files,
                     warn_detector_error, warn_unparseable)
@@ -757,8 +757,8 @@ class DesignSmellDetector(ast.NodeVisitor):
                 continue
             only_key = next(iter(methods))
             # Lazy-init caches behind a property are idiomatic; a field never
-            # populated is dead weight; a reset back to None proves the "None
-            # except during one operation" lifecycle. Without a reset, a field
+            # populated is dead weight; a later reset back to None suggests the
+            # "None except during one operation" lifecycle. Without a reset, a field
             # the method *returns* is an output for callers (part of the state
             # model), and a field only written is an output too. A field the
             # method reads before writing it carries what the previous call left
@@ -772,13 +772,13 @@ class DesignSmellDetector(ast.NodeVisitor):
                     and not _reads_before_writing(bodies[only_key], attr)))
             if is_temporary:
                 only = only_key[1]
-                # A public field without a reset can be a result published to
-                # callers. One visible writer/read-back does not establish its
-                # lifetime outside that method. Keep the observation for review.
-                if not attr.startswith("_") and only_key not in reset_in.get(attr, set()):
+                # Clearing a previous public result before population does not
+                # prove that the next result is scratch. Keep the evidence.
+                if not attr.startswith("_") and (only_key not in reset_in.get(attr, set())
+                        or _only_initial_resets(bodies[only_key], attr)):
                     self._add(line, "temporary_field",
                         f"Public field 'self.{attr}' starts as None and is populated and read only "
-                        f"in '{only}' within this hierarchy; no reset is visible", "", "low",
+                        f"in '{only}' within this hierarchy; no later reset is visible", "", "low",
                         kind="candidate", also_caused_by=(
                             "The field may publish a completed result or status for callers to read after "
                             "this method returns; inspect external consumers before replacing it with local scratch.",))
