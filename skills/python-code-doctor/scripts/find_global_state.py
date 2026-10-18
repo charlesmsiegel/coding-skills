@@ -126,7 +126,17 @@ def _mutates_name(node, names):
     return None
 
 
-def _guarded_nodes(stmts, locks):
+def _context_mutex(expression, locks, contexts):
+    if not isinstance(expression, ast.Name) or expression.id not in locks:
+        return None
+    origins = contexts.get(expression, ())
+    if not origins or any(kind != "guard" or name not in locks for kind, name in origins):
+        return None
+    possible = {locks[name] for _, name in origins}
+    return next(iter(possible)) if len(possible) == 1 else None
+
+
+def _guarded_nodes(stmts, locks, contexts):
     """Same-scope nodes paired with the known module locks held at each node.
 
     `locks` names the module-level Lock/RLock objects. A nested function is
@@ -149,11 +159,11 @@ def _guarded_nodes(stmts, locks):
             for item in node.items:
                 if entered and _suspends([item.context_expr]):
                     invalid = True
-                if isinstance(item.context_expr, ast.Name) and item.context_expr.id in locks:
-                    name = item.context_expr.id
-                    if locks[name].identity in entered and locks[name].factory == "Lock":
+                mutex = _context_mutex(item.context_expr, locks, contexts)
+                if mutex is not None:
+                    if mutex.identity in entered and mutex.factory == "Lock":
                         invalid = True
-                    entered.add(locks[name].identity)
+                    entered.add(mutex.identity)
             if entered and _suspends(node.body):
                 invalid = True
             if invalid:
@@ -161,8 +171,9 @@ def _guarded_nodes(stmts, locks):
             children = []
             for item in node.items:
                 children.append((item.context_expr, held))
-                if held is not None and isinstance(item.context_expr, ast.Name) and item.context_expr.id in locks:
-                    held = held | {locks[item.context_expr.id].identity}
+                mutex = _context_mutex(item.context_expr, locks, contexts)
+                if held is not None and mutex is not None:
+                    held = held | {mutex.identity}
                 if item.optional_vars:
                     children.append((item.optional_vars, held))
             children.extend((stmt, held) for stmt in node.body)
@@ -237,9 +248,12 @@ def _module_bindings(tree) -> Counter:
     return bound
 
 
+_UNKNOWN_ORIGINS = frozenset({("unknown", "")})
+
+
 def _merged_origins(*paths):
     names = set().union(*(set(path) for path in paths))
-    return {name: frozenset().union(*(path.get(name, ()) for path in paths)) for name in names}
+    return {name: frozenset().union(*(path.get(name, _UNKNOWN_ORIGINS) for path in paths)) for name in names}
 
 
 class _LockInterference(ast.NodeVisitor):
@@ -250,22 +264,23 @@ class _LockInterference(ast.NodeVisitor):
     the enclosing function/module, never to another class's namespace.
     """
 
-    def __init__(self, bindings, replaced, released, *, module=False, class_outer=None):
+    def __init__(self, bindings, replaced, released, contexts, *, module=False, class_outer=None):
         self.bindings = {} if module else dict(bindings)
         self.replaced, self.released = replaced, released
         self.module_seeds = dict(bindings) if module else {}
         self.class_outer = class_outer
-        self.exceptional = []
+        self.contexts = contexts
+        self.possible_exits = []
 
     def _origins(self, value):
-        return self.bindings.get(value.id, frozenset()) if isinstance(value, ast.Name) else frozenset()
+        return self.bindings.get(value.id, _UNKNOWN_ORIGINS) if isinstance(value, ast.Name) else _UNKNOWN_ORIGINS
 
     def _set(self, name, origins):
         self.bindings[name] = origins
-        for possible in self.exceptional:
+        for possible in self.possible_exits:
             possible[name] = possible.get(name, frozenset()) | origins
 
-    def _bind(self, target, origins=frozenset()):
+    def _bind(self, target, origins=_UNKNOWN_ORIGINS):
         if isinstance(target, ast.Name):
             self._set(target.id, origins)
         elif isinstance(target, (ast.Tuple, ast.List)):
@@ -277,6 +292,14 @@ class _LockInterference(ast.NodeVisitor):
     def _body(self, body):
         for stmt in body:
             self.visit(stmt)
+
+    def _body_origins(self, body):
+        """Possible bindings at any early exit, including a break or exception."""
+        possible = dict(self.bindings)
+        self.possible_exits.append(possible)
+        self._body(body)
+        self.possible_exits.pop()
+        return possible
 
     def _alternatives(self, bodies):
         before = self.bindings
@@ -315,14 +338,14 @@ class _LockInterference(ast.NodeVisitor):
     def visit_Import(self, node):
         for alias in node.names:
             name = alias.asname or alias.name.split(".")[0]
-            self._set(name, frozenset({("module", "threading")}) if alias.name == "threading" else frozenset())
+            self._set(name, frozenset({("module", "threading")}) if alias.name == "threading" else _UNKNOWN_ORIGINS)
 
     def visit_ImportFrom(self, node):
         if any(alias.name == "*" for alias in node.names):
             self.bindings.clear()
             return
         for alias in node.names:
-            self._set(alias.asname or alias.name, frozenset())
+            self._set(alias.asname or alias.name, _UNKNOWN_ORIGINS)
 
     def visit_Attribute(self, node):
         if isinstance(node.ctx, (ast.Store, ast.Del)) and node.attr in _LOCK_FACTORIES:
@@ -331,6 +354,9 @@ class _LockInterference(ast.NodeVisitor):
         self.generic_visit(node)
 
     def visit_Call(self, node):
+        if isinstance(node.func, ast.Lambda):
+            self._invoke_lambda(node)
+            return
         if isinstance(node.func, ast.Attribute) and node.func.attr in {"release", "__exit__"}:
             self.released.update(name for kind, name in self._origins(node.func.value) if kind == "guard")
         self.generic_visit(node)
@@ -341,7 +367,12 @@ class _LockInterference(ast.NodeVisitor):
 
     def visit_While(self, node):
         self.visit(node.test)
-        self._alternatives([node.body + node.orelse, []])
+        self._loop(node, dict(self.bindings))
+
+    def _loop(self, node, before):
+        possible = self._body_origins(node.body)
+        self._body(node.orelse)
+        self.bindings = _merged_origins(before, possible, self.bindings)
 
     def visit_For(self, node):
         self.visit(node.iter)
@@ -349,13 +380,14 @@ class _LockInterference(ast.NodeVisitor):
         # that never runs leaves its earlier binding possible afterwards.
         before = dict(self.bindings)
         self._bind(node.target)
-        self._body(node.body + node.orelse)
-        self.bindings = _merged_origins(before, self.bindings)
+        self._loop(node, before)
 
     visit_AsyncFor = visit_For
 
     def visit_With(self, node):
         for item in node.items:
+            origins = self._origins(item.context_expr)
+            self.contexts[item.context_expr] = self.contexts.get(item.context_expr, frozenset()) | origins
             self.visit(item.context_expr)
             if item.optional_vars:
                 self._bind(item.optional_vars)
@@ -367,10 +399,7 @@ class _LockInterference(ast.NodeVisitor):
         # Any statement in the try body can fail. A handler/finally can see a
         # binding installed before that failure, even if a later assignment
         # would replace it on the normal path.
-        possible = dict(self.bindings)
-        self.exceptional.append(possible)
-        self._body(node.body)
-        self.exceptional.pop()
+        possible = self._body_origins(node.body)
         self._body(node.orelse)
         outcomes = [self.bindings, possible]
         for handler in node.handlers:
@@ -378,7 +407,7 @@ class _LockInterference(ast.NodeVisitor):
             if handler.type:
                 self.visit(handler.type)
             if handler.name:
-                self._set(handler.name, frozenset())
+                self._set(handler.name, _UNKNOWN_ORIGINS)
             self._body(handler.body)
             outcomes.append(self.bindings)
         self.bindings = _merged_origins(*outcomes)
@@ -386,12 +415,32 @@ class _LockInterference(ast.NodeVisitor):
 
     visit_TryStar = visit_Try
 
+    def visit_Match(self, node):
+        self.visit(node.subject)
+        subject = self._origins(node.subject)
+        before = self.bindings
+        outcomes = [before]  # matching no case is possible too
+        for case in node.cases:
+            self.bindings = dict(before)
+            for pattern in ast.walk(case.pattern):
+                if isinstance(pattern, (ast.MatchAs, ast.MatchStar)) and pattern.name:
+                    self._set(pattern.name, _UNKNOWN_ORIGINS)
+                elif isinstance(pattern, ast.MatchMapping) and pattern.rest:
+                    self._set(pattern.rest, _UNKNOWN_ORIGINS)
+            if isinstance(case.pattern, ast.MatchAs) and case.pattern.pattern is None and case.pattern.name:
+                self._set(case.pattern.name, subject)
+            if case.guard:
+                self.visit(case.guard)
+            self._body(case.body)
+            outcomes.append(self.bindings)
+        self.bindings = _merged_origins(*outcomes)
+
     def visit_FunctionDef(self, node):
         self._body(node.decorator_list)
         self.visit(node.args)
         if node.returns:
             self.visit(node.returns)
-        self._set(node.name, frozenset())
+        self._set(node.name, _UNKNOWN_ORIGINS)
 
     visit_AsyncFunctionDef = visit_FunctionDef
 
@@ -399,26 +448,64 @@ class _LockInterference(ast.NodeVisitor):
         self._body(node.args.defaults)
         self._body(value for value in node.args.kw_defaults if value is not None)
 
+    def _invoke_lambda(self, call):
+        # Defaults and actual arguments run in the enclosing namespace; the
+        # body has its own parameters and walrus locals. A merely created
+        # lambda does not execute its body.
+        node = call.func
+        positional = list(node.args.posonlyargs) + list(node.args.args)
+        defaults = {}
+        for param, value in zip(positional[len(positional) - len(node.args.defaults):], node.args.defaults):
+            self.visit(value)
+            defaults[param.arg] = self._origins(value)
+        for param, value in zip(node.args.kwonlyargs, node.args.kw_defaults):
+            if value is not None:
+                self.visit(value)
+                defaults[param.arg] = self._origins(value)
+        actual = []
+        for value in call.args:
+            self.visit(value)
+            actual.append(self._origins(value))
+        keywords = {}
+        for keyword in call.keywords:
+            self.visit(keyword.value)
+            keywords[keyword.arg] = self._origins(keyword.value)
+        outer = self.bindings if self.class_outer is None else self.class_outer
+        child = _LockInterference(outer, self.replaced, self.released, self.contexts)
+        params = positional + list(node.args.kwonlyargs) + [p for p in (node.args.vararg, node.args.kwarg) if p]
+        for param in params:
+            child._set(param.arg, defaults.get(param.arg, _UNKNOWN_ORIGINS))
+        for param, origins in zip(positional, actual):
+            child._set(param.arg, origins)
+        for name, origins in keywords.items():
+            if name is not None:
+                child._set(name, origins)
+        local = {item.id for item in _module_scope_nodes(ast.Module(body=[node.body], type_ignores=[]))
+                 if isinstance(item, ast.Name) and isinstance(item.ctx, ast.Store)}
+        for name in local - {param.arg for param in params}:
+            child._set(name, _UNKNOWN_ORIGINS)
+        child.visit(node.body)
+
     def visit_ClassDef(self, node):
         self._body(node.decorator_list + node.bases + [keyword.value for keyword in node.keywords])
         outer = self.bindings if self.class_outer is None else self.class_outer
-        child = _LockInterference(outer, self.replaced, self.released, class_outer=dict(outer))
+        child = _LockInterference(outer, self.replaced, self.released, self.contexts, class_outer=dict(outer))
         child._body(node.body)
-        self._set(node.name, frozenset())
+        self._set(node.name, _UNKNOWN_ORIGINS)
 
 
-def _lock_interference(tree, threading_modules, lock_names):
+def _lock_interference(tree, threading_modules, lock_names, contexts):
     """Visible factory replacement/release, with ordinary lexical alias bindings."""
     known = {name: frozenset({("module", "threading")}) for name in threading_modules}
     known.update((name, frozenset({("guard", name)})) for name in lock_names)
     replaced, released = set(), set()
-    _LockInterference(known, replaced, released, module=True)._body(tree.body)
+    _LockInterference(known, replaced, released, contexts, module=True)._body(tree.body)
     for fn, enclosing in _function_scopes(tree):
         global_names = {name for node in _same_scope_nodes(fn.body)
                         if isinstance(node, ast.Global) for name in node.names}
         local = (_bound_names(fn) | enclosing) - global_names
         _LockInterference({name: origins for name, origins in known.items() if name not in local},
-                          replaced, released)._body(fn.body)
+                          replaced, released, contexts)._body(fn.body)
     return replaced, released
 
 
@@ -448,7 +535,7 @@ def _module_aliases(tree, known, stable):
     return visible
 
 
-def _module_locks(tree) -> dict:
+def _module_locks(tree, contexts) -> dict:
     """Stable names bound once to an imported threading Lock/RLock constructor.
 
     A global declaration anywhere keeps a name out of this bounded proof: it
@@ -502,7 +589,7 @@ def _module_locks(tree) -> dict:
     if not locks:
         return {}
     locks = _module_aliases(tree, locks, stable)
-    replaced, released = _lock_interference(tree, threading_modules, set(locks))
+    replaced, released = _lock_interference(tree, threading_modules, set(locks), contexts)
     released_identities = {locks[name][1].identity for name in released}
     return {name: mutex for name, (origin, mutex) in locks.items()
             if mutex.identity not in released_identities
@@ -587,7 +674,8 @@ def detect(tree, filename, lines, ignore):
                 candidates[stmt.target.id] = stmt.lineno
 
     # Pass 2: scan every function for `global` rebinds and mutations of candidates
-    locks = _module_locks(tree)
+    contexts = {}
+    locks = _module_locks(tree, contexts)
     guarded = defaultdict(list)     # name -> [stable module lock names held] per mutation site
     candidate_names = set(candidates)
     for fn, enclosing in _function_scopes(tree):
@@ -627,7 +715,7 @@ def detect(tree, filename, lines, ignore):
         visible = candidate_names - local
         if not visible:
             continue
-        for n, held in _guarded_nodes(fn.body, {name: mutex for name, mutex in locks.items() if name not in local}):
+        for n, held in _guarded_nodes(fn.body, {name: mutex for name, mutex in locks.items() if name not in local}, contexts):
             m = _mutates_name(n, visible)
             if m:
                 guarded[m].append(held)

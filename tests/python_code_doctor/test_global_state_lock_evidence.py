@@ -353,3 +353,49 @@ def test_releasing_an_earlier_wildcard_object_does_not_release_a_later_guard(det
                       "guard = Lock()\nregistry = {}\n"
                       "def put(key):\n    with guard:\n        alias.release()\n        registry[key] = 1\n")
     assert len(found) == 1 and found[0].kind == "candidate"
+
+
+@pytest.mark.parametrize("body, expected", [
+    ("_guard = fake_guard\n        with _guard:\n            registry[key] = 1", "finding"),
+    ("with _guard:\n            registry[key] = 1", "candidate"),
+    ("with _guard:\n            registry[key] = 1\n        _guard = fake_guard", "candidate"),
+    ("if key:\n            _guard = fake_guard\n        with _guard:\n            registry[key] = 1", "finding"),
+])
+def test_class_mutation_guards_use_their_ordered_namespace(detector, body, expected):
+    found = mutations(detector, "from threading import Lock\n_guard = Lock()\nregistry = {}\n"
+                      f"def put(key):\n    class Other:\n        {body}\n")
+    assert len(found) == 1 and found[0].kind == expected
+
+
+def test_match_aliases_keep_every_possible_guard_origin(detector):
+    found = mutations(detector, "from threading import Lock\n_guard = Lock()\nregistry = {}\n"
+                      "def put(key):\n    with _guard:\n        match key:\n"
+                      "            case 1:\n                alias = _guard\n"
+                      "            case _:\n                alias = fake_guard\n"
+                      "        alias.release()\n        registry[key] = 1\n")
+    assert len(found) == 1 and found[0].kind == "finding"
+
+
+@pytest.mark.parametrize("loop", ["while ready", "for value in values"])
+@pytest.mark.parametrize("after_break", ["", "\n            alias = fake_guard"])
+def test_break_paths_preserve_guard_aliases_before_a_loop_else(detector, loop, after_break):
+    found = mutations(detector, "from threading import Lock\n_guard = Lock()\nregistry = {}\n"
+                      f"def put(key):\n    with _guard:\n        {loop}:\n"
+                      f"            alias = _guard\n            break{after_break}\n"
+                      "        else:\n            alias = fake_guard\n"
+                      "        alias.release()\n        registry[key] = 1\n")
+    assert len(found) == 1 and found[0].kind == "finding"
+
+
+@pytest.mark.parametrize("expression, expected", [
+    ("(lambda: _guard.release())()", "finding"),
+    ("(lambda alias: alias.release())(_guard)", "finding"),
+    ("(lambda alias=_guard: alias.release())()", "finding"),
+    ("(lambda _guard: _guard.release())(fake_guard)", "candidate"),
+    ("(lambda _guard=fake_guard: _guard.release())()", "candidate"),
+    ("(lambda: _guard.release())", "candidate"),
+])
+def test_immediate_lambda_calls_use_their_own_parameter_scope(detector, expression, expected):
+    found = mutations(detector, "from threading import Lock\n_guard = Lock()\nregistry = {}\n"
+                      f"def put(key):\n    with _guard:\n        {expression}\n        registry[key] = 1\n")
+    assert len(found) == 1 and found[0].kind == expected
