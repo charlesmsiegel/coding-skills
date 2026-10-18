@@ -144,13 +144,13 @@ def _method_nodes(nodes):
     A nested class is skipped: it is analysed as a class of its own.
     """
     for node in nodes:
+        yield node
         if isinstance(node, ast.ClassDef):
             continue
-        yield node
         yield from _method_nodes(ast.iter_child_nodes(node))
 
 
-_SCOPES = (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda,
+_SCOPES = (ast.Module, ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda,
            ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp)
 _COMPREHENSIONS = (ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp)
 # Builtins whose result is made of their first argument's elements.
@@ -255,7 +255,7 @@ class _Derivation:
         elif isinstance(node, (ast.Global, ast.Nonlocal)):
             for name in node.names:
                 self._bind(scope, name, _FOREIGN)
-        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
             self._bind(self._scope_of(node), node.name, _FOREIGN)
 
     def resolve(self, name_node):
@@ -332,6 +332,8 @@ class _ExternalTypes:
         self.imports: dict[str, str | None] = {}  # local name -> top-level module (None: relative)
         self.defined: set = set()
         self.module_values: dict[str, list] = defaultdict(list)
+        self.parents = {child: parent for parent in ast.walk(tree) for child in ast.iter_child_nodes(parent)}
+        self.scope_bindings = {tree: _Derivation(tree, None).bindings}
         for node in ast.walk(tree):
             if isinstance(node, ast.Import):
                 for alias in node.names:
@@ -363,6 +365,28 @@ class _ExternalTypes:
         if name in self.imports:
             return self._external_module(self.imports[name])
         return name not in self.defined and name not in self.module_values and name in _BUILTIN_TYPES
+
+    def representation_builtin(self, expression, derivation):
+        """A bare builtin dispatch, with the same lexical binding inventory.
+
+        Local/enclosing/module converters and unknown star imports cannot
+        manufacture representation edges. Class attributes do not participate
+        in an ordinary method's free-name lookup.
+        """
+        if not isinstance(expression, ast.Name) or expression.id not in {"str", "repr"}:
+            return None
+        if derivation.resolve(expression) is not None:
+            return None
+        current = self.parents.get(expression)
+        while current is not None:
+            if isinstance(current, _SCOPES):
+                if current not in self.scope_bindings:
+                    self.scope_bindings[current] = _Derivation(current, None).bindings
+                bindings = self.scope_bindings[current]
+                if (id(current), expression.id) in bindings or (id(current), "*") in bindings:
+                    return None
+            current = self.parents.get(current)
+        return "__str__" if expression.id == "str" else "__repr__"
 
     @staticmethod
     def _root_name(expr):
@@ -571,6 +595,13 @@ def _read_method(func, module_names: set, types: "_ExternalTypes | None" = None)
     method.validates = _is_validator(func)
     called = {id(node.func) for node in _method_nodes(func.body) if isinstance(node, ast.Call)}
     for node in _method_nodes(func.body):
+        if (types is not None and isinstance(node, ast.Call) and len(node.args) == 1 and not node.keywords
+                and isinstance(node.args[0], ast.Name) and derivation.receiver_key is not None
+                and derivation.resolve(node.args[0]) == derivation.receiver_key
+                and not any(_name_of(dec) == "classmethod" for dec in func.decorator_list)):
+            representation = types.representation_builtin(node.func, derivation)
+            if representation is not None:
+                method.self_names.append(representation)
         if not isinstance(node, ast.Attribute):
             continue
         base = node.value
@@ -606,6 +637,8 @@ def _behavior_names(methods: dict, name: str, seen: frozenset = frozenset()):
     coordinate real behaviors through the representation that calls them.
     """
     for touched in methods[name].self_names:
+        if touched == "__str__" and touched not in methods and "__repr__" in methods:
+            touched = "__repr__"  # object.__str__ delegates to the repr protocol.
         if touched in _REPRESENTATIONS and touched in methods:
             if touched not in seen:
                 yield from _behavior_names(methods, touched, seen | {touched})

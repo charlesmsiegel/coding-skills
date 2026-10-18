@@ -241,3 +241,120 @@ def test_behavior_coordinating_groups_through_a_representation_can_join_them(det
                 return str((self.left(), self.right()))
     """)
     assert cohesion(detector, tmp_path, source) == []
+
+
+@pytest.mark.parametrize("builtin,presentation", [("str", "__str__"), ("repr", "__repr__"), ("str", "__repr__")])
+@pytest.mark.parametrize("receiver", ["self", "instance"])
+@pytest.mark.parametrize("shared", [False, True])
+def test_builtin_representation_dispatch_retains_the_callers_state(
+        detector, tmp_path, builtin, presentation, receiver, shared):
+    source = textwrap.dedent(f"""
+        class Entry:
+            def measure({receiver}):
+                return len({receiver}.{'payload' if shared else 'metrics'})
+
+            def save({receiver}):
+                return {builtin}({receiver})
+
+            def {presentation}({receiver}):
+                return {receiver}.payload
+    """)
+    found = cohesion(detector, tmp_path, source)
+    if shared:
+        assert found == []
+    else:
+        [record] = found
+        assert record.metric_value == 2
+        assert "{measure} and {save}" in record.description
+
+
+@pytest.mark.parametrize("setup,signature,expression", [
+    ("str = converter\n", "self", "str(self)"),
+    ("def str(value):\n    return 'Entry'\n", "self", "str(self)"),
+    ("from converter import str\n", "self", "str(self)"),
+    ("if flag:\n    str = converter\n", "self", "str(self)"),
+    ("", "self, str", "str(self)"),
+    ("", "self, other", "str(other)"),
+    ("", "self", "(lambda str: str(self))(converter)"),
+    ("", "self", "(lambda self: str(self))(other)"),
+    ("", "self", "str(self, 'utf-8')"),
+    ("", "self", "repr(self, extra)"),
+])
+def test_representation_edges_require_builtin_ownership_receiver_and_arity(
+        detector, tmp_path, setup, signature, expression):
+    source = setup + textwrap.dedent(f"""
+        class Entry:
+            def measure(self):
+                return len(self.metrics)
+
+            def save({signature}):
+                return {expression}
+
+            def __str__(self):
+                return self.payload
+
+            def __repr__(self):
+                return self.payload
+    """)
+    assert cohesion(detector, tmp_path, source) == []
+
+
+def test_other_method_and_class_attribute_shadows_do_not_hide_builtin_dispatch(detector, tmp_path):
+    source = textwrap.dedent("""
+        class Entry:
+            str = converter
+            def measure(self):
+                return len(self.metrics)
+            def unrelated(self, str):
+                return str
+            def save(self):
+                return str(self)
+            def __str__(self):
+                return self.payload
+    """)
+    [record] = cohesion(detector, tmp_path, source)
+    assert record.metric_value == 2
+
+
+def test_enclosing_function_converter_is_not_builtin_dispatch(detector, tmp_path):
+    source = textwrap.dedent("""
+        def build(str):
+            class Entry:
+                def measure(self):
+                    return len(self.metrics)
+                def save(self):
+                    return str(self)
+                def __str__(self):
+                    return self.payload
+            return Entry
+    """)
+    assert cohesion(detector, tmp_path, source) == []
+
+
+def test_str_uses_an_explicit_str_before_repr_fallback(detector, tmp_path):
+    source = textwrap.dedent("""
+        class Entry:
+            def measure(self):
+                return len(self.metrics)
+            def save(self):
+                return str(self)
+            def __str__(self):
+                return 'Entry'
+            def __repr__(self):
+                return self.payload
+    """)
+    assert cohesion(detector, tmp_path, source) == []
+
+
+def test_classmethod_rendering_the_class_does_not_dispatch_to_instance_repr(detector, tmp_path):
+    source = textwrap.dedent("""
+        class Entry:
+            def measure(self):
+                return len(self.metrics)
+            @classmethod
+            def save(cls):
+                return str(cls)
+            def __str__(self):
+                return self.payload
+    """)
+    assert cohesion(detector, tmp_path, source) == []
