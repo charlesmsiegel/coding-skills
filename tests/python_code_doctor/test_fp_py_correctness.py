@@ -384,7 +384,7 @@ def test_a_raise_inside_a_def_in_a_handler_belongs_to_the_def(tmp_path):
 # ---- mutated_global / global_rebind ---------------------------------------- #
 
 
-def test_a_global_mutated_only_under_a_module_lock_is_medium(tmp_path):
+def test_a_global_mutated_only_under_a_module_lock_is_a_candidate(tmp_path):
     found = records("find_global_state.py", tmp_path,
                     "import threading\n"
                     "_L = threading.Lock()\n"
@@ -393,7 +393,8 @@ def test_a_global_mutated_only_under_a_module_lock_is_medium(tmp_path):
                     "    with _L:\n"
                     "        return _C.setdefault(k, object())\n",
                     "mutated_global")
-    assert [(r["kind"], r["severity"]) for r in found] == [("finding", "medium")]
+    assert len(found) == 1
+    assert_candidate_shape(found[0])
 
 
 @pytest.mark.parametrize("source", [
