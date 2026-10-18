@@ -88,6 +88,8 @@ def _class_is_abstract(class_node):
     """True if the class directly inherits from ABC, ABCMeta, or Protocol."""
     abstract_bases = {"ABC", "ABCMeta", "Protocol"}
     for base in class_node.bases:
+        if isinstance(base, ast.Subscript):
+            base = base.value
         if isinstance(base, ast.Name) and base.id in abstract_bases:
             return True
         if isinstance(base, ast.Attribute) and base.attr in abstract_bases:
