@@ -352,6 +352,16 @@ class _LockInterference(ast.NodeVisitor):
         if any(("builtin", name) in callee for name in _ITERATOR_CONSUMERS):
             if actual:
                 self._consume_values(node, actual[0])
+                callback = keywords.get("key", frozenset())
+                if (any(("builtin", name) in callee for name in {"sorted", "min", "max"})
+                        and any(kind == "callable" for kind, _ in callback)):
+                    value = node.args[0]
+                    if len(actual) > 1:
+                        elements = frozenset().union(*actual)
+                    else:
+                        elements = (frozenset().union(*(self.contexts.get(item, self._origins(item)) for item in value.elts))
+                                    if isinstance(value, (ast.Tuple, ast.List)) and value.elts else _UNKNOWN_ORIGINS)
+                    self._apply_callbacks(node, callback, [elements])
         elif ("builtin", "iter") in callee:
             if len(actual) == 1 and not keywords and not any(isinstance(arg, ast.Starred) for arg in node.args):
                 self.expression_origins[node] = actual[0]

@@ -24,6 +24,30 @@ def mutations(detector, source):
             if r.smell_type == "mutated_global"]
 
 
+@pytest.mark.parametrize("consumer", ["sorted", "min", "max"])
+@pytest.mark.parametrize("protected", [False, True])
+def test_builtin_key_callbacks_use_the_execution_site_mutex(detector, consumer, protected):
+    indent = "        " if protected else "    "
+    source = ("from threading import Lock\n_guard = Lock()\nregistry = {}\n"
+              "def put(key):\n    with _guard:\n        registry[key] = 1\n" + indent +
+              f"{consumer}((key,), key=lambda item: registry.pop(item))\n")
+    namespace = {}
+    exec(source, namespace)
+    namespace["put"]("entry")
+    assert namespace["registry"] == {}
+    found = mutations(detector, source)
+    assert len(found) == 1 and found[0].kind == ("candidate" if protected else "finding")
+
+
+@pytest.mark.parametrize("consumer", ["sorted", "min", "max"])
+def test_builtin_key_callback_parameters_retain_literal_mutex_origins(detector, consumer):
+    found = mutations(detector, "from threading import Lock\n_guard = Lock()\nregistry = {}\n"
+                      "def put(key):\n    with _guard:\n" +
+                      f"        {consumer}((_guard,), key=lambda lock: lock.release())\n" +
+                      "        registry[key] = 1\n")
+    assert len(found) == 1 and found[0].kind == "finding"
+
+
 @pytest.mark.parametrize("consumer", ["[*values]", "first, *rest = values", "yield from values",
                                      "None in values", "None not in values"])
 @pytest.mark.parametrize("protected", [False, True])
