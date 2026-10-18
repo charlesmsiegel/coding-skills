@@ -26,6 +26,8 @@ def _eager_children(node, contexts=None):
         children = list(node.args.defaults) + [value for value in node.args.kw_defaults if value is not None]
     elif isinstance(node, ast.GeneratorExp):
         children = [node.generators[0].iter]
+    elif isinstance(node, ast.AnnAssign) and node.value is None:
+        children = [node.annotation]
     else:
         children = list(ast.iter_child_nodes(node))
     if isinstance(node, ast.Call):
@@ -40,6 +42,7 @@ def _eager_children(node, contexts=None):
         if kind == "consume":
             children.append(value.elt)
             for index, generator in enumerate(value.generators):
+                children.append(generator.target)
                 children.extend(generator.ifs)
                 if index:
                     children.append(generator.iter)
@@ -66,11 +69,10 @@ def mutated_names(node, names, contexts):
     if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
         if node.func.attr in _MUTATING_METHODS and _module_name(node.func.value, names, contexts):
             return {node.func.value.id}
-    targets = (node.targets if isinstance(node, (ast.Assign, ast.Delete)) else
-               [node.target] if isinstance(node, (ast.AugAssign, ast.AnnAssign)) else [])
-    return {part.value.id for target in targets for part in ast.walk(target)
-            if isinstance(part, ast.Subscript) and isinstance(part.ctx, (ast.Store, ast.Del))
-            and _module_name(part.value, names, contexts)}
+    if (isinstance(node, ast.Subscript) or isinstance(node, ast.Attribute) and node.attr == "default_factory"):
+        if isinstance(node.ctx, (ast.Store, ast.Del)) and _module_name(node.value, names, contexts):
+            return {node.value.id}
+    return set()
 
 def _context_mutex(expression, locks, contexts):
     origins = {origin for origin in contexts.get(expression, ()) if origin[0] != "global"}
