@@ -55,6 +55,7 @@ class ImportReferences(ast.NodeVisitor):
         self._deferred_annotations = []
         self._quoted_depth = 0
         self._finishing_references = False
+        self._reference_only = False
 
     def visit_Assign(self, node: ast.Assign):
         # Python evaluates the value with the old binding, then stores each
@@ -105,21 +106,98 @@ class ImportReferences(ast.NodeVisitor):
         # Neither branch is known to run. Keep each possible origin; the last
         # branch visited is not evidence that the other was skipped. Restore
         # maps in place: queued deferred bodies retain these namespace objects.
-        before = [origins.copy() for _kind, origins in self._annotation_scopes]
+        before = self._origin_state()
         branches = []
         for statements in alternatives:
-            for (_kind, origins), original in zip(self._annotation_scopes, before):
-                origins.clear()
-                origins.update(original)
+            self._restore_origins(before)
             for statement in statements:
                 self.visit(statement)
-            branches.append([origins.copy() for _kind, origins in self._annotation_scopes])
-        for index, (_kind, origins) in enumerate(self._annotation_scopes):
+            branches.append(self._origin_state())
+        self._restore_origins(self._joined_origins(branches))
+
+    def _origin_state(self):
+        return [origins.copy() for _kind, origins in self._annotation_scopes]
+
+    def _restore_origins(self, state):
+        for (_kind, origins), original in zip(self._annotation_scopes, state):
             origins.clear()
+            origins.update(original)
+
+    def _joined_origins(self, branches):
+        joined = []
+        for index in range(len(self._annotation_scopes)):
+            origins = {}
             names = set().union(*(branch[index] for branch in branches))
             for name in names:
                 origins[name] = frozenset().union(*(
                     self._origin_options(branch[index].get(name, _FALLBACK)) for branch in branches))
+            joined.append(origins)
+        return joined
+
+    def visit_Try(self, node):
+        # An exception can leave after any prefix of the body. Handlers begin
+        # from those possible bindings, not from the last handler we traversed.
+        partial = [self._origin_state()]
+        for statement in node.body:
+            self.visit(statement)
+            partial.append(self._origin_state())
+        handler_entry = self._joined_origins(partial)
+        for statement in node.orelse:
+            self.visit(statement)
+            partial.append(self._origin_state())
+        continuing = [self._origin_state()]
+        for handler in node.handlers:
+            self._restore_origins(handler_entry)
+            self._visit_exception_handler(handler, partial)
+            continuing.append(self._origin_state())
+            if isinstance(node, ast.TryStar):
+                # Several except* handlers can run in order; an ordinary except
+                # chooses only one. The next group may also skip earlier ones.
+                handler_entry = self._joined_origins([handler_entry, continuing[-1]])
+        normal = self._joined_origins(continuing)
+        self._restore_origins(normal)
+        if not node.finalbody:
+            return
+        self._visit_cleanup(node.finalbody, partial, normal)
+
+    visit_TryStar = visit_Try
+
+    def _visit_exception_handler(self, handler, partial):
+        if handler.type is not None:
+            self.visit(handler.type)
+        if handler.name:
+            self._annotation_scopes[-1][1][handler.name] = None
+        for statement in handler.body:
+            self.visit(statement)
+            partial.append(self._origin_state())
+        if handler.name:
+            # Python deletes the exception target at handler exit; a class can
+            # then fall back to an enclosing binding, unlike a function local.
+            kind, origins = self._annotation_scopes[-1]
+            if kind in {"module", "class"}:
+                origins.pop(handler.name, None)
+            else:
+                origins[handler.name] = None
+
+    def _visit_cleanup(self, statements, partial, normal):
+        if self._reference_only:
+            self._restore_origins(self._joined_origins([*partial, normal]))
+        for statement in statements:
+            self.visit(statement)
+        after = self._origin_state()
+        if not self._reference_only:
+            # Finally also runs while an uncaught exception escapes. Its uses
+            # count, but that path cannot supply bindings to later statements.
+            # Reference-only nested cleanups are walked once, avoiding an
+            # exponential second walk for deeply nested try/finally statements.
+            self._reference_only = True
+            self._restore_origins(self._joined_origins([*partial, normal]))
+            try:
+                for statement in statements:
+                    self.visit(statement)
+            finally:
+                self._reference_only = False
+                self._restore_origins(after)
 
     def visit_BoolOp(self, node: ast.BoolOp):
         self.visit(node.values[0])
