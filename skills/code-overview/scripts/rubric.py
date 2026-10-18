@@ -106,6 +106,7 @@ DETECTOR_CATEGORIES = {
 TYPE_CATEGORY_OVERRIDES = {
     "raise_without_from": "hygiene",
     "suppressible_exception": "hygiene",
+    "literal_import": "design",
 }
 
 # code-doctor's own detector registry (`analyze_all.DETECTORS`) uses its own

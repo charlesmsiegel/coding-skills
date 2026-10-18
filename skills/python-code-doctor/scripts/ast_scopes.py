@@ -155,3 +155,41 @@ def _reads_before_writing(body: list[ast.stmt], attr: str) -> bool:
              if _is_self_attribute(node, attr) and isinstance(node.ctx, ast.Load) and id(node) not in repeated]
     writes = [(stmt.end_lineno, stmt.end_col_offset) for stmt in nodes if _writes_self_attribute(stmt, attr)]
     return bool(reads) and (not writes or min(reads) < min(writes))
+
+
+def _only_initial_resets(body: list[ast.stmt], attr: str) -> bool:
+    """All visible resets are direct statements before any field population.
+
+    This bounds a candidate, not a claim about external consumers. Destructuring,
+    deletion and dynamic mutation leave the lifetime unresolved; retain findings.
+    """
+    resets, populations = [], []
+    for node in walk_same_scope(body):
+        if _is_self_attribute(node, "__dict__"):
+            return False
+        if _is_self_attribute(node, attr) and isinstance(node.ctx, ast.Del):
+            return False
+        if isinstance(node, ast.Call):
+            arguments = []
+            if isinstance(node.func, ast.Name) and node.func.id in {"setattr", "delattr"}:
+                arguments = node.args
+            elif isinstance(node.func, ast.Attribute) and node.func.attr in {"__setattr__", "__delattr__"}:
+                owner = node.func.value
+                arguments = [owner, *node.args] if isinstance(owner, ast.Name) and owner.id == "self" else node.args
+            if (len(arguments) >= 2 and isinstance(arguments[0], ast.Name) and arguments[0].id == "self"
+                    and (not isinstance(arguments[1], ast.Constant) or arguments[1].value == attr)):
+                return False
+        if not _writes_self_attribute(node, attr):
+            continue
+        if not isinstance(node, (ast.Assign, ast.AnnAssign)):
+            return False
+        targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+        if not all(_is_self_attribute(target, attr) for target in targets):
+            return False
+        if isinstance(node.value, ast.Constant) and node.value.value is None:
+            resets.append(node)
+        else:
+            populations.append((node.lineno, node.col_offset))
+    return bool(resets and populations) and all(
+        reset in body and (reset.lineno, reset.col_offset) < min(populations)
+        for reset in resets)
