@@ -2,7 +2,10 @@
 
 import ast
 import math
+import sys
 import textwrap
+import types
+from fractions import Fraction
 from pathlib import Path
 
 import pytest
@@ -505,3 +508,51 @@ def test_class_pattern_unshadowed_import_ignores_class_namespace(
     exec(source, namespace)
     assert namespace["Entry"]().save(namespace["Fraction"](3, 2)) == 6.5
     assert findings(detector, tmp_path, source, "feature_envy") == []
+
+
+@pytest.mark.parametrize("scope", ["method", "enclosing"])
+@pytest.mark.parametrize("qualified", [False, True])
+@pytest.mark.parametrize("binding", ["external", "rebound", "first_party"])
+def test_scoped_class_pattern_imports_use_the_nearest_proven_binding(
+        detector, tmp_path, monkeypatch, scope, qualified, binding):
+    payload = "class Payload:\n    numerator = 1\n    denominator = 2\n    real = 3\n"
+    local = tmp_path / "cohesion_local_types.py"
+    local.write_text(payload, encoding="utf-8")
+    module = types.ModuleType("cohesion_local_types")
+    exec(payload, module.__dict__)
+    monkeypatch.setitem(sys.modules, "cohesion_local_types", module)
+    package = "cohesion_local_types" if binding == "first_party" else "fractions"
+    kind = "Payload" if binding == "first_party" else "Fraction"
+    root = "lib" if qualified else "Kind"
+    declaration = f"import {package} as lib" if qualified else f"from {package} import {kind} as Kind"
+    pattern = f"lib.{kind}()" if qualified else "Kind()"
+    if binding == "rebound":
+        declaration += f"\n{root} = " + ("Namespace" if qualified else "Payload")
+    body = textwrap.dedent(f"""
+        class Entry:
+            def measure(self):
+                return self.metrics
+            def save(self, value):
+                BINDING
+                match value:
+                    case {pattern} as item:
+                        return item.numerator + item.denominator + item.real
+    """)
+    if scope == "method":
+        body = body.replace("        BINDING", textwrap.indent(declaration, "        "))
+    else:
+        body = ("def make():\n" + textwrap.indent(declaration, "    ") + "\n"
+                + textwrap.indent(body.replace("        BINDING\n", ""), "    ")
+                + "    return Entry\nEntry = make()\n")
+    source = payload + "class Namespace:\n    Fraction = Payload\n" + body
+    namespace = {}
+    exec(source, namespace)
+    value = module.Payload() if binding == "first_party" else namespace["Payload"]()
+    if binding == "external":
+        value = Fraction(3, 2)
+    assert namespace["Entry"]().save(value) == (6.5 if binding == "external" else 6)
+    found = findings(detector, tmp_path, source, "feature_envy")
+    # A method-local replacement also reads Namespace.Fraction: four distinct
+    # foreign attributes, rather than only the matched value's three.
+    metric = 4 if binding == "rebound" and qualified and scope == "method" else 3
+    assert [row.metric_value for row in found] == ([] if binding == "external" else [metric])

@@ -336,14 +336,17 @@ class _ExternalTypes:
             current = self.parents.get(current)
         return isinstance(expression, ast.Name) and root in _BUILTIN_TYPES
 
-    def _pattern_type(self, pattern, derivation, seen) -> bool:
+    def _pattern_type(self, pattern) -> bool:
         """The whole matched instance, not fields taken from that instance."""
         if isinstance(pattern, ast.MatchClass):
-            return self._pattern_class_root(pattern.cls) and self._callee(pattern.cls, derivation, seen)
+            # The lexical root proof already checks the actual external import.
+            # The general callee reader treats method-local imports as unknown,
+            # which would discard that proof for both bare and qualified classes.
+            return self._pattern_class_root(pattern.cls)
         if isinstance(pattern, ast.MatchAs):
-            return self._pattern_type(pattern.pattern, derivation, seen)
+            return self._pattern_type(pattern.pattern)
         if isinstance(pattern, ast.MatchOr):
-            return all(self._pattern_type(branch, derivation, seen) for branch in pattern.patterns)
+            return all(self._pattern_type(branch) for branch in pattern.patterns)
         return False
 
     def _pattern_value(self, capture, derivation, seen) -> bool:
@@ -352,7 +355,7 @@ class _ExternalTypes:
         A library object's fields and nested containers need additional type
         evidence. Do not infer their types merely from the outer annotation.
         """
-        if self._pattern_type(capture.pattern, derivation, seen):
+        if self._pattern_type(capture.pattern):
             return True
         subject = derivation._pattern_subject(capture, whole=True)
         if subject is not None:
