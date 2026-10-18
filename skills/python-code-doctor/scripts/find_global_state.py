@@ -76,6 +76,12 @@ def _is_mutable_value(value) -> bool:
 _LOCK_FACTORIES = {"Lock", "RLock"}
 
 
+@dataclass(frozen=True)
+class _Mutex:
+    factory: str
+    identity: tuple[int, int]
+
+
 def _same_scope_nodes(stmts):
     # The seeds obey the same rule as the children: a `def` directly in the body
     # is its own scope, and walking into it charged its `global` statements and
@@ -137,9 +143,9 @@ def _guarded_nodes(stmts, locks):
                     invalid = True
                 if isinstance(item.context_expr, ast.Name) and item.context_expr.id in locks:
                     name = item.context_expr.id
-                    if name in entered and locks[name] == "Lock":
+                    if locks[name].identity in entered and locks[name].factory == "Lock":
                         invalid = True
-                    entered.add(name)
+                    entered.add(locks[name].identity)
             if entered and _suspends(node.body):
                 invalid = True
             if invalid:
@@ -148,7 +154,7 @@ def _guarded_nodes(stmts, locks):
             for item in node.items:
                 children.append((item.context_expr, held))
                 if held is not None and isinstance(item.context_expr, ast.Name) and item.context_expr.id in locks:
-                    held = held | {item.context_expr.id}
+                    held = held | {locks[item.context_expr.id].identity}
                 if item.optional_vars:
                     children.append((item.optional_vars, held))
             children.extend((stmt, held) for stmt in node.body)
@@ -241,13 +247,39 @@ def _lock_interference(tree, threading_modules, lock_names):
             if isinstance(node, ast.Attribute) and isinstance(node.ctx, (ast.Store, ast.Del)):
                 if (isinstance(node.value, ast.Name) and node.value.id in threading_modules - local
                         and node.attr in _LOCK_FACTORIES):
-                    replaced.add((node.value.id, node.attr))
+                    replaced.add(("threading", node.attr))
             if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
                 func = node.func
                 if (isinstance(func.value, ast.Name) and func.value.id in lock_names - local
                         and func.attr in {"release", "__exit__"}):
                     released.add(func.value.id)
     return replaced, released
+
+
+def _module_names(stmt):
+    """Direct assignment/import targets understood by the module identity proof."""
+    if isinstance(stmt, (ast.Import, ast.ImportFrom)):
+        return [(alias.asname or alias.name).split(".")[0] for alias in stmt.names]
+    targets = stmt.targets if isinstance(stmt, ast.Assign) else [stmt.target] if isinstance(stmt, ast.AnnAssign) else []
+    return [target.id for target in targets if isinstance(target, ast.Name)]
+
+
+def _module_aliases(tree, known, stable):
+    """Propagate direct, stable module aliases without conflating spellings.
+
+    A chain assignment creates one object, and a later `alias = name` retains
+    that identity. Only propagate a binding after its statement executes: a
+    wildcard may supply an earlier object with the same spelling. Other
+    assignment shapes remain outside this bounded proof.
+    """
+    visible = {}
+    for stmt in tree.body:
+        value = stmt.value if isinstance(stmt, (ast.Assign, ast.AnnAssign)) else None
+        names = _module_names(stmt)
+        if isinstance(value, ast.Name) and value.id in visible:
+            visible.update((name, visible[value.id]) for name in names if name in stable)
+        visible.update((name, known[name]) for name in names if name in known)
+    return visible
 
 
 def _module_locks(tree) -> dict:
@@ -277,6 +309,9 @@ def _module_locks(tree) -> dict:
                     lock_factories[alias.asname or alias.name] = alias.name
     threading_modules &= stable
     lock_factories = {name: factory for name, factory in lock_factories.items() if name in stable}
+    threading_modules = set(_module_aliases(tree, {name: "threading" for name in threading_modules}, stable))
+    lock_factories = _module_aliases(tree, lock_factories, stable)
+    bound_at = {name: (stmt.lineno, stmt.col_offset) for stmt in tree.body for name in _module_names(stmt)}
     locks = {}
     for stmt in tree.body:
         if stmt.lineno <= last_wildcard:
@@ -285,22 +320,27 @@ def _module_locks(tree) -> dict:
         if not isinstance(value, ast.Call):
             continue
         func = value.func
+        position = (stmt.lineno, stmt.col_offset)
         is_lock = (
-            (isinstance(func, ast.Name) and func.id in lock_factories)
+            (isinstance(func, ast.Name) and func.id in lock_factories and bound_at[func.id] < position)
             or (isinstance(func, ast.Attribute) and func.attr in _LOCK_FACTORIES
-                and isinstance(func.value, ast.Name) and func.value.id in threading_modules)
+                and isinstance(func.value, ast.Name) and func.value.id in threading_modules
+                and bound_at[func.value.id] < position)
         )
         if not is_lock:
             continue
         targets = stmt.targets if isinstance(stmt, ast.Assign) else [stmt.target]
-        origin = (func.value.id, func.attr) if isinstance(func, ast.Attribute) else None
+        origin = ("threading", func.attr) if isinstance(func, ast.Attribute) else None
         factory = func.attr if isinstance(func, ast.Attribute) else lock_factories[func.id]
-        locks.update((t.id, (origin, factory)) for t in targets if isinstance(t, ast.Name) and t.id in stable)
+        mutex = _Mutex(factory, (value.lineno, value.col_offset))
+        locks.update((t.id, (origin, mutex)) for t in targets if isinstance(t, ast.Name) and t.id in stable)
     if not locks:
         return {}
+    locks = _module_aliases(tree, locks, stable)
     replaced, released = _lock_interference(tree, threading_modules, set(locks))
-    return {name: factory for name, (origin, factory) in locks.items()
-            if name not in released and origin not in replaced}
+    released_identities = {locks[name][1].identity for name in released}
+    return {name: mutex for name, (origin, mutex) in locks.items()
+            if mutex.identity not in released_identities and origin not in replaced}
 
 
 def _bound_names(fn) -> set:
@@ -420,7 +460,7 @@ def detect(tree, filename, lines, ignore):
         visible = candidate_names - local
         if not visible:
             continue
-        for n, held in _guarded_nodes(fn.body, {name: factory for name, factory in locks.items() if name not in local}):
+        for n, held in _guarded_nodes(fn.body, {name: mutex for name, mutex in locks.items() if name not in local}):
             m = _mutates_name(n, visible)
             if m:
                 guarded[m].append(held)
@@ -428,9 +468,10 @@ def detect(tree, filename, lines, ignore):
     for nm in sorted(guarded):
         common_locks = set.intersection(*(set(held) for held in guarded[nm]))
         if common_locks:
+            names = sorted(name for name, mutex in locks.items() if mutex.identity in common_locks)
             add(candidates[nm], "mutated_global",
                 f"Every detected direct mutation of module-level mutable '{nm}' holds the same stable "
-                f"module lock ({', '.join(sorted(common_locks))})",
+                f"module lock ({', '.join(names)})",
                 "", "medium", also_caused_by=(
                     "an intentional process-wide registry or memo whose direct writes share one threading Lock/RLock",
                     "reads, mutations through aliases, external consumers and fork/reset lifecycle are not proved "

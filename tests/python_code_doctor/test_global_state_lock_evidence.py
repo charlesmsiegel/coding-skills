@@ -185,3 +185,72 @@ def test_explicit_import_and_guard_after_a_wildcard_restore_known_bindings(detec
                       "_guard = Lock()\nregistry = {}\n"
                       "def put(key):\n    with _guard:\n        registry[key] = 1\n")
     assert len(found) == 1 and found[0].kind == "candidate"
+
+
+@pytest.mark.parametrize("factory, expected", [("Lock", "finding"), ("RLock", "candidate")])
+@pytest.mark.parametrize("contexts", ["_a, _b", "_a:\n        with _b"])
+def test_chained_constructor_targets_share_one_mutex_identity(detector, factory, expected, contexts):
+    indent = "        " if "," in contexts else "            "
+    found = mutations(detector, f"from threading import {factory}\n_a = _b = {factory}()\nregistry = {{}}\n"
+                      f"def put(key):\n    with {contexts}:\n{indent}registry[key] = 1\n")
+    assert len(found) == 1 and found[0].kind == expected
+
+
+@pytest.mark.parametrize("setup", [
+    "_guard = Lock()\n_alias = _guard\n",
+    "_guard = _alias = Lock()\n",
+    "_guard = Lock()\n_first = _guard\n_alias = _first\n",
+])
+def test_release_through_a_module_alias_invalidates_the_shared_guard(detector, setup):
+    found = mutations(detector, "from threading import Lock\n" + setup + "registry = {}\n"
+                      "def put(key):\n    with _guard:\n        _alias.release()\n        registry[key] = 1\n")
+    assert len(found) == 1 and found[0].kind == "finding"
+
+
+@pytest.mark.parametrize("alias", ["threads = threading\n", "first = threading\nthreads = first\n"])
+def test_factory_replacement_through_a_module_alias_invalidates_the_origin(detector, alias):
+    found = mutations(detector, "import threading\n" + alias +
+                      "threads.Lock = make_guard\n_guard = threading.Lock()\nregistry = {}\n"
+                      "def put(key):\n    with _guard:\n        registry[key] = 1\n")
+    assert len(found) == 1 and found[0].kind == "finding"
+
+
+def test_different_names_for_the_same_guard_still_exclude_direct_writes(detector):
+    found = mutations(detector, "from threading import Lock\n_guard = Lock()\n_alias = _guard\nregistry = {}\n"
+                      "def put(key):\n    with _guard:\n        registry[key] = 1\n"
+                      "def drop(key):\n    with _alias:\n        registry.pop(key)\n")
+    assert len(found) == 1 and found[0].kind == "candidate"
+
+
+@pytest.mark.parametrize("setup, context", [
+    ("saved = guard\nfrom threading import Lock\nguard = Lock()\n", "saved"),
+    ("threads = threading\nimport threading\nguard = threads.Lock()\n", "guard"),
+    ("new_lock = Lock\nfrom threading import Lock\nguard = new_lock()\n", "guard"),
+])
+def test_aliases_keep_the_object_visible_when_the_assignment_runs(detector, setup, context):
+    # The wildcard can supply each source name before its later explicit binding.
+    # Capturing that earlier object does not capture the later proven lock.
+    found = mutations(detector, "from app_guards import *\n" + setup + "registry = {}\n"
+                      f"def put(key):\n    with {context}:\n        registry[key] = 1\n")
+    assert len(found) == 1 and found[0].kind == "finding"
+
+
+@pytest.mark.parametrize("setup, expected", [
+    ("guard = Lock()\nfrom threading import Lock\n", "finding"),
+    ("guard = threading.Lock()\nimport threading\n", "finding"),
+    ("from threading import Lock; guard = Lock()\n", "candidate"),
+])
+def test_constructor_proof_requires_the_import_to_have_executed(detector, setup, expected):
+    found = mutations(detector, "from app_guards import *\n" + setup + "registry = {}\n"
+                      "def put(key):\n    with guard:\n        registry[key] = 1\n")
+    assert len(found) == 1 and found[0].kind == expected
+
+
+@pytest.mark.parametrize("setup", [
+    "import threading\nfirst = threading\nthreads: object = first\nguard = threads.Lock()\n",
+    "from threading import Lock\nfirst = Lock\nnew_lock: object = first\nguard = new_lock()\n",
+])
+def test_stable_module_and_factory_aliases_preserve_a_known_constructor(detector, setup):
+    found = mutations(detector, setup + "registry = {}\n"
+                      "def put(key):\n    with guard:\n        registry[key] = 1\n")
+    assert len(found) == 1 and found[0].kind == "candidate"
