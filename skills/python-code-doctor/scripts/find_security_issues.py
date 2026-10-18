@@ -9,7 +9,8 @@ Finds:
   - eval_exec              : calls to builtin eval() or exec()
   - shell_injection        : subprocess.* with shell=True, os.system, os.popen
   - unsafe_yaml            : yaml.load() with no Loader= keyword argument
-  - unsafe_deserialization : pickle.load/loads, marshal.load/loads, __import__
+  - unsafe_deserialization : pickle.load/loads, marshal.load/loads, dynamic __import__
+  - literal_import         : a literal __import__ dependency hidden from normal imports
   - weak_hash              : hashlib.md5() or hashlib.sha1()
   - tls_verify_disabled    : call with verify=False, or ssl._create_unverified_context
   - hardcoded_secret       : assignment of a string literal to a name that looks
@@ -635,6 +636,20 @@ _SQL_EXECUTE_ATTRS = {"execute", "executemany", "executescript", "raw", "mogrify
 _SUBPROCESS_FUNCS = {"run", "call", "check_call", "check_output", "Popen"}
 
 
+def _literal_import_arguments(call: ast.Call) -> bool:
+    """Only source literals justify changing an import's security classification."""
+    if not call.args and not any(keyword.arg == 'name' for keyword in call.keywords):
+        return False
+    if any(keyword.arg is None for keyword in call.keywords):
+        return False
+    try:
+        for argument in [*call.args, *(keyword.value for keyword in call.keywords)]:
+            ast.literal_eval(argument)
+    except (ValueError, TypeError):
+        return False
+    return True
+
+
 def detect(tree, filename, lines, ignore):
     issues = []
     proof = _LiteralProof(tree)
@@ -796,10 +811,16 @@ def detect(tree, filename, lines, ignore):
                     "medium")
 
             elif isinstance(func, ast.Name) and func.id == "__import__":
-                add(node.lineno, "unsafe_deserialization",
-                    "__import__() with dynamic arguments can load arbitrary modules",
-                    "Use importlib.import_module() with a validated module name instead.",
-                    "medium")
+                if _literal_import_arguments(node):
+                    add(node.lineno, "literal_import",
+                        "__import__() loads a literal dependency outside normal import declarations",
+                        "Prefer an ordinary import so the dependency is visible to readers and import tooling.",
+                        "low")
+                else:
+                    add(node.lineno, "unsafe_deserialization",
+                        "__import__() with dynamic arguments can load arbitrary modules",
+                        "Use importlib.import_module() with a validated module name instead.",
+                        "medium")
 
             # ---------------------------------------------------------------- #
             # weak_hash — hashlib.md5() or hashlib.sha1()

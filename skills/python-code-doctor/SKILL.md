@@ -87,6 +87,19 @@ dataclass replacement recommendation. Plain classes retain the normal check.
 Immediate `Meta` classes on proven Django Model/ModelForm parents are configuration;
 the same name on unrelated or unresolved parents grants no exemption.
 
+Protocol methods such as context-manager and iterator hooks, and ordinary private
+methods, count as behavior when checking for data-only classes. Initializers alone
+still leave a data-container finding. Cohesion groups declared fields through
+resolved first-party Pydantic ancestry; unresolved or unrelated bases retain their
+normal evidence.
+
+An `__import__` call whose arguments are all source literals keeps a
+`literal_import` design finding about its hidden dependency. Unresolved arguments,
+including starred argument expansion, retain the security finding. Cross-file
+parameter clumps are attributed to the file holding the most members (ties use
+path order), while their occurrence list remains complete. Upstream-marked clumps
+keep their upstream anchor so attribution cannot change whether they are charged.
+
 ## Workflow
 
 **Cleaning up a whole poorly-written repo from cold?** The steps below assume the
