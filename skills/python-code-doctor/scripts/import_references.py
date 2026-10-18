@@ -3,12 +3,17 @@
 This is the one reference reader used by find_dead_code. It owns progressive
 namespace origins and deferred enclosing lookups; the caller owns dead-code
 policy, confidence, issue formatting and framework registration exemptions.
+
+Origins describe possible bindings: skipped loop/filter paths retain the old
+binding, and finally transforms captured exits. Deferred readers retain enclosing
+namespaces, while a store in their own invocation wins over a later import.
+This is a file-local reading, without a call-order or loop fixed-point simulation.
 """
 
 import ast
 import symtable
 from collections import ChainMap
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 
 
 _FALLBACK = object()
@@ -61,6 +66,7 @@ class ImportReferences(ast.NodeVisitor):
         self._finishing_references = False
         self._reference_only = False
         self._loop_breaks = []
+        self._future_annotations = False
 
     def visit_Assign(self, node: ast.Assign):
         # Python evaluates the value with the old binding, then stores each
@@ -145,7 +151,7 @@ class ImportReferences(ast.NodeVisitor):
         self._restore_origins(self._joined_origins([self._origin_state(), *breaks]))
 
     def visit_Break(self, node):
-        if self._loop_breaks:
+        if self._loop_breaks and not self._reference_only:
             self._loop_breaks[-1].append(self._origin_state())
 
     def visit_Match(self, node: ast.Match):
@@ -237,6 +243,9 @@ class ImportReferences(ast.NodeVisitor):
     def visit_Try(self, node):
         # An exception can leave after any prefix of the body. Handlers begin
         # from those possible bindings, not from the last handler we traversed.
+        # Finally also transforms loop exits captured inside this try. Exits
+        # from before it and breaks belonging to completed inner loops differ.
+        break_entries = [(exits, len(exits)) for exits in self._loop_breaks]
         partial = [self._origin_state()]
         for statement in node.body:
             self.visit(statement)
@@ -259,6 +268,19 @@ class ImportReferences(ast.NodeVisitor):
         if not node.finalbody:
             return
         self._visit_cleanup(node.finalbody, partial, normal)
+        if not self._reference_only:
+            after = self._origin_state()
+            self._reference_only = True
+            try:
+                for exits, start in break_entries:
+                    for index in range(start, len(exits)):
+                        self._restore_origins(exits[index])
+                        for statement in node.finalbody:
+                            self.visit(statement)
+                        exits[index] = self._origin_state()
+            finally:
+                self._reference_only = False
+                self._restore_origins(after)
 
     visit_TryStar = visit_Try
 
@@ -415,9 +437,14 @@ class ImportReferences(ast.NodeVisitor):
             self._annotation_scopes.pop()
 
     def visit_Module(self, node: ast.Module):
+        self._future_annotations = any(
+            isinstance(statement, ast.ImportFrom) and statement.module == "__future__"
+            and any(alias.name == "annotations" for alias in statement.names)
+            for statement in node.body
+        )
         self.generic_visit(node)
         # This is a file-local use analysis, not a simulation of call order.
-        # Revisit only unresolved type-bearing calls, retaining earlier proven
+        # Revisit deferred type-bearing calls, retaining earlier proven
         # uses as well as those the completed enclosing namespaces establish.
         self._finishing_references = True
         for call, enclosing in tuple(self._deferred_casts):
@@ -493,12 +520,13 @@ class ImportReferences(ast.NodeVisitor):
         if isinstance(node, ast.Subscript):
             names = self._canonical_names(node.value, self._annotation_origins())
             self._annotation_references(node.value)
-            if self._quoted_depth and not self._finishing_references and self._unresolved_callee(node.value):
+            if self._quoted_depth and not self._finishing_references:
                 # Fully quoted forms can resolve against imports below the
                 # definition. Decide whether their strings are types or data
                 # once that enclosing namespace is complete.
                 self._deferred_annotations.append((node, tuple(self._annotation_scopes)))
-                return
+                if self._unresolved_callee(node.value):
+                    return
             if names and names <= {"typing.Literal", "typing_extensions.Literal"}:
                 self._expression_references(node.slice)
                 return  # String values are data, not forward references.
@@ -516,11 +544,20 @@ class ImportReferences(ast.NodeVisitor):
             self._annotation_references(child)
 
     def _signature_references(self, node):
-        self._annotation_references(node.returns)
+        self._read_annotation(node.returns)
         for arg in (*node.args.posonlyargs, *node.args.args, *node.args.kwonlyargs,
                     node.args.vararg, node.args.kwarg):
             if arg is not None:
-                self._annotation_references(arg.annotation)
+                self._read_annotation(arg.annotation)
+
+    def _read_annotation(self, annotation):
+        # Postponed annotations have the same type/data distinction as quoted
+        # ones, including helpers supplied by a later enclosing import.
+        self._quoted_depth += self._future_annotations
+        try:
+            self._annotation_references(annotation)
+        finally:
+            self._quoted_depth -= self._future_annotations
 
     def visit_AnnAssign(self, node: ast.AnnAssign):
         origins = {}
@@ -530,7 +567,7 @@ class ImportReferences(ast.NodeVisitor):
         if node.value is not None or not isinstance(node.target, ast.Name):
             self.visit(node.target)
             self._store_origins(origins)
-        self._annotation_references(node.annotation)
+        self._read_annotation(node.annotation)
         self.visit(node.annotation)
 
     def _type_parameter_references(self, node):
@@ -562,17 +599,36 @@ class ImportReferences(ast.NodeVisitor):
         self.visit(node.generators[0].iter)
         # Creating a generator executes its first iterable, but its body and
         # walrus stores remain deferred until somebody advances it.
-        with self._preserve_annotation_bindings(isinstance(node, ast.GeneratorExp)), self._annotation_scope(node):
+        with (self._preserve_annotation_bindings(isinstance(node, ast.GeneratorExp)),
+              self._annotation_scope(node), ExitStack() as branches):
             for index, generator in enumerate(node.generators):
                 if index:
                     self.visit(generator.iter)
+                enters = self._loop_entry(generator)
+                if enters is False:
+                    return
+                branches.enter_context(self._optional_origins(enters is None))
                 self.visit(generator.target)
                 for condition in generator.ifs:
                     self.visit(condition)
+                    if isinstance(condition, ast.Constant) and not condition.value:
+                        return
+                    branches.enter_context(self._optional_origins(not isinstance(condition, ast.Constant)))
             for field in ("elt", "key", "value"):
                 expression = getattr(node, field, None)
                 if expression is not None:
                     self.visit(expression)
+
+    @contextmanager
+    def _optional_origins(self, enabled):
+        # Each loop/filter can skip everything after it. Join that skipped
+        # path without losing stores in iterables or already evaluated filters.
+        before = self._origin_state() if enabled else None
+        try:
+            yield
+        finally:
+            if before is not None:
+                self._restore_origins(self._joined_origins([before, self._origin_state()]))
 
     def _call_references(self, node: ast.Call) -> None:
         if isinstance(node.func, ast.Name):
@@ -580,7 +636,7 @@ class ImportReferences(ast.NodeVisitor):
             self.instantiated_classes.add(node.func.id)
         elif isinstance(node.func, ast.Attribute):
             self.called_functions.add(node.func.attr)
-        if not self._typing_cast_references(node) and not self._finishing_references and self._unresolved_callee(node.func) and any(
+        if not self._typing_cast_references(node) and not self._finishing_references and self._unresolved_callee(node.func, include_known=True) and any(
                 kind in {"function", "generator"} for kind, _origins, _globals in self._annotation_scopes):
             enclosing = list(self._annotation_scopes)
             first = dotted_name(node.func).partition(".")[0]
@@ -591,7 +647,7 @@ class ImportReferences(ast.NodeVisitor):
                 enclosing[0] = (module[0], module[1].parents, module[2])
             self._deferred_casts.append((node, tuple(enclosing)))
 
-    def _unresolved_callee(self, node: ast.AST) -> bool:
+    def _unresolved_callee(self, node: ast.AST, include_known=False) -> bool:
         dotted = dotted_name(node)
         if not dotted:
             return False
@@ -602,7 +658,15 @@ class ImportReferences(ast.NodeVisitor):
             # A later import in this very function is an unbound local at the
             # current call. Only an enclosing namespace may complete later.
             return False
-        return first not in origins or bool({"", _FALLBACK} & self._origin_options(origins[first]))
+        module = self._annotation_scopes[0][1]
+        if (include_known and first in self._annotation_scopes[-1][2]
+                and isinstance(module, ChainMap) and first in module.maps[0]):
+            # This invocation already overwrote its global. A later enclosing
+            # import cannot undo a store that runs before every such call.
+            return False
+        # Deferred readers can observe an enclosing binding being replaced,
+        # even when its origin was already known at definition time.
+        return include_known or first not in origins or bool({"", _FALLBACK} & self._origin_options(origins[first]))
 
     def _typing_cast_references(self, node: ast.Call) -> bool:
         # Only typing's cast gives its first argument type semantics. An

@@ -772,3 +772,57 @@ def test_alias_assignment_expressions_share_direct_assignment_origins(tmp_path, 
 ])
 def test_type_alias_values_are_deferred_type_positions(tmp_path, declaration, used):
     assert ("used" not in unused_imports(tmp_path, 'import used\n' + declaration)) is used
+
+
+@pytest.mark.parametrize("annotation", [
+    'def run() -> Literal["unused.Type"]: pass',
+    'value: Literal["unused.Type"]',
+])
+def test_postponed_annotations_resolve_a_later_literal_import(tmp_path, annotation):
+    source = ('from __future__ import annotations\nimport unused\n'
+              + annotation + '\nfrom typing import Literal\n')
+    assert "unused" in unused_imports(tmp_path, source)
+
+
+@pytest.mark.parametrize("expression", [
+    '[cast := converter for _ in []]',
+    '[cast := converter for _ in values]',
+    '[cast := converter for _ in [0] if flag]',
+    '[cast := converter for _ in [0] for item in []]',
+])
+def test_a_possibly_empty_comprehension_preserves_the_typing_origin(tmp_path, expression):
+    source = ('import used\nfrom typing import cast\n' + expression
+              + '\nvalue = cast("used.Type", value)\n')
+    assert "used" not in unused_imports(tmp_path, source)
+
+
+@pytest.mark.parametrize("body", [
+    'def run(value):\n    return cast("used.Type", value)\n',
+    'rows = (cast("used.Type", value) for value in values)\n',
+])
+def test_deferred_bodies_can_see_a_replaced_enclosing_converter(tmp_path, body):
+    source = ('import used\nfrom converter import cast\n' + body
+              + 'from typing import cast\n')
+    assert "used" not in unused_imports(tmp_path, source)
+
+
+def test_a_quoted_annotation_can_see_a_replaced_literal_origin(tmp_path):
+    source = ('import used\nfrom typing import Literal\n'
+              'def run() -> "Literal[\'used.Type\']": pass\n'
+              'from custom import Literal\n')
+    assert "used" not in unused_imports(tmp_path, source)
+
+
+def test_finally_applies_to_a_breaks_outgoing_typing_origin(tmp_path):
+    source = ('import unused\nfrom typing import cast\n'
+              'while True:\n    try:\n        break\n'
+              '    finally:\n        cast = converter.cast\n'
+              'value = cast("unused.Type", value)\n')
+    assert "unused" in unused_imports(tmp_path, source)
+
+
+def test_an_executed_comprehension_filter_still_replaces_the_origin(tmp_path):
+    source = ('import unused\nfrom typing import cast\n'
+              '[value for value in [0] if (cast := converter.cast)]\n'
+              'value = cast("unused.Type", value)\n')
+    assert "unused" in unused_imports(tmp_path, source)
