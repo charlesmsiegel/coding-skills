@@ -68,6 +68,79 @@ def test_implicit_iterator_consumers_preserve_direct_write_evidence(detector, co
     assert len(found) == 1 and found[0].kind == expected
 
 
+@pytest.mark.parametrize("definition, expected", [
+    ("def get_operation():\n    return lambda: _guard.release()\n", "finding"),
+    ("def get_operation():\n    return lambda: None\n", "candidate"),
+    ("def get_operation(lock=_guard):\n    return lambda: lock.release()\n", "finding"),
+])
+def test_returned_visible_callables_keep_effects_or_decline_unknown_closures(detector, definition, expected):
+    found = mutations(detector, "from threading import Lock\n_guard = Lock()\nregistry = {}\n" + definition +
+                      "def put(key):\n    with _guard:\n        get_operation()()\n        registry[key] = 1\n")
+    assert len(found) == 1 and found[0].kind == expected
+
+
+@pytest.mark.parametrize("setup, expression, expected", [
+    ("", 'getattr(_guard, "release")()', "finding"),
+    ("from builtins import getattr as attribute\n", 'attribute(_guard, "release")()', "finding"),
+    ("import builtins as helpers\n", 'helpers.getattr(_guard, "__exit__")(None, None, None)', "finding"),
+    ("", 'getattr(_guard, "locked")()', "candidate"),
+    ("getattr = lambda value, name: lambda: None\n", 'getattr(_guard, "release")()', "candidate"),
+])
+def test_proven_builtin_getattr_preserves_mutex_protocol_receivers(detector, setup, expression, expected):
+    found = mutations(detector, "from threading import Lock\n_guard = Lock()\nregistry = {}\n" + setup +
+                      f"def put(key):\n    with _guard:\n        {expression}\n        registry[key] = 1\n")
+    assert len(found) == 1 and found[0].kind == expected
+
+
+@pytest.mark.parametrize("value, expected", [("_guard", "finding"), ("fake_guard", "candidate")])
+def test_generator_loop_targets_keep_visible_yielded_origins(detector, value, expected):
+    found = mutations(detector, "from threading import Lock\n_guard = Lock()\nregistry = {}\n"
+                      f"def put(key):\n    with _guard:\n        for alias in ({value} for _ in (0,)):\n            alias.release()\n"
+                      "        registry[key] = 1\n")
+    assert len(found) == 1 and found[0].kind == expected
+
+
+@pytest.mark.parametrize("use, expected", [
+    ("with _guard:\n        helper()", "candidate"),
+    ("helper()", "finding"),
+    ("with _guard:\n        helper()\n    return helper", "finding"),
+    ("with _guard:\n        helper()\n    consumer(helper)", "finding"),
+    ("with _guard:\n        helper()\n    return (helper() for _ in (0,))", "finding"),
+    ("alias = helper\n    with _guard:\n        alias()", "finding"),
+])
+def test_only_proven_non_escaping_helpers_use_their_actual_invocation_edges(detector, use, expected):
+    found = mutations(detector, "from threading import Lock\n_guard = Lock()\nregistry = {}\n"
+                      "def put(key):\n    def helper():\n        registry[key] = 1\n    " + use + "\n")
+    assert len(found) == 1 and found[0].kind == expected
+
+
+@pytest.mark.parametrize("statement", ["registry.default_factory = set", "registry.default_factory: object = set"])
+@pytest.mark.parametrize("protected", [False, True])
+def test_writable_mutable_global_attributes_contribute_direct_write_evidence(detector, statement, protected):
+    indent = "        " if protected else "    "
+    found = mutations(detector, "from collections import defaultdict\nfrom threading import Lock\n"
+                      "_guard = Lock()\nregistry = defaultdict(list)\ndef put(key):\n"
+                      "    with _guard:\n        registry[key] = []\n" + indent + statement + "\n")
+    assert len(found) == 1 and found[0].kind == ("candidate" if protected else "finding")
+
+
+@pytest.mark.parametrize("statement", ["for registry[key] in values:\n    pass", "[None for registry[key] in values]"])
+@pytest.mark.parametrize("protected", [False, True])
+def test_iteration_store_targets_count_at_their_actual_execution_site(detector, statement, protected):
+    indent = "        " if protected else "    "
+    found = mutations(detector, "from threading import Lock\n_guard = Lock()\nregistry = {}\n"
+                      "def put(key):\n    with _guard:\n        registry[key] = 1\n" +
+                      "\n".join(indent + line for line in statement.splitlines()) + "\n")
+    assert len(found) == 1 and found[0].kind == ("candidate" if protected else "finding")
+
+
+@pytest.mark.parametrize("callback, expected", [("lambda item: _guard.release()", "finding"), ("lambda item: item", "candidate"), ("None", "candidate")])
+def test_list_sort_executes_its_visible_key_callback(detector, callback, expected):
+    found = mutations(detector, "from threading import Lock\n_guard = Lock()\nregistry = [0]\n"
+                      f"def put(key):\n    with _guard:\n        registry.sort(key={callback})\n        registry.append(key)\n")
+    assert len(found) == 1 and found[0].kind == expected
+
+
 @pytest.mark.parametrize("factory, method, argument", [("Counter", "subtract", "{key: 1}"), ("OrderedDict", "move_to_end", "key")])
 @pytest.mark.parametrize("protected", [False, True])
 def test_counter_and_ordered_dict_public_mutators_contribute_write_evidence(detector, factory, method, argument, protected):

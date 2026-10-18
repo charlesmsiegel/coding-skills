@@ -153,7 +153,7 @@ def module_bindings(tree) -> Counter:
 
 
 def bound_names(fn) -> set:
-    """Names a function binds in its own scope — its locals, as Python decides
+    """Names a function binds in its own scope â€” its locals, as Python decides
     them: parameters, assignment and loop targets, `as` names, imports, and the
     defs and classes it creates. `global` names are the module's and are left
     out; `nonlocal` names are an enclosing function's, so they are kept (they
@@ -230,7 +230,8 @@ def entry_function_scopes(tree):
                 and not callable_is_deferred(fn)):
             if owner not in inventories:
                 scope = ast.Module(body=owner.body, type_ignores=[])
-                lexical = set(module_scope_nodes(scope))
+                deferred = {node for node in ast.walk(scope) if isinstance(node, ast.GeneratorExp)}
+                lexical = set(module_scope_nodes(scope, skipped=deferred))
                 declarations = {name for node in lexical if isinstance(node, (ast.Global, ast.Nonlocal)) for name in node.names}
                 inventories[owner] = lexical, module_bindings(scope), declarations
             lexical, bindings, declarations = inventories[owner]

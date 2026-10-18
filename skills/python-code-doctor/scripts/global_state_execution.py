@@ -65,14 +65,15 @@ def _module_name(value, names, contexts):
             and ("global", value.id) in contexts.get(value, ()))
 
 def mutated_names(node, names, contexts):
-    if isinstance(node, ast.AnnAssign) and node.value is None:
-        return set()
     if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
         if node.func.attr in _MUTATING_METHODS and _module_name(node.func.value, names, contexts):
             return {node.func.value.id}
-    if (isinstance(node, ast.Subscript) or isinstance(node, ast.Attribute) and node.attr == "default_factory"):
-        if isinstance(node.ctx, (ast.Store, ast.Del)) and _module_name(node.value, names, contexts):
-            return {node.value.id}
+    # Store nodes execute under their actual enclosing mutex state. Reading
+    # them here also covers loop/comprehension and attribute targets without
+    # incorrectly assigning all descendants the statement's entry state.
+    if (isinstance(node, (ast.Subscript, ast.Attribute)) and isinstance(node.ctx, (ast.Store, ast.Del))
+            and _module_name(node.value, names, contexts)):
+        return {node.value.id}
     return set()
 
 def _context_mutex(expression, locks, contexts):
