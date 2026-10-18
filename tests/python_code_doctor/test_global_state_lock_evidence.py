@@ -24,6 +24,90 @@ def mutations(detector, source):
             if r.smell_type == "mutated_global"]
 
 
+@pytest.mark.parametrize("expression, expected", [
+    ("(_guard,)[0]", "finding"),
+    ("[_guard][0]", "finding"),
+    ('{"guard": _guard}["guard"]', "finding"),
+    ("(fake_guard, _guard)[-1]", "finding"),
+    ('{"guard": fake_guard, "guard": _guard}["guard"]', "finding"),
+    ("(_guard, fake_guard)[choice]", "finding"),
+    ("(*(_guard,),)[0]", "finding"),
+    ('{**{"guard": _guard}}["guard"]', "finding"),
+    ("((_guard,),)[0][0]", "finding"),
+    ("(fake_guard, _guard)[0]", "candidate"),
+    ('{"guard": _guard, "other": fake_guard}["other"]', "candidate"),
+])
+def test_direct_literal_indexing_preserves_selected_and_possible_guard_origins(detector, expression, expected):
+    found = mutations(detector, "from threading import Lock\n_guard = Lock()\nregistry = {}\n"
+                      f"def put(key):\n    with _guard:\n        {expression}.release()\n        registry[key] = 1\n")
+    assert len(found) == 1 and found[0].kind == expected
+
+
+@pytest.mark.parametrize("setup, wrapper", [
+    ("", "iter(values)"),
+    ("from builtins import iter as wrap\n", "wrap(values)"),
+    ("import builtins as helpers\n", "helpers.iter(values)"),
+])
+@pytest.mark.parametrize("protected", [False, True])
+def test_builtin_iter_preserves_deferred_callbacks_until_actual_consumption(detector, setup, wrapper, protected):
+    indent = "        " if protected else "    "
+    found = mutations(detector, "from threading import Lock\n_guard = Lock()\nregistry = {}\n" + setup +
+                      "def put(key):\n    with _guard:\n        values = map(lambda item: registry.pop(item), keys)\n"
+                      f"        values = {wrapper}\n        registry[key] = 1\n" + indent + "list(values)\n")
+    assert len(found) == 1 and found[0].kind == ("candidate" if protected else "finding")
+
+
+@pytest.mark.parametrize("setup, wrapper", [
+    ("", "opaque(values)"),
+    ("def wrap(values):\n    return values\n", "wrap(values)"),
+    ("wrap = lambda values: values\n", "wrap(values)"),
+])
+def test_opaque_or_returned_lazy_values_cannot_certify_early_consumption(detector, setup, wrapper):
+    found = mutations(detector, "from threading import Lock\n_guard = Lock()\nregistry = {}\n" + setup +
+                      "def put(key):\n    with _guard:\n        values = map(lambda item: registry.pop(item), keys)\n"
+                      f"        values = {wrapper}\n        registry[key] = 1\n    list(values)\n")
+    assert len(found) == 1 and found[0].kind == "finding"
+
+
+def test_creating_a_builtin_iter_wrapper_does_not_execute_its_callback(detector):
+    found = mutations(detector, "from threading import Lock\n_guard = Lock()\nregistry = {}\n"
+                      "def put(key):\n    values = iter(map(lambda item: _guard.release(), keys))\n"
+                      "    with _guard:\n        registry[key] = 1\n")
+    assert len(found) == 1 and found[0].kind == "candidate"
+
+
+@pytest.mark.parametrize("setup, mutation, expected", [
+    ("import sys\n", 'sys.modules["threading"] = fake_module', "finding"),
+    ("import sys as runtime\n", 'runtime.modules["threading"] = fake_module', "finding"),
+    ("from sys import modules as imports\n", 'imports.update(threading=fake_module)', "finding"),
+    ("import sys\n", 'imports = sys.modules\nimports["threading"] = fake_module', "finding"),
+    ("import sys\n", 'sys.modules[name] = fake_module', "finding"),
+    ("import sys\n", 'sys.modules.setdefault("threading", fake_module)', "finding"),
+    ("import sys\n", 'sys.modules.clear()', "finding"),
+    ("import sys\n", 'sys.modules = fake_modules', "finding"),
+    ("import sys\n", 'setattr(sys, "modules", fake_modules)', "finding"),
+    ("import sys\n", 'sys.modules["other"] = fake_module', "candidate"),
+    ("import sys\n", 'sys = fake_runtime\nsys.modules["threading"] = fake_module', "candidate"),
+])
+@pytest.mark.parametrize("capture", ["import threading\n_guard = threading.Lock()", "from threading import Lock\n_guard = Lock()"])
+def test_visible_import_entry_replacement_prevents_a_false_threading_mutex(detector, setup, mutation, expected, capture):
+    found = mutations(detector, setup + mutation + "\n" + capture + "\nregistry = {}\n"
+                      "def put(key):\n    with _guard:\n        registry[key] = 1\n")
+    assert len(found) == 1 and found[0].kind == expected
+
+
+@pytest.mark.parametrize("capture, construct", [
+    ("import threading\n", "threading.Lock()"),
+    ("from threading import Lock\n", "Lock()"),
+    ("import threading as threads\n", "alias.Lock()"),
+])
+def test_captured_module_and_factory_objects_survive_later_import_entry_replacement(detector, capture, construct):
+    alias = "alias = threads\n" if construct.startswith("alias") else ""
+    found = mutations(detector, "import sys\n" + capture + 'sys.modules["threading"] = fake_module\n' + alias +
+                      f"_guard = {construct}\nregistry = {{}}\ndef put(key):\n    with _guard:\n        registry[key] = 1\n")
+    assert len(found) == 1 and found[0].kind == "candidate"
+
+
 @pytest.mark.parametrize("statement, expected", [
     ("first[key] = registry[key] = 1", "finding"),
     ("del first[key], registry[key]", "finding"),
