@@ -282,14 +282,9 @@ def citation_pattern(citation: str) -> "re.Pattern | None":
 
     "410 U.S. 113", "410 U. S. 113" and "410 US 113" are one citation, and a
     literal search finds only the rendering the search API happened to return.
-    Volume and page are exact; the reporter between them must start with a letter
-    and may carry digits, because "F.3d" and "N.Y.S.2d" are reporter names -- a
-    class without digits matched none of the federal reporters with a series
-    number, so the treatment scan silently found nothing in the whole modern
-    corpus and every case came back clean.
-
-    The middle is short and must begin with a letter, so the pattern cannot leap
-    across a sentence and join two unrelated numbers.
+    Volume, reporter letters and series digits, and page are exact. Only periods
+    and whitespace may vary: F.2d and F.3d with the same volume and page identify
+    different authorities and must never share treatment or pass as one file.
 
     One implementation, imported by both the treatment scan and the gate. Two
     copies of a regex this fiddly drift, and the two stages disagreeing about
@@ -298,9 +293,11 @@ def citation_pattern(citation: str) -> "re.Pattern | None":
     parts = parse_citation(citation)
     if not parts:
         return None
-    volume, _reporter, page = parts
+    volume, reporter, page = parts
+    identity = re.sub(r"[\s.]+", "", reporter)
+    reporter_pattern = r"[\s.]*".join(re.escape(char) for char in identity)
     return re.compile(r"\b" + re.escape(volume)
-                      + r"[\s.,]+[A-Za-z][A-Za-z0-9. ]{0,20}?\s+"
+                      + r"[\s.,]+" + reporter_pattern + r"[\s.]+"
                       + re.escape(page) + r"\b")
 
 

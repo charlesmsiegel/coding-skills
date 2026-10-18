@@ -208,6 +208,15 @@ def test_a_document_missing_its_own_citation_fails(verify, corpus):
     assert "not the same authority" in reasons(verify.run(out))
 
 
+@pytest.mark.parametrize("reporter", ["F.2d", "U.S.", "F. Supp. 3d"])
+def test_the_same_volume_and_page_in_a_different_reporter_is_not_the_authority(verify, corpus, reporter):
+    body = f"<p>Wrong case, 901 {reporter} 1099. The privilege protects drafts.</p>".encode()
+    out = (corpus.archive("901f3d1099", body=body).treatment("901f3d1099", "good")
+           .note("901f3d1099", [claim("901f3d1099", quote="The privilege protects drafts.")]).commit())
+
+    assert "not the same authority" in reasons(verify.run(out))
+
+
 def test_a_repunctuated_citation_in_the_document_still_matches(verify, corpus):
     body = b"<html><body>Roe v. Wade, 410 U. S. 113, 118 (1973). The right is qualified.</body></html>"
     out = (corpus.archive("410us113", body=body, citation="410 U.S. 113")
@@ -323,6 +332,26 @@ def test_single_quoted_hrefs_are_checked_too(verify, corpus):
     report.write_text("<a href='docs/case/missing.html'>Doe</a>", encoding="utf-8")
 
     assert verify.run(out, report=report)["failures"]
+
+
+@pytest.mark.parametrize("attribute", ['href = "docs/case/missing.html"',
+                                       "href\t=\n'docs/case/missing.html'"])
+def test_report_links_with_whitespace_around_the_equals_are_checked(verify, corpus, attribute):
+    out = corpus.archive("901f3d1099").commit()
+    report = out / "summary.html"
+    report.write_text(f"<a {attribute}>Doe</a>", encoding="utf-8")
+
+    assert "not on disk" in reasons(verify.run(out, report=report))
+
+
+def test_an_explicit_missing_report_fails_the_gate(verify, corpus, run_script):
+    out = (corpus.archive("901f3d1099").treatment("901f3d1099", "good")
+           .note("901f3d1099", [claim("901f3d1099", quote="The privilege protects drafts.")]).commit())
+    missing = out / "missing-summary.html"
+
+    assert "report file missing" in reasons(verify.run(out, report=missing))
+    result = run_script(SCRIPTS / "verify_authorities.py", "--out", out, "--report", missing, expect_rc=1)
+    assert "report file missing" in result.stdout
 
 
 # --- the gate's own failure modes ---------------------------------------

@@ -114,6 +114,12 @@ def test_the_citation_pattern_survives_repunctuation(treat):
     assert pattern.search("see 410 US 113")
 
 
+def test_treatment_of_a_different_reporter_series_is_not_this_cases_treatment(treat):
+    pattern = treat.citation_pattern("901 F.3d 1099")
+
+    assert treat.find_signals("We overrule the case at 901 F.2d 1099.", pattern) == []
+
+
 def test_the_pattern_does_not_leap_between_unrelated_numbers(treat):
     pattern = treat.citation_pattern("410 U.S. 113")
 

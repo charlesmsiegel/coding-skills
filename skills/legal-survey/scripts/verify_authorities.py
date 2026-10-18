@@ -49,7 +49,7 @@ TEXT_SUFFIXES = (".html", ".htm", ".txt", ".xml", ".md", ".json")
 # Either quote style. Matching only double quotes means a fragment written with
 # single ones is not checked at all, and the gate reports zero failures over a
 # report whose links it never looked at.
-HREF_RE = re.compile(r"""href=["'](docs/[^"']+)["']""")
+HREF_RE = re.compile(r"""href\s*=\s*["'](docs/[^"']+)["']""")
 
 
 def _normalize(text: str) -> str:
@@ -208,7 +208,10 @@ def run(out, report=None) -> dict:
 
     if report is not None:
         report_path = Path(report)
-        if report_path.is_file():
+        if not report_path.is_file():
+            failures.append({"note": "-", "claim": "-", "authority": str(report_path),
+                             "reason": "report file missing at " + str(report_path)})
+        else:
             for href in HREF_RE.findall(report_path.read_text(encoding="utf-8")):
                 # `docs/case/x.pdf#page=4` names the same file as `docs/case/x.pdf`.
                 # A deep link to the page a claim cites is exactly what the report
