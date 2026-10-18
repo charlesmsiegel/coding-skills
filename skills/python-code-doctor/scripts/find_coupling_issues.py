@@ -25,6 +25,7 @@ from dataclasses import dataclass, asdict, field
 from collections import Counter, defaultdict
 from common import first_party_modules, is_test_file, project_root, sort_findings, cached_parse, SEVERITY_ICONS, configure_output, find_python_files, warn_detector_error, warn_unparseable
 from find_mutation_hazards import ClassFamilyResolver
+from find_import_cycles import _module_to_path, _resolve_relative_import
 from coupling_bindings import _Derivation, _FOREIGN, _SCOPES, _TRANSPARENT, _method_nodes, _target_names
 
 
@@ -176,7 +177,7 @@ class _ExternalTypes:
         self.defined: set = set()
         self.module_values: dict[str, list] = defaultdict(list)
         self.parents = {child: parent for parent in ast.walk(tree) for child in ast.iter_child_nodes(parent)}
-        self.scope_bindings = {tree: _Derivation(tree, None).bindings}
+        self.scope_inventories = {tree: _Derivation(tree, None)}
         for node in ast.walk(tree):
             if isinstance(node, ast.Import):
                 for alias in node.names:
@@ -209,6 +210,44 @@ class _ExternalTypes:
             return self._external_module(self.imports[name])
         return name not in self.defined and name not in self.module_values and name in _BUILTIN_TYPES
 
+    def _lexical_binding(self, expression, name):
+        """Nearest possible values, or None for an unbound/builtin name.
+
+        Global selects the module, not an enclosing local and not a foreign
+        value. Both representation dispatch and pattern typing use this same
+        ownership lookup over the existing inventories.
+        """
+        current = self.parents.get(expression)
+        module_only = False
+        module_writes = []
+        while current is not None:
+            if isinstance(current, _SCOPES):
+                if current not in self.scope_inventories:
+                    self.scope_inventories[current] = _Derivation(current, None)
+                inventory = self.scope_inventories[current]
+                key = (id(current), name)
+                if not module_only or isinstance(current, ast.Module):
+                    if key in inventory.globals:
+                        if isinstance(current, ast.Module):
+                            values = inventory.bindings.get(inventory.globals[key], [])
+                            return (module_writes + values) or None
+                        # Ownership alone cannot finish the proof: sibling
+                        # helpers' actual module writes live in outer inventories.
+                        module_only = True
+                    elif (id(current), "*") in inventory.bindings:
+                        return [_FOREIGN]  # an unknown star export may shadow it
+                    elif key in inventory.bindings:
+                        values = inventory.bindings[key]
+                        return module_writes + values if isinstance(current, ast.Module) else values
+                if not isinstance(current, ast.Module):
+                    # A nested helper can write the module without declaring
+                    # this read global. Keep that evidence, but a genuine
+                    # enclosing cell still owns the read before the module.
+                    # An explicit global skips cells, not other module writes.
+                    module_writes.extend(inventory.bindings.get((inventory.global_scope, name), []))
+            current = self.parents.get(current)
+        return module_writes or None
+
     def representation_builtin(self, expression, derivation):
         """A bare builtin dispatch, with the same lexical binding inventory.
 
@@ -218,17 +257,8 @@ class _ExternalTypes:
         """
         if not isinstance(expression, ast.Name) or expression.id not in {"str", "repr"}:
             return None
-        if derivation.resolve(expression) is not None:
+        if self._lexical_binding(expression, expression.id) is not None:
             return None
-        current = self.parents.get(expression)
-        while current is not None:
-            if isinstance(current, _SCOPES):
-                if current not in self.scope_bindings:
-                    self.scope_bindings[current] = _Derivation(current, None).bindings
-                bindings = self.scope_bindings[current]
-                if (id(current), expression.id) in bindings or (id(current), "*") in bindings:
-                    return None
-            current = self.parents.get(current)
         return "__str__" if expression.id == "str" else "__repr__"
 
     @staticmethod
@@ -311,30 +341,51 @@ class _ExternalTypes:
         root = self._root_name(expression)
         if root is None:
             return False
-        current = self.parents.get(expression)
-        while current is not None:
-            if isinstance(current, _SCOPES):
-                if current not in self.scope_bindings:
-                    self.scope_bindings[current] = _Derivation(current, None).bindings
-                bindings = self.scope_bindings[current]
-                if (id(current), "*") in bindings:
+        values = self._lexical_binding(expression, root)
+        if values is not None:
+            for value in values:
+                if isinstance(value, ast.Import):
+                    modules = [alias.name.split(".")[0] for alias in value.names
+                               if (alias.asname or alias.name.split(".")[0]) == root]
+                elif isinstance(value, ast.ImportFrom) and not value.level:
+                    modules = [(value.module or "").split(".")[0]]
+                else:
                     return False
-                key = (id(current), root)
-                if key in bindings:
-                    values = bindings[key]
-                    for value in values:
-                        if isinstance(value, ast.Import):
-                            modules = [alias.name.split(".")[0] for alias in value.names
-                                       if (alias.asname or alias.name.split(".")[0]) == root]
-                        elif isinstance(value, ast.ImportFrom) and not value.level:
-                            modules = [(value.module or "").split(".")[0]]
-                        else:
-                            return False
-                        if not modules or not all(self._external_module(top) for top in modules):
-                            return False
-                    return bool(values)
-            current = self.parents.get(current)
+                if not modules or not all(self._external_module(top) for top in modules):
+                    return False
+            return bool(values)
         return isinstance(expression, ast.Name) and root in _BUILTIN_TYPES
+
+    def imported_namespace(self, declaration, name) -> bool:
+        """An external value or proven first-party submodule, never any member.
+
+        ImportFrom ownership alone says nothing about its exported value. The
+        existing module resolver can prove a submodule only when its package
+        has no contrary export, unknown star export or dynamic attribute hook.
+        """
+        if not declaration.level and self._external_module((declaration.module or "").split(".")[0]):
+            return True  # retain the existing external-value policy
+        alias = next((alias for alias in declaration.names if (alias.asname or alias.name) == name), None)
+        if alias is None or alias.name == "*":
+            return False
+        filename = Path(self.filename).resolve()
+        root = project_root(filename)
+        module = (_resolve_relative_import(declaration.level, declaration.module, filename, root)
+                  if declaration.level else declaration.module)
+        if not module:
+            return False
+        for base in (root, root / "src"):
+            package = _module_to_path(module, base)
+            child = _module_to_path(module + "." + alias.name, base)
+            if package is None or package.name != "__init__.py" or child is None:
+                continue
+            try:
+                _, tree = cached_parse(package)
+            except (OSError, SyntaxError, UnicodeError):
+                return False
+            bindings = _Derivation(tree, None).bindings
+            return not any((id(tree), key) in bindings for key in (alias.name, "*", "__getattr__"))
+        return False
 
     def _pattern_type(self, pattern) -> bool:
         """The whole matched instance, not fields taken from that instance."""
@@ -549,7 +600,7 @@ def _read_method(func, module_names: set, types: "_ExternalTypes | None" = None)
             key = derivation.resolve(base)
             if key is not None and key == derivation.receiver_key:
                 method.self_names.append(node.attr)
-            elif key is not None and derivation.module_namespace(base):
+            elif key is not None and derivation.module_namespace(base, types.imported_namespace if types else None):
                 pass  # module/owned-data reads are safe only when every write proves it
             elif key is not None and derivation.state.get(key):
                 method.derived_reads.add(f"{base.id}.{node.attr}")

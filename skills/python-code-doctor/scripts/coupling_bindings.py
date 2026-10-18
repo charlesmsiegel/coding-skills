@@ -30,7 +30,7 @@ _FOREIGN = None  # a binding whose value comes from outside: a parameter, `with 
 
 
 def _target_names(target):
-    return [n.id for n in ast.walk(target) if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Store)]
+    return [n.id for n in ast.walk(target) if isinstance(n, ast.Name) and isinstance(n.ctx, (ast.Store, ast.Del))]
 
 
 class _Derivation:
@@ -52,6 +52,8 @@ class _Derivation:
         self.receiver_key = (id(func), receiver) if receiver else None
         self.bindings: dict[tuple, list] = defaultdict(list)
         self.nonlocals: dict[tuple, ast.AST] = {}
+        self.globals: dict[tuple, tuple] = {}
+        self.global_scope = id(func) if isinstance(func, ast.Module) else None
         self.module_keys: set = set()
         self.iterated: set = set()  # id() of the iterables a loop or comprehension binds from
         self.unpacked: set = set()  # binding keys that receive elements, rather than the whole value
@@ -60,6 +62,12 @@ class _Derivation:
             self.bindings[self.receiver_key] = []
         for node in _method_nodes([func]):
             self._collect(node, receiver_arg)
+        # A read-only global declaration in a nested function does not create
+        # a module value (in particular, it cannot shadow a builtin there).
+        if isinstance(func, ast.Module):
+            for key in set(self.globals.values()):
+                if not self.bindings[key]:
+                    self.bindings.pop(key)
         self._link_nonlocal_writes()
         self.state = {key: (bool(values) or key == self.receiver_key) and all(v is not _FOREIGN for v in values)
                       for key, values in self.bindings.items()}
@@ -87,7 +95,11 @@ class _Derivation:
 
     def _bind(self, scope, name, value):
         if scope is not None:
-            self.bindings[(id(scope), name)].append(value)
+            self.bindings[self._binding_key(scope, name)].append(value)
+
+    def _binding_key(self, scope, name):
+        key = (id(scope), name)
+        return self.globals.get(key, key)
 
     def _link_nonlocal_writes(self):
         """A closure writes its enclosing binding, not a new local copy.
@@ -99,6 +111,9 @@ class _Derivation:
             enclosing = self._scope_of(scope)
             while enclosing is not None and not isinstance(enclosing, ast.Module):
                 owner = (id(enclosing), key[1])
+                if owner in self.globals:
+                    self.bindings[key].append(_FOREIGN)  # nonlocal cannot cross a global boundary
+                    break
                 if owner in self.bindings and owner not in self.nonlocals:
                     self.bindings[owner].extend(self.bindings.pop(key, []))
                     if key in self.unpacked:
@@ -150,10 +165,16 @@ class _Derivation:
         elif (isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name)
               and isinstance(scope, (ast.FunctionDef, ast.AsyncFunctionDef))):
             # Only function annotations own a local cell; namespace annotations do not bind.
-            self.bindings.setdefault((id(scope), node.target.id), [])
+            self.bindings.setdefault(self._binding_key(scope, node.target.id), [])
+        elif isinstance(node, ast.Delete) and isinstance(scope, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            # Deletion owns a local cell without assigning it a foreign value.
+            # Attribute/subscript targets contain no Name with Del context.
+            for target in node.targets:
+                for name in _target_names(target):
+                    self.bindings.setdefault(self._binding_key(scope, name), [])
         elif isinstance(node, (ast.Import, ast.ImportFrom)):
             for alias in node.names:
-                key = (id(scope), alias.asname or alias.name.split(".")[0])
+                key = self._binding_key(scope, alias.asname or alias.name.split(".")[0])
                 self.bindings[key].append(node)
                 self.module_keys.add(key)
         elif isinstance(node, ast.AugAssign):
@@ -176,7 +197,11 @@ class _Derivation:
                 self.nonlocals[(id(scope), name)] = scope
         elif isinstance(node, ast.Global):
             for name in node.names:
-                self._bind(scope, name, _FOREIGN)
+                key, owner = (id(scope), name), (self.global_scope, name)
+                self.globals[key] = owner
+                # Keep the lexical boundary visible to scope readers, while
+                # every actual global write shares one canonical origin.
+                self.bindings[key] = self.bindings[owner]
         elif isinstance(node, ast.ClassDef):
             self._bind(scope, node.name, node)
         elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
@@ -194,6 +219,8 @@ class _Derivation:
                 skip = (isinstance(current, _COMPREHENSIONS) and from_first_iterable
                         and child is current.generators[0])
                 key = (id(current), name_node.id)
+                if not skip and key in self.globals:
+                    return self.globals[key]
                 if not skip and key in self.bindings:
                     return key
                 from_first_iterable = False
@@ -236,7 +263,7 @@ class _Derivation:
             pending.extend((binding, False) for binding in values)
         return True
 
-    def module_namespace(self, expr) -> bool:
+    def module_namespace(self, expr, imported_namespace=None) -> bool:
         """A module alias stays exempt only while every origin write is safe.
 
         Import writes ground the same iterative identity proof as the receiver.
@@ -244,7 +271,9 @@ class _Derivation:
         merely encountering one import cannot certify the other writes.
         """
         return any(self.binding_identity(expr, origin) and all(
-            isinstance(value, (ast.Import, ast.ImportFrom)) or self.derived(value)
+            isinstance(value, ast.Import)
+            or (isinstance(value, ast.ImportFrom) and imported_namespace is not None
+                and imported_namespace(value, origin[1])) or self.derived(value)
             or self.binding_identity(value, origin) for value in self.bindings[origin])
             for origin in self.module_keys)
 

@@ -556,3 +556,337 @@ def test_scoped_class_pattern_imports_use_the_nearest_proven_binding(
     # foreign attributes, rather than only the matched value's three.
     metric = 4 if binding == "rebound" and qualified and scope == "method" else 3
     assert [row.metric_value for row in found] == ([] if binding == "external" else [metric])
+
+
+@pytest.mark.parametrize("builtin", ["str", "repr"])
+@pytest.mark.parametrize("local_cell", [False, True])
+def test_delete_only_closure_owns_its_nonlocal_write(detector, tmp_path, builtin, local_cell):
+    source = textwrap.dedent(f"""
+        class Entry:
+            def measure(self):
+                return self.metrics
+            def save(self):
+                def middle():
+                    def initialize():
+                        nonlocal self
+                        self = "replacement"
+                    initialize()
+                    DELETE
+                middle()
+                return {builtin}(self)
+            def __{builtin}__(self):
+                return self.payload
+    """).replace("DELETE", "del self" if local_cell else "pass")
+    namespace = {}
+    exec(source, namespace)
+    entry = namespace["Entry"]()
+    entry.payload = "original"
+    assert entry.save() == ("original" if local_cell else repr("replacement") if builtin == "repr" else "replacement")
+    found = findings(detector, tmp_path, source, "low_cohesion")
+    assert [row.metric_value for row in found] == ([2] if local_cell else [])
+
+
+@pytest.mark.parametrize("scope", ["module", "class"])
+def test_namespace_delete_does_not_create_a_builtin_shadow(detector, tmp_path, scope):
+    deletion = "try:\n    del str\nexcept NameError:\n    pass\n"
+    source = textwrap.dedent("""
+        class Entry:
+            def measure(self):
+                return self.metrics
+            def save(self):
+                return str(self)
+            def __str__(self):
+                return self.payload
+    """)
+    source = deletion + source if scope == "module" else source.replace(
+        "class Entry:", "class Entry:\n" + textwrap.indent(deletion, "    "))
+    namespace = {}
+    exec(source, namespace)
+    entry = namespace["Entry"]()
+    entry.payload = "original"
+    assert entry.save() == "original"
+    assert [row.metric_value for row in findings(detector, tmp_path, source, "low_cohesion")] == [2]
+
+
+@pytest.mark.parametrize("binding,external", [
+    ("import math as item", True),
+    ("import math as item\ndef declaration():\n    global item\ndeclaration()", True),
+    ("import math as item\nalias = item\nitem = alias", True),
+    ("import math as item\ndef replace():\n    global item\n    item = supplied\nreplace()", False),
+    ("item = supplied", False),
+    ("pass", False),
+])
+def test_global_namespace_ownership_is_not_a_value_write(detector, tmp_path, binding, external):
+    source = textwrap.dedent("""
+        class Payload:
+            pi = 1
+            e = 2
+            tau = 3
+        item = Payload()
+        class Entry:
+            def measure(self):
+                return self.metrics
+            def save(self, supplied):
+                global item
+                BINDING
+                return item.pi + item.e + item.tau
+    """).replace("        BINDING", textwrap.indent(binding, "        "))
+    namespace = {}
+    exec(source, namespace)
+    assert namespace["Entry"]().save(namespace["Payload"]()) == (math.pi + math.e + math.tau if external else 6)
+    found = findings(detector, tmp_path, source, "feature_envy")
+    assert [row.metric_value for row in found] == ([] if external else [3])
+
+
+def test_global_representation_lookup_skips_an_enclosing_converter(detector, tmp_path):
+    source = textwrap.dedent("""
+        def make():
+            str = lambda value: "local converter"
+            class Entry:
+                def measure(self):
+                    return self.metrics
+                def save(self):
+                    global str
+                    return str(self)
+                def __str__(self):
+                    return self.payload
+            return Entry
+        Entry = make()
+    """)
+    namespace = {}
+    exec(source, namespace)
+    entry = namespace["Entry"]()
+    entry.payload = "original"
+    assert entry.save() == "original"
+    assert [row.metric_value for row in findings(detector, tmp_path, source, "low_cohesion")] == [2]
+
+
+@pytest.mark.parametrize("ownership", ["global", "nonlocal"])
+def test_global_and_nonlocal_receiver_writes_have_different_owners(detector, tmp_path, ownership):
+    source = textwrap.dedent(f"""
+        class Entry:
+            def measure(self):
+                return self.metrics
+            def save(self):
+                def replace():
+                    {ownership} self
+                    self = "replacement"
+                replace()
+                return str(self)
+            def __str__(self):
+                return self.payload
+    """)
+    namespace = {}
+    exec(source, namespace)
+    entry = namespace["Entry"]()
+    entry.payload = "original"
+    assert entry.save() == ("original" if ownership == "global" else "replacement")
+    found = findings(detector, tmp_path, source, "low_cohesion")
+    assert [row.metric_value for row in found] == ([2] if ownership == "global" else [])
+
+
+@pytest.mark.parametrize("export", ["instance", "submodule", "shadowed_submodule", "dynamic", "mixed"])
+@pytest.mark.parametrize("aliased", [False, True])
+def test_first_party_from_members_need_namespace_value_proof(detector, tmp_path, monkeypatch, export, aliased):
+    package = tmp_path / "cohesion_exports"
+    package.mkdir()
+    payload = "class Payload:\n    first = 1\n    second = 2\n    third = 3\n"
+    exports = payload
+    member = "payload" if export in {"instance", "mixed"} else "sub"
+    if export in {"instance", "shadowed_submodule", "mixed"}:
+        exports += f"{member} = Payload()\n"
+    elif export == "dynamic":
+        exports += "def __getattr__(name):\n    return Payload()\n"
+    (package / "__init__.py").write_text(exports, encoding="utf-8")
+    (package / "sub.py").write_text("first = 1\nsecond = 2\nthird = 3\n", encoding="utf-8")
+    module = types.ModuleType("cohesion_exports")
+    module.__path__ = [str(package)]
+    exec(exports, module.__dict__)
+    monkeypatch.setitem(sys.modules, "cohesion_exports", module)
+    source = textwrap.dedent(f"""
+        class Entry:
+            def measure(self):
+                return self.metrics
+            def save(self):
+                from cohesion_exports import {member} as imported
+                ALIAS
+                return item.first + item.second + item.third
+    """).replace("        ALIAS", "        item = imported" if aliased else "        pass").replace(
+        "return item.", "return imported." if not aliased else "return item.")
+    if not aliased:
+        source = source.replace(" + item.", " + imported.")
+    if export == "mixed":
+        source = source.replace("import payload as imported", "import payload as imported, sub as module_value")
+        source = source.replace(".third\n", ".third + module_value.first\n")
+    namespace = {}
+    try:
+        exec(source, namespace)
+        assert namespace["Entry"]().save() == (7 if export == "mixed" else 6)
+    finally:
+        sys.modules.pop("cohesion_exports.sub", None)
+    found = findings(detector, tmp_path, source, "feature_envy")
+    assert [row.metric_value for row in found] == ([] if export == "submodule" else [3])
+
+
+def test_external_imported_member_alias_keeps_its_existing_value_exemption(detector, tmp_path):
+    source = textwrap.dedent("""
+        class Entry:
+            def measure(self):
+                return self.metrics
+            def save(self):
+                from sys import float_info as imported
+                alias = imported
+                return alias.max_exp + alias.min_exp + alias.mant_dig
+    """)
+    namespace = {}
+    exec(source, namespace)
+    assert namespace["Entry"]().save() == sys.float_info.max_exp + sys.float_info.min_exp + sys.float_info.mant_dig
+    assert findings(detector, tmp_path, source, "feature_envy") == []
+
+
+@pytest.mark.parametrize("builtin", ["str", "repr"])
+def test_free_representation_lookup_sees_a_helpers_actual_global_write(detector, tmp_path, builtin):
+    source = textwrap.dedent(f"""
+        class Entry:
+            def measure(self):
+                return self.metrics
+            def save(self):
+                def configure():
+                    global {builtin}
+                    {builtin} = lambda value: "converted"
+                configure()
+                return {builtin}(self)
+            def __{builtin}__(self):
+                return self.payload
+    """)
+    namespace = {}
+    exec(source, namespace)
+    entry = namespace["Entry"]()
+    entry.payload = "original"
+    assert entry.save() == "converted"
+    assert findings(detector, tmp_path, source, "low_cohesion") == []
+
+
+@pytest.mark.parametrize("qualified", [False, True])
+def test_helpers_global_write_does_not_replace_an_enclosing_pattern_cell(detector, tmp_path, qualified):
+    declaration = "import fractions as library" if qualified else "from fractions import Fraction as Kind"
+    root = "library" if qualified else "Kind"
+    replacement = "Namespace" if qualified else "Payload"
+    pattern = "library.Fraction()" if qualified else "Kind()"
+    source = textwrap.dedent(f"""
+        class Payload:
+            numerator = 1
+            denominator = 2
+            real = 3
+        class Namespace:
+            Fraction = Payload
+        def make():
+            {declaration}
+            class Entry:
+                def measure(self):
+                    return self.metrics
+                def save(self, value):
+                    def configure():
+                        global {root}
+                        {root} = {replacement}
+                    configure()
+                    match value:
+                        case {pattern} as item:
+                            return item.numerator + item.denominator + item.real
+            return Entry
+        Entry = make()
+    """)
+    namespace = {}
+    exec(source, namespace)
+    assert namespace["Entry"]().save(Fraction(3, 2)) == 6.5
+    assert namespace[root] is namespace[replacement]
+    assert findings(detector, tmp_path, source, "feature_envy") == []
+
+
+@pytest.mark.parametrize("builtin", ["str", "repr"])
+def test_global_representation_reader_keeps_a_sibling_helpers_write(detector, tmp_path, builtin):
+    source = textwrap.dedent(f"""
+        class Entry:
+            def measure(self):
+                return self.metrics
+            def save(self):
+                def configure():
+                    global {builtin}
+                    {builtin} = lambda value: "converted"
+                def render():
+                    global {builtin}
+                    return {builtin}(self)
+                configure()
+                return render()
+            def __{builtin}__(self):
+                return self.payload
+    """)
+    namespace = {}
+    exec(source, namespace)
+    entry = namespace["Entry"]()
+    entry.payload = "original"
+    assert entry.save() == "converted"
+    assert findings(detector, tmp_path, source, "low_cohesion") == []
+
+
+def test_enclosing_global_import_keeps_an_inner_helpers_actual_write(detector, tmp_path):
+    source = textwrap.dedent("""
+        class Payload:
+            numerator = 1
+            denominator = 2
+            real = 3
+        def make():
+            global Kind
+            from fractions import Fraction as Kind
+            class Entry:
+                def measure(self):
+                    return self.metrics
+                def save(self, value):
+                    def configure():
+                        global Kind
+                        Kind = Payload
+                    configure()
+                    match value:
+                        case Kind() as item:
+                            return item.numerator + item.denominator + item.real
+            return Entry
+        Entry = make()
+    """)
+    namespace = {}
+    exec(source, namespace)
+    assert namespace["Entry"]().save(namespace["Payload"]()) == 6
+    assert namespace["Kind"] is namespace["Payload"]
+    assert [row.metric_value for row in findings(detector, tmp_path, source, "feature_envy")] == [3]
+
+
+@pytest.mark.parametrize("rebound", [False, True])
+def test_conditional_global_import_keeps_sibling_writes_until_the_module(detector, tmp_path, rebound):
+    source = textwrap.dedent(f"""
+        from fractions import Fraction as Kind
+        class Payload:
+            numerator = 1
+            denominator = 2
+            real = 3
+        class Entry:
+            def measure(self):
+                return self.metrics
+            def save(self, value):
+                def configure():
+                    global Kind
+                    {"Kind = Payload" if rebound else "pass"}
+                def render(flag):
+                    global Kind
+                    if flag:
+                        from fractions import Fraction as Kind
+                    match value:
+                        case Kind() as item:
+                            return item.numerator + item.denominator + item.real
+                configure()
+                return render(False)
+    """)
+    namespace = {}
+    exec(source, namespace)
+    value = namespace["Payload"]() if rebound else Fraction(3, 2)
+    assert namespace["Entry"]().save(value) == (6 if rebound else 6.5)
+    found = findings(detector, tmp_path, source, "feature_envy")
+    assert [row.metric_value for row in found] == ([3] if rebound else [])
