@@ -1,6 +1,6 @@
 # coding-skills
 
-Fifteen agentic skills for AI-assisted software work, plus seven Claude Code
+Seventeen agentic skills for AI-assisted software work, plus seven Claude Code
 output styles that change how the agent talks while it uses them.
 
 The skills pair **deterministic detectors** — stdlib-only scripts that parse the
@@ -134,6 +134,11 @@ list — an open issue usually records a design decision made and not yet acted 
 Language-agnostic, and each carries a script only where something is genuinely
 mechanical.
 
+- **[code-deleter](skills/code-deleter)** — safely remove redundant code,
+  defensive checks, duplication, and unnecessary abstractions. Every run must
+  reduce code lines or leave them constant. A worktree snapshot and blocking
+  line-budget check count production and tests, including new untracked files;
+  unproven simplifications stay untouched.
 - **[brutal-review](skills/brutal-review)** — adversarial review of a diff. Every
   finding must name the input that breaks the code; a complaint with no failing
   case is cut. Delegates to python-code-doctor's `analyze_diff.py` for Python.
@@ -162,6 +167,23 @@ mechanical.
   masthead number is computed by `corpus_stats.py` from the manifest, the notes
   and the snowball state — a hand-typed count would be an unverified claim in the
   one place whose job is to establish the report's numbers can be trusted.
+- **[legal-survey](skills/legal-survey)** — literature-survey's shape pointed at
+  a legal question, which turns out to need a different discipline rather than a
+  different vocabulary. Discovery across CourtListener, the Federal Register,
+  eCFR, OpenAlex and Crossref, with UK and EU sources pluggable. Two failures it
+  exists to prevent, and each gets its own mechanical check. **The fabricated
+  citation**: `verify_authorities.py` re-resolves every pincite against a
+  hash-pinned manifest *and* requires each archived case to contain its own
+  reporter citation, so a real file cannot stand in for an invented cite. **Bad
+  law**: `check_treatment.py` walks the open citation graph for every case and
+  the gate refuses a claim resting on overruled authority unless the claim says
+  why. That check is emphatically **not a citator** — no Shepard's, no KeyCite —
+  and the masthead carries the qualifier as part of the figure, because "no
+  negative signal found" and "validated" are different claims. Three things the
+  type system enforces that prose cannot: a selected authority must say whether
+  it *binds the named forum*, an archived statute must carry the version date it
+  was read at, and a holding is a `Claim` while dicta is a `Dictum` — a separate
+  type that may not carry locators, so it cannot be dressed as a holding.
   Rate-limited, `robots.txt`-respecting, and paywalls are recorded as gaps rather
   than circumvented.
 - **[science-investigation](skills/science-investigation)** — audits whether a
@@ -241,7 +263,7 @@ python tools/validate_skills.py     # frontmatter, naming, description limit, ev
 ```
 
 `tools/validate_skills.py` is the single definition of a structurally valid
-skill: CI runs it over all fourteen on every pull request, and the release job
+skill: CI runs it over every skill on each pull request, and the release job
 runs it on the one skill it is about to package. It is stdlib-only, like the
 detectors, so it runs wherever the skills do. Its own rules are tested against
 deliberately-invalid skills in `tests/test_validate_skills.py` — a validator that
@@ -265,11 +287,13 @@ graphs. Two files differ on purpose and are NOT synced: `assets/template.html`
 (each skill has its own theme around the same placeholders and tab contract)
 and `references/llm-tabs.md` (different tab sets).
 
-literature-survey ships a `common.py` of its own that is **not** a copy of
-anybody's: same filename, entirely different subject (HTTP transport, the corpus
-records, the reporter). It is the reason its masthead goes in through
+literature-survey and legal-survey each ship a `common.py` of their own that is
+**not** a copy of anybody's: same filename, entirely different subject (HTTP
+transport, the corpus records, the reporter) — and different from each other,
+because a legal corpus records weight, currency and treatment that a scholarly
+one has no use for. They are the reason both mastheads go in through
 `inject_masthead.py` at a marker rather than through a raw-HTML flag on
-`assemble.py` — a flag one skill needs is how three copies of a file start to
+`assemble.py` — a flag one skill needs is how four copies of a file start to
 drift.
 
 django-code-doctor ships its own copies of python-code-doctor's `common.py` and

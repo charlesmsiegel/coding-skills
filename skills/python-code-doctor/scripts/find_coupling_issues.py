@@ -23,6 +23,7 @@ import argparse
 from pathlib import Path
 from dataclasses import dataclass, asdict, field
 from collections import Counter, defaultdict
+from ast_scopes import walk_same_scope
 from common import first_party_modules, is_test_file, project_root, sort_findings, cached_parse, SEVERITY_ICONS, configure_output, find_python_files, warn_detector_error, warn_unparseable
 from find_mutation_hazards import ClassFamilyResolver
 
@@ -104,6 +105,11 @@ def _declared_fields(node: ast.ClassDef, classes: ClassFamilyResolver | None = N
 # Initializers assign every attribute the class has, so as LCOM4 nodes they
 # would join every group into one and hide exactly the split being measured.
 _INITIALIZERS = frozenset({"__init__", "__new__", "__post_init__", "__init_subclass__"})
+# A representation can show any slice of an object without adding a behavioral
+# responsibility. Reading every field to print it cannot join real responsibilities
+# either, so these methods are neither vertices nor bridges in the cohesion graph.
+# Other protocols (__len__, __iter__, __call__, ...) still express behavior.
+_REPRESENTATIONS = frozenset({"__repr__", "__str__"})
 _METHOD_TYPES = (ast.FunctionDef, ast.AsyncFunctionDef)
 _VALIDATOR_DECORATORS = frozenset({
     "model_validator", "field_validator", "validator", "root_validator",
@@ -325,6 +331,12 @@ class _ExternalTypes:
         self.filename = filename
         self._first_party = None
         self.imports: dict[str, str | None] = {}  # local name -> top-level module (None: relative)
+        self.module_imports = {
+            alias.asname or alias.name.split(".")[0]
+            for node in walk_same_scope(getattr(tree, "body", []))
+            if isinstance(node, (ast.Import, ast.ImportFrom))
+            for alias in node.names
+        }
         self.defined: set = set()
         self.module_values: dict[str, list] = defaultdict(list)
         for node in ast.walk(tree):
@@ -564,8 +576,16 @@ def _read_method(func, module_names: set, types: "_ExternalTypes | None" = None)
                                      func.args.vararg, func.args.kwarg] if a is not None}
     method.constructs = _constructs(func, receiver)
     method.validates = _is_validator(func)
+    shadowed = (types.module_imports | types.defined | types.module_values.keys()) if types else set()
     called = {id(node.func) for node in _method_nodes(func.body) if isinstance(node, ast.Call)}
     for node in _method_nodes(func.body):
+        if (receiver is not None and isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Name) and node.func.id in {"str", "repr"}
+                and node.func.id not in shadowed and derivation.resolve(node.func) is None
+                and len(node.args) == 1 and not node.keywords
+                and isinstance(node.args[0], ast.Name)
+                and derivation.resolve(node.args[0]) == derivation.receiver_key):
+            method.self_names.append(f"__{node.func.id}__")
         if not isinstance(node, ast.Attribute):
             continue
         base = node.value
@@ -593,17 +613,33 @@ def _read_method(func, module_names: set, types: "_ExternalTypes | None" = None)
     return method
 
 
+def _behavior_names(methods: dict, name: str, seen: frozenset = frozenset()):
+    """A behavior keeps the state it reaches through a presentation protocol.
+
+    The protocol itself is not a responsibility, but delegating a save's state
+    access to it does not make that save stateless. A normal caller can also
+    coordinate real behaviors through the representation that calls them.
+    """
+    for touched in methods[name].self_names:
+        if touched in _REPRESENTATIONS and touched in methods:
+            if touched not in seen:
+                yield from _behavior_names(methods, touched, seen | {touched})
+        else:
+            yield touched
+
+
 def _groups(methods: dict, fields: set = frozenset()) -> list[list[str]]:
     """LCOM4: connected components of the methods that touch instance state.
 
     Two methods are joined when they touch a common `self.<attribute>` (read or
     write; a property read through `self.prop` reaches the property's own node)
     or when one refers to the other through self; a record's declared ``fields``
-    count as one attribute (see _declared_fields). Initializers are left out, and
-    so is a method with no edge at all: one that uses no instance state is a
-    static-method candidate, not evidence that the class splits.
+    count as one attribute (see _declared_fields). Initializers and representations
+    are left out, and so is a method with no edge at all: one that uses no instance
+    state is a static-method candidate, not evidence that the class splits.
     """
-    names = [n for n in methods if n not in _INITIALIZERS and not methods[n].validates]
+    names = [n for n in methods
+             if n not in _INITIALIZERS and n not in _REPRESENTATIONS and not methods[n].validates]
     parent = {n: n for n in names}
 
     def find(n):
@@ -618,7 +654,7 @@ def _groups(methods: dict, fields: set = frozenset()) -> list[list[str]]:
     linked = set()
     holders = defaultdict(list)
     for name in names:
-        for touched in methods[name].self_names:
+        for touched in _behavior_names(methods, name):
             if touched in parent and touched != name:
                 union(name, touched)
                 linked.update((name, touched))
@@ -690,7 +726,12 @@ def _analyze_class(node: ast.ClassDef, filename: str, module_names: set,
     # Low cohesion (LCOM4)
     interface = any(_name_of(base) in _INTERFACE_BASES for base in node.bases) or any(
         kw.arg == "metaclass" and _name_of(kw.value) == "ABCMeta" for kw in node.keywords)
-    groups = [] if in_tests or interface else _groups(methods, _declared_fields(node, classes))
+    cohesion_methods = methods
+    # With no explicit base, object.__str__ delegates to this class's __repr__.
+    # A custom base can override __str__, so its fallback is not established.
+    if not node.bases and "__str__" not in methods and "__repr__" in methods:
+        cohesion_methods = {**methods, "__str__": methods["__repr__"]}
+    groups = [] if in_tests or interface else _groups(cohesion_methods, _declared_fields(node, classes))
     inherited = any(_name_of(base) not in _NEUTRAL_BASES for base in node.bases)
     if len(groups) >= 2:
         issues.append(CouplingIssue(

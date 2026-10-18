@@ -458,3 +458,41 @@ def test_confirmed_empty_object_types_keep_their_scored_findings(ts, tmp_path, s
     found = records("find_type_gaps.py", root, "empty_object_type")
     assert len(found) == expected
     assert all(r["kind"] == "finding" and r["suggestion"] for r in found)
+
+
+@pytest.mark.parametrize("statement", [
+    "const x = ready ? convert(value) : fallback;",
+    "const x = ready ? convert(value) : { fallback };",
+    "const x = ready ? convert(value) : fallback\n{ consume(x); }",
+    "const x = ready ? await convert(value) : fallback\n{ consume(x); }",
+    "const x = ready ? void convert(value) : fallback\n{ consume(x); }",
+    "const x = ready ? convert<Value>(value) : fallback\n{ consume(x); }",
+])
+def test_ternary_runtime_imports_are_not_reported_as_type_only(ts, tmp_path, statement):
+    source = 'import { fallback } from "./client";\n' + statement
+    file = parse(ts, source)
+    uses = [i for i, token in enumerate(file.tokens) if token.value == "fallback" and token.line > 1]
+    assert uses and not any(file.in_type_position(i) for i in uses)
+    assert not any(func.name == "convert" for func in file.functions)
+    root = project(tmp_path, {
+        "tsconfig.json": '{"compilerOptions": {"verbatimModuleSyntax": true}}',
+        "src/client.ts": "export const fallback = {};\n",
+        "src/sample.ts": source,
+    })
+    assert records("find_module_issues.py", root, "missing_import_type") == []
+
+
+@pytest.mark.parametrize("declaration", [
+    "const methods = { make(): Shape { return {}; } };",
+    "class C { run() { const methods = { make(): Shape { return {}; } }; } }",
+    "const methods = { get value(): Shape { return {}; } };",
+    "const methods = { *values(): Iterable<Shape> { yield {}; } };",
+])
+def test_confirmed_object_method_return_types_keep_import_evidence(tmp_path, declaration):
+    root = project(tmp_path, {
+        "tsconfig.json": '{"compilerOptions": {"verbatimModuleSyntax": true}}',
+        "src/client.ts": "export interface Shape { id?: string }\n",
+        "src/sample.ts": 'import { Shape } from "./client";\n' + declaration,
+    })
+    found = records("find_module_issues.py", root, "missing_import_type")
+    assert [record["description"] for record in found] == ["`Shape` from './client' is only used as a type"]
