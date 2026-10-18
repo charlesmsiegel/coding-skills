@@ -24,6 +24,7 @@ from pathlib import Path
 from dataclasses import dataclass, asdict, field
 from collections import Counter, defaultdict
 from common import first_party_modules, is_test_file, project_root, sort_findings, cached_parse, SEVERITY_ICONS, configure_output, find_python_files, warn_detector_error, warn_unparseable
+from find_mutation_hazards import ClassFamilyResolver
 
 
 @dataclass
@@ -78,7 +79,7 @@ def _name_of(node: ast.AST) -> str | None:
     return None
 
 
-def _declared_fields(node: ast.ClassDef) -> set:
+def _declared_fields(node: ast.ClassDef, classes: ClassFamilyResolver | None = None) -> set:
     """The fields a record declares as class-level annotations, or nothing if it is not one."""
     names = set()
     for dec in node.decorator_list:
@@ -90,10 +91,13 @@ def _declared_fields(node: ast.ClassDef) -> set:
     for base in node.bases:
         target = base.value if isinstance(base, ast.Subscript) else base
         names.add(getattr(target, "id", getattr(target, "attr", None)))
-    if not (names & _RECORD_DECORATORS or names & _RECORD_BASES):
+    inherited_model = classes is not None and classes.is_family(node, 'copying_model')
+    if not (names & _RECORD_DECORATORS or names & _RECORD_BASES or inherited_model):
         return set()
     return {item.target.id for item in node.body
             if isinstance(item, ast.AnnAssign) and isinstance(item.target, ast.Name)
+            # Pydantic private attributes are not validated model fields.
+            and (not inherited_model or not item.target.id.startswith('_'))
             and "ClassVar" not in ast.unparse(item.annotation)}
 
 
@@ -670,14 +674,18 @@ def coupling_issues(tree: ast.AST, filename: str, in_tests: bool = False) -> lis
                     for alias in node.names}
     issues: list[CouplingIssue] = []
     types = _ExternalTypes(tree, filename)
+    parents = {child: parent for parent in ast.walk(tree)
+               for child in ast.iter_child_nodes(parent)}
+    classes = ClassFamilyResolver(tree, parents, Path(filename))
     for node in ast.walk(tree):
         if isinstance(node, ast.ClassDef):
-            issues.extend(_analyze_class(node, filename, module_names, in_tests, types))
+            issues.extend(_analyze_class(node, filename, module_names, in_tests, types, classes))
     return issues
 
 
 def _analyze_class(node: ast.ClassDef, filename: str, module_names: set,
-                   in_tests: bool = False, types: "_ExternalTypes | None" = None) -> list[CouplingIssue]:
+                   in_tests: bool = False, types: "_ExternalTypes | None" = None,
+                   classes: ClassFamilyResolver | None = None) -> list[CouplingIssue]:
     defs = [item for item in node.body if isinstance(item, _METHOD_TYPES)]
     if len(defs) < 2:
         return []
@@ -703,7 +711,7 @@ def _analyze_class(node: ast.ClassDef, filename: str, module_names: set,
     # Low cohesion (LCOM4)
     interface = any(_name_of(base) in _INTERFACE_BASES for base in node.bases) or any(
         kw.arg == "metaclass" and _name_of(kw.value) == "ABCMeta" for kw in node.keywords)
-    groups = [] if in_tests or interface else _groups(methods, _declared_fields(node))
+    groups = [] if in_tests or interface else _groups(methods, _declared_fields(node, classes))
     inherited = any(_name_of(base) not in _NEUTRAL_BASES for base in node.bases)
     if len(groups) >= 2:
         issues.append(CouplingIssue(
