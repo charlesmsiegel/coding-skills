@@ -1144,3 +1144,164 @@ def test_representation_module_lookup_includes_class_writes_without_inventing_de
     entry.payload = "original"
     assert entry.save() == ("converted" if rebound else "original")
     assert [row.metric_value for row in findings(detector, tmp_path, source, "low_cohesion")] == ([] if rebound else [2])
+
+
+@pytest.mark.parametrize("nested", [False, True])
+@pytest.mark.parametrize("binding", ["rebound", "foreign", "readonly", "external"])
+def test_class_nonlocal_writes_reach_the_actual_enclosing_pattern_owner(detector, tmp_path, nested, binding):
+    statement = {"rebound": "Kind = Payload", "foreign": "with nullcontext(Payload) as Kind:\n    pass",
+                 "readonly": "pass", "external": "from fractions import Fraction as Kind"}[binding]
+    entry = textwrap.dedent("""
+        class Configure:
+            nonlocal Kind
+            BINDING
+        class Entry:
+            def measure(self):
+                return self.metrics
+            def save(self, value):
+                match value:
+                    case Kind() as item:
+                        return item.numerator + item.denominator + item.real
+        return Entry
+    """).replace("    BINDING", textwrap.indent(statement, "    "))
+    if nested:
+        entry = "def middle():\n    nonlocal Kind\n" + textwrap.indent(entry, "    ") + "return middle()\n"
+    source = ("from contextlib import nullcontext\nclass Payload:\n    numerator=1\n    denominator=2\n    real=3\n"
+              + "def make():\n    from fractions import Fraction as Kind\n" + textwrap.indent(entry, "    ")
+              + "Entry = make()\n")
+    namespace = {}
+    exec(source, namespace)
+    replaced = binding in {"rebound", "foreign"}
+    value = namespace["Payload"]() if replaced else Fraction(3, 2)
+    assert namespace["Entry"]().save(value) == (6 if replaced else 6.5)
+    assert [row.metric_value for row in findings(detector, tmp_path, source, "feature_envy")] == ([3] if replaced else [])
+
+
+@pytest.mark.parametrize("builtin", ["str", "repr"])
+@pytest.mark.parametrize("global_alias", [False, True])
+def test_receiver_identity_does_not_borrow_a_partial_global_alias(detector, tmp_path, builtin, global_alias):
+    binding = "global original\nif keep:\n    original = self" if global_alias else "original = self"
+    source = textwrap.dedent(f"""
+        class Replacement:
+            def __{builtin}__(self):
+                return "replacement"
+        original = Replacement()
+        class Entry:
+            def measure(self):
+                return self.metrics
+            def save(self, keep):
+                BINDING
+                self = original
+                return {builtin}(self)
+            def __{builtin}__(self):
+                return self.payload
+    """).replace("        BINDING", textwrap.indent(binding, "        "))
+    namespace = {}
+    exec(source, namespace)
+    entry = namespace["Entry"]()
+    entry.payload = "original"
+    assert entry.save(False) == ("replacement" if global_alias else "original")
+    assert [row.metric_value for row in findings(detector, tmp_path, source, "low_cohesion")] == ([] if global_alias else [2])
+
+
+@pytest.mark.parametrize("placement", ["after", "before", "conditional", "nested", "ambient", "loop"])
+def test_namespace_read_view_keeps_unsafe_writers_but_not_own_straight_line_future(
+        detector, tmp_path, placement):
+    body = {
+        "after": "import math as alias\nresult = alias.pi + alias.e + alias.tau\nalias = Payload()\nreturn result",
+        "before": "import math as alias\nalias = Payload()\nreturn alias.pi + alias.e + alias.tau",
+        "conditional": "import math as alias\nif replace:\n    alias = Payload()\nreturn alias.pi + alias.e + alias.tau",
+        "nested": "import math as alias\ndef configure():\n    global alias\n    alias = Payload()\nconfigure()\nreturn alias.pi + alias.e + alias.tau",
+        "ambient": "import math as alias\nconfigure()\nreturn alias.pi + alias.e + alias.tau",
+        "loop": "import math as alias\nfor unused in range(2):\n    result = alias.pi + alias.e + alias.tau\n    alias = Payload()\nreturn result",
+    }[placement]
+    source = "class Payload:\n    pi=1\n    e=2\n    tau=3\nalias=Payload()\n"
+    if placement == "ambient":
+        source += "def configure():\n    global alias\n    alias=Payload()\n"
+    source += textwrap.dedent("""
+        class Entry:
+            def measure(self):
+                return self.metrics
+            def save(self, replace=True):
+                global alias
+                BODY
+    """).replace("        BODY", textwrap.indent(body, "        "))
+    namespace = {}
+    exec(source, namespace)
+    entry = namespace["Entry"]()
+    expected = math.pi + math.e + math.tau if placement == "after" else 6
+    assert (entry.save(), entry.save()) == (expected, expected)
+    assert [row.metric_value for row in findings(detector, tmp_path, source, "feature_envy")] == ([] if placement == "after" else [3])
+
+
+@pytest.mark.parametrize("binding", ["single", "chain", "long", "attribute", "qualified", "local", "enclosing",
+                                     "rebound", "mixed", "foreign_cycle", "class_shadow"])
+def test_pattern_class_aliases_are_iteratively_grounded_in_their_actual_binding(detector, tmp_path, binding):
+    aliases = "Kind = Fraction\n"
+    pattern = "Kind()"
+    if binding == "chain":
+        aliases = "First = Fraction\nKind = First\n"
+    elif binding == "long":
+        aliases = "First0 = Fraction\n" + "".join(f"First{index} = First{index-1}\n" for index in range(1, 1000)) + "Kind = First999\n"
+    elif binding == "attribute":
+        aliases = "Kind = library.Fraction\n"
+    elif binding == "qualified":
+        aliases, pattern = "Kind = library\n", "Kind.Fraction()"
+    elif binding in {"rebound", "mixed"}:
+        aliases += "Kind = Payload\n" if binding == "rebound" else "if True:\n    Kind = Payload\n"
+    elif binding == "foreign_cycle":
+        aliases = "First = Payload\nKind = First\nFirst = Kind\n"
+    elif binding == "class_shadow":
+        aliases = "class Configure:\n    global Kind\n    Fraction = Payload\n    Kind = Fraction\n"
+    entry = textwrap.dedent(f"""
+        class Entry:
+            def measure(self):
+                return self.metrics
+            def save(self, value):
+                LOCAL
+                match value:
+                    case {pattern} as item:
+                        return item.numerator + item.denominator + item.real
+    """)
+    if binding == "local":
+        entry = entry.replace("        LOCAL", "        Kind = Fraction")
+        aliases = ""
+    else:
+        entry = entry.replace("        LOCAL", "        pass")
+    if binding == "enclosing":
+        entry = "def make():\n" + textwrap.indent(aliases + entry, "    ") + "    return Entry\nEntry = make()\n"
+        aliases = ""
+    source = ("from fractions import Fraction\nimport fractions as library\nclass Payload:\n    numerator=1\n    denominator=2\n    real=3\n"
+              + aliases + entry)
+    namespace = {}
+    exec(source, namespace)
+    foreign = binding in {"rebound", "mixed", "foreign_cycle", "class_shadow"}
+    value = namespace["Payload"]() if foreign else Fraction(3, 2)
+    assert namespace["Entry"]().save(value) == (6 if foreign else 6.5)
+    assert [row.metric_value for row in findings(detector, tmp_path, source, "feature_envy")] == ([3] if foreign else [])
+
+
+@pytest.mark.parametrize("builtin", ["str", "repr"])
+@pytest.mark.parametrize("replaced", [False, True])
+def test_class_nonlocal_receiver_writes_reach_the_existing_identity_proof(detector, tmp_path, builtin, replaced):
+    source = textwrap.dedent(f"""
+        class Replacement:
+            def __{builtin}__(self):
+                return "replacement"
+        class Entry:
+            def measure(self):
+                return self.metrics
+            def save(self):
+                class Configure:
+                    nonlocal self
+                    {"self = Replacement()" if replaced else "pass"}
+                return {builtin}(self)
+            def __{builtin}__(self):
+                return self.payload
+    """)
+    namespace = {}
+    exec(source, namespace)
+    entry = namespace["Entry"]()
+    entry.payload = "original"
+    assert entry.save() == ("replacement" if replaced else "original")
+    assert [row.metric_value for row in findings(detector, tmp_path, source, "low_cohesion")] == ([] if replaced else [2])

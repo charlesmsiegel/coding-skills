@@ -180,6 +180,7 @@ class _ExternalTypes:
         self.module_scope = tree
         self.scope_inventories = {tree: _Derivation(tree, None)}
         self.global_scopes: dict[str, set] = defaultdict(set)
+        self.nonlocal_scopes: dict[str, set] = defaultdict(set)
         for node in ast.walk(tree):
             if isinstance(node, ast.Import):
                 for alias in node.names:
@@ -188,13 +189,14 @@ class _ExternalTypes:
                 top = None if node.level else (node.module or "").split(".")[0]
                 for alias in node.names:
                     self.imports[alias.asname or alias.name] = top
-            elif isinstance(node, ast.Global):
+            elif isinstance(node, (ast.Global, ast.Nonlocal)):
                 scope = self.parents.get(node)
                 while scope is not None and not isinstance(scope, _SCOPES + (ast.ClassDef,)):
                     scope = self.parents.get(scope)
                 if scope is not None and not isinstance(scope, ast.Module):
                     for name in node.names:
-                        self.global_scopes[name].add(scope)
+                        owners = self.global_scopes if isinstance(node, ast.Global) else self.nonlocal_scopes
+                        owners[name].add(scope)
         for node in getattr(tree, "body", []):
             if isinstance(node, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
                 self.defined.add(node.name)
@@ -258,7 +260,7 @@ class _ExternalTypes:
         for scope in self.global_scopes.get(name, ()):
             writer = self._inventory(scope)
             if not all(self._namespace_write(value, name, writer)
-                       for value in writer.bindings.get((writer.global_scope, name), [])):
+                       for value in writer.namespace_values((writer.global_scope, name), expression)):
                 return False
         module = self._inventory(self.module_scope)
         values = module.bindings.get((id(self.module_scope), name), [])
@@ -276,6 +278,29 @@ class _ExternalTypes:
             values.extend(writer.bindings.get((writer.global_scope, name), []))
         return values
 
+    def _nonlocal_owner(self, scope, name):
+        """Find the actual enclosing cell, skipping classes/declarations."""
+        current = self.parents.get(scope)
+        while current is not None and not isinstance(current, ast.Module):
+            if isinstance(current, _SCOPES):
+                inventory = self._inventory(current)
+                key = (id(current), name)
+                if key in inventory.globals:
+                    return None
+                if key in inventory.bindings and key not in inventory.nonlocals:
+                    return current
+            current = self.parents.get(current)
+        return None
+
+    def _nonlocal_write_values(self, owner, name):
+        values = []
+        for scope in self.nonlocal_scopes.get(name, ()):
+            if self._nonlocal_owner(scope, name) is owner:
+                writer = self._inventory(scope)
+                scope_id = writer.global_scope if isinstance(scope, ast.ClassDef) else id(scope)
+                values.extend(writer.nonlocal_writes.get((scope_id, name), []))
+        return values
+
     def _lexical_binding(self, expression, name):
         """Nearest possible values, or None for an unbound/builtin name.
 
@@ -286,8 +311,23 @@ class _ExternalTypes:
         current = self.parents.get(expression)
         module_only = False
         module_writes = []
+        nonlocal_writes = []
+        first_scope = True
         while current is not None:
+            if isinstance(current, ast.ClassDef) and first_scope:
+                # A class body's own aliases see its namespace; an ordinary
+                # method (or nested class) never closes over that namespace.
+                first_scope = False
+                inventory = self._inventory(current)
+                key = (inventory.global_scope, name)
+                if key in inventory.globals:
+                    module_only = True
+                elif key in inventory.nonlocals:
+                    nonlocal_writes.extend(inventory.nonlocal_writes.get(key, []))
+                elif key in inventory.bindings:
+                    return inventory.bindings[key]
             if isinstance(current, _SCOPES):
+                first_scope = False
                 inventory = self._inventory(current)
                 key = (id(current), name)
                 if isinstance(current, ast.Module):
@@ -302,11 +342,14 @@ class _ExternalTypes:
                         # Ownership alone cannot finish the proof: sibling
                         # helpers' actual module writes live in outer inventories.
                         module_only = True
+                    elif key in inventory.nonlocals:
+                        nonlocal_writes.extend(inventory.nonlocal_writes.get(key, []))
                     elif (id(current), "*") in inventory.bindings:
                         return [_FOREIGN]  # an unknown star export may shadow it
                     elif key in inventory.bindings:
                         values = inventory.bindings[key]
-                        return module_writes + values if isinstance(current, ast.Module) else values
+                        return (module_writes + values if isinstance(current, ast.Module) else
+                                nonlocal_writes + values + self._nonlocal_write_values(current, name))
                 if not isinstance(current, ast.Module):
                     # A nested helper can write the module without declaring
                     # this read global. Keep that evidence, but a genuine
@@ -399,30 +442,60 @@ class _ExternalTypes:
                                     and self._item_annotation(v.annotation, index) for v in values)
 
     def _pattern_class_root(self, expression) -> bool:
-        """MatchClass needs the class actually bound here, not a flat import.
+        """Every identity alias must ground in an actual external import.
 
-        A module/enclosing replacement can turn an imported class into a local
-        one. Reuse the lexical inventory, skipping class namespaces just as an
-        ordinary method's lookup does; every possible nearest write must be an
-        external import. Qualified class expressions need the same root proof.
+        Resolve each RHS in its own source scope, not the pattern's scope.
+        Iteration keeps flat, long alias chains off the Python call stack;
+        cycles, extracted data and any possible foreign replacement decline.
         """
-        root = self._root_name(expression)
-        if root is None:
-            return False
-        values = self._lexical_binding(expression, root)
-        if values is not None:
+        pending = [(expression, False)]
+        active, proven = set(), set()
+        while pending:
+            current, leaving = pending.pop()
+            root = self._root_name(current)
+            if root is None:
+                return False
+            key = (current, root)
+            if key in proven:
+                continue
+            if leaving:
+                active.remove(key)
+                proven.add(key)
+                continue
+            if key in active:
+                return False
+            values = self._lexical_binding(current, root)
+            if values is None:
+                if isinstance(current, ast.Name) and root in _BUILTIN_TYPES:
+                    proven.add(key)
+                    continue
+                return False
+            if not values:
+                return False
+            active.add(key)
+            pending.append((current, True))
             for value in values:
                 if isinstance(value, ast.Import):
                     modules = [alias.name.split(".")[0] for alias in value.names
                                if (alias.asname or alias.name.split(".")[0]) == root]
                 elif isinstance(value, ast.ImportFrom) and not value.level:
                     modules = [(value.module or "").split(".")[0]]
+                elif isinstance(value, (ast.Name, ast.Attribute)) and self._identity_assignment(value, root):
+                    pending.append((value, False))
+                    continue
                 else:
                     return False
                 if not modules or not all(self._external_module(top) for top in modules):
                     return False
-            return bool(values)
-        return isinstance(expression, ast.Name) and root in _BUILTIN_TYPES
+        return True
+
+    def _identity_assignment(self, value, name):
+        """A whole RHS assigned to this name, never an iterable/extraction."""
+        parent = self.parents.get(value)
+        if isinstance(parent, ast.Assign) and parent.value is value:
+            return any(isinstance(target, ast.Name) and target.id == name for target in parent.targets)
+        return (isinstance(parent, (ast.AnnAssign, ast.NamedExpr)) and parent.value is value
+                and isinstance(parent.target, ast.Name) and parent.target.id == name)
 
     def imported_namespace(self, declaration, name) -> bool:
         """An external value or proven first-party submodule, never any member.
@@ -661,8 +734,10 @@ def _read_method(func, module_names: set, types: "_ExternalTypes | None" = None)
                 and derivation.resolve(node.args[0]) == derivation.receiver_key
                 # Self-derived replacements can be a child with a different protocol.
                 and derivation.receiver_key not in derivation.unpacked
-                and all(derivation.binding_identity(value, derivation.receiver_key)
-                        for value in derivation.bindings[derivation.receiver_key])
+                and all(derivation.binding_identity(value, derivation.receiver_key,
+                            lambda _inventory, _expression, _key: False)
+                        for value in (derivation.bindings[derivation.receiver_key]
+                                      + types._nonlocal_write_values(func, receiver)))
                 and not any(_name_of(dec) == "classmethod" for dec in func.decorator_list)):
             representation = types.representation_builtin(node.func, derivation)
             if representation is not None:

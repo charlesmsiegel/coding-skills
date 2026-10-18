@@ -62,6 +62,9 @@ class _Derivation:
             self.bindings[self.receiver_key] = []
         for node in _method_nodes([func]):
             self._collect(node, receiver_arg)
+        # Outside-owner fallback is uncertainty, not an actual write. Preserve
+        # the latter so enclosing inventories can link class nonlocals too.
+        self.nonlocal_writes = {key: list(self.bindings.get(key, [])) for key in self.nonlocals}
         # A read-only global declaration in a nested function does not create
         # a module value (in particular, it cannot shadow a builtin there).
         if isinstance(func, ast.Module):
@@ -227,7 +230,7 @@ class _Derivation:
             child, current = current, self.parent.get(id(current))
         return None
 
-    def binding_identity(self, expr, origin, global_namespace=None) -> bool:
+    def binding_identity(self, expr, origin, global_namespace=None, values_at=None) -> bool:
         """A name alias grounded in one binding, never merely its data.
 
         The caller checks every write to the origin separately. Cycles among
@@ -258,7 +261,7 @@ class _Derivation:
                 continue
             if key in active:
                 return False
-            values = self.bindings.get(key, [])
+            values = values_at(key, value) if values_at is not None else self.bindings.get(key, [])
             if not values:
                 return False
             active.add(key)
@@ -273,12 +276,49 @@ class _Derivation:
         A possible foreign replacement in that binding or any alias still wins;
         merely encountering one import cannot certify the other writes.
         """
-        return any(self.binding_identity(expr, origin, global_namespace) and all(
+        return any(self.binding_identity(expr, origin, global_namespace, self.namespace_values) and all(
             isinstance(value, ast.Import)
             or (isinstance(value, ast.ImportFrom) and imported_namespace is not None
                 and imported_namespace(value, origin[1])) or self.derived(value)
-            or self.binding_identity(value, origin, global_namespace) for value in self.bindings[origin])
+            or self.binding_identity(value, origin, global_namespace, self.namespace_values)
+            for value in self.namespace_values(origin, expr))
             for origin in self.module_keys)
+
+    def _direct_statement(self, expression, scope):
+        current = expression
+        while current is not None:
+            parent = self.parent.get(id(current))
+            if parent is scope:
+                return current
+            current = parent
+        return None
+
+    def namespace_values(self, key, expression):
+        """A narrow read-position view over this same binding inventory.
+
+        Only a direct read after a completed direct import can ignore direct
+        own writes after that read. Reads in loops/branches and writes from
+        nested, conditional or ambient owners keep the all-writes policy.
+        """
+        values = self.bindings.get(key, [])
+        scope = self._scope_of(expression)
+        read = self._direct_statement(expression, scope) if scope is not None else None
+        if not isinstance(read, (ast.Assign, ast.AnnAssign, ast.Return, ast.Expr)):
+            return values
+        if not any(isinstance(value, (ast.Import, ast.ImportFrom))
+                   and self.parent.get(id(value)) is scope
+                   and (value.end_lineno, value.end_col_offset) < (read.lineno, read.col_offset)
+                   for value in values):
+            return values
+        visible = []
+        for value in values:
+            statement = self._direct_statement(value, scope) if isinstance(value, ast.AST) else None
+            if (self._scope_of(value) is scope
+                    and isinstance(statement, (ast.Assign, ast.AnnAssign, ast.Import, ast.ImportFrom))
+                    and (read.end_lineno, read.end_col_offset) < (statement.lineno, statement.col_offset)):
+                continue
+            visible.append(value)
+        return visible
 
     def derived(self, expr) -> bool:
         """True when ``expr`` navigates from self or from a self-derived name."""
