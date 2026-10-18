@@ -631,3 +631,47 @@ def test_later_exception_group_handlers_see_earlier_handler_imports(tmp_path):
               'try:\n    may_fail()\nexcept* ValueError:\n    from typing import cast\n'
               'except* TypeError:\n    value = cast("used.Type", None)\n')
     assert "used" not in unused_imports(tmp_path, source)
+
+
+@pytest.mark.parametrize("loop", ["for", "async for"])
+def test_potentially_empty_loops_keep_the_typing_origin(tmp_path, loop):
+    source = ('import used\nfrom typing import cast\n'
+              'async def run(values, value):\n'
+              f'    {loop} item in values:\n        cast = converter.cast\n'
+              '    return cast("used.Type", value)\n')
+    # A function assignment makes cast local for the whole function. Use a
+    # class's progressive namespace to exercise the zero-iteration fallback.
+    if loop == "for":
+        source = ('import used\nfrom typing import cast\nclass Result:\n'
+                  '    for item in values:\n        cast = converter.cast\n'
+                  '    value = cast("used.Type", value)\n')
+    else:
+        source = source.replace('    async for', '    from typing import cast\n    async for')
+    assert "used" not in unused_imports(tmp_path, source)
+
+
+@pytest.mark.parametrize("callee,argument,used", [
+    ("typing.cast", 'typ="used.Type", val=value', True),
+    ("cast", 'typ="used.Type", val=value', True),
+    ("converter.cast", 'typ="used.Type", val=value', False),
+    ("typing.cast", 'typ="str", val="used.Type"', False),
+])
+def test_keyword_cast_type_is_distinct_from_ordinary_keyword_data(tmp_path, callee, argument, used):
+    source = ('import used\nimport typing\nfrom typing import cast\nimport converter\n'
+              f'value = {callee}({argument})\n')
+    assert ("used" not in unused_imports(tmp_path, source)) is used
+
+
+@pytest.mark.parametrize("bindings,expression,used", [
+    ('from typing import cast\nconvert = cast\n', 'convert("used.Type", value)', True),
+    ('import typing\ntypes = typing\nconvert = types.cast\n', 'convert("used.Type", value)', True),
+    ('import typing\nconvert = typing.cast\nconvert = converter\n', 'convert("used.Type", value)', False),
+    ('from converter import cast\nconvert = cast\n', 'convert("used.Type", value)', False),
+    ('from typing import Literal\nChoice = Literal\n', 'Choice["used"]', False),
+    ('from custom import Literal\nChoice = Literal\n', 'Choice["used.Type"]', True),
+])
+def test_direct_aliases_keep_the_known_origin_without_inventing_type_semantics(tmp_path, bindings, expression, used):
+    source = 'import used\n' + bindings + f'def run(value):\n    return {expression}\n'
+    if "Choice" in expression:
+        source = 'import used\n' + bindings + f'def run() -> {expression}: pass\n'
+    assert ("used" not in unused_imports(tmp_path, source)) is used

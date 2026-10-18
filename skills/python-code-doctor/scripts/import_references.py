@@ -62,8 +62,19 @@ class ImportReferences(ast.NodeVisitor):
         # target. In `cast = cast("models.Model", value)` that order decides
         # whether the first argument is a type or ordinary string data.
         self.visit(node.value)
-        for target in node.targets:
+        assignments = [self._assignment_origins(target, node.value) for target in node.targets]
+        for target, origins in zip(node.targets, assignments):
             self.visit(target)
+            self._annotation_scopes[-1][1].update(origins)
+
+    def _assignment_origins(self, target, value):
+        if isinstance(target, ast.Name):
+            names = self._canonical_names(value, self._annotation_origins())
+            return {target.id: frozenset(name or None for name in names)} if names else {}
+        if isinstance(target, (ast.Tuple, ast.List)) and isinstance(value, (ast.Tuple, ast.List)) and len(target.elts) == len(value.elts):
+            return {name: origin for left, right in zip(target.elts, value.elts)
+                    for name, origin in self._assignment_origins(left, right).items()}
+        return {}
 
     def visit_NamedExpr(self, node: ast.NamedExpr):
         self.visit(node.value)
@@ -81,8 +92,10 @@ class ImportReferences(ast.NodeVisitor):
 
     def visit_For(self, node: ast.For | ast.AsyncFor):
         self.visit(node.iter)
-        self.visit(node.target)
-        for statement in (*node.body, *node.orelse):
+        # The iterable can be empty. Only an executing iteration binds its
+        # target or body, so retain the incoming origin beside that outcome.
+        self._join_branches(([], [node.target, *node.body]))
+        for statement in node.orelse:
             self.visit(statement)
 
     def visit_If(self, node: ast.If):
@@ -404,10 +417,13 @@ class ImportReferences(ast.NodeVisitor):
                 self._annotation_references(arg.annotation)
 
     def visit_AnnAssign(self, node: ast.AnnAssign):
+        origins = {}
         if node.value is not None:
             self.visit(node.value)
+            origins = self._assignment_origins(node.target, node.value)
         if node.value is not None or not isinstance(node.target, ast.Name):
             self.visit(node.target)
+            self._annotation_scopes[-1][1].update(origins)
         self._annotation_references(node.annotation)
         self.visit(node.annotation)
 
@@ -472,8 +488,9 @@ class ImportReferences(ast.NodeVisitor):
         # unrelated converter.cast("Model", value) receives ordinary data,
         # including when it appears inside quoted Annotated metadata.
         callees = self._canonical_names(node.func, self._annotation_origins())
-        if callees & {"typing.cast", "typing_extensions.cast"} and node.args:
-            self._annotation_references(node.args[0])
+        if callees & {"typing.cast", "typing_extensions.cast"}:
+            typ = node.args[0] if node.args else next((keyword.value for keyword in node.keywords if keyword.arg == "typ"), None)
+            self._annotation_references(typ)
             return True
         return False
 
