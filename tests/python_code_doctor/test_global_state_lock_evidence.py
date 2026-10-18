@@ -127,3 +127,61 @@ def test_local_shadowing_does_not_replace_the_imported_factory_or_release_the_gu
                       "    threading.Lock = make_guard\n    _guard.release()\n"
                       "def put(key):\n    with _guard:\n        registry[key] = 1\n")
     assert len(found) == 1 and found[0].kind == "candidate"
+
+
+@pytest.mark.parametrize("factory", ["Lock", "RLock"])
+@pytest.mark.parametrize("body", [
+    "        await prepare()\n        registry[key] = 1\n",
+    "        registry[key] = 1\n        await finish()\n",
+    "        async for value in values:\n            registry[key] = value\n",
+    "        registry[key] = [value async for value in values]\n",
+    "        def read(value=await prepare()):\n            return value\n        registry[key] = 1\n",
+])
+def test_thread_locks_do_not_certify_suspended_task_mutations(detector, factory, body):
+    found = mutations(detector, f"from threading import {factory}\n_guard = {factory}()\nregistry = {{}}\n"
+                      "async def put(key):\n    with _guard:\n" + body)
+    assert len(found) == 1 and found[0].kind == "finding"
+
+
+@pytest.mark.parametrize("contexts", ["_guard, _guard", "_guard:\n        with _guard"])
+@pytest.mark.parametrize("factory, expected", [("Lock", "finding"), ("RLock", "candidate")])
+def test_only_reentrant_locks_support_repeated_acquisition(detector, contexts, factory, expected):
+    indent = "        " if "," in contexts else "            "
+    found = mutations(detector, f"from threading import {factory}\n_guard = {factory}()\nregistry = {{}}\n"
+                      f"def put(key):\n    with {contexts}:\n{indent}registry[key] = 1\n")
+    assert len(found) == 1 and found[0].kind == expected
+
+
+@pytest.mark.parametrize("replacement", [
+    "class Replace:\n    threading.Lock = make_guard\n",
+    "class Outer:\n    class Replace:\n        threading.Lock = make_guard\n",
+])
+def test_class_execution_can_replace_the_imported_factory(detector, replacement):
+    found = mutations(detector, "import threading\n" + replacement +
+                      "_guard = threading.Lock()\nregistry = {}\n"
+                      "def put(key):\n    with _guard:\n        registry[key] = 1\n")
+    assert len(found) == 1 and found[0].kind == "finding"
+
+
+@pytest.mark.parametrize("setup", [
+    "from threading import Lock\nfrom app_guards import *\n_guard = Lock()\n",
+    "import threading\nfrom app_guards import *\n_guard = threading.Lock()\n",
+    "from threading import Lock\n_guard = Lock()\nfrom app_guards import *\n",
+])
+def test_wildcard_exports_leave_the_lock_identity_unproved(detector, setup):
+    found = mutations(detector, setup + "registry = {}\n"
+                      "def put(key):\n    with _guard:\n        registry[key] = 1\n")
+    assert len(found) == 1 and found[0].kind == "finding"
+
+
+def test_an_async_function_without_suspension_can_use_a_thread_lock(detector):
+    found = mutations(detector, "from threading import Lock\n_guard = Lock()\nregistry = {}\n"
+                      "async def put(key):\n    with _guard:\n        registry[key] = 1\n")
+    assert len(found) == 1 and found[0].kind == "candidate"
+
+
+def test_explicit_import_and_guard_after_a_wildcard_restore_known_bindings(detector):
+    found = mutations(detector, "from app_guards import *\nfrom threading import Lock\n"
+                      "_guard = Lock()\nregistry = {}\n"
+                      "def put(key):\n    with _guard:\n        registry[key] = 1\n")
+    assert len(found) == 1 and found[0].kind == "candidate"

@@ -122,14 +122,32 @@ def _guarded_nodes(stmts, locks):
     stack = [(s, frozenset()) for s in stmts if not isinstance(s, _SCOPE_BOUNDARIES)]
     while stack:
         node, held = stack.pop()
-        yield node, held
+        yield node, held if held is not None else frozenset()
         if isinstance(node, ast.With):
             # Context expressions are evaluated before their own __enter__,
             # in order: the first expression is not protected by a later lock.
+            # A thread mutex cannot certify task exclusion across suspension;
+            # Lock also cannot be acquired twice by the same thread. Keep an
+            # invalid proof invalid through nested contexts, even a different
+            # lock: the surrounding operation can already suspend or deadlock.
+            entered = set(held or ())
+            invalid = held is None
+            for item in node.items:
+                if entered and _suspends([item.context_expr]):
+                    invalid = True
+                if isinstance(item.context_expr, ast.Name) and item.context_expr.id in locks:
+                    name = item.context_expr.id
+                    if name in entered and locks[name] == "Lock":
+                        invalid = True
+                    entered.add(name)
+            if entered and _suspends(node.body):
+                invalid = True
+            if invalid:
+                held = None
             children = []
             for item in node.items:
                 children.append((item.context_expr, held))
-                if isinstance(item.context_expr, ast.Name) and item.context_expr.id in locks:
+                if held is not None and isinstance(item.context_expr, ast.Name) and item.context_expr.id in locks:
                     held = held | {item.context_expr.id}
                 if item.optional_vars:
                     children.append((item.optional_vars, held))
@@ -141,7 +159,15 @@ def _guarded_nodes(stmts, locks):
                 stack.append((child, held))
 
 
-def _module_scope_nodes(tree):
+def _suspends(stmts):
+    """Visible suspension in this execution scope, including implicit awaits."""
+    scope = ast.Module(body=list(stmts), type_ignores=[])
+    return any(isinstance(node, (ast.Await, ast.Yield, ast.YieldFrom, ast.AsyncFor, ast.AsyncWith))
+               or (isinstance(node, ast.comprehension) and node.is_async)
+               for node in _module_scope_nodes(scope, include_class_bodies=True))
+
+
+def _module_scope_nodes(tree, *, include_class_bodies=False):
     """Nodes evaluated in the module's scope, including definition inputs.
 
     Bodies of functions and classes have their own namespace. Defaults,
@@ -156,6 +182,10 @@ def _module_scope_nodes(tree):
             if isinstance(node, ast.ClassDef):
                 stack.extend(node.bases)
                 stack.extend(k.value for k in node.keywords)
+                if include_class_bodies:
+                    # Class assignments bind a separate namespace, but an
+                    # attribute store may still replace threading.Lock itself.
+                    stack.extend(node.body)
             else:
                 stack.extend(ast.iter_child_nodes(node.args))
                 if node.returns:
@@ -199,7 +229,7 @@ def _lock_interference(tree, threading_modules, lock_names):
     Use the same lexical bindings as the mutation reader: releasing a caller's
     same-named parameter says nothing about the module's guard.
     """
-    scopes = [(_module_scope_nodes(tree), frozenset())]
+    scopes = [(_module_scope_nodes(tree, include_class_bodies=True), frozenset())]
     for fn, enclosing in _function_scopes(tree):
         global_names = {name for node in _same_scope_nodes(fn.body)
                         if isinstance(node, ast.Global) for name in node.names}
@@ -220,17 +250,23 @@ def _lock_interference(tree, threading_modules, lock_names):
     return replaced, released
 
 
-def _module_locks(tree) -> set:
+def _module_locks(tree) -> dict:
     """Stable names bound once to an imported threading Lock/RLock constructor.
 
     A global declaration anywhere keeps a name out of this bounded proof: it
     permits a later call to replace the object the name originally identified.
     """
+    # An unknown export can replace a factory alias, the threading module or
+    # an already-created guard. Without resolving that surface none is stable.
+    last_wildcard = max((node.lineno for node in _module_scope_nodes(tree)
+                         if isinstance(node, ast.ImportFrom) and any(a.name == "*" for a in node.names)), default=0)
     bindings = _module_bindings(tree)
     global_names = {name for node in ast.walk(tree) if isinstance(node, ast.Global) for name in node.names}
     stable = {name for name, count in bindings.items() if count == 1} - global_names
-    threading_modules, lock_factories = set(), set()
+    threading_modules, lock_factories = set(), {}
     for stmt in tree.body:
+        if stmt.lineno <= last_wildcard:
+            continue
         if isinstance(stmt, ast.Import):
             for alias in stmt.names:
                 if alias.name == "threading":
@@ -238,11 +274,13 @@ def _module_locks(tree) -> set:
         elif isinstance(stmt, ast.ImportFrom) and stmt.module == "threading" and stmt.level == 0:
             for alias in stmt.names:
                 if alias.name in _LOCK_FACTORIES:
-                    lock_factories.add(alias.asname or alias.name)
+                    lock_factories[alias.asname or alias.name] = alias.name
     threading_modules &= stable
-    lock_factories &= stable
+    lock_factories = {name: factory for name, factory in lock_factories.items() if name in stable}
     locks = {}
     for stmt in tree.body:
+        if stmt.lineno <= last_wildcard:
+            continue
         value = stmt.value if isinstance(stmt, (ast.Assign, ast.AnnAssign)) else None
         if not isinstance(value, ast.Call):
             continue
@@ -256,11 +294,13 @@ def _module_locks(tree) -> set:
             continue
         targets = stmt.targets if isinstance(stmt, ast.Assign) else [stmt.target]
         origin = (func.value.id, func.attr) if isinstance(func, ast.Attribute) else None
-        locks.update((t.id, origin) for t in targets if isinstance(t, ast.Name) and t.id in stable)
+        factory = func.attr if isinstance(func, ast.Attribute) else lock_factories[func.id]
+        locks.update((t.id, (origin, factory)) for t in targets if isinstance(t, ast.Name) and t.id in stable)
     if not locks:
-        return set()
+        return {}
     replaced, released = _lock_interference(tree, threading_modules, set(locks))
-    return {name for name, origin in locks.items() if name not in released and origin not in replaced}
+    return {name: factory for name, (origin, factory) in locks.items()
+            if name not in released and origin not in replaced}
 
 
 def _bound_names(fn) -> set:
@@ -380,7 +420,7 @@ def detect(tree, filename, lines, ignore):
         visible = candidate_names - local
         if not visible:
             continue
-        for n, held in _guarded_nodes(fn.body, locks - local):
+        for n, held in _guarded_nodes(fn.body, {name: factory for name, factory in locks.items() if name not in local}):
             m = _mutates_name(n, visible)
             if m:
                 guarded[m].append(held)
