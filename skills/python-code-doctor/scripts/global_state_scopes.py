@@ -56,6 +56,41 @@ def callable_is_deferred(node):
                for item in module_scope_nodes(ast.Module(body=body, type_ignores=[])))
 
 
+def literal_index_values(value, index):
+    """Selected literal elements, or all possible elements plus uncertainty.
+
+    This inspects an expression's fresh literal, never a mutable container alias.
+    Unknown keys/unpackings cannot erase any visible guard-bearing alternative.
+    """
+    if isinstance(value, ast.Subscript):
+        selected = literal_index_values(value.value, value.slice)
+        if selected is None:
+            return None
+        values, exact = [], selected[1]
+        for member in selected[0]:
+            nested = literal_index_values(member, index)
+            if nested is None:
+                values.append(member)
+                exact = False
+            else:
+                values.extend(nested[0])
+                exact &= nested[1]
+        return values, exact
+    if not isinstance(value, (ast.Tuple, ast.List, ast.Dict)):
+        return None
+    values = value.values if isinstance(value, ast.Dict) else value.elts
+    try:
+        key = ast.literal_eval(index)
+        if isinstance(value, ast.Dict):
+            pairs = [(ast.literal_eval(item), result) for item, result in zip(value.keys, values)]
+            return [next(result for item, result in reversed(pairs) if item == key)], True
+        if any(isinstance(item, ast.Starred) for item in values):
+            return values, False
+        return [values[key]], True
+    except (ValueError, TypeError, IndexError, StopIteration):
+        return values, False
+
+
 def module_scope_nodes(tree, *, include_class_bodies=False, skipped=frozenset()):
     """Nodes evaluated in the module's scope, including definition inputs.
 
