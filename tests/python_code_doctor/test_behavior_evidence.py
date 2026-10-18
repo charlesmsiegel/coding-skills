@@ -95,6 +95,70 @@ def completed(runtime):
     assert 'None except inside' not in row['description']
 
 
+@pytest.mark.parametrize('declaration', ['self.result = None', 'self.result: object | None = None'])
+@pytest.mark.parametrize('preparation', ['', '        prepare(task)\n'])
+def test_result_cleared_at_operation_entry_keeps_candidate_evidence(run_script, tmp_path, declaration, preparation):
+    [row] = detect(run_script, tmp_path, 'find_design_smells.py',
+                   'class Strategy:\n'
+                   f'    def __init__(self):\n        {declaration}\n'
+                   '    def run(self, task):\n'
+                   '        """Publish the last completed verification for the caller."""\n'
+                   f'{preparation}'
+                   f'        {declaration}\n'
+                   '        for attempt in task.attempts:\n'
+                   '            self.result = verify(attempt)\n'
+                   '            if self.result.verified:\n'
+                   '                return outcome(attempt)\n'
+                   '\ndef receipt(strategy):\n    return strategy.result\n', 'temporary_field')
+    assert row['kind'] == 'candidate'
+    assert row['also_caused_by'] and not row['suggestion']
+    assert 'self.result' in row['description'] and 'Strategy.run' in row['description']
+    assert 'None except inside' not in row['description']
+
+
+@pytest.mark.parametrize(('field', 'body'), [
+    ('_scratch', '        self._scratch = None\n'
+                 '        self._scratch = text.split()\n        log(self._scratch)\n'),
+    ('scratch', '        self.scratch = None\n        self.scratch = text.split()\n'
+                '        log(self.scratch)\n        self.scratch = None\n'),
+    ('scratch', '        self.scratch = None; self.scratch = text.split(); '
+                'log(self.scratch); self.scratch = None\n'),
+    ('scratch', '        self.scratch = None\n        try:\n'
+                '            self.scratch = text.split()\n            log(self.scratch)\n'
+                '        finally:\n            self.scratch = None\n'),
+    ('scratch', '        if text:\n            self.scratch = None\n'
+                '        self.scratch = text.split()\n        log(self.scratch)\n'),
+])
+def test_entry_reset_does_not_hide_private_or_later_reset_scratch(run_script, tmp_path, field, body):
+    [row] = detect(run_script, tmp_path, 'find_design_smells.py',
+                   'class Parser:\n'
+                   f'    def __init__(self):\n        self.{field} = None\n'
+                   f'    def parse(self, text):\n{body}', 'temporary_field')
+    assert row['kind'] == 'finding'
+    assert row['suggestion'] and not row['also_caused_by']
+
+
+@pytest.mark.parametrize('cleanup', [
+    'del self.result',
+    'self.result, text = None, text',
+    'self.result, text = clear_result(text)',
+    'setattr(self, "result", None)',
+    'delattr(self, "result")',
+    'object.__setattr__(self, "result", None)',
+    'self.__delattr__("result")',
+    'self.__dict__["result"] = None',
+])
+def test_initial_reset_does_not_hide_other_field_cleanup(run_script, tmp_path, cleanup):
+    [row] = detect(run_script, tmp_path, 'find_design_smells.py',
+                   'class Parser:\n'
+                   '    def __init__(self):\n        self.result = None\n'
+                   '    def parse(self, text):\n        self.result = None\n'
+                   '        self.result = text.split()\n        log(self.result)\n'
+                   f'        {cleanup}\n', 'temporary_field')
+    assert row['kind'] == 'finding'
+    assert row['suggestion'] and not row['also_caused_by']
+
+
 @pytest.mark.parametrize(('field', 'reset'), [('_scratch', ''), ('scratch', '        self.scratch = None\n')])
 def test_single_method_scratch_keeps_a_finding(run_script, tmp_path, field, reset):
     [row] = detect(run_script, tmp_path, 'find_design_smells.py',
