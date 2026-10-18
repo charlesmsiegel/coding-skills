@@ -342,3 +342,68 @@ def test_an_executing_branch_can_replace_the_visible_cast(tmp_path):
     source = ("import unused\nfrom typing import cast\nif True:\n    cast = converter\n"
               "def result(value):\n    return cast('unused.Type', value)\n")
     assert "unused" in unused_imports(tmp_path, source)
+
+
+def test_quoted_metadata_stores_do_not_rebind_the_surrounding_source(tmp_path):
+    source = ('import used\nfrom typing import Annotated, cast\n'
+              'value: "Annotated[int, (cast := converter)]"\n'
+              'value = cast("used.Type", None)\n')
+    assert "used" not in unused_imports(tmp_path, source)
+
+
+def test_a_known_converter_call_does_not_become_typing_after_a_later_import(tmp_path):
+    source = ('import unused\ndef run(value):\n    from converter import convert\n'
+              '    value = convert("unused.Type", value)\n'
+              '    from typing import cast as convert\n    return value\n')
+    assert "unused" in unused_imports(tmp_path, source)
+
+
+@pytest.mark.parametrize("expression", [
+    '[convert := converter for _ in [0]]',
+    '{convert := converter for _ in [0]}',
+    '{key: (convert := converter) for key in [0]}',
+])
+def test_comprehension_walrus_binds_in_its_containing_scope(tmp_path, expression):
+    source = (f'import unused\nfrom typing import cast as convert\n{expression}\n'
+              'value = convert("unused.Type", None)\n')
+    assert "unused" in unused_imports(tmp_path, source)
+
+
+@pytest.mark.parametrize("binding", [
+    'convert = converter.convert',
+    'from converter import convert',
+])
+def test_an_inner_function_uses_its_enclosing_functions_local_binding(tmp_path, binding):
+    source = ('import unused\nfrom typing import cast as convert\ndef outer():\n'
+              '    def inner(value):\n        return convert("unused.Type", value)\n'
+              f'    {binding}\n    return inner\n')
+    assert "unused" in unused_imports(tmp_path, source)
+
+
+@pytest.mark.parametrize("scope", ["module", "class"])
+def test_a_bare_annotation_does_not_replace_an_existing_import(tmp_path, scope):
+    statement = 'Kind: Kind["unused"]'
+    if scope == "class":
+        statement = 'class Container:\n    ' + statement
+    source = f'from typing import Literal as Kind\nimport unused\n{statement}\n'
+    assert "unused" in unused_imports(tmp_path, source)
+
+
+def test_a_generator_body_does_not_rebind_its_containing_scope_at_creation(tmp_path):
+    source = ('import used\nfrom typing import cast as convert\n'
+              'rows = (convert := converter for _ in [0])\n'
+              'value = convert("used.Type", None)\n')
+    assert "used" not in unused_imports(tmp_path, source)
+
+
+def test_a_generators_first_iterable_still_executes_in_the_containing_scope(tmp_path):
+    source = ('import unused\nfrom typing import cast as convert\n'
+              'rows = (value for value in (convert := converter))\n'
+              'value = convert("unused.Type", None)\n')
+    assert "unused" in unused_imports(tmp_path, source)
+
+
+def test_a_lambda_walrus_declares_a_local_before_its_first_reference(tmp_path):
+    source = ('import unused\nfrom typing import cast as convert\n'
+              'run = lambda value: (convert("unused.Type", value), (convert := converter))\n')
+    assert "unused" in unused_imports(tmp_path, source)

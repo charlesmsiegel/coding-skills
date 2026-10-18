@@ -23,6 +23,7 @@ import io
 import json
 import argparse
 import re
+import symtable
 import tokenize
 from pathlib import Path
 from dataclasses import dataclass, asdict
@@ -177,6 +178,7 @@ class ScopeTracker(ast.NodeVisitor):
         filename: str,
         parents: dict[ast.AST, ast.AST],
         comments: dict[int, list[str]],
+        function_bindings: dict[tuple[int, str], set[str]],
     ):
         self.filename = filename
         self.issues: list[DeadCodeIssue] = []
@@ -190,6 +192,7 @@ class ScopeTracker(ast.NodeVisitor):
         self.instantiated_classes: Set[str] = set()
         self.parents = parents
         self.comments = comments
+        self.function_bindings = function_bindings
         self.import_origins: dict[str, str] = {}
         self._annotation_scopes = [("module", {})]
         # Unresolved calls in deferred bodies may use an import below their
@@ -274,7 +277,17 @@ class ScopeTracker(ast.NodeVisitor):
 
     def visit_NamedExpr(self, node: ast.NamedExpr):
         self.visit(node.value)
-        self.visit(node.target)
+        # Unlike a comprehension's iteration target, a walrus binds in its
+        # containing non-comprehension scope (PEP 572).
+        previous = self._annotation_scopes
+        end = len(previous)
+        while previous[end - 1][0] == "comprehension":
+            end -= 1
+        self._annotation_scopes = previous[:end]
+        try:
+            self.visit(node.target)
+        finally:
+            self._annotation_scopes = previous
 
     def visit_For(self, node: ast.For | ast.AsyncFor):
         self.visit(node.iter)
@@ -327,9 +340,38 @@ class ScopeTracker(ast.NodeVisitor):
         return out
 
     @contextmanager
+    def _preserve_annotation_bindings(self, enabled=True):
+        saved = [(origins, origins.copy()) for _kind, origins in self._annotation_scopes] if enabled else []
+        try:
+            yield
+        finally:
+            for origins, original in saved:
+                origins.clear()
+                origins.update(original)
+
+    def _lambda_bindings(self, node: ast.Lambda) -> set[str]:
+        names = set()
+        for expression in ast.walk(node.body):
+            if not isinstance(expression, ast.NamedExpr):
+                continue
+            child, parent = expression, self.parents.get(expression)
+            while parent is not None:
+                if isinstance(parent, ast.Lambda) and child is parent.body:
+                    if parent is node:
+                        names.add(expression.target.id)
+                    break
+                child, parent = parent, self.parents.get(parent)
+        return names
+
+    @contextmanager
     def _annotation_scope(self, node):
         is_class = isinstance(node, ast.ClassDef)
-        origins = {}
+        # Python decides a function's locals for its whole body, including
+        # bindings below a nested definition. An empty origin is pending; None
+        # means a parameter or an already visited non-import binding.
+        origins = {name: "" for name in self.function_bindings.get((node.lineno, getattr(node, "name", "")), ())}
+        if isinstance(node, ast.Lambda):
+            origins.update((name, "") for name in self._lambda_bindings(node))
         args = getattr(node, "args", None)
         if args is not None:
             for arg in (*args.posonlyargs, *args.args, *args.kwonlyargs, args.vararg, args.kwarg):
@@ -506,7 +548,12 @@ class ScopeTracker(ast.NodeVisitor):
             # file's AST: a callee is called, not handed out as a callback.
             self.parents.update((child, parent) for parent in ast.walk(expression)
                                 for child in ast.iter_child_nodes(parent))
-            self._annotation_references(expression)
+            # A string annotation can contain stores when eventually evaluated,
+            # but reading it here does not execute those stores in the source.
+            # Restore the existing maps in place so deferred bodies keep their
+            # live namespace references for imports encountered later.
+            with self._preserve_annotation_bindings():
+                self._annotation_references(expression)
             return
         if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load):
             # Match the existing file-local, conservative treatment of names.
@@ -541,7 +588,7 @@ class ScopeTracker(ast.NodeVisitor):
     def visit_AnnAssign(self, node: ast.AnnAssign):
         if node.value is not None:
             self.visit(node.value)
-        self.visit(node.target)
+            self.visit(node.target)
         self._annotation_references(node.annotation)
         self.visit(node.annotation)
 
@@ -582,7 +629,9 @@ class ScopeTracker(ast.NodeVisitor):
         # Later iterables/filters see preceding targets, and no target leaks
         # into the enclosing annotation or expression.
         self.visit(node.generators[0].iter)
-        with self._annotation_scope(node):
+        # Creating a generator executes its first iterable, but its body and
+        # walrus stores remain deferred until somebody advances it.
+        with self._preserve_annotation_bindings(isinstance(node, ast.GeneratorExp)), self._annotation_scope(node):
             for index, generator in enumerate(node.generators):
                 if index:
                     self.visit(generator.iter)
@@ -628,9 +677,17 @@ class ScopeTracker(ast.NodeVisitor):
             self.instantiated_classes.add(node.func.id)
         elif isinstance(node.func, ast.Attribute):
             self.called_functions.add(node.func.attr)
-        if not self._typing_cast_references(node) and any(
+        if not self._typing_cast_references(node) and self._unresolved_callee(node.func) and any(
                 kind == "function" for kind, _origins in self._annotation_scopes):
             self._deferred_casts.append((node, tuple(self._annotation_scopes)))
+
+    def _unresolved_callee(self, node: ast.AST) -> bool:
+        dotted = _dotted_name(node)
+        if not dotted:
+            return False
+        first = dotted.partition(".")[0]
+        origins = self._annotation_origins()
+        return first not in origins or origins[first] == ""
 
     def _typing_cast_references(self, node: ast.Call) -> bool:
         # Only typing's cast gives its first argument type semantics. An
@@ -870,6 +927,25 @@ class RedundantCodeDetector(ast.NodeVisitor):
         self.generic_visit(node)
 
 
+def _function_bindings(source: str, filename: str) -> dict[tuple[int, str], set[str]]:
+    """Use Python's lexical scope analysis rather than guessing locals from
+    traversal order. Classes deliberately remain progressive namespaces."""
+    try:
+        tables = [symtable.symtable(source, filename, "exec")]
+    except SyntaxError:
+        # ast.parse accepts some incomplete snippets that symbol analysis
+        # rejects. They still get the existing structural/reference checks.
+        return {}
+    bindings = {}
+    while tables:
+        table = tables.pop()
+        tables.extend(table.get_children())
+        if table.get_type() == "function" and table.get_name() != "lambda":
+            bindings[table.get_lineno(), table.get_name()] = {
+                symbol.get_name() for symbol in table.get_symbols() if symbol.is_local()}
+    return bindings
+
+
 def analyze_file(filepath: Path, ignore: set[str] = frozenset()) -> list[DeadCodeIssue]:
     try:
         source, tree = cached_parse(filepath)
@@ -883,7 +959,7 @@ def analyze_file(filepath: Path, ignore: set[str] = frozenset()) -> list[DeadCod
             for child in ast.iter_child_nodes(parent)
         }
         
-        tracker = ScopeTracker(str(filepath), parents, comments)
+        tracker = ScopeTracker(str(filepath), parents, comments, _function_bindings(source, str(filepath)))
         tracker.visit(tree)
         tracker.finalize()
         
