@@ -274,3 +274,70 @@ def test_shadowed_representation_names_do_not_invent_state(detector, tmp_path, b
                 return self.payload
     """)
     assert cohesion(detector, tmp_path, source) == []
+
+
+@pytest.mark.parametrize("builtin,protocol", [("str", "__str__"), ("repr", "__repr__")])
+def test_an_unrelated_local_import_does_not_shadow_representation_dispatch(detector, tmp_path, builtin, protocol):
+    source = textwrap.dedent(f"""
+        def unrelated():
+            from builtins import repr as {builtin}
+
+        class Split:
+            def measure(self):
+                return len(self.metrics)
+            def save(self):
+                return {builtin}(self)
+            def {protocol}(self):
+                return self.payload
+    """)
+    [record] = cohesion(detector, tmp_path, source)
+    assert record.metric_value == 2
+    assert "{measure} and {save}" in record.description
+
+
+@pytest.mark.parametrize("builtin,protocol", [("str", "__str__"), ("repr", "__repr__")])
+def test_a_module_import_still_shadows_representation_dispatch(detector, tmp_path, builtin, protocol):
+    source = textwrap.dedent(f"""
+        from external import render as {builtin}
+
+        class Entry:
+            def measure(self):
+                return len(self.metrics)
+            def save(self):
+                return {builtin}(self)
+            def {protocol}(self):
+                return self.payload
+    """)
+    assert cohesion(detector, tmp_path, source) == []
+
+
+def test_builtin_str_fallback_to_repr_preserves_behavioral_state(detector, tmp_path):
+    source = textwrap.dedent("""
+        class Split:
+            def measure(self):
+                return len(self.metrics)
+            def save(self):
+                return str(self)
+            def __repr__(self):
+                return self.payload
+    """)
+    [record] = cohesion(detector, tmp_path, source)
+    assert record.metric_value == 2
+    assert "{measure} and {save}" in record.description
+
+
+def test_inherited_str_is_not_assumed_to_dispatch_to_local_repr(detector, tmp_path):
+    source = textwrap.dedent("""
+        class Base:
+            def __str__(self):
+                return str(self.metrics)
+
+        class Entry(Base):
+            def measure(self):
+                return len(self.metrics)
+            def save(self):
+                return str(self)
+            def __repr__(self):
+                return self.payload
+    """)
+    assert cohesion(detector, tmp_path, source) == []
