@@ -100,6 +100,11 @@ def _declared_fields(node: ast.ClassDef) -> set:
 # Initializers assign every attribute the class has, so as LCOM4 nodes they
 # would join every group into one and hide exactly the split being measured.
 _INITIALIZERS = frozenset({"__init__", "__new__", "__post_init__", "__init_subclass__"})
+# A representation can show any slice of an object without adding a behavioral
+# responsibility. Reading every field to print it cannot join real responsibilities
+# either, so these methods are neither vertices nor bridges in the cohesion graph.
+# Other protocols (__len__, __iter__, __call__, ...) still express behavior.
+_REPRESENTATIONS = frozenset({"__repr__", "__str__"})
 _METHOD_TYPES = (ast.FunctionDef, ast.AsyncFunctionDef)
 _VALIDATOR_DECORATORS = frozenset({
     "model_validator", "field_validator", "validator", "root_validator",
@@ -595,11 +600,12 @@ def _groups(methods: dict, fields: set = frozenset()) -> list[list[str]]:
     Two methods are joined when they touch a common `self.<attribute>` (read or
     write; a property read through `self.prop` reaches the property's own node)
     or when one refers to the other through self; a record's declared ``fields``
-    count as one attribute (see _declared_fields). Initializers are left out, and
-    so is a method with no edge at all: one that uses no instance state is a
-    static-method candidate, not evidence that the class splits.
+    count as one attribute (see _declared_fields). Initializers and representations
+    are left out, and so is a method with no edge at all: one that uses no instance
+    state is a static-method candidate, not evidence that the class splits.
     """
-    names = [n for n in methods if n not in _INITIALIZERS and not methods[n].validates]
+    names = [n for n in methods
+             if n not in _INITIALIZERS and n not in _REPRESENTATIONS and not methods[n].validates]
     parent = {n: n for n in names}
 
     def find(n):
