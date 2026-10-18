@@ -109,11 +109,12 @@ def _is_exported(file: TsFile, index: int) -> bool:
 _TYPE_CONTINUING = frozenset({":", "|", "&", "=>", "<", "(", ",", "[", "?", "=", "extends"})
 
 
-def read_type_after_colon(file: TsFile, colon: int, stop: int) -> tuple[str, int]:
+def read_type_after_colon(file: TsFile, colon: int, stop: int, *, record_span: bool = True) -> tuple[str, int]:
     """Read a type annotation starting at a `:`. Returns (text, index after).
 
     The span is recorded on the file so `in_type_position` can later tell a
-    function type from a function.
+    function type from a function. Speculative declaration readers defer that
+    record until they have established that the colon really starts a type.
     """
     cursor = colon + 1
     start = cursor
@@ -154,7 +155,7 @@ def read_type_after_colon(file: TsFile, colon: int, stop: int) -> tuple[str, int
                 and token.value not in CONTINUATIONS and token.kind == "name":
             break
         cursor += 1
-    if cursor > start:
+    if record_span and cursor > start:
         file.type_spans.append((start, cursor - 1))
     text = file.slice(start, cursor)
     if cursor < stop and file.tokens[cursor].is_op(">=", ">>=", ">>>="):
@@ -687,13 +688,19 @@ def extract_object_methods(file: TsFile) -> None:
             continue
         close = file.closer(opener)
         after = close + 1
+        type_colon = -1
         if after < len(tokens) and tokens[after].is_op(":"):
-            _, after = read_type_after_colon(file, after, len(tokens))
+            type_colon = after
+            _, after = read_type_after_colon(file, after, len(tokens), record_span=False)
         if after >= len(tokens) or not tokens[after].is_op("{"):
             continue
         previous = tokens[index - 1] if index else None
         if previous is not None and (previous.is_op(".", "?.", "=", "new") or previous.is_name(*CONTROL_KEYWORDS)):
             continue
+        # `condition ? call(value) : {}` also has a colon after parentheses.
+        # A rejected method probe must not publish its value branch as a type.
+        if type_colon >= 0 and after > type_colon + 1:
+            file.type_spans.append((type_colon + 1, after - 1))
         if file.enclosing_class(index) is not None:
             continue
         is_async = bool(previous is not None and previous.is_name("async"))
