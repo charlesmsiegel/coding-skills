@@ -452,3 +452,73 @@ def test_quoted_type_parameter_bounds_and_constraints_use_imports(tmp_path, decl
 ])
 def test_quoted_type_parameter_defaults_use_imports(tmp_path, declaration):
     assert "models" not in unused_imports(tmp_path, f'import models\n{declaration}\n')
+
+
+@pytest.mark.parametrize("branch", [
+    'if flag:\n    cast = converter\n',
+    'if flag:\n    cast = converter\nelse:\n    pass\n',
+    'if flag:\n    pass\nelse:\n    cast = converter\n',
+])
+def test_a_conditional_shadow_retains_the_possible_typing_origin(tmp_path, branch):
+    source = ('import used\nfrom typing import cast\n' + branch
+              + 'def run(value):\n    return cast("used.Type", value)\n')
+    assert "used" not in unused_imports(tmp_path, source)
+
+
+def test_both_conditional_branches_can_replace_a_typing_origin(tmp_path):
+    source = ('import unused\nfrom typing import cast\n'
+              'if flag:\n    cast = converter\nelse:\n    cast = other_converter\n'
+              'def run(value):\n    return cast("unused.Type", value)\n')
+    assert "unused" in unused_imports(tmp_path, source)
+
+
+@pytest.mark.parametrize("name,annotation", [
+    ('Literal', "Literal['unused.Type']"),
+    ('Annotated', "Annotated[int, 'unused.Type']"),
+    ('Literal as Values', "Values['unused.Type']"),
+])
+def test_later_typing_import_resolves_a_fully_quoted_special_form(tmp_path, name, annotation):
+    source = (f'import unused\ndef run(value: {annotation!r}): pass\n'
+              f'from typing import {name}\n')
+    assert "unused" in unused_imports(tmp_path, source)
+
+
+def test_a_later_custom_generic_still_reads_its_forward_reference(tmp_path):
+    source = ('import used\ndef run(value: "Values[\'used.Type\']"): pass\n'
+              'from custom_types import Values\n')
+    assert "used" not in unused_imports(tmp_path, source)
+
+
+def test_deleting_a_class_shadow_exposes_the_enclosing_typing_import(tmp_path):
+    source = ('import used\nfrom typing import cast\nclass Container:\n'
+              '    cast = converter\n    del cast\n'
+              '    value = cast("used.Type", None)\n')
+    assert "used" not in unused_imports(tmp_path, source)
+
+
+def test_deleting_a_function_local_does_not_expose_the_global_cast(tmp_path):
+    source = ('import unused\nfrom typing import cast\ndef run(value):\n'
+              '    cast = converter\n    del cast\n'
+              '    return cast("unused.Type", value)\n')
+    assert "unused" in unused_imports(tmp_path, source)
+
+
+def test_a_call_before_its_own_function_local_import_is_not_a_typing_cast(tmp_path):
+    source = ('import unused\ndef run(value):\n'
+              '    value = convert("unused.Type", value)\n'
+              '    from typing import cast as convert\n    return value\n')
+    assert "unused" in unused_imports(tmp_path, source)
+
+
+def test_a_nested_function_can_use_a_later_enclosing_cast_import(tmp_path):
+    source = ('import used\ndef outer():\n    def inner(value):\n'
+              '        return convert("used.Type", value)\n'
+              '    from typing import cast as convert\n    return inner\n')
+    assert "used" not in unused_imports(tmp_path, source)
+
+
+def test_a_possible_custom_generic_retains_its_type_argument(tmp_path):
+    source = ('import used\nfrom typing import Literal\n'
+              'if flag:\n    Literal = custom_generic\n'
+              'value: Literal["used.Type"]\n')
+    assert "used" not in unused_imports(tmp_path, source)
