@@ -436,6 +436,18 @@ class ScopeTracker(ast.NodeVisitor):
             self.used_names.add(node.value.id)
         self.generic_visit(node)
 
+    def _expression_references(self, node: ast.AST) -> None:
+        """Metadata expressions use names, while their strings remain data.
+
+        A quoted annotation has no ordinary AST walk through its contents.
+        Literal enum members and Annotated metadata still need their imports,
+        without interpreting a string argument as another forward reference.
+        """
+        names = {child.id for child in ast.walk(node)
+                 if isinstance(child, ast.Name) and isinstance(child.ctx, ast.Load)}
+        self.used_names.update(names)
+        self.value_references.update(names)
+
     def _annotation_references(self, node: ast.AST | None) -> None:
         """Read forward references only in annotation type positions."""
         if node is None:
@@ -455,10 +467,13 @@ class ScopeTracker(ast.NodeVisitor):
             name = self._canonical_name(node.value, self._annotation_scopes[-1][1])
             self._annotation_references(node.value)
             if name in {"typing.Literal", "typing_extensions.Literal"}:
+                self._expression_references(node.slice)
                 return  # String values are data, not forward references.
             if name in {"typing.Annotated", "typing_extensions.Annotated"}:
-                first = node.slice.elts[0] if isinstance(node.slice, ast.Tuple) else node.slice
-                self._annotation_references(first)
+                args = node.slice.elts if isinstance(node.slice, ast.Tuple) else [node.slice]
+                self._annotation_references(args[0])
+                for metadata in args[1:]:
+                    self._expression_references(metadata)
                 return  # Remaining arguments are metadata.
             self._annotation_references(node.slice)
             return

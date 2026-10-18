@@ -101,3 +101,28 @@ def test_local_typing_import_does_not_leak_into_sibling_function(tmp_path):
               'def f():\n    from typing import Literal\n    value: Literal["used.Type"]\n'
               'def g(Literal):\n    value: Literal["used.Type"]\n')
     assert 'used' not in unused_imports(tmp_path, source)
+
+
+@pytest.mark.parametrize("declaration", [
+    'def result(value: "Literal[Color.RED, \'unused.Type\']"): pass',
+    'async def result() -> "Literal[Color.RED, \'unused.Type\']": pass',
+    'def result(*values: "Literal[Color.RED, \'unused.Type\']"): pass',
+    'def result(**values: "Literal[Color.RED, \'unused.Type\']"): pass',
+    'value: "Literal[Color.RED, \'unused.Type\']"',
+])
+@pytest.mark.parametrize("module", ["typing", "typing_extensions"])
+def test_quoted_literal_values_retain_expression_names_but_not_string_data(tmp_path, declaration, module):
+    source = (f"from {module} import Literal\nfrom colors import Color\nimport unused\n"
+              + declaration + "\n")
+    assert unused_imports(tmp_path, source) == {"unused"}
+
+
+@pytest.mark.parametrize("imports, annotation", [
+    ("from typing import Literal as Choices", "Choices[Color.RED, 'unused.Type']"),
+    ("import typing as types", "types.Literal[Color.RED, 'unused.Type']"),
+    ("from typing import Annotated", "Annotated[int, Color.RED, 'unused.Type']"),
+    ("from typing import Annotated", "Annotated[int, {'color': Color.RED, 'text': 'unused.Type'}]"),
+])
+def test_quoted_metadata_expressions_retain_imports(tmp_path, imports, annotation):
+    source = f"{imports}\nfrom colors import Color\nimport unused\nvalue: {annotation!r}\n"
+    assert unused_imports(tmp_path, source) == {"unused"}
