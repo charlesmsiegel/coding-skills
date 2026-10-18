@@ -101,21 +101,6 @@ def _loads_attribute(path: Path, receivers: set[str], attr: str) -> bool:
                for node in ast.walk(tree))
 
 
-def _string_annotation_names(annotation: ast.AST | None) -> set[str]:
-    """Names a string annotation (`"Model"`, `list["Model"]`) refers to."""
-    names: set[str] = set()
-    if annotation is None:
-        return names
-    for node in ast.walk(annotation):
-        if isinstance(node, ast.Constant) and isinstance(node.value, str):
-            try:
-                parsed = ast.parse(node.value.strip(), mode="eval")
-            except (SyntaxError, ValueError):
-                continue
-            names.update(inner.id for inner in ast.walk(parsed) if isinstance(inner, ast.Name))
-    return names
-
-
 def _dotted_name(node) -> str | None:
     if isinstance(node, ast.Name):
         return node.id
@@ -556,10 +541,12 @@ class ScopeTracker(ast.NodeVisitor):
             self.instantiated_classes.add(node.func.id)
         elif isinstance(node.func, ast.Attribute):
             self.called_functions.add(node.func.attr)
-        # typing.cast("Model", value) names a type in a string, as an annotation does.
-        callee = node.func.id if isinstance(node.func, ast.Name) else getattr(node.func, "attr", None)
-        if callee == "cast" and node.args:
-            self.used_names.update(_string_annotation_names(node.args[0]))
+        # Only typing's cast gives its first argument type semantics. An
+        # unrelated converter.cast("Model", value) receives ordinary data,
+        # including when it appears inside quoted Annotated metadata.
+        callee = self._canonical_name(node.func, self._annotation_scopes[-1][1])
+        if callee in {"typing.cast", "typing_extensions.cast"} and node.args:
+            self._annotation_references(node.args[0])
 
     def visit_Call(self, node: ast.Call):
         self._call_references(node)

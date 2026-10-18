@@ -155,3 +155,39 @@ def test_metadata_call_is_not_a_callback_reference(tmp_path, quoted):
     issues = dead_code_issues(tmp_path, source)
     assert any(item["issue_type"] == "unused_parameter" and item["name"] == "unused"
                and item["kind"] == "finding" for item in issues)
+
+
+@pytest.mark.parametrize("quoted", [False, True])
+@pytest.mark.parametrize("imports, callee", [
+    ("import converter", "converter.cast"),
+    ("from converter import cast", "cast"),
+])
+def test_unrelated_cast_strings_remain_metadata_data(tmp_path, quoted, imports, callee):
+    annotation = f"Annotated[int, {callee}('unused.Type', 1)]"
+    source = (f"import unused\nfrom typing import Annotated\n{imports}\n"
+              f"value: {repr(annotation) if quoted else annotation}\n")
+    assert "unused" in unused_imports(tmp_path, source)
+
+
+@pytest.mark.parametrize("module", ["typing", "typing_extensions"])
+@pytest.mark.parametrize("imports, callee", [
+    ("from {module} import cast as convert", "convert"),
+    ("import {module} as types", "types.cast"),
+])
+def test_typing_cast_aliases_retain_quoted_type_imports(tmp_path, module, imports, callee):
+    annotation = f"Annotated[int, {callee}('used.Type', 1)]"
+    source = (f"import used\nfrom typing import Annotated\n{imports.format(module=module)}\n"
+              f"value: {annotation!r}\n")
+    assert "used" not in unused_imports(tmp_path, source)
+
+
+def test_a_shadowed_typing_cast_is_an_ordinary_metadata_call(tmp_path):
+    source = ("import unused\nfrom typing import Annotated, cast\n"
+              "def run(cast):\n    value: \"Annotated[int, cast('unused.Type', 1)]\"\n")
+    assert "unused" in unused_imports(tmp_path, source)
+
+
+def test_typing_cast_type_reader_preserves_literal_string_data(tmp_path):
+    source = ("import unused\nfrom typing import Annotated, Literal, cast\n"
+              "value: \"Annotated[int, cast(\\\"Literal['unused.Type']\\\", 1)]\"\n")
+    assert "unused" in unused_imports(tmp_path, source)
