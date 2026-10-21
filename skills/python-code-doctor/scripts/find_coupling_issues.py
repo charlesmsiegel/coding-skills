@@ -226,6 +226,7 @@ def _read_method(func, module_names: set, types: "_ExternalTypes | None" = None)
                             lambda _inventory, _expression, _key: False)
                         for value in (derivation.bindings[derivation.receiver_key]
                                       + types._nonlocal_write_values(func, receiver)))
+                and func.name not in {"__class_getitem__", "__init_subclass__"}
                 and not any(_name_of(dec) == "classmethod" for dec in func.decorator_list)):
             representation = types.representation_builtin(node.func, derivation)
             if representation is not None:
@@ -244,9 +245,7 @@ def _read_method(func, module_names: set, types: "_ExternalTypes | None" = None)
                 method.derived_reads.add(f"{base.id}.{node.attr}")
             elif key is None and base.id in module_names:
                 pass  # a module has no class to move the method to
-            elif key is not None and derivation.bindings[key] and all(
-                    isinstance(value, ast.ClassDef) and not (value.bases or value.keywords or value.decorator_list)
-                    for value in derivation.bindings[key]):
+            elif key is not None and types is not None and types.class_namespace(base):
                 pass  # a proven class namespace is not another instance's data
             elif types is not None and types.name(base, derivation):
                 pass  # a library or builtin object: nowhere to move the method to

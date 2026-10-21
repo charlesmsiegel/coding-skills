@@ -3,6 +3,8 @@
 Lexical inventories prove whether a value belongs outside the repository;
 cohesion and feature-envy aggregation consume that evidence in the detector.
 This reader reuses the shared binding inventory rather than executing flow.
+Import paths identify the same object across lexical aliases; actual member
+writes and visible local subclasses can contradict an external pattern proof.
 """
 
 import ast
@@ -56,12 +58,18 @@ class _ExternalTypes:
         self.scope_inventories = {tree: _Derivation(tree, None)}
         self.global_scopes: dict[str, set] = defaultdict(set)
         self.nonlocal_scopes: dict[str, set] = defaultdict(set)
-        self.attribute_writes: set[tuple] = set()
+        self.attribute_writes: list[ast.Attribute] = []
+        self.import_paths: dict[ast.AST, set[tuple]] = {}
+        self.member_writes: dict[int, set] = {}
+        self.subclass_paths: dict[int, set] = {}
         for node in ast.walk(tree):
             if isinstance(node, ast.Attribute) and isinstance(node.ctx, (ast.Store, ast.Del)):
+                parent = self.parents.get(node)
+                if isinstance(parent, ast.AnnAssign) and parent.value is None:
+                    continue  # An annotation evaluates its target without replacing the member.
                 path = self._attribute_path(node)
                 if path is not None:
-                    self.attribute_writes.add(path)
+                    self.attribute_writes.append(node)
             if isinstance(node, ast.Import):
                 for alias in node.names:
                     self.imports[alias.asname or alias.name.split(".")[0]] = alias.name.split(".")[0]
@@ -195,13 +203,13 @@ class _ExternalTypes:
         value. Both representation dispatch and pattern typing use this same
         ownership lookup over the existing inventories.
         """
-        current = self.parents.get(expression)
+        child, current = expression, self.parents.get(expression)
         module_only = False
         module_writes = []
         nonlocal_writes = []
         first_scope = True
         while current is not None:
-            if isinstance(current, ast.ClassDef) and first_scope:
+            if isinstance(current, ast.ClassDef) and first_scope and child in current.body:
                 # A class body's own aliases see its namespace; an ordinary
                 # method (or nested class) never closes over that namespace.
                 first_scope = False
@@ -243,7 +251,7 @@ class _ExternalTypes:
                     # enclosing cell still owns the read before the module.
                     # An explicit global skips cells, not other module writes.
                     module_writes.extend(inventory.bindings.get((inventory.global_scope, name), []))
-            current = self.parents.get(current)
+            child, current = current, self.parents.get(current)
         return module_writes or None
 
     def representation_builtin(self, expression, derivation):
@@ -258,6 +266,13 @@ class _ExternalTypes:
         if self._lexical_binding(expression, expression.id) is not None:
             return None
         return "__str__" if expression.id == "str" else "__repr__"
+
+    def class_namespace(self, expression):
+        """Every lexical writer, including class-body nonlocals, leaves a plain class."""
+        values = self._lexical_binding(expression, expression.id)
+        return bool(values) and all(isinstance(value, ast.ClassDef)
+                                    and not (value.bases or value.keywords or value.decorator_list)
+                                    for value in values)
 
     @staticmethod
     def _root_name(expr):
@@ -336,60 +351,105 @@ class _ExternalTypes:
             expression = expression.value
         return (expression.id, *reversed(names)) if isinstance(expression, ast.Name) else None
 
-    def _pattern_class_root(self, expression) -> bool:
-        """Every identity alias must ground in an actual external import.
+    @staticmethod
+    def _import_origins(declaration, name):
+        if isinstance(declaration, ast.Import):
+            return {tuple((alias.name if alias.asname else alias.name.split(".")[0]).split("."))
+                    for alias in declaration.names if (alias.asname or alias.name.split(".")[0]) == name}
+        if isinstance(declaration, ast.ImportFrom) and not declaration.level:
+            return {tuple((declaration.module or "").split(".")) + tuple(alias.name.split("."))
+                    for alias in declaration.names if (alias.asname or alias.name) == name}
+        return None
 
-        Resolve each RHS in its own source scope, not the pattern's scope.
-        Iteration keeps flat, long alias chains off the Python call stack;
-        cycles, extracted data and any possible foreign replacement decline.
-        This all-writes proof does not order match flows or certify unpacked
-        aliases; unknowns remain ungraded feature-envy candidates.
+    def _import_paths(self, expression):
+        """Canonical import paths, grounded iteratively in every lexical write.
+
+        A qualified alias retains its suffix at every hop. Unknown writes,
+        extraction and cycles cannot certify identity; modules are never loaded.
         """
         pending = [(expression, False)]
-        active, proven = set(), set()
+        active = set()
         while pending:
             current, leaving = pending.pop()
-            # An imported module root cannot certify a visibly replaced member.
-            # Check each qualified alias RHS too; no module execution is inferred.
+            if current in self.import_paths:
+                continue
             path = self._attribute_path(current)
-            if path and any(path[:end] in self.attribute_writes for end in range(2, len(path) + 1)):
-                return False
-            root = self._root_name(current)
-            if root is None:
-                return False
-            key = (current, root)
-            if key in proven:
-                continue
-            if leaving:
-                active.remove(key)
-                proven.add(key)
-                continue
-            if key in active:
-                return False
+            if path is None:
+                return set()
+            root, suffix = path[0], path[1:]
             values = self._lexical_binding(current, root)
             if values is None:
                 if isinstance(current, ast.Name) and root in _BUILTIN_TYPES:
-                    proven.add(key)
+                    self.import_paths[current] = {("builtins", root)}
                     continue
-                return False
+                return set()
             if not values:
-                return False
-            active.add(key)
+                return set()
+            if leaving:
+                paths = set()
+                for value in values:
+                    origins = self._import_origins(value, root)
+                    paths.update(origin + suffix for origin in (
+                        origins if origins is not None else self.import_paths[value]))
+                self.import_paths[current] = paths
+                active.remove(current)
+                continue
+            if current in active:
+                return set()
+            active.add(current)
             pending.append((current, True))
             for value in values:
-                if isinstance(value, ast.Import):
-                    modules = [alias.name.split(".")[0] for alias in value.names
-                               if (alias.asname or alias.name.split(".")[0]) == root]
-                elif isinstance(value, ast.ImportFrom) and not value.level:
-                    modules = [(value.module or "").split(".")[0]]
-                elif isinstance(value, (ast.Name, ast.Attribute)) and self._identity_assignment(value, root):
-                    pending.append((value, False))
+                if isinstance(value, ast.Import) or (isinstance(value, ast.ImportFrom) and not value.level):
                     continue
+                if isinstance(value, (ast.Name, ast.Attribute)) and self._identity_assignment(value, root):
+                    pending.append((value, False))
                 else:
-                    return False
-                if not modules or not all(self._external_module(top) for top in modules):
-                    return False
-        return True
+                    return set()
+        return self.import_paths.get(expression, set())
+
+    def _possible_import_paths(self, expression, max_depth, *, generic=False):
+        """Contradictions need any known origin, even beside unknown writes.
+
+        Only paths no longer than the pattern can contradict its prefixes.
+        That bound also terminates aliases whose cycles add member suffixes.
+        """
+        pending = [(expression, ())]
+        seen, paths = set(), set()
+        while pending:
+            current, suffix = pending.pop()
+            if generic and isinstance(current, ast.Subscript):
+                current = current.value
+            key = (current, suffix)
+            if key in seen or len(suffix) >= max_depth:
+                continue
+            seen.add(key)
+            path = self._attribute_path(current)
+            if path is None:
+                continue
+            root, suffix = path[0], path[1:] + suffix
+            values = self._lexical_binding(current, root)
+            if values is None:
+                if isinstance(current, ast.Name) and root in _BUILTIN_TYPES:
+                    paths.add(("builtins", root) + suffix)
+                continue
+            for value in values:
+                origins = self._import_origins(value, root)
+                if origins is not None:
+                    paths.update(origin + suffix for origin in origins if len(origin + suffix) <= max_depth)
+                elif isinstance(value, (ast.Name, ast.Attribute)) or (generic and isinstance(value, ast.Subscript)):
+                    pending.append((value, suffix))
+        return paths
+
+    def _pattern_class_root(self, expression) -> bool:
+        """An external import with no visible writes to its canonical members."""
+        paths = self._import_paths(expression)
+        if not paths or not all(self._external_module(path[0]) for path in paths):
+            return False
+        depth = max(map(len, paths))
+        if depth not in self.member_writes:
+            self.member_writes[depth] = {path for write in self.attribute_writes
+                                         for path in self._possible_import_paths(write, depth)}
+        return not any(path[:end] in self.member_writes[depth] for path in paths for end in range(2, len(path) + 1))
 
     def _identity_assignment(self, value, name):
         """A whole RHS assigned to this name, never an iterable/extraction."""
@@ -435,10 +495,17 @@ class _ExternalTypes:
         if isinstance(pattern, ast.MatchSingleton):
             return True  # True/False/None match by identity, not overloaded equality.
         if isinstance(pattern, ast.MatchClass):
-            # The lexical root proof already checks the actual external import.
-            # The general callee reader treats method-local imports as unknown,
-            # which would discard that proof for both bare and qualified classes.
-            return self._pattern_class_root(pattern.cls)
+            if not self._pattern_class_root(pattern.cls):
+                return False
+            paths = self._import_paths(pattern.cls)
+            depth = max(map(len, paths))
+            if depth not in self.subclass_paths:
+                self.subclass_paths[depth] = {("builtins", "object")} | {
+                    path for node in ast.walk(self.module_scope) if isinstance(node, ast.ClassDef)
+                    for base in node.bases for path in self._possible_import_paths(base, depth, generic=True)}
+            # A class pattern accepts subclasses too. Visible first-party
+            # subclasses keep the capture eligible for an ungraded candidate.
+            return paths.isdisjoint(self.subclass_paths[depth])
         if isinstance(pattern, ast.MatchAs):
             return self._pattern_type(pattern.pattern)
         if isinstance(pattern, ast.MatchOr):

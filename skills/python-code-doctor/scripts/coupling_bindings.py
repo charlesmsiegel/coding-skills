@@ -344,5 +344,3 @@ class _Derivation:
                 return key is not None and self.state.get(key, False)
             else:
                 return False
-
-
