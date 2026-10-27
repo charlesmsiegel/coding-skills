@@ -133,6 +133,56 @@ def _is_subclass_or_same(child, parent):
     return child == parent or parent in _exc_ancestors(child)
 
 
+class _BuiltinExceptions:
+    """Known inheritance applies only to lexically unshadowed builtin names."""
+
+    def __init__(self, tree):
+        self.parents = {child: parent for parent in ast.walk(tree) for child in ast.iter_child_nodes(parent)}
+        self.bound = {}
+        boundaries = (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda)
+        for scope in ast.walk(tree):
+            if not isinstance(scope, (ast.Module, *boundaries)):
+                continue
+            names = set()
+            args = getattr(scope, 'args', None)
+            if args is not None:
+                names.update(arg.arg for arg in ast.walk(args) if isinstance(arg, ast.arg))
+            body = scope.body if not isinstance(scope, ast.Lambda) else [scope.body]
+            stack = list(body)
+            while stack:
+                node = stack.pop()
+                if isinstance(node, boundaries):
+                    if hasattr(node, 'name'):
+                        names.add(node.name)
+                    continue
+                if isinstance(node, ast.Name) and isinstance(node.ctx, (ast.Store, ast.Del)):
+                    names.add(node.id)
+                elif isinstance(node, (ast.Import, ast.ImportFrom)):
+                    names.update(alias.asname or alias.name.split('.')[0] for alias in node.names)
+                elif isinstance(node, (ast.Global, ast.Nonlocal)):
+                    names.update(node.names)
+                elif isinstance(node, (ast.ExceptHandler, ast.MatchAs, ast.MatchStar)) and node.name:
+                    names.add(node.name)
+                elif isinstance(node, ast.MatchMapping) and node.rest:
+                    names.add(node.rest)
+                stack.extend(ast.iter_child_nodes(node))
+            self.bound[scope] = names
+
+    def name(self, expr):
+        if not isinstance(expr, ast.Name) or expr.id not in {'BaseException', *_EXC_PARENT}:
+            return None
+        scope = self.parents.get(expr)
+        in_function = False
+        while scope is not None:
+            if scope in self.bound and not (in_function and isinstance(scope, ast.ClassDef)):
+                if expr.id in self.bound[scope] or '*' in self.bound[scope]:
+                    return None
+            if isinstance(scope, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+                in_function = True
+            scope = self.parents.get(scope)
+        return expr.id
+
+
 def _handler_type_names(handler):
     """Return (names, is_bare): names is the list of exception names this handler
     catches (Name.id / Attribute.attr); is_bare is True for `except:`."""
@@ -234,6 +284,10 @@ class ExceptionIssueDetector(ast.NodeVisitor):
             also_caused_by=tuple(also_caused_by),
         ))
 
+    def visit_Module(self, node):
+        self._builtin_exceptions = _BuiltinExceptions(node)
+        self.generic_visit(node)
+
     def visit_FunctionDef(self, node):
         self._functions.append(node)
         self.generic_visit(node)
@@ -250,31 +304,31 @@ class ExceptionIssueDetector(ast.NodeVisitor):
     def visit_Try(self, node: ast.Try):
         for handler in node.handlers:
             self._try_of[handler] = node
-        caught_names = []        # names caught by earlier handlers
-        catch_all_label = None   # label of an earlier catch-all (bare / Exception / BaseException)
+        caught = []
+        bare = False
         for handler in node.handlers:
-            names, is_bare = _handler_type_names(handler)
-            if is_bare:
-                catch_all_label = catch_all_label or "<bare except>"
-                continue  # the bare except itself is reported by find_code_smells
-            if catch_all_label is not None:
+            # Keep unknown tuple members: proving one covered member does not
+            # prove the whole handler unreachable. Attribute leaves are not
+            # builtin bindings (e.g. asyncio.CancelledError).
+            def members(expr):
+                if isinstance(expr, ast.Tuple):
+                    return [part for item in expr.elts for part in members(item)]
+                return [expr]
+
+            current = members(handler.type) if handler.type is not None else []
+            names = [self._builtin_exceptions.name(part) for part in current]
+            covered = bool(names) and all(
+                name is not None and any(_is_subclass_or_same(name, earlier) for earlier in caught)
+                for name in names)
+            if bare or covered:
+                label = ast.unparse(handler.type) if handler.type is not None else "<bare except>"
                 self._add(handler.lineno, "unreachable_except",
-                    f"This 'except {' / '.join(names)}' can never run; an earlier 'except {catch_all_label}' already catches it",
-                    "Put specific exception handlers before the catch-all, or remove the redundant clause.",
+                    f"'except {label}' can never run because earlier handlers cover every caught type",
+                    "List specific exceptions before their base class, or drop the redundant handler.",
                     severity="high")
-            else:
-                for nm in names:
-                    base = next((e for e in caught_names if _is_subclass_or_same(nm, e)), None)
-                    if base is not None:
-                        self._add(handler.lineno, "unreachable_except",
-                            f"'except {nm}' can never run because the earlier 'except {base}' already catches it",
-                            "List specific exceptions before their base class, or drop the redundant handler.",
-                            severity="high")
-                        break
-            for nm in names:
-                caught_names.append(nm)
-                if catch_all_label is None and nm in {"Exception", "BaseException"}:
-                    catch_all_label = nm
+            if handler.type is None:
+                bare = True
+            caught.extend(name for name in names if name is not None)
         self.generic_visit(node)
 
     # -- helpers for swallowed_exception ----------------------------------
