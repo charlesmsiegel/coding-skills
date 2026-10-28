@@ -473,5 +473,3 @@ def _quoted_constant_sql_checker(tree):
                 and all(proof.quoted(value) for kind, value in parts if kind == "value"))
 
     return check
-
-
