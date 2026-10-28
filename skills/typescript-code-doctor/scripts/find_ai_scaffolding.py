@@ -6,13 +6,13 @@ markers.
 
 These are not "AI smells" in some mystical sense. They are what any code written
 faster than it was read looks like: plausible shape, missing middle. The two
-that cost the most are the silent ones — a second declaration of the same name,
-where the later one wins and the earlier one is dead; and an options parameter
+that cost the most are the subtle ones — a conflicting declaration in the same scope and namespace,
+where incompatible bindings cause compile errors or duplicate implementations; and an options parameter
 the body never destructures, so every caller's setting is ignored.
 """
 
 import re
-from collections import defaultdict
+from declaration_bindings import check_duplicate_bindings
 
 from common import Reporter, is_test_file, run_file_detector
 from tsparse import TsFile, body_indices
@@ -76,31 +76,7 @@ def _check_unused_options(file: TsFile, report: Reporter) -> None:
 
 
 def _check_duplicate_definitions(file: TsFile, report: Reporter) -> None:
-    """The same name declared twice at module scope — the later one wins."""
-    declarations: dict[str, list[int]] = defaultdict(list)
-    for func in file.functions:
-        # Module scope only. Two nested `function onKeyDown` helpers in two
-        # different components are separate bindings, not a redefinition.
-        if func.kind == "function" and func.name != "<anonymous>" and func.has_body \
-                and file.top_level(func.start):
-            declarations[func.name].append(func.line)
-    for klass in file.classes:
-        if klass.name != "<anonymous>" and file.top_level(klass.start):
-            declarations[klass.name].append(klass.line)
-    for decl in file.types:
-        # Interfaces merge by design; a repeated `type` or `enum` does not.
-        if decl.kind != "interface":
-            declarations[decl.name].append(decl.line)
-
-    for name, lines in declarations.items():
-        if len(lines) < 2:
-            continue
-        report.add(lines[-1], "duplicate_definition",
-                   f"`{name}` is declared {len(lines)} times in this file (lines "
-                   f"{', '.join(str(line) for line in lines)})",
-                   "Merge them and delete the loser. The last declaration wins at runtime, so the "
-                   "earlier body is dead code that still reads as live.", "high",
-                   related=lines[:-1])
+    check_duplicate_bindings(file, report)
 
 
 def _check_conflict_markers(file: TsFile, report: Reporter) -> None:

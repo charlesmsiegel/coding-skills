@@ -430,3 +430,6 @@ the repo's own adjudication: the record becomes a candidate, and the reason is
 what to check. A bare `# noqa: BLE001` says nothing and stays a finding. The
 detectors that read it: `swallowed_exception` and `catches_baseexception` (BLE001),
 and `global_rebind` (PLW0603, on the `global` statement).
+
+For the exact local SQL quoting and exception reachability recognition conditions
+and their limits, see `references/detector-evidence.md`.

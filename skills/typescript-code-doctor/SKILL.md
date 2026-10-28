@@ -390,3 +390,6 @@ test-smell detection that scaffold a safety net), the **AI-code tells**
 (scaffolding, ignored options, duplicate definitions), the fact that it **runs
 with no install and no node_modules** — plus the **judgment guides**, which no
 linter provides.
+
+For lexical binding scopes, ambient namespace exports and bounded enum/interface
+merge evidence, see `references/declaration-bindings.md`.
